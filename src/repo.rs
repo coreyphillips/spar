@@ -250,6 +250,35 @@ impl Repo {
         let path = self.worktree_path(&format!("issue-{issue}"));
 
         self.git_try(&["fetch", "origin", base]);
+
+        // Never rebuild a branch that already carries work.
+        //
+        // `run_issue` sends an issue with an open pull request to the resume
+        // path, so reaching here with a remote branch ahead of the base means
+        // commits were pushed that no open PR accounts for. Rebuilding would
+        // force push over them, and the lease is no protection: the remote
+        // tracking ref survives the local branch being deleted, so it still
+        // matches and the push succeeds.
+        self.git_try(&["fetch", "origin", &branch]);
+        let remote_branch = format!("origin/{branch}");
+        if self.rev_exists(&self.root, &remote_branch) {
+            let range = format!("origin/{base}..{remote_branch}");
+            let ahead: u32 = self
+                .git_try(&["rev-list", "--count", &range])
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            if ahead > 0 {
+                bail!(
+                    "origin/{branch} already has {ahead} commit(s) that are not on {base}, and no \
+                     open pull request accounts for them. Rebuilding it would force push over \
+                     that work.\nOpen a pull request for the branch and run `spar resume <pr>` to \
+                     continue it, or delete it with `git push origin --delete {branch}` if it is \
+                     stale."
+                );
+            }
+        }
+
         self.worktree_remove(issue);
         self.git_try(&["branch", "-D", &branch]);
 

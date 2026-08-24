@@ -56,7 +56,7 @@ pub enum Command {
         no_worktrees: bool,
     },
 
-    /// Triage only. Writes the plan and changes no code.
+    /// Triage only. Writes the plan and touches nothing else.
     Triage {
         /// Issue numbers. Omit to take every open issue, up to --limit.
         issues: Vec<i64>,
@@ -136,7 +136,8 @@ pub struct Common {
 
 #[derive(Args, Debug, Clone)]
 pub struct LoopFlags {
-    /// Review rounds before escalating to a human.
+    /// Review rounds this run may spend before escalating. Resuming grants a
+    /// fresh budget; it is not a lifetime cap on the pull request.
     #[arg(long)]
     pub max_rounds: Option<u32>,
     /// Merge when no blocking findings remain. Off by default, deliberately.
@@ -193,8 +194,10 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 return Ok(0);
             }
             let issues = repo.fetch_issues(&numbers)?;
-            let plan = make_plan(&agents, &cfg, &repo, &issues, &plan_out)?;
-            act_on_plan(&cfg, &repo, &plan);
+            // Deliberately no act_on_plan here. `triage` is the command you
+            // reach for to look before leaping, and a preview that comments on
+            // and closes issues is a trap.
+            make_plan(&agents, &cfg, &repo, &issues, &plan_out)?;
             Ok(0)
         }
         Command::Run {

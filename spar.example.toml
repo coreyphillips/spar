@@ -29,7 +29,10 @@ effort = "ultra"
 # it out and spar asks for JSON in the prompt and parses it back.
 
 [loop]
-max_rounds        = 3        # review rounds before escalating to a human
+max_rounds        = 3        # review rounds ONE invocation may spend before
+                             # escalating. Resuming a PR grants a fresh budget,
+                             # so this is not a lifetime cap. Round numbers keep
+                             # counting up so the ledger stays coherent.
 auto_merge        = false    # off on purpose: two models agreeing is not the
                              # same as being right, and neither carries the
                              # consequences of a bad merge

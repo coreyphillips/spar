@@ -64,10 +64,11 @@ numbers for `resume`. Omit them and spar takes everything open.
 ```bash
 spar run                    # triage every open issue, then work them in order
 spar run 42 51 60           # or name the ones you care about
-spar triage                 # triage only, write plan.json, change nothing
+spar triage                 # triage only, write plan.json, touch nothing
 spar run --limit 50         # raise the cap on how many open issues to take
 spar run 42 --auto-merge    # merge when no blocking findings remain
 spar run 42 --max-rounds 5  # allow more review rounds before escalating
+spar run 42                 # if 42 already has an open PR, continues it
 spar run 42 --first codex   # the other agent implements
 spar run 42 --no-close-skipped   # comment on a declined issue but leave it open
 
@@ -113,6 +114,13 @@ next one's base. The first agent implements and opens a PR. Custody passes to
 the other, which reviews with full repo context rather than a bare diff. Each
 finding is labelled `blocking`, `non-blocking`, or `nit`.
 
+**Rounds.** `max_rounds` is a budget for one invocation, not a lifetime cap on
+the PR. A run that escalates after three rounds and is then resumed gets three
+more, because a person looked at it and chose to continue. Round numbers keep
+counting up (4, 5, 6) so the refutation ledger and the PR history stay coherent,
+and the escalation comment says both how many rounds this run spent and how many
+the PR has seen in total.
+
 **Convergence.** Only `blocking` findings gate the merge. Everything else is
 filed as a follow-up issue and the PR proceeds. This matters: a competent
 reviewer can always find something, so "no objections remaining" is not a
@@ -123,6 +131,13 @@ stopping condition, but "no blocking objections" is.
 `spar resume <pr>` picks up any open PR, whether or not spar created it. Human
 authored, agent authored, half finished, does not matter: if it has a branch and
 a diff, the loop can take custody of it.
+
+`spar run <issue>` does the same thing when that issue already has an open PR:
+it continues the existing PR from where the last session stopped rather than
+implementing over the top of it. Running spar again on work in progress is always
+a resume, never a restart. If a branch carries pushed work that no open PR
+accounts for, spar refuses rather than force pushing over it, and says how to
+recover.
 
 This is also the cheapest way to adopt spar. No agent writes a feature from
 scratch; it only reviews what already exists.

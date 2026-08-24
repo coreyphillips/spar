@@ -765,3 +765,72 @@ fn a_preset_override_under_the_spar_directory_is_honoured() {
     assert!(!out.contains("unknown preset"), "{out}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Never rebuilding over work that already exists
+// ---------------------------------------------------------------------------
+
+/// The data loss case behind `spar run 42` on an issue that has already been
+/// worked. Deleting the local branch and rebuilding from the base leaves the
+/// remote tracking ref intact, so `--force-with-lease` is satisfied and the
+/// push quietly replaces the previous round's commits.
+#[test]
+fn a_remote_branch_with_unaccounted_work_is_not_rebuilt() {
+    let fx = repo("noclobber");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+
+    // A previous session's work, pushed.
+    git(&fx.work, &["checkout", "-q", "-b", "issue-42"]);
+    commit(
+        &fx.work,
+        "feature.txt",
+        "round one\n",
+        "Implement the feature",
+    );
+    git(&fx.work, &["push", "-q", "-u", "origin", "issue-42"]);
+    git(&fx.work, &["checkout", "-q", "main"]);
+    let before = git(&fx.work, &["rev-parse", "origin/issue-42"]);
+
+    let err = repo.worktree_add(42, "main").unwrap_err().to_string();
+
+    assert!(err.contains("issue-42"), "{err}");
+    assert!(
+        err.contains("force push"),
+        "the reason has to be in the message: {err}"
+    );
+    assert!(
+        err.contains("spar resume"),
+        "the remedy has to be in the message: {err}"
+    );
+    assert_eq!(
+        before,
+        git(&fx.work, &["rev-parse", "origin/issue-42"]),
+        "the previous work must still be on origin"
+    );
+}
+
+#[test]
+fn a_branch_that_matches_the_base_is_not_treated_as_work() {
+    let fx = repo("noclobber-equal");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+
+    // A branch pushed with nothing on it beyond the base.
+    git(&fx.work, &["push", "-q", "origin", "main:issue-43"]);
+
+    let (path, branch) = repo
+        .worktree_add(43, "main")
+        .expect("an empty branch carries no work to lose");
+    assert_eq!("issue-43", branch);
+    assert!(path.is_dir());
+    repo.worktree_remove(43);
+}
+
+#[test]
+fn a_fresh_issue_is_unaffected_by_the_guard() {
+    let fx = repo("noclobber-fresh");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, branch) = repo.worktree_add(44, "main").unwrap();
+    assert_eq!("issue-44", branch);
+    assert!(path.join("README.md").is_file());
+    repo.worktree_remove(44);
+}

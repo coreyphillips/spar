@@ -132,6 +132,23 @@ pub fn run_issue(
     issue: &Issue,
     ledger: &mut Ledger,
 ) -> IssueRun {
+    // Continue an existing PR rather than implementing over the top of it.
+    //
+    // Without this, a second `spar run 42` deletes the local branch, rebuilds
+    // it from the base, implements from scratch, and force pushes. The lease
+    // holds because the remote tracking ref survives the local branch being
+    // deleted, so the push succeeds and the previous round's work is gone from
+    // the PR with nothing to say it ever existed.
+    let branch = repo.branch_for_issue(item.issue);
+    if let Some(existing) = repo.pr_for_branch(&branch) {
+        log!(
+            "#{}: {} is already open, continuing it instead of implementing again",
+            item.issue,
+            existing.url
+        );
+        return resume_pr(agents, cfg, repo, existing.number, None);
+    }
+
     let mut state = IssueRun::new(item.issue, item.title.clone());
     let base = cfg.base_branch().to_string();
 
@@ -317,14 +334,6 @@ fn resume_inner(
         None => log!("PR #{pr_number}: no prior spar state, starting fresh with {holder}"),
     }
 
-    if start_round > cfg.loop_cfg.max_rounds {
-        return Err(spar_err!(
-            "PR #{pr_number} already used {} of {} rounds. Raise --max-rounds to continue.",
-            start_round - 1,
-            cfg.loop_cfg.max_rounds
-        ));
-    }
-
     let mut state = IssueRun::new(subject, pr.title.clone());
     state.pr = Some(pr.url.clone());
     if let Some(s) = &saved {
@@ -398,7 +407,16 @@ fn review_loop(
     let base = cfg.base_branch().to_string();
     let mut holder = ctx.holder.clone();
 
-    for round in ctx.start_round..=cfg.loop_cfg.max_rounds {
+    // `max_rounds` is a budget for this invocation, not a lifetime cap on the
+    // pull request. Running spar again on a PR that already spent its rounds is
+    // a deliberate act by a person who has looked at it, so it gets a fresh
+    // budget rather than an error telling them to raise a number they cannot
+    // see from the outside.
+    let (first, last_allowed) = round_window(ctx.start_round, cfg.loop_cfg.max_rounds);
+    let mut last_round = first.saturating_sub(1);
+
+    for round in first..=last_allowed {
+        last_round = round;
         state.rounds = round;
         let reviewer = agent::find(agents, &holder)?;
         let effort = cfg.effort_for_round(&reviewer.spec, round);
@@ -537,26 +555,54 @@ fn review_loop(
     }
 
     state.status = Status::Escalated;
-    state.notes.push(format!(
-        "no convergence after {} rounds",
-        cfg.loop_cfg.max_rounds
-    ));
+    state
+        .notes
+        .push(exhausted_note(ctx.start_round, last_round));
     let _ = repo.comment_pr(
         ctx.pr_number,
-        &format!(
-            "Stopping after {} review rounds without convergence. Needs a human decision.",
-            cfg.loop_cfg.max_rounds
-        ),
+        &exhausted_comment(ctx.start_round, last_round),
     );
-    persist(
-        repo,
-        ctx.pr_number,
-        state,
-        ledger,
-        cfg.loop_cfg.max_rounds,
-        &holder,
-    );
+    persist(repo, ctx.pr_number, state, ledger, last_round, &holder);
     Ok(())
+}
+
+/// The inclusive range of round numbers this invocation will work through.
+///
+/// Round numbers keep counting up across sessions so the ledger and the PR
+/// history stay coherent, while the budget resets each time a person chooses to
+/// run spar again.
+fn round_window(start_round: u32, budget: u32) -> (u32, u32) {
+    (start_round, start_round + budget.saturating_sub(1))
+}
+
+/// How many rounds this invocation spent, and how many the PR has seen in
+/// total. A resumed PR that stops at round 8 did not have 8 rounds of budget,
+/// and saying so would misreport both the cost and the history.
+fn spent(start_round: u32, last_round: u32) -> (u32, u32) {
+    (last_round.saturating_sub(start_round) + 1, last_round)
+}
+
+fn exhausted_note(start_round: u32, last_round: u32) -> String {
+    let (this_run, total) = spent(start_round, last_round);
+    if this_run == total {
+        format!("no convergence after {this_run} rounds")
+    } else {
+        format!("no convergence after {this_run} more rounds ({total} in total)")
+    }
+}
+
+fn exhausted_comment(start_round: u32, last_round: u32) -> String {
+    let (this_run, total) = spent(start_round, last_round);
+    if this_run == total {
+        format!(
+            "Stopping after {this_run} review rounds without convergence. Needs a human decision."
+        )
+    } else {
+        format!(
+            "Stopping after {this_run} more review rounds without convergence, {total} in total. \
+             Needs a human decision."
+        )
+    }
 }
 
 fn persist(
@@ -1070,6 +1116,62 @@ mod tests {
     #[test]
     fn nothing_is_released_when_worktrees_are_off() {
         assert!(!should_release(&cfg_with(false, false), Status::Approved));
+    }
+
+    // -- round budget ----------------------------------------------------
+
+    /// A fresh PR gets rounds 1 through max_rounds.
+    #[test]
+    fn a_fresh_run_starts_at_one() {
+        assert_eq!((1, 3), round_window(1, 3));
+        assert_eq!((1, 5), round_window(1, 5));
+    }
+
+    /// The budget is per invocation, not a lifetime cap. Running spar again on
+    /// a PR that already spent five rounds gives it five more, because a person
+    /// looked at it and chose to.
+    #[test]
+    fn a_resumed_run_gets_a_full_fresh_budget() {
+        assert_eq!((6, 10), round_window(6, 5));
+        assert_eq!((11, 13), round_window(11, 3));
+    }
+
+    #[test]
+    fn a_budget_of_one_is_a_single_round() {
+        assert_eq!((6, 6), round_window(6, 1));
+    }
+
+    #[test]
+    fn round_numbers_keep_counting_across_sessions() {
+        // Three sessions of three rounds each land on 1..3, 4..6, 7..9.
+        let mut start = 1;
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let (first, last) = round_window(start, 3);
+            seen.push((first, last));
+            start = last + 1;
+        }
+        assert_eq!(vec![(1, 3), (4, 6), (7, 9)], seen);
+    }
+
+    #[test]
+    fn a_fresh_run_reports_its_rounds_plainly() {
+        assert_eq!("no convergence after 3 rounds", exhausted_note(1, 3));
+        assert!(exhausted_comment(1, 3).contains("after 3 review rounds"));
+        assert!(!exhausted_comment(1, 3).contains("in total"));
+    }
+
+    /// A resumed PR that stops at round 10 did not have ten rounds of budget,
+    /// and saying so would misreport both the cost and the history.
+    #[test]
+    fn a_resumed_run_distinguishes_this_run_from_the_total() {
+        assert_eq!(
+            "no convergence after 5 more rounds (10 in total)",
+            exhausted_note(6, 10)
+        );
+        let comment = exhausted_comment(6, 10);
+        assert!(comment.contains("5 more review rounds"), "{comment}");
+        assert!(comment.contains("10 in total"), "{comment}");
     }
 
     // -- the ledger ------------------------------------------------------

@@ -32,13 +32,19 @@ Needs `git`, `gh` (authenticated), and two agent CLIs. Rust 1.85 or newer to
 build (`rustup update` if yours is older).
 
 ```bash
-cargo install --git https://github.com/coreyphillips/spar spar-cli
+cargo install spar-cli
 spar doctor
 ```
 
 The package is named `spar-cli` because `spar` is taken on crates.io by an
 unrelated config parser. The binary it installs is `spar`, which is what you
-type. Nothing is published to crates.io yet, so install from git.
+type.
+
+For whatever is on main rather than the last release:
+
+```bash
+cargo install --git https://github.com/coreyphillips/spar spar-cli
+```
 
 From a clone:
 

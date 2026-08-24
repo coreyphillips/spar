@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::config::{Config, Followups, StateStore};
 use crate::error::Result;
-use crate::model::{Issue, PersistedState, PrRef, PrView};
+use crate::model::{Issue, IssueRef, ItemKind, PersistedState, PrRef, PrView};
 use crate::proc::{self, ExecOpts};
 use crate::style::{self, Style};
 use crate::{bail, logdim, spar_err};
@@ -598,13 +598,64 @@ impl Repo {
             })
     }
 
+    /// Whether a number names an issue or a pull request.
+    ///
+    /// `gh issue view` happily returns a pull request when handed its number,
+    /// so it cannot be used to tell them apart. The issues API carries both and
+    /// marks a pull request with a `pull_request` key, which is definitive.
+    pub fn item_kind(&self, number: i64) -> Result<ItemKind> {
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{number}");
+        let text = self
+            .gh(&[
+                "api",
+                &path,
+                "--jq",
+                "if .pull_request then \"pr\" else \"issue\" end",
+            ])
+            .map_err(|e| {
+                spar_err!(
+                    "no issue or pull request #{number} in this repository. {}",
+                    e.last_line()
+                )
+            })?;
+        match text.trim() {
+            "pr" => Ok(ItemKind::Pr),
+            "issue" => Ok(ItemKind::Issue),
+            other => Err(spar_err!(
+                "could not tell whether #{number} is an issue or a pull request (got {other:?})"
+            )),
+        }
+    }
+
+    /// An open pull request that would close this issue, whoever opened it.
+    ///
+    /// spar's own branch naming is checked first because it is exact and cheap.
+    /// Falling back to GitHub's own issue linkage is what lets spar pick up a
+    /// pull request a person started on a branch named anything at all.
+    pub fn open_pr_for_issue(&self, issue: i64) -> Option<PrRef> {
+        if let Some(pr) = self.pr_for_branch(&self.branch_for_issue(issue)) {
+            return Some(pr);
+        }
+        let text = self.gh_try(&[
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            &FETCH_CEILING.to_string(),
+            "--json",
+            "number,url,title,closingIssuesReferences",
+        ]);
+        find_linked_pr(&text, issue)
+    }
+
     pub fn pr_view(&self, number: i64) -> Result<PrView> {
         let text = self.gh(&[
             "pr",
             "view",
             &number.to_string(),
             "--json",
-            "number,url,title,headRefName,baseRefName,state,closingIssuesReferences",
+            "number,url,title,headRefName,baseRefName,state,closingIssuesReferences,isCrossRepository",
         ])?;
         serde_json::from_str(&text).map_err(|e| spar_err!("unexpected shape for PR #{number}: {e}"))
     }
@@ -1093,6 +1144,40 @@ pub fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<
     Ok(())
 }
 
+/// Among the open pull requests gh listed, the first that would close `issue`.
+///
+/// Separated from the gh call so the real payload shape can be tested. GitHub
+/// returns far more per linked issue than the number, and silently failing to
+/// parse it would look exactly like "no pull request exists", which is the
+/// answer that makes spar implement over the top of somebody's work.
+pub fn find_linked_pr(json: &str, issue: i64) -> Option<PrRef> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Row {
+        number: i64,
+        #[serde(default)]
+        url: String,
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        closing_issues_references: Vec<IssueRef>,
+    }
+
+    serde_json::from_str::<Vec<Row>>(json.trim())
+        .ok()?
+        .into_iter()
+        .find(|row| {
+            row.closing_issues_references
+                .iter()
+                .any(|linked| linked.number == issue)
+        })
+        .map(|row| PrRef {
+            number: row.number,
+            url: row.url,
+            title: row.title,
+        })
+}
+
 /// Flatten whatever `gh api --paginate` printed into a list of comments.
 ///
 /// Current gh merges array pages into one array. Older builds concatenated one
@@ -1404,5 +1489,82 @@ mod comment_page_tests {
             .find_map(|c| parse_state_comment(c["body"].as_str().unwrap_or("")))
             .unwrap();
         assert_eq!(5, last.round);
+    }
+}
+
+#[cfg(test)]
+mod linked_pr_tests {
+    use super::*;
+
+    /// The exact shape `gh pr list --json closingIssuesReferences` returns.
+    /// It carries an id and a whole repository object per linked issue, and a
+    /// parser that chokes on those reports "no pull request", which is the one
+    /// answer that makes spar implement over the top of somebody's work.
+    const REAL_PAYLOAD: &str = r#"[
+      {"number":14252,"title":"fix: reject leading-dash branch names",
+       "url":"https://github.com/cli/cli/pull/14252",
+       "closingIssuesReferences":[{"id":"I_kwDO","number":14238,
+         "repository":{"id":"MDEwOlJl","name":"cli","owner":{"id":"MDEy","login":"cli"}},
+         "url":"https://github.com/cli/cli/issues/14238"}]},
+      {"number":14217,"title":"another change",
+       "url":"https://github.com/cli/cli/pull/14217",
+       "closingIssuesReferences":[{"id":"I_kwDO","number":9761,
+         "repository":{"id":"MDEwOlJl","name":"cli","owner":{"id":"MDEy","login":"cli"}},
+         "url":"https://github.com/cli/cli/issues/9761"}]},
+      {"number":14200,"title":"unlinked work",
+       "url":"https://github.com/cli/cli/pull/14200","closingIssuesReferences":[]}
+    ]"#;
+
+    #[test]
+    fn a_linked_pr_is_found_whatever_its_branch_is_called() {
+        let pr = find_linked_pr(REAL_PAYLOAD, 14238).expect("should find it");
+        assert_eq!(14252, pr.number);
+        assert_eq!("https://github.com/cli/cli/pull/14252", pr.url);
+    }
+
+    #[test]
+    fn the_right_pr_is_picked_out_of_several() {
+        assert_eq!(14217, find_linked_pr(REAL_PAYLOAD, 9761).unwrap().number);
+    }
+
+    #[test]
+    fn an_issue_nobody_is_working_on_finds_nothing() {
+        assert!(find_linked_pr(REAL_PAYLOAD, 99999).is_none());
+    }
+
+    #[test]
+    fn an_unlinked_pr_is_never_matched() {
+        // 14200 closes nothing, so no issue number should ever return it.
+        for issue in [14200, 0, 1] {
+            if let Some(pr) = find_linked_pr(REAL_PAYLOAD, issue) {
+                assert_ne!(14200, pr.number, "matched a PR that closes nothing");
+            }
+        }
+    }
+
+    #[test]
+    fn empty_or_broken_output_is_none_rather_than_a_panic() {
+        assert!(find_linked_pr("", 1).is_none());
+        assert!(find_linked_pr("[]", 1).is_none());
+        assert!(find_linked_pr("gh: Not Found (HTTP 404)", 1).is_none());
+        assert!(find_linked_pr("[{\"number\":", 1).is_none());
+    }
+
+    /// A fork PR cannot be pushed to, so the flag has to survive parsing.
+    #[test]
+    fn pr_view_reads_the_cross_repository_flag() {
+        let json = r#"{"number":7,"url":"u","title":"t","headRefName":"patch-1",
+                       "baseRefName":"main","state":"OPEN",
+                       "closingIssuesReferences":[],"isCrossRepository":true}"#;
+        let pr: PrView = serde_json::from_str(json).unwrap();
+        assert!(pr.is_cross_repository);
+        assert!(pr.is_open());
+
+        let same_repo = json.replace("\"isCrossRepository\":true", "\"isCrossRepository\":false");
+        assert!(
+            !serde_json::from_str::<PrView>(&same_repo)
+                .unwrap()
+                .is_cross_repository
+        );
     }
 }

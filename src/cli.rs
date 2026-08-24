@@ -8,13 +8,13 @@ use clap::{Args, Parser, Subcommand};
 use crate::agent::{self, Agent};
 use crate::config::{self, Config};
 use crate::error::Result;
-use crate::model::{Issue, IssueRun, Ledger, Plan, Status};
+use crate::model::{Issue, IssueRun, ItemKind, Ledger, Plan, Status};
 use crate::proc::{self, ExecOpts};
 use crate::repo::Repo;
 use crate::review;
 use crate::style;
 use crate::triage;
-use crate::{bail, log, logdim, logging, spar_err};
+use crate::{bail, log, logdim, logging, logwarn, spar_err};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -193,7 +193,15 @@ fn dispatch(cli: Cli) -> Result<i32> {
             if numbers.is_empty() {
                 return Ok(0);
             }
-            let issues = repo.fetch_issues(&numbers)?;
+            let sorted = classify(&repo, &numbers)?;
+            for number in &sorted.prs {
+                log!("#{number} is a pull request, nothing to triage");
+            }
+            if sorted.issues.is_empty() {
+                log!("no issues to triage");
+                return Ok(0);
+            }
+            let issues = repo.fetch_issues(&sorted.issues)?;
             // Deliberately no act_on_plan here. `triage` is the command you
             // reach for to look before leaping, and a preview that comments on
             // and closes issues is a trap.
@@ -214,27 +222,36 @@ fn dispatch(cli: Cli) -> Result<i32> {
             if numbers.is_empty() {
                 return Ok(0);
             }
-            let fetched = repo.fetch_issues(&numbers)?;
-            let plan = make_plan(&agents, &cfg, &repo, &fetched, &plan_out)?;
-            act_on_plan(&cfg, &repo, &plan);
-            if plan.order.is_empty() {
+            let sorted = classify(&repo, &numbers)?;
+            let mut results = Vec::new();
+
+            if !sorted.issues.is_empty() {
+                let fetched = repo.fetch_issues(&sorted.issues)?;
+                let plan = make_plan(&agents, &cfg, &repo, &fetched, &plan_out)?;
+                act_on_plan(&cfg, &repo, &plan);
+                let mut ledger = Ledger::new();
+                for item in &plan.order {
+                    let Some(issue) = fetched.iter().find(|i| i.number == item.issue) else {
+                        continue;
+                    };
+                    results.push(review::run_issue(
+                        &agents,
+                        &cfg,
+                        &repo,
+                        item,
+                        issue,
+                        &mut ledger,
+                    ));
+                }
+            }
+
+            for number in sorted.prs {
+                results.push(review::resume_pr(&agents, &cfg, &repo, number, None));
+            }
+
+            if results.is_empty() {
                 log!("nothing scheduled");
                 return Ok(0);
-            }
-            let mut ledger = Ledger::new();
-            let mut results = Vec::new();
-            for item in &plan.order {
-                let Some(issue) = fetched.iter().find(|i| i.number == item.issue) else {
-                    continue;
-                };
-                results.push(review::run_issue(
-                    &agents,
-                    &cfg,
-                    &repo,
-                    item,
-                    issue,
-                    &mut ledger,
-                ));
             }
             Ok(report(&results, &cfg))
         }
@@ -269,8 +286,9 @@ fn dispatch(cli: Cli) -> Result<i32> {
             } else {
                 prs
             };
+            let sorted = classify(&repo, &numbers)?;
             let mut results = Vec::new();
-            for number in numbers {
+            for number in sorted.prs {
                 results.push(review::resume_pr(
                     &agents,
                     &cfg,
@@ -278,6 +296,29 @@ fn dispatch(cli: Cli) -> Result<i32> {
                     number,
                     next_actor.as_deref(),
                 ));
+            }
+            // An issue number handed to `resume` is not a mistake worth
+            // refusing over. If work is already open for it, continue that.
+            for number in sorted.issues {
+                match repo.open_pr_for_issue(number) {
+                    Some(pr) => {
+                        log!("#{number} is an issue; continuing its open PR {}", pr.url);
+                        results.push(review::resume_pr(
+                            &agents,
+                            &cfg,
+                            &repo,
+                            pr.number,
+                            next_actor.as_deref(),
+                        ));
+                    }
+                    None => logwarn!(
+                        "#{number} is an issue with no open pull request. Use `spar run {number}` \
+                         to implement it."
+                    ),
+                }
+            }
+            if results.is_empty() {
+                return Ok(0);
             }
             Ok(report(&results, &cfg))
         }
@@ -397,6 +438,35 @@ fn pick_issues(repo: &Repo, given: Vec<i64>, limit: usize) -> Result<Vec<i64>> {
             .join(", ")
     );
     Ok(found)
+}
+
+/// Numbers split by what they actually name.
+///
+/// Issues and pull requests share one number sequence per repository, so a
+/// person should not have to remember which command takes which. Both `run` and
+/// `resume` sort the numbers themselves and route each one.
+#[derive(Debug, Default)]
+struct Sorted {
+    issues: Vec<i64>,
+    prs: Vec<i64>,
+}
+
+fn classify(repo: &Repo, numbers: &[i64]) -> Result<Sorted> {
+    let mut sorted = Sorted::default();
+    for number in numbers {
+        match repo.item_kind(*number)? {
+            ItemKind::Issue => sorted.issues.push(*number),
+            ItemKind::Pr => sorted.prs.push(*number),
+        }
+    }
+    if !sorted.issues.is_empty() && !sorted.prs.is_empty() {
+        log!(
+            "{} issue(s) and {} pull request(s) given",
+            sorted.issues.len(),
+            sorted.prs.len()
+        );
+    }
+    Ok(sorted)
 }
 
 fn make_plan(

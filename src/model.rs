@@ -530,6 +530,27 @@ pub struct PrView {
     pub state: String,
     #[serde(default)]
     pub closing_issues_references: Vec<IssueRef>,
+    /// True when the PR's head branch lives on a fork rather than this
+    /// repository.
+    #[serde(default)]
+    pub is_cross_repository: bool,
+}
+
+/// Issues and pull requests share one number sequence per repository, so a
+/// number names exactly one of them and spar can work out which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemKind {
+    Issue,
+    Pr,
+}
+
+impl std::fmt::Display for ItemKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ItemKind::Issue => "issue",
+            ItemKind::Pr => "pull request",
+        })
+    }
 }
 
 impl PrView {

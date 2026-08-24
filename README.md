@@ -58,8 +58,11 @@ spar run 478   # triage issue 478, and open a PR if it is worth doing
 
 ## Use
 
-Arguments are **issue** numbers for `run` and `triage`, and **pull request**
-numbers for `resume`. Omit them and spar takes everything open.
+Point it at a number and it works out the rest. Issues and pull requests share
+one number sequence per repository, so spar sorts them itself: `spar run 42` does
+the right thing whether 42 is an untouched issue, an issue that already has a
+pull request open, or a pull request. Omit the numbers and `run` takes every open
+issue while `resume` takes every open PR.
 
 ```bash
 spar run                    # triage every open issue, then work them in order
@@ -68,7 +71,9 @@ spar triage                 # triage only, write plan.json, touch nothing
 spar run --limit 50         # raise the cap on how many open issues to take
 spar run 42 --auto-merge    # merge when no blocking findings remain
 spar run 42 --max-rounds 5  # allow more review rounds before escalating
-spar run 42                 # if 42 already has an open PR, continues it
+spar run 42                 # if 42 already has an open PR, continues that
+spar run 101                # 101 is a PR? it reviews it, no triage
+spar run 42 101             # mixed is fine
 spar run 42 --first codex   # the other agent implements
 spar run 42 --no-close-skipped   # comment on a declined issue but leave it open
 
@@ -132,12 +137,18 @@ stopping condition, but "no blocking objections" is.
 authored, agent authored, half finished, does not matter: if it has a branch and
 a diff, the loop can take custody of it.
 
-`spar run <issue>` does the same thing when that issue already has an open PR:
-it continues the existing PR from where the last session stopped rather than
-implementing over the top of it. Running spar again on work in progress is always
-a resume, never a restart. If a branch carries pushed work that no open PR
-accounts for, spar refuses rather than force pushing over it, and says how to
-recover.
+`spar run <issue>` does the same thing when that issue already has work open. It
+checks its own branch naming first, then falls back to GitHub's issue linkage, so
+a pull request somebody else started on a branch called anything at all is found
+and continued rather than duplicated. Running spar again on work in progress is
+always a resume, never a restart.
+
+If a branch carries pushed commits that no open pull request accounts for, spar
+refuses rather than force pushing over them, and says how to recover.
+
+One thing it will not do: a pull request from a fork. spar has to push its fixes
+back to the PR's branch, and that branch is not in your repository. It says so
+and stops before spending anything.
 
 This is also the cheapest way to adopt spar. No agent writes a feature from
 scratch; it only reviews what already exists.

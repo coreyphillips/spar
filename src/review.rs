@@ -139,8 +139,7 @@ pub fn run_issue(
     // holds because the remote tracking ref survives the local branch being
     // deleted, so the push succeeds and the previous round's work is gone from
     // the PR with nothing to say it ever existed.
-    let branch = repo.branch_for_issue(item.issue);
-    if let Some(existing) = repo.pr_for_branch(&branch) {
+    if let Some(existing) = repo.open_pr_for_issue(item.issue) {
         log!(
             "#{}: {} is already open, continuing it instead of implementing again",
             item.issue,
@@ -304,6 +303,13 @@ fn resume_inner(
     let pr: PrView = repo.pr_view(pr_number)?;
     if !pr.is_open() {
         return Err(spar_err!("PR #{pr_number} is {}", pr.state.to_lowercase()));
+    }
+    if pr.is_cross_repository {
+        return Err(spar_err!(
+            "PR #{pr_number} comes from a fork. spar has to push its fixes back to the pull \
+             request's branch, and that branch is not in this repository.\nAsk the author to push \
+             the branch here, or review it by hand."
+        ));
     }
 
     let subject = pr

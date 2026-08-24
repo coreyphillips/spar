@@ -32,8 +32,9 @@ cargo install --git https://github.com/coreyphillips/spar spar-cli
 spar doctor
 ```
 
-The crate is `spar-cli` because `spar` is taken on crates.io by an unrelated
-parser. The binary it installs is `spar`.
+The package is named `spar-cli` because `spar` is taken on crates.io by an
+unrelated config parser. The binary it installs is `spar`, which is what you
+type. Nothing is published to crates.io yet, so install from git.
 
 From a clone:
 

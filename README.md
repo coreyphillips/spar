@@ -77,6 +77,10 @@ spar run 42 101             # mixed is fine
 spar run 42 --first codex   # the other agent implements
 spar run 42 --no-close-skipped   # comment on a declined issue but leave it open
 
+spar review 108             # review a PR without touching it, fork or not
+spar review 108 --dry-run   # print the review instead of posting it
+spar review                 # review every open PR
+
 spar resume                 # continue the loop on every open PR
 spar resume 108             # or name them
 spar resume 108 --next codex     # override whose turn it is
@@ -146,9 +150,52 @@ always a resume, never a restart.
 If a branch carries pushed commits that no open pull request accounts for, spar
 refuses rather than force pushing over them, and says how to recover.
 
-One thing it will not do: a pull request from a fork. spar has to push its fixes
-back to the PR's branch, and that branch is not in your repository. It says so
-and stops before spending anything.
+## Reviewing what you cannot push to
+
+A pull request from a fork cannot be resumed: spar has to push its fixes back to
+the PR's branch, and that branch is not in your repository. Reviewing it is still
+the useful thing, and for an outside contribution it is usually the only thing
+you wanted, so `spar review` does that and `run` falls into it automatically when
+it meets a fork.
+
+```bash
+spar review 108             # any PR, fork or not
+spar review 108 --dry-run   # see it before it is posted
+```
+
+The loop is different here, and deliberately so. The custody loop converges
+because the diff changes between rounds. In review only mode nothing changes, so
+more rounds would just re-litigate the same unchanged code. It is three passes:
+
+1. **Independent review.** Both agents review at the same time, neither seeing
+   the other. A finding both reach on their own is the strongest signal there is.
+2. **Cross-adjudication.** Each reads the other's remaining findings, goes to the
+   code, and rules on them. A point one model raised and the other examined and
+   rejected is usually a pattern match, and saying so is worth more to you than
+   forwarding both.
+3. **Rebuttal.** Anything rejected goes back to whoever raised it, to withdraw or
+   to substantiate with the line, the input, the failing case.
+
+What comes out is sorted by how well it is attested, so a maintainer can see at a
+glance which findings carry two independent signatures:
+
+```
+Two independent reviews: 1 blocking, 1 non-blocking, 1 disputed.
+
+A further point was raised and withdrawn on a second look, and is not listed.
+
+needs changing before merge
+- Retry loop never terminates when max_attempts is unset (src/net.rs:88) [both].
+  Both reviewers reproduced this: the guard on line 91 compares against Some(0).
+
+the reviewers disagree, your call
+- Config loader swallows a parse error (src/config.rs:210). claude says yes; the
+  other says the caller validates against the schema first
+```
+
+Nothing is committed, pushed, merged, or closed. `--max-rounds` picks how far it
+goes: 1 is two independent reviews with no cross-checking, 2 adds it, 3 adds the
+rebuttal.
 
 This is also the cheapest way to adopt spar. No agent writes a feature from
 scratch; it only reviews what already exists.

@@ -15,6 +15,7 @@ pub mod model;
 pub mod proc;
 pub mod repo;
 pub mod review;
+pub mod review_only;
 pub mod schema;
 pub mod style;
 pub mod triage;

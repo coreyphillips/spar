@@ -12,6 +12,7 @@ use crate::model::{Issue, IssueRun, ItemKind, Ledger, Plan, Status};
 use crate::proc::{self, ExecOpts};
 use crate::repo::Repo;
 use crate::review;
+use crate::review_only;
 use crate::style;
 use crate::triage;
 use crate::{bail, log, logdim, logging, logwarn, spar_err};
@@ -77,6 +78,25 @@ pub enum Command {
         /// Which agent reviews next, overriding the PR's saved state.
         #[arg(long = "next", value_name = "AGENT")]
         next_actor: Option<String>,
+    },
+
+    /// Review pull requests without changing them, including from a fork.
+    ///
+    /// Both agents review independently, then rule on each other's findings,
+    /// then answer the objections. Nothing is committed, pushed, or merged.
+    Review {
+        /// Pull request numbers. An issue number resolves to its open PR.
+        /// Omit to take every open PR, up to --limit.
+        items: Vec<i64>,
+        #[command(flatten)]
+        common: Common,
+        /// Print the review instead of posting it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Adjudication passes. 1 is two independent reviews with no
+        /// cross-checking, 2 adds it, 3 adds a rebuttal on what they dispute.
+        #[arg(long)]
+        max_rounds: Option<u32>,
     },
 
     /// Detect installed agent CLIs and write a spar.toml.
@@ -176,6 +196,51 @@ fn dispatch(cli: Cli) -> Result<i32> {
     match cli.command {
         Command::ScrubFilter => cmd_scrub_filter(),
         Command::Doctor { config } => cmd_doctor(config.as_deref()),
+        Command::Review {
+            items,
+            common,
+            dry_run,
+            max_rounds,
+        } => {
+            let overrides = Overrides {
+                max_rounds,
+                ..Overrides::default()
+            };
+            let (cfg, repo, agents) = prepare(&common, Some(overrides))?;
+            let numbers = if items.is_empty() {
+                let found = repo.list_open_prs(common.limit)?;
+                if found.is_empty() {
+                    log!("no open PRs");
+                    return Ok(0);
+                }
+                log!("no PRs given, reviewing {} open", found.len());
+                found
+            } else {
+                items
+            };
+            let sorted = classify(&repo, &numbers)?;
+            let mut targets = sorted.prs;
+            for number in sorted.issues {
+                match repo.open_pr_for_issue(number) {
+                    Some(pr) => {
+                        log!("#{number} is an issue; reviewing its open PR {}", pr.url);
+                        targets.push(pr.number);
+                    }
+                    None => logwarn!("#{number} is an issue with no open pull request to review"),
+                }
+            }
+            let mut results = Vec::new();
+            for number in targets {
+                results.push(review_only::review_pr(
+                    &agents, &cfg, &repo, number, dry_run,
+                ));
+            }
+            if results.is_empty() {
+                return Ok(0);
+            }
+            Ok(report(&results, &cfg))
+        }
+
         Command::Init { out, force } => cmd_init(&out, force),
         Command::Clean {
             repo,
@@ -938,6 +1003,42 @@ mod tests {
             !help.contains("scrub-filter"),
             "it is plumbing, not a command"
         );
+    }
+
+    #[test]
+    fn review_takes_pr_numbers_and_a_dry_run() {
+        let cli = Cli::parse_from(["spar", "review", "101", "102", "--dry-run"]);
+        match cli.command {
+            Command::Review { items, dry_run, .. } => {
+                assert_eq!(vec![101, 102], items);
+                assert!(dry_run);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_posts_unless_told_not_to() {
+        match Cli::parse_from(["spar", "review", "101"]).command {
+            Command::Review { dry_run, .. } => assert!(!dry_run),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_with_no_numbers_is_allowed() {
+        match Cli::parse_from(["spar", "review"]).command {
+            Command::Review { items, .. } => assert!(items.is_empty()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_takes_its_own_round_budget() {
+        match Cli::parse_from(["spar", "review", "101", "--max-rounds", "2"]).command {
+            Command::Review { max_rounds, .. } => assert_eq!(Some(2), max_rounds),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

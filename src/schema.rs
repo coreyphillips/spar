@@ -144,6 +144,53 @@ pub fn response() -> Value {
     })
 }
 
+/// One reviewer judging the other reviewer's findings.
+///
+/// Used only in review only mode, where nobody is going to fix anything and the
+/// product is the finding list itself. Asking each model to read the code and
+/// rule on the other's claims is what separates a defect worth a maintainer's
+/// attention from one model's pattern match.
+pub fn adjudication() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "verdicts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Copy the finding's title exactly, so it can be matched up."
+                        },
+                        "file": {
+                            "type": "string",
+                            "description": "Copy the finding's file exactly. Empty string if it had none."
+                        },
+                        "agrees": {
+                            "type": "boolean",
+                            "description": "True only if you read the code and the defect is real. Do not defer to the other reviewer, and do not agree to be agreeable: a finding you cannot confirm is one a maintainer should not have to spend time on."
+                        },
+                        "severity": {
+                            "type": "string",
+                            "enum": ["blocking", "non-blocking", "nit"],
+                            "description": "Your own view of how badly it matters, even where you agree the defect is real."
+                        },
+                        "reasoning": {
+                            "type": "string",
+                            "description": "One or two sentences. If you disagree, this is the whole argument, so give the reason rather than an opinion."
+                        }
+                    },
+                    "required": ["title", "file", "agrees", "severity", "reasoning"]
+                }
+            }
+        },
+        "required": ["verdicts"]
+    })
+}
+
 pub fn all() -> Vec<(&'static str, Value)> {
     vec![
         ("triage", triage()),

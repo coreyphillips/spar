@@ -25,12 +25,12 @@ macro_rules! string_enum {
     (
         $(#[$meta:meta])*
         pub enum $name:ident {
-            $( $variant:ident = $canonical:literal $( | $alias:literal )* ),+ $(,)?
+            $( $(#[$vmeta:meta])* $variant:ident = $canonical:literal $( | $alias:literal )* ),+ $(,)?
         }
     ) => {
         $(#[$meta])*
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub enum $name { $( $variant ),+ }
+        pub enum $name { $( $(#[$vmeta])* $variant ),+ }
 
         impl $name {
             pub fn as_str(self) -> &'static str {
@@ -146,6 +146,10 @@ string_enum! {
         Merged = "merged",
         Escalated = "escalated",
         Error = "error",
+        /// Review only: findings were produced and posted, nothing was changed.
+        Reviewed = "reviewed",
+        /// Review only: both reviewers found nothing that blocks a merge.
+        Clean = "clean",
     }
 }
 
@@ -155,6 +159,33 @@ impl Complexity {
             Complexity::S => 0,
             Complexity::M => 1,
             Complexity::L => 2,
+        }
+    }
+}
+
+impl Severity {
+    /// How badly it matters, independent of the order the variants happen to
+    /// be declared in. Relying on derived `Ord` here would silently invert the
+    /// moment somebody reorders the enum.
+    pub fn rank(self) -> u8 {
+        match self {
+            Severity::Nit => 0,
+            Severity::NonBlocking => 1,
+            Severity::Blocking => 2,
+        }
+    }
+
+    /// The graver of two judgements.
+    ///
+    /// Two reviewers disagreeing about severity is resolved upward on purpose.
+    /// Nothing here gates a merge, it is all advice to a person, and advice
+    /// that under-reports a real defect is worse than advice that over-reports
+    /// a small one.
+    pub fn graver(self, other: Self) -> Self {
+        if self.rank() >= other.rank() {
+            self
+        } else {
+            other
         }
     }
 }
@@ -337,6 +368,61 @@ pub struct Disposition {
     pub new_issue_body: Option<String>,
 }
 
+/// One reviewer's judgement of a finding the *other* reviewer raised.
+///
+/// This is the whole point of review only mode. A finding both models raise
+/// independently is worth a maintainer's attention; a finding one raised and
+/// the other examined and rejected is usually not, and saying so is more useful
+/// than forwarding both.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Adjudication {
+    #[serde(default, deserialize_with = "de_string")]
+    pub title: String,
+    #[serde(default, deserialize_with = "de_string")]
+    pub file: String,
+    /// Whether the defect is real, judged by reading the code rather than by
+    /// deferring to the other reviewer.
+    #[serde(deserialize_with = "de_bool")]
+    pub agrees: bool,
+    /// This reviewer's own view of how badly it matters.
+    pub severity: Severity,
+    #[serde(default, deserialize_with = "de_string")]
+    pub reasoning: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdjudicationDoc {
+    #[serde(default)]
+    pub verdicts: Vec<Adjudication>,
+}
+
+/// A finding after both reviewers have had their say.
+#[derive(Debug, Clone)]
+pub struct Judged {
+    pub finding: Finding,
+    /// Who first raised it.
+    pub raised_by: String,
+    /// How it ended up.
+    pub standing: Standing,
+    /// The other reviewer's reasoning, when they had something to say.
+    pub counterpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// Both reviewers raised it independently. The strongest signal there is.
+    Corroborated,
+    /// One raised it, the other read the code and agreed.
+    Confirmed,
+    /// One raised it, the other read the code and rejected it, and it survived
+    /// a rebuttal. A person decides.
+    Disputed,
+    /// Raised, rejected, and withdrawn by the reviewer who raised it.
+    Withdrawn,
+    /// Raised with nobody left to check it, because the round budget ran out.
+    Unverified,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseDoc {
     #[serde(default, deserialize_with = "de_string")]
@@ -442,10 +528,17 @@ impl IssueRun {
     }
 
     /// Whether this outcome counts as the run having done its job.
+    ///
+    /// A review that produced findings did its job: the findings are the
+    /// product, and a PR needing work is not a failure of the reviewer.
     pub fn succeeded(&self) -> bool {
         matches!(
             self.status,
-            Status::Merged | Status::Approved | Status::Abandoned
+            Status::Merged
+                | Status::Approved
+                | Status::Abandoned
+                | Status::Reviewed
+                | Status::Clean
         )
     }
 }

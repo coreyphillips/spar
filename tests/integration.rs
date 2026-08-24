@@ -834,3 +834,105 @@ fn a_fresh_issue_is_unaffected_by_the_guard() {
     assert!(path.join("README.md").is_file());
     repo.worktree_remove(44);
 }
+
+// ---------------------------------------------------------------------------
+// Reviewing what cannot be pushed to
+// ---------------------------------------------------------------------------
+
+/// A pull request from a fork has no branch in the upstream repository, which
+/// is why it cannot be resumed. GitHub still serves `refs/pull/N/head` for it,
+/// and that is what makes reviewing an outside contribution possible at all.
+/// Verified against real GitHub as well: for cli/cli PR 14252, the head branch
+/// is absent from the upstream repo while refs/pull/14252/head resolves.
+#[test]
+fn a_pull_request_head_is_checked_out_without_any_branch() {
+    let fx = repo("prhead");
+    let origin = fx.dir.join("origin.git");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+
+    // Somebody else's commit, published only as a pull request head.
+    git(&fx.work, &["checkout", "-q", "-b", "contributor-work"]);
+    commit(
+        &fx.work,
+        "contributed.txt",
+        "their change\n",
+        "Their contribution",
+    );
+    let head = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    git(
+        &fx.work,
+        &["push", "-q", "origin", "HEAD:refs/pull/42/head"],
+    );
+    git(&fx.work, &["checkout", "-q", "main"]);
+    git(&fx.work, &["branch", "-D", "-q", "contributor-work"]);
+
+    // The branch is nowhere in the repository: only the pull request ref is.
+    let branches = git(
+        &fx.work,
+        &["for-each-ref", "refs/heads/", "--format=%(refname)"],
+    );
+    assert!(!branches.contains("contributor-work"), "{branches}");
+    let remote_refs = git(&fx.work, &["ls-remote", origin.to_str().unwrap()]);
+    assert!(remote_refs.contains("refs/pull/42/head"), "{remote_refs}");
+
+    let path = repo
+        .worktree_for_pr_head(42)
+        .expect("the head must be reachable");
+
+    assert!(path.is_dir(), "{}", path.display());
+    assert_eq!(
+        "their change\n",
+        std::fs::read_to_string(path.join("contributed.txt")).unwrap()
+    );
+    assert_eq!(head, git(&path, &["rev-parse", "HEAD"]).trim());
+
+    // Detached on purpose: there is nothing here to push, so there should be
+    // nothing that looks pushable.
+    assert_eq!(
+        "HEAD",
+        git(&path, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "the review checkout must not be on a branch"
+    );
+    let after = git(
+        &fx.work,
+        &["for-each-ref", "refs/heads/", "--format=%(refname)"],
+    );
+    assert!(
+        !after.contains("pr-42"),
+        "no branch should have been created: {after}"
+    );
+
+    repo.release_review_worktree(42);
+    assert!(!path.is_dir(), "the worktree should be gone");
+    let refs = git(
+        &fx.work,
+        &["for-each-ref", "refs/spar/", "--format=%(refname)"],
+    );
+    assert_eq!("", refs.trim(), "the parked ref should be gone too: {refs}");
+}
+
+#[test]
+fn a_missing_pull_request_head_says_what_went_wrong() {
+    let fx = repo("prheadmissing");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let err = repo.worktree_for_pr_head(999).unwrap_err().to_string();
+    assert!(err.contains("999"), "{err}");
+    assert!(
+        err.contains("refs/pull"),
+        "the message should explain the mechanism: {err}"
+    );
+}
+
+#[test]
+fn review_worktrees_are_swept_by_clean_all() {
+    let fx = repo("prheadclean");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/7/head"]);
+    let path = repo.worktree_for_pr_head(7).unwrap();
+    assert!(path.is_dir());
+
+    let removed = repo.prune_worktrees(true);
+
+    assert!(removed.iter().any(|r| r == "review-7"), "{removed:?}");
+    assert!(!path.is_dir());
+}

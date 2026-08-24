@@ -345,6 +345,44 @@ impl Repo {
         Ok((path, head))
     }
 
+    /// Check a pull request's head out read only, detached, with no branch.
+    ///
+    /// Fetches `refs/pull/N/head`, which GitHub serves for every pull request
+    /// including one from a fork whose branch is not in this repository at all.
+    /// That is what makes reviewing an outside contribution possible when
+    /// pushing to it is not.
+    ///
+    /// Detached on purpose. Review only mode has nothing to push, and a branch
+    /// would only invite something to try.
+    pub fn worktree_for_pr_head(&self, number: i64) -> Result<PathBuf> {
+        let path = self.worktree_path(&format!("review-{number}"));
+        let local_ref = review_ref(number);
+        let refspec = format!("+refs/pull/{number}/head:{local_ref}");
+
+        self.git(&["fetch", "origin", &refspec]).map_err(|e| {
+            spar_err!(
+                "could not fetch the head of PR #{number}. {}\nGitHub serves refs/pull/N/head for \
+                 every pull request, so this usually means the number is wrong or `origin` does \
+                 not point at the repository the PR is on.",
+                e.last_line()
+            )
+        })?;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| spar_err!("could not create {}: {e}", parent.display()))?;
+        }
+        self.remove_worktree_at(&path);
+        let path_str = path.display().to_string();
+        self.git(&["worktree", "add", "--detach", &path_str, &local_ref])?;
+        Ok(path)
+    }
+
+    pub fn release_review_worktree(&self, number: i64) {
+        self.remove_worktree_at(&self.worktree_path(&format!("review-{number}")));
+        self.git_try(&["update-ref", "-d", &review_ref(number)]);
+    }
+
     pub fn release_pr_worktree(&self, number: i64) {
         let path = self.worktree_path(&format!("pr-{number}"));
         self.remove_worktree_at(&path);
@@ -1019,6 +1057,17 @@ impl Repo {
             names.sort();
 
             for name in names {
+                // A review worktree is detached and owns no branch, so it is
+                // tied to the pull request only by its directory name.
+                if let Some(rest) = name.strip_prefix("review-") {
+                    let number: i64 = rest.parse().unwrap_or(-1);
+                    if !(force_all || is_finished(&self.pr_state(number))) {
+                        continue;
+                    }
+                    self.release_review_worktree(number);
+                    removed.push(name);
+                    continue;
+                }
                 let branch = format!("{}{name}", self.branch_prefix);
                 if !(force_all || self.worktree_is_done(&branch)) {
                     continue;
@@ -1120,6 +1169,12 @@ impl Repo {
 pub struct BranchRecord {
     pub kind: String,
     pub number: i64,
+}
+
+/// Where a pull request's fetched head is parked. Under `refs/spar/` rather
+/// than `refs/heads/` so it can never be mistaken for a branch, or pushed.
+pub fn review_ref(number: i64) -> String {
+    format!("refs/spar/pr-{number}")
 }
 
 pub fn is_finished(state: &str) -> bool {

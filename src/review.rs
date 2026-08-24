@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::{self, Agent};
 use crate::config::{Config, Followups};
-use crate::error::Result;
+use crate::error::{Result, SparError};
 use crate::jsonx::finding_key;
 use crate::model::{
     Action, Dispute, Finding, Issue, IssueRun, Ledger, LedgerEntry, NextAction, PersistedState,
@@ -281,15 +281,31 @@ pub fn resume_pr(
     pr_number: i64,
     holder_override: Option<&str>,
 ) -> IssueRun {
-    match resume_inner(agents, cfg, repo, pr_number, holder_override) {
+    let failed = |e: SparError| {
+        log!("PR #{pr_number} failed: {e}");
+        let mut state = IssueRun::new(pr_number, format!("PR #{pr_number}"));
+        state.status = Status::Error;
+        state.notes.push(e.to_string());
+        state
+    };
+
+    let pr = match repo.pr_view(pr_number) {
+        Ok(pr) => pr,
+        Err(e) => return failed(e),
+    };
+
+    // A pull request from a fork cannot be pushed to, so the loop that fixes
+    // things cannot run on it. Reviewing it is still the useful thing, and it
+    // is what a maintainer wants from an outside contribution anyway, so do
+    // that rather than refusing.
+    if pr.is_cross_repository {
+        log!("PR #{pr_number} comes from a fork, reviewing it without changing it");
+        return crate::review_only::review_pr(agents, cfg, repo, pr_number, false);
+    }
+
+    match resume_inner(agents, cfg, repo, pr, holder_override) {
         Ok(state) => state,
-        Err(e) => {
-            log!("PR #{pr_number} failed: {e}");
-            let mut state = IssueRun::new(pr_number, format!("PR #{pr_number}"));
-            state.status = Status::Error;
-            state.notes.push(e.to_string());
-            state
-        }
+        Err(e) => failed(e),
     }
 }
 
@@ -297,19 +313,12 @@ fn resume_inner(
     agents: &[Agent],
     cfg: &Config,
     repo: &Repo,
-    pr_number: i64,
+    pr: PrView,
     holder_override: Option<&str>,
 ) -> Result<IssueRun> {
-    let pr: PrView = repo.pr_view(pr_number)?;
+    let pr_number = pr.number;
     if !pr.is_open() {
         return Err(spar_err!("PR #{pr_number} is {}", pr.state.to_lowercase()));
-    }
-    if pr.is_cross_repository {
-        return Err(spar_err!(
-            "PR #{pr_number} comes from a fork. spar has to push its fixes back to the pull \
-             request's branch, and that branch is not in this repository.\nAsk the author to push \
-             the branch here, or review it by hand."
-        ));
     }
 
     let subject = pr
@@ -684,6 +693,11 @@ fn normalise(text: &str) -> String {
 /// Match a disposition back to the finding it answers, so the ledger key it
 /// records is the same key the next round's finding will hash to. Without this
 /// the re-litigation guard is dead code for any finding that names a file.
+/// Whether two titles name the same point, ignoring wording noise.
+pub(crate) fn same_point(a: &str, b: &str) -> bool {
+    normalise(a) == normalise(b)
+}
+
 fn matching_finding<'a>(findings: &'a [Finding], title: &str) -> Option<&'a Finding> {
     let wanted = normalise(title);
     findings.iter().find(|f| normalise(&f.title) == wanted)
@@ -1039,7 +1053,7 @@ pub fn skip_comment(item: &SkippedItem, style: &Style) -> String {
 
 /// Findings as a model should see them: full detail, since this one is not for
 /// a human to read.
-fn findings_for_prompt(findings: &[Finding]) -> String {
+pub(crate) fn findings_for_prompt(findings: &[Finding]) -> String {
     if findings.is_empty() {
         return "(none)".to_string();
     }

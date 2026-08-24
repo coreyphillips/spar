@@ -7,8 +7,11 @@
 //! The model output below is deliberately as verbose as a real model gets. What
 //! prints is what a reviewer would actually read.
 
-use spar::model::{Finding, NextAction, ResponseDoc, Review, Severity, SkippedItem, Verdict};
+use spar::model::{
+    Finding, Judged, NextAction, ResponseDoc, Review, Severity, SkippedItem, Standing, Verdict,
+};
 use spar::review::{disposition_comment, pr_body, review_comment, skip_comment};
+use spar::review_only::verdict_comment;
 use spar::style::Style;
 
 fn finding(severity: &str, title: &str, detail: &str, file: &str, in_scope: bool) -> Finding {
@@ -147,6 +150,66 @@ fn main() {
             478,
             "Retry a 429 with exponential backoff instead of failing the request.",
             "2 files changed, 34 insertions(+), 6 deletions(-)",
+            &style
+        )
+    );
+
+    rule("A review of somebody else's pull request (spar review)");
+    let judged = |standing, severity, title: &str, detail: &str, file: &str, by: &str| Judged {
+        finding: finding(severity, title, detail, file, true),
+        raised_by: by.to_string(),
+        standing,
+        counterpoint: None,
+    };
+    let mut disputed = judged(
+        Standing::Disputed,
+        "blocking",
+        "Config loader swallows a parse error",
+        "load_config discards the error from serde and returns a default.",
+        "src/config.rs:210",
+        "claude",
+    );
+    disputed.counterpoint =
+        Some("the caller validates against the schema before load_config is reached".into());
+    println!(
+        "{}",
+        verdict_comment(
+            &[
+                judged(
+                    Standing::Corroborated,
+                    "blocking",
+                    "Retry loop never terminates when max_attempts is unset",
+                    "Both reviewers reproduced this: the guard on line 91 compares against \
+                     Some(0) rather than checking for None, so the 429 test hangs.",
+                    "src/net.rs:88",
+                    "claude and codex",
+                ),
+                judged(
+                    Standing::Confirmed,
+                    "non-blocking",
+                    "The request timeout is hard coded",
+                    "Not a regression, the previous code had the same limitation.",
+                    "src/net.rs:44",
+                    "codex",
+                ),
+                judged(
+                    Standing::Unverified,
+                    "nit",
+                    "Log line does not say how many attempts remain",
+                    "Readability for whoever reads the logs at 3am.",
+                    "src/net.rs:102",
+                    "claude",
+                ),
+                disputed,
+                judged(
+                    Standing::Withdrawn,
+                    "blocking",
+                    "Off by one in the backoff",
+                    "Withdrawn after the other reviewer pointed at the test that covers it.",
+                    "src/net.rs:70",
+                    "codex",
+                ),
+            ],
             &style
         )
     );

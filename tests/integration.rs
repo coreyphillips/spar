@@ -753,11 +753,15 @@ fn a_preset_override_under_the_spar_directory_is_honoured() {
     )
     .unwrap();
 
-    let (ok, out, _) = spar(&["doctor", "--config", "spar.toml"], &dir);
-    assert!(ok, "{out}");
+    let (_, out, _) = spar(&["doctor", "--config", "spar.toml"], &dir);
+    // Deliberately not the exit code. `doctor` also checks gh authentication,
+    // which is an unrelated prerequisite that no CI runner has, and asserting
+    // on it would make this a test about the environment rather than about
+    // which binary the preset resolved to.
     assert!(
         out.contains("/bin/echo"),
         "the override was not used:\n{out}"
     );
+    assert!(!out.contains("unknown preset"), "{out}");
     let _ = std::fs::remove_dir_all(&dir);
 }

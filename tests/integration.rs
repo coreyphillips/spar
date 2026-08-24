@@ -936,3 +936,92 @@ fn review_worktrees_are_swept_by_clean_all() {
     assert!(removed.iter().any(|r| r == "review-7"), "{removed:?}");
     assert!(!path.is_dir());
 }
+
+// ---------------------------------------------------------------------------
+// The documentation is part of the product
+// ---------------------------------------------------------------------------
+
+const EXAMPLE_CONFIG: &str = include_str!("../spar.example.toml");
+
+/// spar.example.toml is the file people copy. If it stops parsing, the first
+/// thing a new user does fails, and nothing else in the suite would notice.
+#[test]
+fn the_example_config_parses() {
+    let cfg = spar::config::parse(EXAMPLE_CONFIG)
+        .unwrap_or_else(|e| panic!("spar.example.toml does not parse: {e}"));
+    assert_eq!(2, cfg.agents.len());
+    assert!(cfg.has_agent(&cfg.first_implementor));
+}
+
+/// It also has to keep saying what the code actually does. `deny_unknown_fields`
+/// catches a key the example has and the code dropped; this catches the other
+/// direction, a key the code gained and nobody documented. Both matter: an
+/// undocumented option is one an error message can tell you to set and you
+/// cannot find.
+#[test]
+fn every_config_option_is_documented_in_the_example() {
+    fn keys_of<T: serde::Serialize>(value: &T) -> Vec<String> {
+        let text = toml::to_string(value).expect("serializable");
+        text.lines()
+            .filter_map(|l| l.split_once(" = ").map(|(k, _)| k.trim().to_string()))
+            .filter(|k| !k.is_empty())
+            .collect()
+    }
+
+    let mut expected: Vec<String> = Vec::new();
+    expected.extend(keys_of(&spar::config::LoopCfg::default()));
+    expected.extend(keys_of(&spar::config::StyleCfg::default()));
+    expected.extend(keys_of(&spar::config::EffortSchedule {
+        round_1: Some("high".into()),
+        rest: Some("low".into()),
+    }));
+    // Per-agent options, which a preset normally supplies but a user may set.
+    expected.extend(
+        [
+            "model",
+            "effort",
+            "output",
+            "timeout",
+            "search_paths",
+            "system_via",
+            "message_path",
+            "message_match",
+            "command",
+            "preset",
+        ]
+        .map(String::from),
+    );
+
+    // Documented means findable by somebody reading the file. A commented out
+    // option counts, since the example shows options that are off by default
+    // without turning them on, and a sub-table counts as documenting its name.
+    let documented = |key: &str| -> bool {
+        EXAMPLE_CONFIG.lines().any(|line| {
+            let bare = line.trim_start().trim_start_matches('#').trim_start();
+            bare.starts_with(&format!("{key} "))
+                || bare.starts_with(&format!("{key}="))
+                || bare.starts_with(&format!("[{key}]"))
+                || bare.contains(&format!(".{key}]"))
+        })
+    };
+    let missing: Vec<&String> = expected.iter().filter(|key| !documented(key)).collect();
+
+    assert!(
+        missing.is_empty(),
+        "spar.example.toml does not mention: {missing:?}\n\
+         Every option the parser accepts has to be findable by somebody reading \
+         the example config."
+    );
+}
+
+/// `spar init` writes a config too, and it has to parse for the same reason.
+#[test]
+fn the_generated_config_is_not_stale_against_the_example() {
+    // Both must at least agree on the options they do mention.
+    for key in ["max_rounds", "auto_merge", "first_implementor", "worktrees"] {
+        assert!(
+            EXAMPLE_CONFIG.contains(key),
+            "{key} missing from spar.example.toml"
+        );
+    }
+}

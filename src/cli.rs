@@ -49,6 +49,8 @@ pub enum Command {
         common: Common,
         #[command(flatten)]
         loop_flags: LoopFlags,
+        #[command(flatten)]
+        triage_flags: TriageFlags,
         /// Where to write the triage plan.
         #[arg(long, default_value = "plan.json")]
         plan_out: PathBuf,
@@ -166,6 +168,12 @@ pub struct LoopFlags {
     /// Leave worktrees in place after a run, for inspection.
     #[arg(long)]
     pub keep_worktrees: bool,
+}
+
+/// Only `run` triages, so only `run` can decline an issue. Offering these on
+/// `resume` would accept a flag that does nothing.
+#[derive(Args, Debug, Clone)]
+pub struct TriageFlags {
     /// Close an issue both agents declined, after posting the reasoning.
     #[arg(long, conflicts_with = "no_close_skipped")]
     pub close_skipped: bool,
@@ -277,11 +285,18 @@ fn dispatch(cli: Cli) -> Result<i32> {
             issues,
             common,
             loop_flags,
+            triage_flags,
             plan_out,
             no_worktrees,
         } => {
             let mut overrides = Overrides::from(&loop_flags);
             overrides.worktrees = if no_worktrees { Some(false) } else { None };
+            overrides.close_skipped =
+                match (triage_flags.close_skipped, triage_flags.no_close_skipped) {
+                    (true, _) => Some(true),
+                    (_, true) => Some(false),
+                    _ => None,
+                };
             let (cfg, repo, agents) = prepare(&common, Some(overrides))?;
             let numbers = pick_issues(&repo, issues, common.limit)?;
             if numbers.is_empty() {
@@ -410,11 +425,7 @@ impl From<&LoopFlags> for Overrides {
             auto_merge: flags.auto_merge.then_some(true),
             keep_worktrees: flags.keep_worktrees.then_some(true),
             worktrees: None,
-            close_skipped: match (flags.close_skipped, flags.no_close_skipped) {
-                (true, _) => Some(true),
-                (_, true) => Some(false),
-                _ => None,
-            },
+            close_skipped: None,
         }
     }
 }
@@ -955,32 +966,32 @@ mod tests {
         );
     }
 
+    /// Only `run` triages, so only `run` can decline an issue. Accepting the
+    /// flag on `resume` would silently do nothing.
     #[test]
-    fn close_skipped_resolves_to_a_tristate() {
-        let none = LoopFlags {
-            max_rounds: None,
-            auto_merge: false,
-            keep_worktrees: false,
-            close_skipped: false,
-            no_close_skipped: false,
+    fn close_skipped_is_offered_only_where_it_means_something() {
+        assert!(Cli::try_parse_from(["spar", "run", "--close-skipped"]).is_ok());
+        assert!(Cli::try_parse_from(["spar", "run", "--no-close-skipped"]).is_ok());
+        assert!(Cli::try_parse_from(["spar", "resume", "--close-skipped"]).is_err());
+        assert!(Cli::try_parse_from(["spar", "review", "--close-skipped"]).is_err());
+        assert!(Cli::try_parse_from(["spar", "triage", "--close-skipped"]).is_err());
+    }
+
+    #[test]
+    fn the_close_skipped_pair_resolves_to_a_tristate() {
+        let read = |argv: &[&str]| match Cli::parse_from(argv).command {
+            Command::Run { triage_flags, .. } => {
+                match (triage_flags.close_skipped, triage_flags.no_close_skipped) {
+                    (true, _) => Some(true),
+                    (_, true) => Some(false),
+                    _ => None,
+                }
+            }
+            other => panic!("{other:?}"),
         };
-        assert_eq!(None, Overrides::from(&none).close_skipped);
-        assert_eq!(
-            Some(true),
-            Overrides::from(&LoopFlags {
-                close_skipped: true,
-                ..none.clone()
-            })
-            .close_skipped
-        );
-        assert_eq!(
-            Some(false),
-            Overrides::from(&LoopFlags {
-                no_close_skipped: true,
-                ..none
-            })
-            .close_skipped
-        );
+        assert_eq!(None, read(&["spar", "run"]));
+        assert_eq!(Some(true), read(&["spar", "run", "--close-skipped"]));
+        assert_eq!(Some(false), read(&["spar", "run", "--no-close-skipped"]));
     }
 
     #[test]

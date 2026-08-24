@@ -8,6 +8,10 @@ follow-ups, and then hands custody to the other. A reviewer that finds a problem
 can either fix it directly and hand back for review of its own fix, or return
 notes for the author to address.
 
+It also reviews without touching: `spar review <pr>` puts two independent
+reviewers on a pull request you cannot push to, including one from a fork, and
+reports what they agree on and what they do not.
+
 Ships pairing **Claude Code** with **OpenAI Codex**. Any two CLIs work.
 
 ## Why alternate instead of assigning roles
@@ -75,7 +79,10 @@ spar run 42                 # if 42 already has an open PR, continues that
 spar run 101                # 101 is a PR? it reviews it, no triage
 spar run 42 101             # mixed is fine
 spar run 42 --first codex   # the other agent implements
+spar run 42 --base develop  # base branch, if origin/HEAD is not what you want
+spar run 42 --plan-out /tmp/plan.json      # where the triage plan is written
 spar run 42 --no-close-skipped   # comment on a declined issue but leave it open
+spar run 42 --close-skipped      # close it (the default, so rarely needed)
 
 spar review 108             # review a PR without touching it, fork or not
 spar review 108 --dry-run   # print the review instead of posting it
@@ -365,6 +372,10 @@ type        = "item.completed"
 Binaries are located by walking `SPAR_<NAME>_BIN`, then PATH, then the preset's
 `search_paths`. Nothing is hardcoded, and a miss reports every location tried.
 
+Every option a preset supplies can be overridden per agent, including `timeout`
+(seconds one call may take before spar gives up), `search_paths`, and
+`system_via`. [`spar.example.toml`](spar.example.toml) lists the full set.
+
 Presets are embedded in the binary, and a file on disk of the same name wins
 over the built-in copy. So when a CLI's flags drift you can fix it without
 waiting for a release:
@@ -385,11 +396,18 @@ by accident produces a baffling failure.
 
 ```bash
 spar clean          # drop worktrees, branches, and state whose PR is finished
-spar clean --all    # drop every worktree and branch spar created
+spar clean --all    # drop every worktree and branch spar created, review ones too
 spar clean --pr-state   # also delete state comments left on finished PRs
 spar doctor         # check prerequisites and resolve each configured agent
 spar doctor --config other.toml   # check a config before adopting it
+
+spar init                     # write spar.toml from the CLIs you have
+spar init --out other.toml    # somewhere else
+spar init --force             # overwrite an existing config
 ```
+
+`--close-skipped` and `--no-close-skipped` are offered only on `run`, since it is
+the only command that triages and so the only one that can decline an issue.
 
 Each issue gets its own git worktree so a failed run cannot poison the next
 one's base. A worktree is released as soon as its run reaches a terminal
@@ -412,6 +430,10 @@ Every review round is a repo-aware pass at the configured effort. A full ultra
 review of a three-line round-3 delta is money on fire, which is what
 `effort_schedule` exists to prevent. Both agents bill against their respective
 subscriptions.
+
+Rough shape per issue: two calls for triage, one to implement, then two per
+review round. `spar review` is cheaper, four to six calls for a whole pull
+request, because nothing is being rewritten between passes.
 
 ## Caveats
 

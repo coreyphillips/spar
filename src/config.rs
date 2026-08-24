@@ -172,7 +172,7 @@ impl StateStore {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffortSchedule {
     /// The deep first review.
@@ -181,7 +181,7 @@ pub struct EffortSchedule {
     pub rest: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoopCfg {
     #[serde(default = "three")]
@@ -255,7 +255,7 @@ impl Default for LoopCfg {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StyleCfg {
     #[serde(default = "yes")]

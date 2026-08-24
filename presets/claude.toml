@@ -1,0 +1,15 @@
+# Claude Code. Model and effort are per-invocation flags.
+command = [
+  "claude", "-p",
+  ["--model", "{model}"],
+  ["--effort", "{effort}"],
+  ["--permission-mode", "acceptEdits"],
+  # Equals form on purpose: --allowedTools is variadic, so the separate
+  # form swallows the following positional prompt unless another flag
+  # happens to sit between them.
+  ["--allowedTools=Bash,Read,Write,Edit,Glob,Grep,WebFetch"],
+  ["--append-system-prompt", "{system}"],
+  "{prompt}",
+]
+system_via = "placeholder"
+output = "text"

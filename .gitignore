@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# spar's own working state, when spar is run on this repo
+/spar.toml
+/plan.json
+/.spar/
+/.spar-worktrees/

@@ -1,0 +1,1379 @@
+//! git and gh. Every outbound string passes through the style and concision
+//! gates before it reaches GitHub.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+use serde_json::Value;
+
+use crate::config::{Config, Followups, StateStore};
+use crate::error::Result;
+use crate::model::{Issue, PersistedState, PrRef, PrView};
+use crate::proc::{self, ExecOpts};
+use crate::style::{self, Style};
+use crate::{bail, logdim, spar_err};
+
+/// gh returns newest first, so its `--limit` cannot be used to take the lowest
+/// numbered items: it would slice the newest N and then sorting that slice
+/// silently drops the older ones. Fetch a generous page, sort, then truncate.
+pub const FETCH_CEILING: usize = 500;
+
+/// An unclosed HTML comment on purpose. The payload is written after it and
+/// terminated with `-->`, so GitHub renders the whole block as nothing.
+pub const STATE_MARKER: &str = "<!-- spar:state";
+
+const WORKTREE_DIR: &str = ".spar-worktrees";
+const STATE_DIR: &str = ".spar";
+
+#[derive(Debug)]
+pub struct Repo {
+    root: PathBuf,
+    pub style: Style,
+    pub branch_prefix: String,
+    pub state_store: StateStore,
+    pub followups: Followups,
+}
+
+impl Repo {
+    pub fn open(root: impl AsRef<Path>, cfg: &Config) -> Result<Self> {
+        let root =
+            std::fs::canonicalize(root.as_ref()).unwrap_or_else(|_| root.as_ref().to_path_buf());
+        // A linked worktree has a `.git` file rather than a directory, and a
+        // bare-ish layout can have neither, so ask git instead of guessing.
+        let inside = proc::run_str(
+            &["git", "rev-parse", "--is-inside-work-tree"],
+            &ExecOpts::new().cwd(&root).check(false).timeout_secs(30),
+        )
+        .unwrap_or_default();
+        if inside.trim() != "true" {
+            bail!("not a git repository: {}", root.display());
+        }
+        let repo = Self {
+            root,
+            style: cfg.style.clone(),
+            branch_prefix: cfg.loop_cfg.branch_prefix.clone(),
+            state_store: cfg.loop_cfg.state_store,
+            followups: cfg.loop_cfg.followups,
+        };
+        repo.self_exclude();
+        Ok(repo)
+    }
+
+    /// Keep spar's own scratch directories out of the target repo's
+    /// `git status`.
+    ///
+    /// Written to `.git/info/exclude`, never to a tracked `.gitignore`: this is
+    /// somebody else's repository and spar has no business committing to it.
+    /// Best effort and silent on failure, because a read-only git directory is
+    /// not a reason to abandon a run.
+    fn self_exclude(&self) {
+        let git_dir = self.git_try(&["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+        let git_dir = git_dir.trim();
+        if git_dir.is_empty() {
+            return;
+        }
+        let path = Path::new(git_dir).join("info").join("exclude");
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+
+        let wanted = [format!("/{WORKTREE_DIR}/"), format!("/{STATE_DIR}/")];
+        let missing: Vec<&String> = wanted
+            .iter()
+            .filter(|line| !existing.lines().any(|l| l.trim() == line.as_str()))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+
+        use std::io::Write;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut block = String::new();
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            block.push('\n');
+        }
+        block.push_str("\n# added by spar: its worktrees and run state\n");
+        for line in missing {
+            block.push_str(line);
+            block.push('\n');
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = file.write_all(block.as_bytes());
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    // -- gates ------------------------------------------------------------
+
+    /// Scrub, then verify. A leak here reaches GitHub, so it is a hard error
+    /// rather than a warning: silent partial compliance is how a style rule
+    /// erodes over a long run.
+    pub fn clean(&self, text: &str) -> Result<String> {
+        let out = style::scrub(text, &self.style);
+        let bad = style::violations(&out, &self.style);
+        if !bad.is_empty() {
+            bail!(
+                "style gate could not clean text ({}): {}",
+                bad.join(", "),
+                style::clip(&out, 300)
+            );
+        }
+        Ok(out)
+    }
+
+    /// Clean, and hold to a length budget. For anything a model wrote.
+    pub fn clean_body(&self, text: &str) -> Result<String> {
+        self.clean(&style::body(text, &self.style))
+    }
+
+    /// The single transform every outbound title goes through.
+    ///
+    /// Scrub first, clip second, and never the other way round. Clipping first
+    /// lets the scrub lengthen the result past the budget (an em dash becomes
+    /// two characters), so a second pass would clip again and produce a
+    /// different string. That broke follow-up deduplication silently: the
+    /// lookup searched for one title while GitHub had stored another, no match
+    /// was ever found, and a fresh duplicate issue was filed every review
+    /// round. Doing it in this order makes the transform idempotent, which the
+    /// tests assert.
+    pub fn clean_title(&self, text: &str) -> Result<String> {
+        Ok(style::title(&self.clean(text)?, &self.style))
+    }
+
+    // -- git --------------------------------------------------------------
+
+    fn git_opts(&self, cwd: Option<&Path>, check: bool) -> ExecOpts {
+        ExecOpts::new()
+            .cwd(cwd.unwrap_or(&self.root))
+            .check(check)
+            .timeout_secs(600)
+    }
+
+    pub fn git(&self, args: &[&str]) -> Result<String> {
+        self.git_at(None, args)
+    }
+
+    pub fn git_at(&self, cwd: Option<&Path>, args: &[&str]) -> Result<String> {
+        let mut argv = vec!["git".to_string()];
+        argv.extend(args.iter().map(|s| s.to_string()));
+        proc::run(&argv, &self.git_opts(cwd, true))
+    }
+
+    /// Run git, tolerating failure. Returns whatever landed on stdout.
+    pub fn git_try(&self, args: &[&str]) -> String {
+        self.git_try_at(None, args)
+    }
+
+    pub fn git_try_at(&self, cwd: Option<&Path>, args: &[&str]) -> String {
+        let mut argv = vec!["git".to_string()];
+        argv.extend(args.iter().map(|s| s.to_string()));
+        proc::run(&argv, &self.git_opts(cwd, false)).unwrap_or_default()
+    }
+
+    /// The base branch the remote actually points at, rather than assuming
+    /// `main`. Falls back to the configured value when there is no origin.
+    pub fn default_branch(&self, configured: &str) -> String {
+        let refname = self.git_try(&["symbolic-ref", "refs/remotes/origin/HEAD"]);
+        match refname.trim().rsplit('/').next() {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => configured.to_string(),
+        }
+    }
+
+    // -- branch naming and ownership --------------------------------------
+    //
+    // Branch names default to `issue-N`, which is exactly what a person would
+    // name a branch by hand. Ownership therefore cannot be inferred from the
+    // name, so every branch spar creates is recorded and cleanup only ever
+    // touches what is in that record.
+
+    pub fn branch_for_issue(&self, issue: i64) -> String {
+        format!("{}issue-{issue}", self.branch_prefix)
+    }
+
+    pub fn branch_for_pr(&self, number: i64) -> String {
+        format!("{}pr-{number}", self.branch_prefix)
+    }
+
+    fn ledger_path(&self) -> PathBuf {
+        self.root.join(STATE_DIR).join("branches.json")
+    }
+
+    pub fn known_branches(&self) -> BTreeMap<String, BranchRecord> {
+        std::fs::read_to_string(self.ledger_path())
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn record_branch(&self, branch: &str, kind: &str, number: i64) {
+        let mut data = self.known_branches();
+        data.insert(
+            branch.to_string(),
+            BranchRecord {
+                kind: kind.to_string(),
+                number,
+            },
+        );
+        if let Err(e) = write_json_atomic(&self.ledger_path(), &data) {
+            logdim!("could not record branch {branch}: {e}");
+        }
+    }
+
+    pub fn forget_branch(&self, branch: &str) {
+        let mut data = self.known_branches();
+        if data.remove(branch).is_none() {
+            return;
+        }
+        if let Err(e) = write_json_atomic(&self.ledger_path(), &data) {
+            logdim!("could not update the branch record: {e}");
+        }
+    }
+
+    // -- worktrees --------------------------------------------------------
+
+    fn worktree_path(&self, name: &str) -> PathBuf {
+        self.root.join(WORKTREE_DIR).join(name)
+    }
+
+    /// Isolate an issue so a failed run cannot poison the next one's base.
+    pub fn worktree_add(&self, issue: i64, base: &str) -> Result<(PathBuf, String)> {
+        let branch = self.branch_for_issue(issue);
+        let path = self.worktree_path(&format!("issue-{issue}"));
+
+        self.git_try(&["fetch", "origin", base]);
+        self.worktree_remove(issue);
+        self.git_try(&["branch", "-D", &branch]);
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| spar_err!("could not create {}: {e}", parent.display()))?;
+        }
+
+        let path_str = path.display().to_string();
+        let remote_start = format!("origin/{base}");
+        let created = self
+            .git(&["worktree", "add", "-b", &branch, &path_str, &remote_start])
+            .or_else(|_| self.git(&["worktree", "add", "-b", &branch, &path_str, base]));
+
+        // Recorded on both paths: an unrecorded branch is one cleanup will
+        // never remove, and the fallback creates a branch just the same.
+        created.map_err(|e| {
+            spar_err!(
+                "could not create a worktree for issue #{issue}. {}\nIs `{base}` a real branch, \
+                 and does `origin` exist?",
+                e.last_line()
+            )
+        })?;
+        self.record_branch(&branch, "issue", issue);
+        Ok((path, branch))
+    }
+
+    pub fn worktree_remove(&self, issue: i64) {
+        self.remove_worktree_at(&self.worktree_path(&format!("issue-{issue}")));
+    }
+
+    fn remove_worktree_at(&self, path: &Path) {
+        let path_str = path.display().to_string();
+        self.git_try(&["worktree", "remove", "--force", &path_str]);
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        self.git_try(&["worktree", "prune"]);
+    }
+
+    /// Check an existing PR branch out into an isolated worktree.
+    pub fn worktree_for_pr(&self, pr: &PrView) -> Result<(PathBuf, String)> {
+        let head = pr.head_ref_name.clone();
+        if head.trim().is_empty() {
+            bail!("PR #{} has no head branch to check out", pr.number);
+        }
+        let path = self.worktree_path(&format!("pr-{}", pr.number));
+        let local = self.branch_for_pr(pr.number);
+
+        self.git(&["fetch", "origin", &head]).map_err(|e| {
+            spar_err!(
+                "could not fetch the branch behind PR #{}: {}",
+                pr.number,
+                e.last_line()
+            )
+        })?;
+        self.remove_worktree_at(&path);
+        self.git_try(&["branch", "-D", &local]);
+
+        let path_str = path.display().to_string();
+        let start = format!("origin/{head}");
+        self.git(&["worktree", "add", "-B", &local, &path_str, &start])?;
+        self.record_branch(&local, "pr", pr.number);
+        Ok((path, head))
+    }
+
+    pub fn release_pr_worktree(&self, number: i64) {
+        let path = self.worktree_path(&format!("pr-{number}"));
+        self.remove_worktree_at(&path);
+        let local = self.branch_for_pr(number);
+        self.git_try(&["branch", "-D", &local]);
+        self.forget_branch(&local);
+    }
+
+    // -- branch state -----------------------------------------------------
+
+    /// What to diff against: the remote tracking branch when it resolves, the
+    /// local branch when it does not.
+    ///
+    /// This is not a nicety. Every "did the agent do anything" check hangs off
+    /// this ref, and `git log` against a ref that does not exist fails silently
+    /// and reads as "no commits". A checkout whose `origin/main` was never
+    /// fetched would report every implementation as abandoned and throw the
+    /// work away.
+    pub fn base_ref(&self, cwd: &Path, base: &str) -> String {
+        let remote = format!("origin/{base}");
+        if self.rev_exists(cwd, &remote) {
+            return remote;
+        }
+        if self.rev_exists(cwd, base) {
+            logdim!("origin/{base} does not resolve, comparing against local {base}");
+            return base.to_string();
+        }
+        logdim!("neither origin/{base} nor {base} resolves; results will be unreliable");
+        remote
+    }
+
+    fn rev_exists(&self, cwd: &Path, refname: &str) -> bool {
+        let spec = format!("{refname}^{{commit}}");
+        !self
+            .git_try_at(Some(cwd), &["rev-parse", "--verify", "--quiet", &spec])
+            .trim()
+            .is_empty()
+    }
+
+    pub fn has_changes(&self, cwd: &Path, base: &str) -> bool {
+        let range = format!("{}..HEAD", self.base_ref(cwd, base));
+        !self
+            .git_try_at(Some(cwd), &["log", &range, "--oneline"])
+            .trim()
+            .is_empty()
+    }
+
+    pub fn diff_stat(&self, cwd: &Path, base: &str) -> String {
+        let range = format!("{}...HEAD", self.base_ref(cwd, base));
+        let full = self.git_try_at(Some(cwd), &["diff", &range, "--shortstat"]);
+        full.trim().to_string()
+    }
+
+    /// Scrub commit messages that slipped past the prompt.
+    ///
+    /// `git filter-branch` calls back into this same binary, so there is no
+    /// interpreter to find and no second copy of the rules to drift.
+    pub fn rewrite_commits_if_needed(&self, cwd: &Path, base: &str) -> Result<()> {
+        let range = format!("{}..HEAD", self.base_ref(cwd, base));
+        let raw = self.git_try_at(Some(cwd), &["log", &range, "--format=%H%x00%B%x1e"]);
+
+        let offenders = raw
+            .split('\x1e')
+            .filter_map(|entry| entry.split_once('\0'))
+            .filter(|(_, body)| !style::violations(body, &self.style).is_empty())
+            .count();
+        if offenders == 0 {
+            return Ok(());
+        }
+        logdim!("{offenders} commit message(s) violated style rules, rewriting");
+
+        let exe = self_binary()?;
+        let filter = format!("{} scrub-filter", sh_quote(&exe.display().to_string()));
+
+        let argv: Vec<String> = [
+            "git",
+            "filter-branch",
+            "-f",
+            "--msg-filter",
+            &filter,
+            &range,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let opts = ExecOpts::new()
+            .cwd(cwd)
+            .check(false)
+            .timeout_secs(600)
+            .env("FILTER_BRANCH_SQUELCH_WARNING", "1")
+            .env("SPAR_BAN_EM_DASH", bool_env(self.style.ban_em_dash))
+            .env(
+                "SPAR_BAN_AI_ATTRIBUTION",
+                bool_env(self.style.ban_ai_attribution),
+            );
+        let _ = proc::run(&argv, &opts);
+
+        let after = self.git_try_at(Some(cwd), &["log", &range, "--format=%B"]);
+        if !style::violations(&after, &self.style).is_empty() {
+            bail!(
+                "commit messages still violate style rules after a rewrite. Fix them by hand in \
+                 {} and rerun.",
+                cwd.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Push by explicit refspec from HEAD.
+    ///
+    /// A resumed PR is checked out under a local name (`pr-N`) that does not
+    /// match its remote branch, so pushing by branch name would resolve the
+    /// wrong local ref or fail outright.
+    pub fn push(&self, cwd: &Path, branch: &str) -> Result<()> {
+        let refspec = format!("HEAD:{branch}");
+        self.git_at(
+            Some(cwd),
+            &["push", "--force-with-lease", "origin", &refspec],
+        )
+        .map(|_| ())
+        .map_err(|e| {
+            spar_err!(
+                "could not push to origin/{branch}. {}\nCheck push access and whether the \
+                     branch moved under you.",
+                e.last_line()
+            )
+        })
+    }
+
+    // -- gh ---------------------------------------------------------------
+
+    pub fn gh(&self, args: &[&str]) -> Result<String> {
+        self.gh_at(None, args)
+    }
+
+    pub fn gh_at(&self, cwd: Option<&Path>, args: &[&str]) -> Result<String> {
+        let mut argv = vec!["gh".to_string()];
+        argv.extend(args.iter().map(|s| s.to_string()));
+        proc::run(
+            &argv,
+            &ExecOpts::new()
+                .cwd(cwd.unwrap_or(&self.root))
+                .timeout_secs(300),
+        )
+    }
+
+    pub fn gh_try(&self, args: &[&str]) -> String {
+        let mut argv = vec!["gh".to_string()];
+        argv.extend(args.iter().map(|s| s.to_string()));
+        proc::run(
+            &argv,
+            &ExecOpts::new()
+                .cwd(&self.root)
+                .check(false)
+                .timeout_secs(300),
+        )
+        .unwrap_or_default()
+    }
+
+    pub fn fetch_issues(&self, numbers: &[i64]) -> Result<Vec<Issue>> {
+        let mut issues = Vec::new();
+        for number in numbers {
+            let text = self
+                .gh(&[
+                    "issue",
+                    "view",
+                    &number.to_string(),
+                    "--json",
+                    "number,title,body,labels,state,url",
+                ])
+                .map_err(|e| spar_err!("could not read issue #{number}: {}", e.last_line()))?;
+            let issue: Issue = serde_json::from_str(&text)
+                .map_err(|e| spar_err!("unexpected shape for issue #{number}: {e}"))?;
+            if issue.is_closed() {
+                crate::log!("issue #{number} is closed, skipping");
+                continue;
+            }
+            issues.push(issue);
+        }
+        if issues.is_empty() {
+            bail!("no open issues to work on");
+        }
+        Ok(issues)
+    }
+
+    fn open_numbers(&self, kind: &str, limit: usize) -> Result<Vec<i64>> {
+        #[derive(Deserialize)]
+        struct Row {
+            number: i64,
+        }
+        let text = self.gh(&[
+            kind,
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            &FETCH_CEILING.to_string(),
+            "--json",
+            "number",
+        ])?;
+        let rows: Vec<Row> = serde_json::from_str(text.trim()).unwrap_or_default();
+        let mut numbers: Vec<i64> = rows.into_iter().map(|r| r.number).collect();
+        numbers.sort_unstable();
+
+        let noun = if kind == "issue" { "issues" } else { "PRs" };
+        if numbers.len() >= FETCH_CEILING {
+            crate::log!(
+                "more than {FETCH_CEILING} open {noun}; only the first {FETCH_CEILING} were \
+                 considered."
+            );
+        }
+        if numbers.len() > limit {
+            crate::log!(
+                "{} open {noun}, taking the {limit} lowest numbered. Raise --limit or name them \
+                 explicitly.",
+                numbers.len()
+            );
+            numbers.truncate(limit);
+        }
+        Ok(numbers)
+    }
+
+    /// Open issues, lowest numbered first. `gh issue list` excludes PRs.
+    pub fn list_open_issues(&self, limit: usize) -> Result<Vec<i64>> {
+        self.open_numbers("issue", limit)
+    }
+
+    pub fn list_open_prs(&self, limit: usize) -> Result<Vec<i64>> {
+        self.open_numbers("pr", limit)
+    }
+
+    pub fn pr_for_branch(&self, branch: &str) -> Option<PrRef> {
+        let text = self.gh_try(&[
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--json",
+            "number,url,title",
+        ]);
+        serde_json::from_str::<Vec<PrRef>>(text.trim())
+            .ok()
+            .and_then(|mut v| {
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.remove(0))
+                }
+            })
+    }
+
+    pub fn pr_view(&self, number: i64) -> Result<PrView> {
+        let text = self.gh(&[
+            "pr",
+            "view",
+            &number.to_string(),
+            "--json",
+            "number,url,title,headRefName,baseRefName,state,closingIssuesReferences",
+        ])?;
+        serde_json::from_str(&text).map_err(|e| spar_err!("unexpected shape for PR #{number}: {e}"))
+    }
+
+    pub fn pr_state(&self, number: i64) -> String {
+        let text = self.gh_try(&["pr", "view", &number.to_string(), "--json", "state"]);
+        serde_json::from_str::<Value>(text.trim())
+            .ok()
+            .and_then(|v| v.get("state").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    pub fn create_pr(
+        &self,
+        cwd: &Path,
+        branch: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<PrRef> {
+        let title = self.clean_title(title)?;
+        let body = self.clean(body)?;
+        self.gh_at(
+            Some(cwd),
+            &[
+                "pr", "create", "--base", base, "--head", branch, "--title", &title, "--body",
+                &body,
+            ],
+        )
+        .map_err(|e| spar_err!("could not open a PR for {branch}. {}", e.last_line()))?;
+        self.pr_for_branch(branch).ok_or_else(|| {
+            spar_err!("PR creation reported success but none was found for {branch}")
+        })
+    }
+
+    pub fn comment_pr(&self, number: i64, body: &str) -> Result<()> {
+        let body = self.clean(body)?;
+        self.gh(&["pr", "comment", &number.to_string(), "--body", &body])
+            .map(|_| ())
+    }
+
+    pub fn comment_issue(&self, number: i64, body: &str) -> Result<()> {
+        let body = self.clean(body)?;
+        self.gh(&["issue", "comment", &number.to_string(), "--body", &body])
+            .map(|_| ())
+    }
+
+    /// Comment, then close as not planned.
+    ///
+    /// Only ever called when both agents independently declined the issue: one
+    /// agent's opinion is not enough to close somebody's report.
+    pub fn close_issue(&self, number: i64, body: &str) -> Result<()> {
+        self.comment_issue(number, body)?;
+        let n = number.to_string();
+        if self
+            .gh(&["issue", "close", &n, "--reason", "not planned"])
+            .is_ok()
+        {
+            return Ok(());
+        }
+        // Older gh builds do not take --reason.
+        self.gh(&["issue", "close", &n]).map(|_| ()).map_err(|e| {
+            spar_err!(
+                "commented on #{number} but could not close it: {}",
+                e.last_line()
+            )
+        })
+    }
+
+    pub fn create_issue(&self, title: &str, body: &str) -> Result<String> {
+        let title = self.clean_title(title)?;
+        let body = self.clean_body(body)?;
+        Ok(self
+            .gh(&["issue", "create", "--title", &title, "--body", &body])?
+            .trim()
+            .to_string())
+    }
+
+    /// Avoid filing a duplicate when a follow-up already exists.
+    pub fn find_issue_by_title(&self, title: &str) -> Option<String> {
+        #[derive(Deserialize)]
+        struct Row {
+            title: String,
+            url: String,
+        }
+        let needle = title.trim().to_lowercase();
+        if needle.is_empty() {
+            return None;
+        }
+        // Quotes and newlines would be read as search syntax rather than text.
+        let query: String = title
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\'' | '\n' | '\r'))
+            .take(120)
+            .collect();
+        let text = self.gh_try(&[
+            "issue",
+            "list",
+            "--state",
+            "all",
+            "--limit",
+            "100",
+            "--search",
+            query.trim(),
+            "--json",
+            "number,title,url",
+        ]);
+        serde_json::from_str::<Vec<Row>>(text.trim())
+            .ok()?
+            .into_iter()
+            .find(|row| row.title.trim().to_lowercase() == needle)
+            .map(|row| row.url)
+    }
+
+    /// Squash merge, tolerating cleanup failures after a successful merge.
+    ///
+    /// `gh pr merge --delete-branch` exits non-zero when it cannot delete the
+    /// local branch, which happens *after* the merge has already landed.
+    /// Treating that as a failure reports work as lost when it is not.
+    pub fn merge_pr(&self, number: i64) -> Result<()> {
+        let n = number.to_string();
+        match self.gh(&["pr", "merge", &n, "--squash", "--delete-branch"]) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if self.pr_state(number) == "MERGED" {
+                    logdim!(
+                        "PR #{number} merged; branch cleanup did not finish: {}",
+                        e.last_line()
+                    );
+                    Ok(())
+                } else {
+                    Err(spar_err!("could not merge PR #{number}. {}", e.last_line()))
+                }
+            }
+        }
+    }
+
+    // -- follow-ups -------------------------------------------------------
+
+    /// Append a follow-up to a local note instead of the tracker.
+    ///
+    /// Deduplicated on the title, matching the issue path. Returns a display
+    /// string, or None when it was already recorded.
+    pub fn append_local_followup(&self, title: &str, body: &str, source: i64) -> Option<String> {
+        let path = self.root.join(STATE_DIR).join("followups.md");
+        let heading = format!("## {}", title.trim());
+        if let Ok(existing) = std::fs::read_to_string(&path) {
+            if existing.contains(&heading) {
+                logdim!("follow-up already noted: {title}");
+                return None;
+            }
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        use std::io::Write;
+        let entry = format!("{heading}\n\nFrom #{source}.\n\n{}\n\n", body.trim());
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                let _ = file.write_all(entry.as_bytes());
+                Some(format!("note: {}", title.trim()))
+            }
+            Err(e) => {
+                logdim!("could not write {}: {e}", path.display());
+                None
+            }
+        }
+    }
+
+    // -- resumable state --------------------------------------------------
+    //
+    // Custody cannot be read from GitHub authorship: every agent commits and
+    // comments as the same git identity, so `author` is always the human who
+    // ran spar. State is kept on disk by default and can additionally travel in
+    // a PR comment, which is what lets a run be resumed from another machine.
+
+    pub fn state_path(&self, number: i64) -> PathBuf {
+        self.root
+            .join(STATE_DIR)
+            .join("state")
+            .join(format!("pr-{number}.json"))
+    }
+
+    fn read_local_state(&self, number: i64) -> Option<PersistedState> {
+        let path = self.state_path(number);
+        let text = std::fs::read_to_string(&path).ok()?;
+        match serde_json::from_str(&text) {
+            Ok(state) => Some(state),
+            Err(_) => {
+                logdim!("could not read {}, starting fresh", path.display());
+                None
+            }
+        }
+    }
+
+    pub fn read_state(&self, pr: &PrView) -> Option<PersistedState> {
+        if let Some(local) = self.read_local_state(pr.number) {
+            return Some(local);
+        }
+        if self.state_store.writes_pr() {
+            return self.read_pr_state(pr.number);
+        }
+        None
+    }
+
+    fn read_pr_state(&self, number: i64) -> Option<PersistedState> {
+        for body in self.state_comment_bodies(number).into_iter().rev() {
+            if let Some(state) = parse_state_comment(&body) {
+                return Some(state);
+            }
+        }
+        None
+    }
+
+    pub fn write_state(&self, number: i64, state: &PersistedState) -> Result<()> {
+        if self.state_store.writes_local() {
+            write_json_atomic(&self.state_path(number), state)?;
+        }
+        if self.state_store.writes_pr() {
+            self.write_pr_state(number, state)?;
+        }
+        Ok(())
+    }
+
+    fn write_pr_state(&self, number: i64, state: &PersistedState) -> Result<()> {
+        // Not run through clean(): this is structured data, and scrubbing would
+        // corrupt refutation text stored in the ledger. It sits inside an
+        // unclosed HTML comment so GitHub renders it as nothing.
+        let body = format!(
+            "{STATE_MARKER}\n{}\n-->",
+            serde_json::to_string_pretty(state)?
+        );
+        if let Some(id) = self.state_comment_id(number) {
+            let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
+            let field = format!("body={body}");
+            self.gh_try(&["api", "-X", "PATCH", &path, "-f", &field, "--silent"]);
+            return Ok(());
+        }
+        self.gh(&["pr", "comment", &number.to_string(), "--body", &body])
+            .map(|_| ())
+    }
+
+    fn comments_json(&self, number: i64) -> Vec<Value> {
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{number}/comments");
+        parse_comment_pages(&self.gh_try(&["api", "--paginate", &path]))
+    }
+
+    fn state_comments(&self, number: i64) -> Vec<(i64, String)> {
+        self.comments_json(number)
+            .into_iter()
+            .filter_map(|c| {
+                let body = c.get("body").and_then(Value::as_str)?.to_string();
+                if !body.contains("spar:state") {
+                    return None;
+                }
+                let id = c.get("id").and_then(Value::as_i64)?;
+                Some((id, body))
+            })
+            .collect()
+    }
+
+    fn state_comment_bodies(&self, number: i64) -> Vec<String> {
+        self.state_comments(number)
+            .into_iter()
+            .map(|(_, b)| b)
+            .collect()
+    }
+
+    fn state_comment_id(&self, number: i64) -> Option<i64> {
+        self.state_comments(number).last().map(|(id, _)| *id)
+    }
+
+    /// Drop state once the PR is finished and there is nothing to resume.
+    pub fn clear_state(&self, number: i64) {
+        let path = self.state_path(number);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("json.tmp"));
+    }
+
+    // -- housekeeping -----------------------------------------------------
+
+    /// Remove state files whose PR is merged or closed.
+    pub fn prune_state(&self) -> Vec<String> {
+        let base = self.root.join(STATE_DIR).join("state");
+        let Ok(entries) = std::fs::read_dir(&base) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|n| n.starts_with("pr-") && n.ends_with(".json"))
+            .collect();
+        names.sort();
+
+        let mut removed = Vec::new();
+        for name in names {
+            let Ok(number) = name[3..name.len() - 5].parse::<i64>() else {
+                continue;
+            };
+            if is_finished(&self.pr_state(number)) {
+                let _ = std::fs::remove_file(base.join(&name));
+                removed.push(format!("state {name}"));
+            }
+        }
+        removed
+    }
+
+    /// Delete state comments from PRs that are finished.
+    ///
+    /// Open PRs are left alone: their state may still be live.
+    pub fn prune_pr_state(&self, numbers: Option<Vec<i64>>) -> Vec<String> {
+        #[derive(Deserialize)]
+        struct Row {
+            number: i64,
+        }
+        let numbers = numbers.unwrap_or_else(|| {
+            let text = self.gh_try(&[
+                "pr", "list", "--state", "all", "--limit", "200", "--json", "number",
+            ]);
+            serde_json::from_str::<Vec<Row>>(text.trim())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| r.number)
+                .collect()
+        });
+
+        let mut removed = Vec::new();
+        for number in numbers {
+            if !is_finished(&self.pr_state(number)) {
+                continue;
+            }
+            for (id, _) in self.state_comments(number) {
+                let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
+                self.gh_try(&["api", "-X", "DELETE", &path, "--silent"]);
+                removed.push(format!("state comment on PR #{number}"));
+            }
+        }
+        removed
+    }
+
+    /// Drop worktrees whose PR is finished, then the branches they left behind.
+    ///
+    /// With auto_merge off, which is the default, a run ends at "approved", so
+    /// nothing would ever clean these up on its own and they accumulate one per
+    /// run. A stranded worktree also holds its branch checked out, which makes
+    /// a later `gh pr merge --delete-branch` fail to clean up.
+    pub fn prune_worktrees(&self, force_all: bool) -> Vec<String> {
+        let base = self.root.join(WORKTREE_DIR);
+        let mut removed = Vec::new();
+
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            let mut names: Vec<String> = entries
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .collect();
+            names.sort();
+
+            for name in names {
+                let branch = format!("{}{name}", self.branch_prefix);
+                if !(force_all || self.worktree_is_done(&branch)) {
+                    continue;
+                }
+                self.remove_worktree_at(&base.join(&name));
+                self.git_try(&["branch", "-D", &branch]);
+                self.forget_branch(&branch);
+                removed.push(name);
+            }
+        }
+        if !removed.is_empty() {
+            self.git_try(&["worktree", "prune"]);
+        }
+        removed.extend(self.prune_branches(force_all));
+        removed
+    }
+
+    /// Delete leftover branches spar created whose worktree is already gone.
+    ///
+    /// Deletion is driven by the ledger of branches spar actually created, not
+    /// by a name pattern. Names default to `issue-N`, which is exactly what a
+    /// person would call a branch themselves, so a name alone can never
+    /// establish ownership. This is the data loss guard.
+    pub fn prune_branches(&self, force_all: bool) -> Vec<String> {
+        let branches: Vec<String> = self.known_branches().keys().cloned().collect();
+        if branches.is_empty() {
+            return Vec::new();
+        }
+
+        let checked_out: Vec<String> = self
+            .git_try(&["worktree", "list", "--porcelain"])
+            .lines()
+            .filter_map(|l| l.strip_prefix("branch refs/heads/").map(str::to_string))
+            .collect();
+
+        // %(refname:short) is ambiguous when a tag shares the branch name (it
+        // yields "heads/..."), so take the full ref and strip it here.
+        let existing: Vec<String> = self
+            .git_try(&["for-each-ref", "refs/heads/", "--format=%(refname)"])
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("refs/heads/").map(str::to_string))
+            .collect();
+
+        let mut removed = Vec::new();
+        for branch in branches {
+            if !existing.contains(&branch) {
+                self.forget_branch(&branch); // already gone, drop the record
+                continue;
+            }
+            if checked_out.contains(&branch) {
+                continue;
+            }
+            if !(force_all || self.worktree_is_done(&branch)) {
+                continue;
+            }
+            match self.git(&["branch", "-D", &branch]) {
+                Ok(_) => {
+                    self.forget_branch(&branch);
+                    removed.push(format!("branch {branch}"));
+                }
+                Err(e) => {
+                    // A branch that silently survives pruning looks like a spar
+                    // bug, so the name and git's own reason have to be said.
+                    logdim!("could not delete {branch}: {}", e.last_line());
+                }
+            }
+        }
+        removed
+    }
+
+    /// True when the PR behind this branch is merged or closed.
+    fn worktree_is_done(&self, branch: &str) -> bool {
+        #[derive(Deserialize)]
+        struct Row {
+            state: String,
+        }
+        let entry = branch
+            .strip_prefix(self.branch_prefix.as_str())
+            .unwrap_or(branch);
+        if let Some(rest) = entry.strip_prefix("pr-") {
+            return is_finished(&self.pr_state(rest.parse().unwrap_or(-1)));
+        }
+        if entry.starts_with("issue-") {
+            let text = self.gh_try(&[
+                "pr", "list", "--head", branch, "--state", "all", "--json", "state",
+            ]);
+            let rows: Vec<Row> = serde_json::from_str(text.trim()).unwrap_or_default();
+            return !rows.is_empty() && rows.iter().all(|r| is_finished(&r.state));
+        }
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Free helpers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+pub struct BranchRecord {
+    pub kind: String,
+    pub number: i64,
+}
+
+pub fn is_finished(state: &str) -> bool {
+    matches!(state.trim().to_uppercase().as_str(), "MERGED" | "CLOSED")
+}
+
+/// Write JSON through a temporary file and rename, so a kill cannot leave a
+/// truncated state file behind.
+pub fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| spar_err!("could not create {}: {e}", parent.display()))?;
+    }
+    let tmp = path.with_extension(format!(
+        "{}.tmp",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("json")
+    ));
+    std::fs::write(&tmp, serde_json::to_vec_pretty(value)?)
+        .map_err(|e| spar_err!("could not write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| spar_err!("could not replace {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Flatten whatever `gh api --paginate` printed into a list of comments.
+///
+/// Current gh merges array pages into one array. Older builds concatenated one
+/// document per page. A streaming parser reads either, and unlike splitting the
+/// text on a bracket pair it cannot be fooled by a comment body that happens to
+/// contain one, which would otherwise make a resume silently start over.
+pub fn parse_comment_pages(text: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    for value in serde_json::Deserializer::from_str(text.trim()).into_iter::<Value>() {
+        match value {
+            Ok(Value::Array(items)) => out.extend(items),
+            Ok(other) => out.push(other),
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+/// Extract the payload from a state comment. The marker is followed by JSON and
+/// terminated with `-->`.
+pub fn parse_state_comment(body: &str) -> Option<PersistedState> {
+    let marker = body.find(STATE_MARKER)?;
+    let start = body[marker..].find('{')? + marker;
+    let end = body.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    match serde_json::from_str(&body[start..=end]) {
+        Ok(state) => Some(state),
+        Err(_) => {
+            logdim!("found a spar state comment but could not parse it");
+            None
+        }
+    }
+}
+
+/// Where this binary lives, so `git filter-branch` can call back into it.
+///
+/// `SPAR_SELF_BIN` overrides the answer. That matters for the integration
+/// tests, whose `current_exe` is the test harness rather than spar, and for
+/// anyone who ships spar behind a wrapper script.
+pub fn self_binary() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("SPAR_SELF_BIN") {
+        let path = PathBuf::from(path);
+        if proc::is_executable(&path) {
+            return Ok(path);
+        }
+        bail!(
+            "SPAR_SELF_BIN is set to {}, which is not executable",
+            path.display()
+        );
+    }
+    std::env::current_exe()
+        .map_err(|e| spar_err!("could not locate the spar binary for a commit rewrite: {e}"))
+}
+
+fn bool_env(value: bool) -> &'static str {
+    if value {
+        "1"
+    } else {
+        "0"
+    }
+}
+
+/// Wrap a string for a POSIX shell. `git filter-branch` takes its filter as a
+/// shell command, and an install path with a space in it is not exotic.
+pub fn sh_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+/// Style rules for the `scrub-filter` subcommand, which runs in a child process
+/// spawned by git and so cannot see the parent's config.
+pub fn style_from_env() -> Style {
+    let flag = |key: &str| !matches!(std::env::var(key).as_deref(), Ok("0"));
+    Style {
+        ban_em_dash: flag("SPAR_BAN_EM_DASH"),
+        ban_ai_attribution: flag("SPAR_BAN_AI_ATTRIBUTION"),
+        ..Style::permissive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::StateStore;
+    use crate::model::{Ledger, Status};
+
+    fn repo_for_titles() -> Repo {
+        Repo {
+            root: PathBuf::from("/nonexistent"),
+            style: Style::default(),
+            branch_prefix: String::new(),
+            state_store: StateStore::Local,
+            followups: crate::config::Followups::Issues,
+        }
+    }
+
+    /// Follow-up deduplication compares a title it computed against the title
+    /// GitHub stored. If those two transforms can disagree, the check never
+    /// matches and every review round files another copy of the same issue.
+    #[test]
+    fn clean_title_is_idempotent_even_when_the_scrub_lengthens_it() {
+        let repo = repo_for_titles();
+        for raw in [
+            "Retry loop spins \u{2014} Retry-After parses to zero",
+            "plain title",
+            "  spread   over\nlines  ",
+            "\u{1F916} Generated with something",
+            &format!("a \u{2014} {}", "very long title ".repeat(20)),
+            &"x".repeat(300),
+            &format!("{} \u{2014} end", "y".repeat(88)),
+            // Exactly the budget, with two spaceless dashes. The scrub turns
+            // each "a\u{2014}b" into "a, b", so clip-then-scrub lands one
+            // character over budget per dash and a second pass clips again,
+            // producing a different string. Scrub-then-clip cannot.
+            &{
+                let tail = "a\u{2014}b c\u{2014}d";
+                let pad = Style::default().max_title_chars - tail.chars().count();
+                format!("{}{tail}", "w".repeat(pad))
+            },
+        ] {
+            let once = repo.clean_title(raw).unwrap();
+            let twice = repo.clean_title(&once).unwrap();
+            assert_eq!(once, twice, "not idempotent for {raw:?}");
+            assert!(
+                once.chars().count() <= repo.style.max_title_chars,
+                "over budget: {once:?}"
+            );
+            assert!(style::violations(&once, &repo.style).is_empty(), "{once:?}");
+        }
+    }
+
+    #[test]
+    fn a_title_with_an_em_dash_survives_as_readable_text() {
+        let repo = repo_for_titles();
+        assert_eq!(
+            "Retry loop spins, Retry-After parses to zero",
+            repo.clean_title("Retry loop spins \u{2014} Retry-After parses to zero")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn sh_quote_survives_a_quote() {
+        assert_eq!(r"'a'\''b'", sh_quote("a'b"));
+    }
+
+    #[test]
+    fn sh_quote_wraps_a_space() {
+        assert_eq!(
+            "'/Applications/My App/spar'",
+            sh_quote("/Applications/My App/spar")
+        );
+    }
+
+    #[test]
+    fn finished_states_are_recognised_case_insensitively() {
+        assert!(is_finished("MERGED"));
+        assert!(is_finished("closed"));
+        assert!(!is_finished("OPEN"));
+        assert!(!is_finished(""));
+    }
+
+    fn state() -> PersistedState {
+        PersistedState {
+            version: 1,
+            round: 4,
+            next_actor: "codex".into(),
+            status: Status::Pending,
+            ledger: Ledger::new(),
+            filed: vec![],
+        }
+    }
+
+    #[test]
+    fn a_state_comment_round_trips() {
+        let body = format!(
+            "{STATE_MARKER}\n{}\n-->",
+            serde_json::to_string(&state()).unwrap()
+        );
+        let back = parse_state_comment(&body).unwrap();
+        assert_eq!(4, back.round);
+        assert_eq!("codex", back.next_actor);
+    }
+
+    /// It must render as nothing, so PRs are not littered with machine state.
+    #[test]
+    fn the_state_block_is_an_html_comment() {
+        let body = format!(
+            "{STATE_MARKER}\n{}\n-->",
+            serde_json::to_string(&state()).unwrap()
+        );
+        assert!(body.starts_with("<!--"));
+        assert!(body.trim_end().ends_with("-->"));
+        assert!(!body[..body.find('{').unwrap()].contains("-->"));
+    }
+
+    #[test]
+    fn an_unrelated_json_block_is_not_state() {
+        assert!(parse_state_comment("here is a snippet\n```json\n{\"round\": 99}\n```").is_none());
+    }
+
+    #[test]
+    fn a_malformed_state_comment_is_none_not_a_panic() {
+        assert!(parse_state_comment(&format!("{STATE_MARKER}\n{{not json\n-->")).is_none());
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("spar-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("state").join("pr-7.json");
+        write_json_atomic(&path, &state()).unwrap();
+        let files: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .collect();
+        assert_eq!(vec!["pr-7.json".to_string()], files);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_overwrites_rather_than_accumulating() {
+        let dir = std::env::temp_dir().join(format!("spar-overwrite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("pr-7.json");
+        for round in 1..4 {
+            let mut s = state();
+            s.round = round;
+            write_json_atomic(&path, &s).unwrap();
+        }
+        let back: PersistedState =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(3, back.round);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn style_from_env_defaults_to_enforcing() {
+        std::env::remove_var("SPAR_BAN_EM_DASH");
+        std::env::remove_var("SPAR_BAN_AI_ATTRIBUTION");
+        let style = style_from_env();
+        assert!(style.ban_em_dash && style.ban_ai_attribution);
+        assert!(
+            !style.terse,
+            "the commit filter must not truncate a commit message"
+        );
+    }
+}
+
+#[cfg(test)]
+mod comment_page_tests {
+    use super::*;
+
+    #[test]
+    fn a_single_merged_array_is_read() {
+        let pages = parse_comment_pages(r#"[{"id":1,"body":"a"},{"id":2,"body":"b"}]"#);
+        assert_eq!(2, pages.len());
+        assert_eq!(Some(2), pages[1]["id"].as_i64());
+    }
+
+    #[test]
+    fn concatenated_pages_from_an_older_gh_are_read_too() {
+        let pages = parse_comment_pages(r#"[{"id":1}][{"id":2}]"#);
+        assert_eq!(2, pages.len());
+    }
+
+    /// A comment body containing a bracket pair used to split the payload into
+    /// two invalid halves, so no state comment was found and a resume silently
+    /// started from round one.
+    #[test]
+    fn a_comment_body_containing_a_bracket_pair_is_not_mistaken_for_a_page_break() {
+        let text = r#"[{"id":1,"body":"see [the docs][ref] for why"},{"id":2,"body":"ok"}]"#;
+        let pages = parse_comment_pages(text);
+        assert_eq!(2, pages.len(), "{pages:?}");
+        assert!(pages[0]["body"].as_str().unwrap().contains("[ref]"));
+    }
+
+    #[test]
+    fn empty_output_is_no_comments_not_a_panic() {
+        assert!(parse_comment_pages("").is_empty());
+        assert!(parse_comment_pages("   ").is_empty());
+        assert!(parse_comment_pages("[]").is_empty());
+    }
+
+    #[test]
+    fn a_gh_error_message_on_stdout_yields_nothing_rather_than_garbage() {
+        assert!(parse_comment_pages("gh: Not Found (HTTP 404)").is_empty());
+    }
+
+    #[test]
+    fn state_is_found_in_the_last_matching_comment() {
+        let payload = |round: u32| {
+            format!(
+                "{STATE_MARKER}\n{{\"version\":1,\"round\":{round},\"next_actor\":\"a\",\"status\":\"pending\",\"ledger\":{{}},\"filed\":[]}}\n-->"
+            )
+        };
+        let text = serde_json::to_string(&serde_json::json!([
+            {"id": 1, "body": payload(1)},
+            {"id": 2, "body": "looks good to me"},
+            {"id": 3, "body": payload(5)},
+        ]))
+        .unwrap();
+        let pages = parse_comment_pages(&text);
+        let last = pages
+            .iter()
+            .rev()
+            .find_map(|c| parse_state_comment(c["body"].as_str().unwrap_or("")))
+            .unwrap();
+        assert_eq!(5, last.round);
+    }
+}

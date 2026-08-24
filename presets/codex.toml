@@ -1,0 +1,27 @@
+# OpenAI Codex. Ships inside the ChatGPT desktop app on macOS, or standalone.
+#
+# Note: `codex exec review` is deliberately not used. It refuses a custom prompt
+# alongside --base and returns prose regardless of --output-schema, so it cannot
+# produce a machine-checkable verdict.
+command = [
+  "codex", "exec", "--json", "--skip-git-repo-check",
+  ["-s", "workspace-write"],
+  ["-m", "{model}"],
+  ["-c", "model_reasoning_effort={effort}"],
+  ["-C", "{cwd}"],
+  ["--output-schema", "{schema_file}"],
+  "--", "{prompt}",
+]
+output = "jsonl"
+message_path = "item.text"
+search_paths = [
+  "/Applications/ChatGPT.app/Contents/Resources",
+  "~/.codex/bin",
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  "~/.local/bin",
+]
+
+[message_match]
+type = "item.completed"
+"item.type" = "agent_message"

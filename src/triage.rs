@@ -1,0 +1,492 @@
+//! Both agents judge every issue independently, then the two verdicts are
+//! reconciled mechanically.
+//!
+//! Nothing here lets one agent overrule the other. Both say do, it is
+//! scheduled. Both say skip, it is skipped and the shared reasoning is posted.
+//! They disagree, it is parked for a person, because a disagreement between two
+//! competent reviewers is information, not noise to be averaged away.
+
+use std::collections::BTreeMap;
+
+use crate::agent::Agent;
+use crate::config::Config;
+use crate::error::Result;
+use crate::model::{
+    Complexity, ContestedItem, Issue, Plan, PlanItem, Risk, SkippedItem, TriageResponse,
+    TriageVerdict,
+};
+use crate::repo::Repo;
+use crate::{log, schema, spar_err};
+
+const TRIAGE_PROMPT: &str = "\
+You are triaging GitHub issues for the repository in your working directory.
+Read the codebase as needed before judging. Do not modify anything.
+
+For each issue decide:
+- worth_doing: is this a real, valid, actionable issue worth a PR? Say false for
+  duplicates, stale requests, things already fixed, vague reports with nothing
+  reproducible, or changes that would make the codebase worse.
+- complexity: s, m, or l.
+- depends_on: issue numbers from this same list that should land first.
+- risk: how likely a change here is to break something.
+
+Judge independently. Be willing to say an issue is not worth doing. Your reason
+is posted on the issue when the other reviewer agrees with you, so write one
+sentence a maintainer would be happy to have their name on.
+
+Issues:
+";
+
+/// Ask both agents, then reconcile.
+pub fn triage(agents: &[Agent], cfg: &Config, repo: &Repo, issues: &[Issue]) -> Result<Plan> {
+    let rendered: String = issues
+        .iter()
+        .map(|i| {
+            let body: String = i.body_text().trim().chars().take(2000).collect();
+            format!("#{}: {}\n{body}", i.number, i.title)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let prompt = format!("{TRIAGE_PROMPT}{rendered}");
+    let schema = schema::triage();
+
+    let answers = if cfg.loop_cfg.parallel_triage && agents.len() > 1 {
+        ask_together(agents, cfg, repo, &prompt, &schema)
+    } else {
+        ask_in_turn(agents, cfg, repo, &prompt, &schema)
+    };
+
+    let mut verdicts: Vec<(String, BTreeMap<i64, TriageVerdict>)> = Vec::new();
+    for (name, answer) in answers {
+        let response = answer?;
+        let mut by_issue = BTreeMap::new();
+        for verdict in response.issues {
+            by_issue.insert(verdict.issue, verdict);
+        }
+        verdicts.push((name, by_issue));
+    }
+
+    Ok(reconcile(issues, &verdicts))
+}
+
+type Answer = (String, Result<TriageResponse>);
+
+fn ask_one(
+    agent: &Agent,
+    cfg: &Config,
+    repo: &Repo,
+    prompt: &str,
+    schema: &serde_json::Value,
+) -> Answer {
+    let effort = cfg.effort_for_round(&agent.spec, 1);
+    let out = agent.ask_json::<TriageResponse>(prompt, schema, repo.root(), effort.as_deref());
+    (agent.name().to_string(), out)
+}
+
+/// Both agents at once. Triage only reads, so there is nothing to serialise,
+/// and a full repo pass is the slowest step in a run.
+fn ask_together(
+    agents: &[Agent],
+    cfg: &Config,
+    repo: &Repo,
+    prompt: &str,
+    schema: &serde_json::Value,
+) -> Vec<Answer> {
+    log!("triage: asking {} in parallel", names(agents));
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = agents
+            .iter()
+            .map(|agent| scope.spawn(move || ask_one(agent, cfg, repo, prompt, schema)))
+            .collect();
+        handles
+            .into_iter()
+            .zip(agents)
+            .map(|(handle, agent)| {
+                handle.join().unwrap_or_else(|_| {
+                    (
+                        agent.name().to_string(),
+                        Err(spar_err!("triage thread for '{}' panicked", agent.name())),
+                    )
+                })
+            })
+            .collect()
+    })
+}
+
+fn ask_in_turn(
+    agents: &[Agent],
+    cfg: &Config,
+    repo: &Repo,
+    prompt: &str,
+    schema: &serde_json::Value,
+) -> Vec<Answer> {
+    agents
+        .iter()
+        .map(|agent| {
+            log!(
+                "triage: asking {} ({})",
+                agent.name(),
+                agent.spec.describe()
+            );
+            ask_one(agent, cfg, repo, prompt, schema)
+        })
+        .collect()
+}
+
+fn names(agents: &[Agent]) -> String {
+    agents
+        .iter()
+        .map(Agent::name)
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation
+// ---------------------------------------------------------------------------
+
+fn reconcile(issues: &[Issue], verdicts: &[(String, BTreeMap<i64, TriageVerdict>)]) -> Plan {
+    let mut agreed = Vec::new();
+    let mut skipped = Vec::new();
+    let mut contested = Vec::new();
+
+    for issue in issues {
+        let number = issue.number;
+        let seen: Vec<(&String, Option<&TriageVerdict>)> = verdicts
+            .iter()
+            .map(|(name, map)| (name, map.get(&number)))
+            .collect();
+
+        if seen.iter().any(|(_, v)| v.is_none()) {
+            let missing: Vec<&str> = seen
+                .iter()
+                .filter(|(_, v)| v.is_none())
+                .map(|(n, _)| n.as_str())
+                .collect();
+            contested.push(ContestedItem {
+                issue: number,
+                title: issue.title.clone(),
+                positions: BTreeMap::new(),
+                reasons: BTreeMap::new(),
+                note: Some(format!("no verdict from {}", missing.join(", "))),
+            });
+            continue;
+        }
+
+        let all: Vec<(&String, &TriageVerdict)> = seen
+            .into_iter()
+            .map(|(n, v)| (n, v.expect("checked")))
+            .collect();
+
+        if all.iter().all(|(_, v)| v.worth_doing) {
+            let complexity = all
+                .iter()
+                .map(|(_, v)| v.complexity)
+                .max_by_key(|c| c.rank())
+                .unwrap_or(Complexity::M);
+            let risk = all
+                .iter()
+                .map(|(_, v)| v.risk)
+                .max_by_key(|r| r.rank())
+                .unwrap_or(Risk::Med);
+            let mut depends: Vec<i64> =
+                all.iter().flat_map(|(_, v)| v.depends_on.clone()).collect();
+            depends.sort_unstable();
+            depends.dedup();
+            agreed.push(PlanItem {
+                issue: number,
+                title: issue.title.clone(),
+                complexity,
+                risk,
+                depends_on: depends,
+                reason: all[0].1.reason.clone(),
+            });
+        } else if all.iter().all(|(_, v)| !v.worth_doing) {
+            skipped.push(SkippedItem {
+                issue: number,
+                title: issue.title.clone(),
+                reasons: all
+                    .iter()
+                    .map(|(n, v)| ((*n).clone(), v.reason.clone()))
+                    .collect(),
+            });
+        } else {
+            contested.push(ContestedItem {
+                issue: number,
+                title: issue.title.clone(),
+                positions: all
+                    .iter()
+                    .map(|(n, v)| {
+                        (
+                            (*n).clone(),
+                            if v.worth_doing { "do" } else { "skip" }.to_string(),
+                        )
+                    })
+                    .collect(),
+                reasons: all
+                    .iter()
+                    .map(|(n, v)| ((*n).clone(), v.reason.clone()))
+                    .collect(),
+                note: None,
+            });
+        }
+    }
+
+    Plan {
+        order: order(agreed),
+        skipped,
+        contested,
+    }
+}
+
+/// Topological by dependency, then cheapest first, so blockers clear early and
+/// the large risky items inherit a healthier base.
+pub fn order(items: Vec<PlanItem>) -> Vec<PlanItem> {
+    let by_number: BTreeMap<i64, PlanItem> = items.iter().map(|i| (i.issue, i.clone())).collect();
+
+    let mut entry: Vec<&PlanItem> = items.iter().collect();
+    entry.sort_by_key(|i| (i.complexity.rank(), i.issue));
+
+    let mut ordered = Vec::new();
+    let mut done: Vec<i64> = Vec::new();
+    let mut visiting: Vec<i64> = Vec::new();
+
+    fn visit(
+        number: i64,
+        by_number: &BTreeMap<i64, PlanItem>,
+        done: &mut Vec<i64>,
+        visiting: &mut Vec<i64>,
+        ordered: &mut Vec<PlanItem>,
+    ) {
+        if done.contains(&number) {
+            return;
+        }
+        let Some(item) = by_number.get(&number) else {
+            return; // a dependency outside this run's list
+        };
+        if visiting.contains(&number) {
+            return; // dependency cycle, break it rather than hang
+        }
+        visiting.push(number);
+        let mut deps = item.depends_on.clone();
+        deps.sort_unstable();
+        for dep in deps {
+            visit(dep, by_number, done, visiting, ordered);
+        }
+        visiting.retain(|n| *n != number);
+        done.push(number);
+        ordered.push(item.clone());
+    }
+
+    for item in entry {
+        visit(
+            item.issue,
+            &by_number,
+            &mut done,
+            &mut visiting,
+            &mut ordered,
+        );
+    }
+    ordered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(n: i64, complexity: &str, deps: &[i64]) -> PlanItem {
+        PlanItem {
+            issue: n,
+            title: format!("i{n}"),
+            complexity: Complexity::parse_lenient(complexity).unwrap(),
+            risk: Risk::Low,
+            depends_on: deps.to_vec(),
+            reason: String::new(),
+        }
+    }
+
+    fn numbers(items: Vec<PlanItem>) -> Vec<i64> {
+        order(items).into_iter().map(|i| i.issue).collect()
+    }
+
+    #[test]
+    fn a_dependency_precedes_its_dependent() {
+        let out = numbers(vec![item(1, "s", &[2]), item(2, "l", &[])]);
+        let (a, b) = (
+            out.iter().position(|n| *n == 2).unwrap(),
+            out.iter().position(|n| *n == 1).unwrap(),
+        );
+        assert!(a < b, "{out:?}");
+    }
+
+    #[test]
+    fn cheapest_first_without_dependencies() {
+        assert_eq!(
+            vec![2, 3, 1],
+            numbers(vec![
+                item(1, "l", &[]),
+                item(2, "s", &[]),
+                item(3, "m", &[])
+            ])
+        );
+    }
+
+    #[test]
+    fn a_cycle_does_not_hang() {
+        assert_eq!(
+            2,
+            numbers(vec![item(1, "s", &[2]), item(2, "s", &[1])]).len()
+        );
+    }
+
+    #[test]
+    fn an_unknown_dependency_is_ignored() {
+        assert_eq!(vec![1], numbers(vec![item(1, "s", &[99])]));
+    }
+
+    #[test]
+    fn every_item_appears_exactly_once() {
+        let items: Vec<PlanItem> = (1..=5).map(|n| item(n, "m", &[])).collect();
+        let out = numbers(items);
+        assert_eq!(vec![1, 2, 3, 4, 5], out);
+    }
+
+    #[test]
+    fn a_dependency_chain_is_ordered_end_to_end() {
+        let items: Vec<PlanItem> = (1..=5)
+            .map(|n| {
+                let deps: Vec<i64> = if n > 1 { vec![n - 1] } else { vec![] };
+                PlanItem {
+                    depends_on: deps,
+                    ..item(n, "m", &[])
+                }
+            })
+            .collect();
+        assert_eq!(vec![1, 2, 3, 4, 5], numbers(items));
+    }
+
+    // -- reconciliation --------------------------------------------------
+
+    fn issue(n: i64) -> Issue {
+        Issue {
+            number: n,
+            title: format!("issue {n}"),
+            body: Some("body".into()),
+            state: "OPEN".into(),
+            url: String::new(),
+            labels: vec![],
+        }
+    }
+
+    fn verdict(n: i64, worth: bool, complexity: &str, risk: &str, deps: &[i64]) -> TriageVerdict {
+        TriageVerdict {
+            issue: n,
+            worth_doing: worth,
+            reason: format!("because {n}"),
+            complexity: Complexity::parse_lenient(complexity).unwrap(),
+            depends_on: deps.to_vec(),
+            risk: Risk::parse_lenient(risk).unwrap(),
+        }
+    }
+
+    fn pair(
+        a: Vec<TriageVerdict>,
+        b: Vec<TriageVerdict>,
+    ) -> Vec<(String, BTreeMap<i64, TriageVerdict>)> {
+        vec![
+            (
+                "claude".to_string(),
+                a.into_iter().map(|v| (v.issue, v)).collect(),
+            ),
+            (
+                "codex".to_string(),
+                b.into_iter().map(|v| (v.issue, v)).collect(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn both_agreeing_to_do_schedules_it() {
+        let plan = reconcile(
+            &[issue(1)],
+            &pair(
+                vec![verdict(1, true, "s", "low", &[])],
+                vec![verdict(1, true, "s", "low", &[])],
+            ),
+        );
+        assert_eq!(1, plan.order.len());
+        assert!(plan.skipped.is_empty() && plan.contested.is_empty());
+    }
+
+    #[test]
+    fn both_agreeing_to_skip_records_both_reasons() {
+        let plan = reconcile(
+            &[issue(1)],
+            &pair(
+                vec![verdict(1, false, "s", "low", &[])],
+                vec![verdict(1, false, "s", "low", &[])],
+            ),
+        );
+        assert_eq!(1, plan.skipped.len());
+        assert_eq!(2, plan.skipped[0].reasons.len());
+        assert!(plan.skipped[0].reasons.contains_key("claude"));
+        assert!(plan.skipped[0].reasons.contains_key("codex"));
+    }
+
+    /// One agent never overrules the other. A split goes to a person.
+    #[test]
+    fn a_disagreement_is_contested_not_averaged() {
+        let plan = reconcile(
+            &[issue(1)],
+            &pair(
+                vec![verdict(1, true, "s", "low", &[])],
+                vec![verdict(1, false, "s", "low", &[])],
+            ),
+        );
+        assert!(plan.order.is_empty() && plan.skipped.is_empty());
+        assert_eq!(1, plan.contested.len());
+        assert_eq!(
+            Some(&"do".to_string()),
+            plan.contested[0].positions.get("claude")
+        );
+        assert_eq!(
+            Some(&"skip".to_string()),
+            plan.contested[0].positions.get("codex")
+        );
+    }
+
+    #[test]
+    fn a_missing_verdict_is_contested_and_says_who_was_silent() {
+        let plan = reconcile(
+            &[issue(1)],
+            &pair(vec![verdict(1, true, "s", "low", &[])], vec![]),
+        );
+        assert_eq!(1, plan.contested.len());
+        assert!(plan.contested[0].note.as_deref().unwrap().contains("codex"));
+    }
+
+    #[test]
+    fn the_pessimistic_estimate_wins() {
+        let plan = reconcile(
+            &[issue(1)],
+            &pair(
+                vec![verdict(1, true, "s", "low", &[])],
+                vec![verdict(1, true, "l", "high", &[])],
+            ),
+        );
+        assert_eq!(Complexity::L, plan.order[0].complexity);
+        assert_eq!(Risk::High, plan.order[0].risk);
+    }
+
+    #[test]
+    fn dependencies_from_both_agents_are_unioned() {
+        let plan = reconcile(
+            &[issue(1)],
+            &pair(
+                vec![verdict(1, true, "s", "low", &[2, 3])],
+                vec![verdict(1, true, "s", "low", &[3, 4])],
+            ),
+        );
+        assert_eq!(vec![2, 3, 4], plan.order[0].depends_on);
+    }
+}

@@ -1,0 +1,372 @@
+# spar
+
+Two coding agents alternate implementing and reviewing GitHub issues until a PR
+converges. Neither agent reviews its own most recent edit.
+
+Roles are not fixed. Whoever holds the PR may implement, review, fix, or file
+follow-ups, and then hands custody to the other. A reviewer that finds a problem
+can either fix it directly and hand back for review of its own fix, or return
+notes for the author to address.
+
+Ships pairing **Claude Code** with **OpenAI Codex**. Any two CLIs work.
+
+## Why alternate instead of assigning roles
+
+A single model reviewing its own work grades its own homework. Two models with
+different training and different failure modes catch different things, and the
+disagreements are the useful part. In an early run, Codex flagged that Python's
+`\d` matches Unicode digits, so `"١h"` parsed as a valid duration. The Claude
+agent had missed it. On a separate point the Claude agent pushed back and
+refused the change with a reason, which is what kept the code from drifting.
+
+Refutation is a first-class outcome. An agent that accepts every review comment
+to get approved produces worse code, not better.
+
+## Install
+
+Needs `git`, `gh` (authenticated), and two agent CLIs. Rust 1.85 or newer to
+build (`rustup update` if yours is older).
+
+```bash
+cargo install --git https://github.com/coreyphillips/spar spar-cli
+spar doctor
+```
+
+The crate is `spar-cli` because `spar` is taken on crates.io by an unrelated
+parser. The binary it installs is `spar`.
+
+From a clone:
+
+```bash
+git clone https://github.com/coreyphillips/spar && cd spar
+cargo install --path .
+```
+
+`spar doctor` checks every prerequisite, resolves each configured agent, and
+tells you which is missing. Presets are compiled into the binary, so there is
+nothing to copy alongside it.
+
+## Quick start
+
+```bash
+cd ~/projects/thing
+spar init      # detects your installed CLIs, writes spar.toml
+spar doctor    # confirms it works
+spar run 478   # triage issue 478, and open a PR if it is worth doing
+```
+
+## Use
+
+Arguments are **issue** numbers for `run` and `triage`, and **pull request**
+numbers for `resume`. Omit them and spar takes everything open.
+
+```bash
+spar run                    # triage every open issue, then work them in order
+spar run 42 51 60           # or name the ones you care about
+spar triage                 # triage only, write plan.json, change nothing
+spar run --limit 50         # raise the cap on how many open issues to take
+spar run 42 --auto-merge    # merge when no blocking findings remain
+spar run 42 --max-rounds 5  # allow more review rounds before escalating
+spar run 42 --first codex   # the other agent implements
+spar run 42 --no-close-skipped   # comment on a declined issue but leave it open
+
+spar resume                 # continue the loop on every open PR
+spar resume 108             # or name them
+spar resume 108 --next codex     # override whose turn it is
+
+spar run 42 --quiet         # suppress progress; warnings and errors still print
+```
+
+`--quiet` works before or after the subcommand.
+
+With no numbers given, spar takes the 20 lowest numbered open items. It says
+which ones it picked, and says so explicitly when there were more than the cap
+rather than quietly truncating. Raise it with `--limit`.
+
+Works on any GitHub repo you have cloned with push access. It follows `gh`
+conventions: the repo comes from the checkout you point at, and the base branch
+is detected from `origin/HEAD` rather than assumed to be `main`.
+
+```bash
+spar run --repo ~/projects/thing 42     # --repo belongs to the subcommand
+```
+
+## How a run goes
+
+**Triage.** Both agents independently judge every issue: is it worth doing, how
+complex, what does it depend on, how risky. They run at the same time, and
+neither sees the other's answer. Then reconcile mechanically:
+
+- Both say do, it is scheduled.
+- Both say skip, the shared reasoning is posted and the issue is closed as not
+  planned. Turn that off with `close_skipped = false`.
+- They disagree, that issue is parked for you and the run continues. One agent
+  never overrules the other.
+
+Scheduled issues are ordered by dependency, then cheapest first, so blockers
+clear early and risky work inherits a healthier base. The plan is written to
+`plan.json`.
+
+**Per issue.** An isolated git worktree, so a failed issue cannot poison the
+next one's base. The first agent implements and opens a PR. Custody passes to
+the other, which reviews with full repo context rather than a bare diff. Each
+finding is labelled `blocking`, `non-blocking`, or `nit`.
+
+**Convergence.** Only `blocking` findings gate the merge. Everything else is
+filed as a follow-up issue and the PR proceeds. This matters: a competent
+reviewer can always find something, so "no objections remaining" is not a
+stopping condition, but "no blocking objections" is.
+
+## Resuming work someone else started
+
+`spar resume <pr>` picks up any open PR, whether or not spar created it. Human
+authored, agent authored, half finished, does not matter: if it has a branch and
+a diff, the loop can take custody of it.
+
+This is also the cheapest way to adopt spar. No agent writes a feature from
+scratch; it only reviews what already exists.
+
+Resuming needs state that GitHub cannot provide. Every agent commits and
+comments as the same git identity, so `author` is always the human who ran spar,
+and authorship reveals nothing about who acted last. So spar keeps its own
+state: round number, whose turn is next, and the full disputed ledger. That
+lives in `.spar/state/` by default, and can also travel on the PR as a hidden
+comment (`state_store = "pr"`) if a run might be picked up from another machine.
+
+A PR with no spar state starts fresh, with the agent that did not implement
+taking the first review.
+
+## Keeping it readable
+
+The reader of a PR is a person with other work. Model prose defaults to three
+paragraphs where one sentence would do, and asking nicely for brevity has the
+same reliability problem as asking for no em-dashes.
+
+So spar does not forward what a model wrote. It asks for structured findings,
+composes every comment itself, and clips each field to a budget. A clean review
+is two lines:
+
+```
+codex round 1: no findings.
+
+The retry path is correct and the test covers the 429 case.
+```
+
+A review with work to do leads with the counts, gives the detail only for what
+blocks, and lists everything else by title because it has been filed as an issue
+where the detail can actually be acted on:
+
+```
+codex round 2: 1 blocking, 2 non-blocking.
+
+One real problem, the rest are follow-ups.
+
+blocking
+- Retry loop never terminates (src/net.rs:88). Confirmed by running the 429 test
+  with max_attempts unset: it spins.
+
+non-blocking, filed as follow-ups
+- Timeout is not configurable (src/net.rs)
+- Error message does not name the host (src/net.rs)
+```
+
+Budgets live in `[style]` and every one is configurable. Set `terse = false` to
+turn the whole thing off. To see exactly what spar would post, before spending a
+token on it:
+
+```bash
+cargo run --example preview            # every comment type, gate on
+cargo run --example preview -- --loose # the same input with the gate off
+```
+
+## Failure modes it handles
+
+Cross-model review loops break in specific ways. These are handled explicitly.
+
+**The nitpick spiral.** Round 6 findings are worse than round 1 findings and a
+naive loop cannot tell. Severity gating means only real defects block.
+
+**Re-litigation.** If A refutes a point and B raises it again next round, the
+loop never ends. Refuted points are hashed into a ledger carried across rounds
+and injected into the next reviewer's prompt as settled. Re-raising needs new
+evidence, and a second re-raise escalates to you.
+
+**Approval drift.** Optimizing for "get approved" pressures the author into
+accepting wrong review comments. Refutation is explicitly blessed in the prompt,
+disputes are surfaced in the summary, and the merge gate is
+blocking-findings-empty rather than reviewer-satisfied.
+
+**Merge authority.** Two models agreeing is not the same as being right, and
+neither carries the consequences. `--auto-merge` is off by default; the terminal
+state is "approved, ready for a human to merge". Branch protection on the target
+repo should be considered required, not optional, if you turn it on.
+
+**Style rules models forget.** Prompting alone is unreliable over a long run.
+Every commit message, PR body, and comment is scrubbed deterministically and
+then re-verified. A leak is a hard error, not a warning.
+
+**Two agents that are secretly one.** Config keys are arbitrary, so `alpha` and
+`beta` can both be Claude on the same model. spar compares the resolved binary
+(by inode, so a symlink does not fool it) and the configured model, and warns
+loudly. An approval from a model reviewing itself looks identical to a real one,
+which is worse than no review at all.
+
+## Configuration
+
+`spar init` writes a config from the CLIs you actually have:
+
+```
+  missing  aider
+  found    claude     /Users/you/.local/bin/claude
+  found    codex      /Applications/ChatGPT.app/Contents/Resources/codex
+  missing  gemini
+
+wrote spar.toml
+```
+
+```toml
+[agents.claude]
+preset = "claude"
+model  = "fable"        # omit to use the CLI's own default
+effort = "high"
+
+[agents.codex]
+preset = "codex"
+model  = "gpt-5.6-sol"
+effort = "ultra"
+
+[loop]
+max_rounds        = 3       # then escalate rather than loop
+auto_merge        = false
+first_implementor = "claude"
+close_skipped     = true
+worktrees         = true
+
+[loop.effort_schedule]
+round_1 = "ultra"           # the deep pass
+rest    = "high"            # later rounds only see a small delta
+
+[style]
+ban_em_dash        = true
+ban_ai_attribution = true
+terse              = true
+```
+
+See [`spar.example.toml`](spar.example.toml) for every option with its
+reasoning.
+
+## Pairing other agents
+
+An agent is a command template plus an output adapter, not a class. Supporting a
+new CLI is a preset file, not a code change. Presets ship for claude, codex,
+gemini, and aider; any two can be paired, and agent names are arbitrary.
+
+To wire up something with no preset, declare it inline:
+
+```toml
+[agents.custom]
+command = ["mytool", ["-m", "{model}"], "--prompt", "{prompt}"]
+output  = "text"            # text | jsonl | json
+```
+
+Placeholders: `{prompt}` `{system}` `{model}` `{effort}` `{cwd}` `{schema_file}`.
+
+An argument group whose placeholder is unset is dropped whole, so omitting
+`model` drops the `-m` flag rather than passing an empty string. Include
+`{schema_file}` and spar uses the CLI's native structured output; leave it out
+and spar asks for JSON in the prompt and parses it back.
+
+For a CLI that emits an event stream rather than plain text, say where the
+answer lives:
+
+```toml
+output       = "jsonl"
+message_path = "item.text"
+
+[agents.custom.message_match]
+type        = "item.completed"
+"item.type" = "agent_message"
+```
+
+Binaries are located by walking `SPAR_<NAME>_BIN`, then PATH, then the preset's
+`search_paths`. Nothing is hardcoded, and a miss reports every location tried.
+
+Presets are embedded in the binary, and a file on disk of the same name wins
+over the built-in copy. So when a CLI's flags drift you can fix it without
+waiting for a release:
+
+```bash
+mkdir -p ~/.config/spar/presets
+spar doctor   # see what it resolves today
+$EDITOR ~/.config/spar/presets/codex.toml
+```
+
+`SPAR_PRESET_DIR` overrides the search, and `.spar/presets/` in the repo you are
+working on is checked first, for an override that should travel with one
+project. A bare `presets/` directory is deliberately *not* searched: it is an
+ordinary directory name in plenty of projects, and shadowing a built-in preset
+by accident produces a baffling failure.
+
+## Housekeeping
+
+```bash
+spar clean          # drop worktrees, branches, and state whose PR is finished
+spar clean --all    # drop every worktree and branch spar created
+spar clean --pr-state   # also delete state comments left on finished PRs
+spar doctor         # check prerequisites and resolve each configured agent
+spar doctor --config other.toml   # check a config before adopting it
+```
+
+Each issue gets its own git worktree so a failed run cannot poison the next
+one's base. A worktree is released as soon as its run reaches a terminal
+outcome, and kept only on `escalated` or `error`, where you may want to inspect
+local state. Pass `--keep-worktrees` to hold on to them regardless, or
+`--no-worktrees` to work directly in the main checkout.
+
+Releasing matters for more than tidiness: a stranded worktree holds its branch
+checked out, which makes a later `gh pr merge --delete-branch` fail to clean up.
+Runs also sweep any finished worktrees on start.
+
+Cleanup only ever touches branches spar recorded creating. Branch names default
+to `issue-N`, which is exactly what a person would call a branch by hand, so the
+name alone can never establish ownership: `spar clean --all` will not delete
+your `issue-9`.
+
+## Cost
+
+Every review round is a repo-aware pass at the configured effort. A full ultra
+review of a three-line round-3 delta is money on fire, which is what
+`effort_schedule` exists to prevent. Both agents bill against their respective
+subscriptions.
+
+## Caveats
+
+On macOS the Codex CLI usually lives inside `ChatGPT.app`, currently an alpha
+build, so its path and flags will drift. That location is only one entry in the
+preset's `search_paths`, not an assumption: PATH wins, `SPAR_CODEX_BIN`
+overrides everything, and a miss reports every location tried rather than
+degrading quietly.
+
+Triage runs both agents concurrently in the repo root. They are told to read
+only, but they are real agent CLIs with write permissions. Commit or stash
+anything you care about before a run, which you would want to do anyway.
+
+## Development
+
+```bash
+cargo test          # unit and integration tests, no network needed
+cargo clippy --all-targets
+cargo fmt
+```
+
+The integration tests build real git repositories in a temp directory and
+exercise the worktree, branch-ledger, and commit-rewrite paths end to end. They
+never touch the network and never call `gh`.
+
+`cargo run --example preview` renders every comment spar can post, from
+deliberately verbose model output. It is the fastest way to judge a change to
+the concision gate.
+
+## License
+
+MIT.

@@ -1,0 +1,8 @@
+# Aider, non-interactive single message.
+command = [
+  "aider", "--no-auto-commits", "--yes",
+  ["--model", "{model}"],
+  "--message", "{prompt}",
+]
+output = "text"
+search_paths = ["~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"]

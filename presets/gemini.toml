@@ -1,0 +1,5 @@
+# Google Gemini CLI. No native structured output, so spar asks for JSON in the
+# prompt and parses it back out.
+command = ["gemini", ["-m", "{model}"], "-p", "{prompt}"]
+output = "text"
+search_paths = ["~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"]

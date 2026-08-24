@@ -1,0 +1,67 @@
+# Copy to spar.toml, or run `spar init` to generate one from the CLIs you
+# actually have installed. Each agent inherits a command template from a preset
+# compiled into the binary; anything set here overrides it.
+
+[agents.claude]
+preset = "claude"
+model  = "fable"        # omit to use the CLI's own default
+effort = "high"
+
+[agents.codex]
+preset = "codex"
+model  = "gpt-5.6-sol"
+effort = "ultra"
+
+# Any two agents work. To pair different CLIs, point at other presets:
+#   [agents.gemini]
+#   preset = "gemini"
+#
+# Or declare a command template inline, with no preset at all. An argument group
+# whose placeholder is unset is dropped whole, so omitting `model` drops the
+# `-m` flag rather than passing an empty string.
+#
+#   [agents.custom]
+#   command = ["mytool", ["-m", "{model}"], "--prompt", "{prompt}"]
+#   output  = "text"        # text | jsonl | json
+#
+# Placeholders: {prompt} {system} {model} {effort} {cwd} {schema_file}
+# Include {schema_file} and spar uses the CLI's native structured output; leave
+# it out and spar asks for JSON in the prompt and parses it back.
+
+[loop]
+max_rounds        = 3        # review rounds before escalating to a human
+auto_merge        = false    # off on purpose: two models agreeing is not the
+                             # same as being right, and neither carries the
+                             # consequences of a bad merge
+first_implementor = "claude"
+base_branch       = "main"   # only a fallback; origin/HEAD wins when it exists
+worktrees         = true     # isolate each issue in its own git worktree
+keep_worktrees    = false    # keep them after a run, for inspection
+branch_prefix     = ""       # branches are issue-N and pr-N. Set e.g. "spar/"
+                             # to namespace them
+close_skipped     = true     # close an issue both agents independently declined,
+                             # after posting the shared reasoning
+parallel_triage   = true     # both agents triage at once; they only read
+followups         = "issues" # issues | local | none. Where out-of-scope findings
+                             # go. Use local on a repo that is not yours: notes
+                             # land in .spar/followups.md instead of the tracker
+file_nits         = false    # nits stay in the PR thread, never the tracker
+state_store       = "local"  # local | pr | both. local keeps resume state in
+                             # .spar/state and off the PR
+
+[loop.effort_schedule]
+round_1 = "ultra"            # the deep first review
+rest    = "high"             # later rounds only see a small delta
+
+[style]
+ban_em_dash        = true
+ban_ai_attribution = true
+
+# The concision gate. spar composes every comment itself from structured fields
+# and holds each one to a budget, so a model that writes three paragraphs where
+# one sentence would do cannot put them on your PR.
+terse              = true
+max_title_chars    = 90      # a finding, issue, or PR title
+max_summary_chars  = 200     # a one-line verdict or refutation
+max_detail_chars   = 320     # a blocking finding's explanation, in the thread
+max_body_chars     = 900     # a filed issue's body

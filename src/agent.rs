@@ -536,6 +536,9 @@ mod tests {
             search_paths: vec![],
             system_via: SystemVia::Prompt,
             timeout: 60,
+            models: vec![],
+            efforts: vec![],
+            options_note: None,
         }
     }
 

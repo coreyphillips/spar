@@ -988,6 +988,9 @@ fn every_config_option_is_documented_in_the_example() {
             "message_match",
             "command",
             "preset",
+            "models",
+            "efforts",
+            "options_note",
         ]
         .map(String::from),
     );
@@ -1024,4 +1027,72 @@ fn the_generated_config_is_not_stale_against_the_example() {
             "{key} missing from spar.example.toml"
         );
     }
+}
+
+/// `spar init` writes the file most people will ever read. It has to name the
+/// values that go in `model` and `effort`, because "..." is exactly the
+/// guesswork the command exists to remove.
+#[test]
+fn the_generated_config_names_the_options_rather_than_guessing() {
+    let dir = unique("inithints");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("spar.toml");
+    let (_, stdout, _) = spar(&["init", "--out", out.to_str().unwrap()], &dir);
+
+    assert!(
+        !stdout.contains("BROKEN"),
+        "a preset failed to build:\n{stdout}"
+    );
+    if !out.exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return; // fewer than two agent CLIs here, covered by another test
+    }
+    let text = std::fs::read_to_string(&out).unwrap();
+
+    assert!(!text.contains("\"...\""), "no placeholder values:\n{text}");
+    for key in [
+        "keep_worktrees",
+        "parallel_triage",
+        "file_nits",
+        "branch_prefix",
+        "state_store",
+        "max_title_chars",
+        "max_detail_chars",
+    ] {
+        assert!(
+            text.contains(key),
+            "{key} is not offered in the generated config:\n{text}"
+        );
+    }
+    // And it still has to load.
+    let cfg = spar::config::load(Some(&out)).unwrap();
+    assert_eq!(2, cfg.agents.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every built in preset has to survive being turned into an agent. A preset
+/// that does not is reported as BROKEN rather than silently skipped, because
+/// skipping it made a malformed preset look like an uninstalled CLI.
+#[test]
+fn no_builtin_preset_is_broken() {
+    for name in spar::config::available_presets() {
+        let raw = spar::config::load_preset(&name)
+            .unwrap_or_else(|e| panic!("preset {name} does not load: {e}"));
+        let table = raw.as_table().cloned().expect("a table");
+        let spec: Result<spar::config::AgentSpec, _> = toml::Value::Table(table).try_into();
+        spec.unwrap_or_else(|e| panic!("preset {name} does not build: {e}"));
+    }
+}
+
+/// The hint lists are advisory. Validating against them would refuse a model
+/// that works the moment a CLI adds one.
+#[test]
+fn a_model_outside_the_hint_list_is_still_accepted() {
+    let text = "[agents.a]\npreset = \"claude\"\nmodel = \"some-model-nobody-listed\"\n\
+                effort = \"invented-effort\"\n[agents.b]\ncommand = [\"x\"]\n";
+    let cfg = spar::config::parse(text).expect("hints must not be a whitelist");
+    assert_eq!(
+        Some("some-model-nobody-listed"),
+        cfg.spec("a").unwrap().model.as_deref()
+    );
 }

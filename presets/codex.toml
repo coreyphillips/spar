@@ -22,6 +22,13 @@ search_paths = [
   "~/.local/bin",
 ]
 
+# Hints for `spar init`. Never validated against, only written as comments. The
+# Codex CLI does not enumerate these in its help, so this lists what is known to
+# work rather than guessing at a full set.
+models = ["gpt-5.6-sol"]
+efforts = ["ultra"]
+options_note = "Codex does not list these in its help. Your ~/.codex/config.toml is the source of truth, and effort is passed through as -c model_reasoning_effort=..."
+
 [message_match]
 type = "item.completed"
 "item.type" = "agent_message"

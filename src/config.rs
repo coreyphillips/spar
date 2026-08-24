@@ -109,6 +109,22 @@ pub struct AgentSpec {
     pub system_via: SystemVia,
     #[serde(default = "default_timeout")]
     pub timeout: u64,
+
+    // -- hints, inert at runtime -----------------------------------------
+    //
+    // Written into a generated config as comments so nobody has to guess what
+    // to put in `model` or `effort`. Deliberately never validated against: a
+    // CLI's options drift, and a stale allow list that refuses a model which
+    // actually works would be worse than no hint at all.
+    /// Model names this CLI is known to accept.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Effort levels this CLI is known to accept.
+    #[serde(default)]
+    pub efforts: Vec<String>,
+    /// Where to check the current list, when spar cannot enumerate it.
+    #[serde(default)]
+    pub options_note: Option<String>,
 }
 
 impl AgentSpec {
@@ -792,6 +808,9 @@ model = "gpt-5.6-sol"
             search_paths: vec![],
             system_via: SystemVia::Prompt,
             timeout: 60,
+            models: vec![],
+            efforts: vec![],
+            options_note: None,
         };
         let b = AgentSpec {
             model: Some("  ".into()),

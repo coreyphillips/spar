@@ -13,3 +13,11 @@ command = [
 ]
 system_via = "placeholder"
 output = "text"
+
+# Hints for `spar init`. Never validated against, only written as comments, so a
+# value missing from this list still works. Reported by `claude --help`.
+# The first entry of each list is what `spar init` writes as the suggested
+# value, so the sensible default goes first rather than the CLI's own ordering.
+models = ["fable", "opus", "sonnet"]
+efforts = ["high", "low", "medium", "xhigh", "max"]
+options_note = "Model takes an alias or a full name like claude-fable-5. Check the current sets with: claude --help"

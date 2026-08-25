@@ -15,7 +15,7 @@ use crate::config::{AgentSpec, CommandPart, OutputMode, SystemVia};
 use crate::error::{Result, SparError};
 use crate::jsonx;
 use crate::proc::{self, ExecOpts};
-use crate::{bail, spar_err};
+use crate::{bail, logdim, spar_err};
 
 /// Injected into every request. Prompting alone is not sufficient for any of
 /// these, which is why each one is also enforced deterministically on the way
@@ -170,14 +170,17 @@ impl Agent {
         Ok(out)
     }
 
-    /// True when the template has somewhere to put a schema file, meaning the
-    /// CLI can do structured output natively.
+    /// True when the template has somewhere to put a schema, meaning the CLI can
+    /// do structured output natively rather than being asked in the prompt.
+    ///
+    /// Either form counts: a path for a CLI that reads the schema from disk, or
+    /// the schema itself for one that takes it as an argument.
     pub fn supports_schema(&self) -> bool {
         self.spec
             .command
             .iter()
             .flat_map(|p| p.args())
-            .any(|a| a.contains("{schema_file}"))
+            .any(|a| a.contains("{schema_file}") || a.contains("{schema}"))
     }
 
     // -- output adapters ---------------------------------------------------
@@ -224,7 +227,7 @@ impl Agent {
     // -- the two operations everything else is built from -------------------
 
     pub fn ask(&self, prompt: &str, cwd: &Path, effort: Option<&str>) -> Result<String> {
-        self.ask_inner(prompt, cwd, effort, None)
+        self.ask_inner(prompt, cwd, effort, None, None)
     }
 
     fn ask_inner(
@@ -233,6 +236,7 @@ impl Agent {
         cwd: &Path,
         effort: Option<&str>,
         schema_file: Option<&Path>,
+        schema: Option<&str>,
     ) -> Result<String> {
         let body = match self.spec.system_via {
             SystemVia::Placeholder => prompt.to_string(),
@@ -247,6 +251,7 @@ impl Agent {
                 .or_else(|| self.spec.effort.clone()),
             cwd: Some(cwd.display().to_string()),
             schema_file: schema_file.map(|p| p.display().to_string()),
+            schema: schema.map(str::to_string),
         };
         let argv = self.render(&values)?;
         let opts = ExecOpts::new().cwd(cwd).timeout_secs(self.spec.timeout);
@@ -264,22 +269,64 @@ impl Agent {
         cwd: &Path,
         effort: Option<&str>,
     ) -> Result<T> {
+        // One retry, with the parser's own complaint handed back.
+        //
+        // A single malformed answer used to cost half a review: the other agent
+        // carried on alone, which is the one thing this design exists to avoid.
+        // Models correct a shape error readily when told what was wrong.
+        const ATTEMPTS: usize = 2;
+        let mut last: Option<SparError> = None;
+
+        for attempt in 1..=ATTEMPTS {
+            let asked = match &last {
+                None => prompt.to_string(),
+                Some(e) => format!(
+                    "{prompt}\n\nYour previous answer could not be used: {}\nReturn the whole \
+                     object this time, exactly matching the schema, and nothing else.",
+                    e.first_line()
+                ),
+            };
+            match self.ask_json_once::<T>(&asked, schema, cwd, effort) {
+                Ok(parsed) => {
+                    if attempt > 1 {
+                        logdim!("{} answered on the retry", self.spec.name);
+                    }
+                    return Ok(parsed);
+                }
+                Err(e) => {
+                    if attempt < ATTEMPTS {
+                        logdim!("{}: {}, asking again", self.spec.name, e.first_line());
+                    }
+                    last = Some(e);
+                }
+            }
+        }
+        Err(spar_err!(
+            "agent '{}' returned an unusable answer twice: {}",
+            self.spec.name,
+            last.expect("at least one attempt").message()
+        ))
+    }
+
+    fn ask_json_once<T: serde::de::DeserializeOwned>(
+        &self,
+        prompt: &str,
+        schema: &Value,
+        cwd: &Path,
+        effort: Option<&str>,
+    ) -> Result<T> {
         let text = if self.supports_schema() {
+            let inline = serde_json::to_string(schema).unwrap_or_default();
             let file = TempJson::write(schema)?;
-            self.ask_inner(prompt, cwd, effort, Some(file.path()))?
+            self.ask_inner(prompt, cwd, effort, Some(file.path()), Some(&inline))?
         } else {
             let full = format!(
                 "{prompt}\n\n{JSON_INSTRUCTION}\n{}",
                 serde_json::to_string_pretty(schema).unwrap_or_default()
             );
-            self.ask_inner(&full, cwd, effort, None)?
+            self.ask_inner(&full, cwd, effort, None, None)?
         };
-        jsonx::extract_into(&text).map_err(|e| {
-            spar_err!(
-                "agent '{}' returned an unusable answer: {e}",
-                self.spec.name
-            )
-        })
+        jsonx::extract_into(&text)
     }
 
     /// Review the branch against `base`.
@@ -317,7 +364,10 @@ pub struct Placeholders {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub cwd: Option<String>,
+    /// A path to the schema, for a CLI that reads one from disk.
     pub schema_file: Option<String>,
+    /// The schema itself, for a CLI that takes it as an argument.
+    pub schema: Option<String>,
 }
 
 impl Placeholders {
@@ -329,6 +379,7 @@ impl Placeholders {
             "effort" => self.effort.as_deref(),
             "cwd" => self.cwd.as_deref(),
             "schema_file" => self.schema_file.as_deref(),
+            "schema" => self.schema.as_deref(),
             _ => None,
         };
         value.filter(|v| !v.is_empty())
@@ -337,7 +388,15 @@ impl Placeholders {
     /// Substitute every placeholder in one argument. `None` means a placeholder
     /// in this argument had no value, so the whole group is dropped.
     fn substitute(&self, arg: &str) -> Option<String> {
-        const KEYS: [&str; 6] = ["prompt", "system", "model", "effort", "cwd", "schema_file"];
+        const KEYS: [&str; 7] = [
+            "prompt",
+            "system",
+            "model",
+            "effort",
+            "cwd",
+            "schema_file",
+            "schema",
+        ];
         let mut out = arg.to_string();
         for key in KEYS {
             let token = format!("{{{key}}}");
@@ -852,5 +911,125 @@ mod tests {
         assert!(lower.contains("brief"));
         assert!(lower.contains("co-authored-by"));
         assert!(lower.contains("em-dash"));
+    }
+}
+
+#[cfg(test)]
+mod schema_placeholder_tests {
+    use super::*;
+    use crate::config::{OutputMode, SystemVia};
+
+    fn spec_with(command: Vec<CommandPart>) -> AgentSpec {
+        AgentSpec {
+            name: "claude".into(),
+            command,
+            model: None,
+            effort: None,
+            output: OutputMode::Text,
+            message_match: BTreeMap::new(),
+            message_path: None,
+            search_paths: vec![],
+            system_via: SystemVia::Prompt,
+            timeout: 60,
+            models: vec![],
+            efforts: vec![],
+            options_note: None,
+        }
+    }
+
+    fn one(s: &str) -> CommandPart {
+        CommandPart::One(s.into())
+    }
+    fn group(parts: &[&str]) -> CommandPart {
+        CommandPart::Group(parts.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// Claude Code takes the schema as an argument, not a path, so the file
+    /// form alone was not enough to give it native structured output.
+    #[test]
+    fn either_schema_form_counts_as_native_support() {
+        let inline = Agent::with_bin(
+            spec_with(vec![one("x"), group(&["--json-schema", "{schema}"])]),
+            "/b",
+        );
+        let byfile = Agent::with_bin(
+            spec_with(vec![one("x"), group(&["--output-schema", "{schema_file}"])]),
+            "/b",
+        );
+        let neither = Agent::with_bin(spec_with(vec![one("x"), one("{prompt}")]), "/b");
+        assert!(inline.supports_schema());
+        assert!(byfile.supports_schema());
+        assert!(!neither.supports_schema());
+    }
+
+    #[test]
+    fn the_inline_schema_is_substituted_whole() {
+        let agent = Agent::with_bin(
+            spec_with(vec![
+                one("x"),
+                group(&["--json-schema", "{schema}"]),
+                one("{prompt}"),
+            ]),
+            "/b",
+        );
+        let values = Placeholders {
+            prompt: Some("review it".into()),
+            schema: Some(r#"{"type":"object"}"#.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            vec!["/b", "--json-schema", r#"{"type":"object"}"#, "review it"],
+            agent.render(&values).unwrap()
+        );
+    }
+
+    /// A call that wants prose back passes no schema, and the flag must go with
+    /// it rather than being handed an empty string.
+    #[test]
+    fn the_schema_flag_drops_when_no_schema_is_wanted() {
+        let agent = Agent::with_bin(
+            spec_with(vec![
+                one("x"),
+                group(&["--json-schema", "{schema}"]),
+                one("{prompt}"),
+            ]),
+            "/b",
+        );
+        let values = Placeholders {
+            prompt: Some("implement it".into()),
+            ..Default::default()
+        };
+        assert_eq!(vec!["/b", "implement it"], agent.render(&values).unwrap());
+    }
+
+    /// `{schema_file}` must not be mistaken for `{schema}`.
+    #[test]
+    fn the_two_schema_placeholders_do_not_collide() {
+        let agent = Agent::with_bin(
+            spec_with(vec![one("x"), group(&["--output-schema", "{schema_file}"])]),
+            "/b",
+        );
+        let values = Placeholders {
+            schema: Some("INLINE".into()),
+            schema_file: Some("/tmp/s.json".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            vec!["/b", "--output-schema", "/tmp/s.json"],
+            agent.render(&values).unwrap()
+        );
+    }
+
+    /// The preset that was failing in the field.
+    #[test]
+    fn the_shipped_claude_preset_now_has_native_structured_output() {
+        let raw = crate::config::load_preset("claude").unwrap();
+        let table = raw.as_table().cloned().unwrap();
+        let mut spec: AgentSpec = toml::Value::Table(table).try_into().unwrap();
+        spec.name = "claude".into();
+        assert!(
+            Agent::with_bin(spec, "/b").supports_schema(),
+            "without this a long review is parsed out of prose and truncates"
+        );
     }
 }

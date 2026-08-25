@@ -8,6 +8,15 @@ command = [
   # form swallows the following positional prompt unless another flag
   # happens to sit between them.
   ["--allowedTools=Bash,Read,Write,Edit,Glob,Grep,WebFetch"],
+  # Native structured output. Claude Code takes the schema as an argument rather
+  # than a path, hence {schema} and not {schema_file}. The group drops when
+  # there is no schema, which is every call that wants prose back.
+  #
+  # Without this, spar asked for JSON in the prompt and parsed whatever came
+  # back, and a long review hit the output limit: the response stopped before
+  # its outer object closed, the last complete thing in it was a nested finding,
+  # and half the review was lost.
+  ["--json-schema", "{schema}"],
   ["--append-system-prompt", "{system}"],
   "{prompt}",
 ]

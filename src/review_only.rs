@@ -200,6 +200,14 @@ fn run_phases(
         return Err(spar_err!("neither reviewer returned a usable review"));
     }
     if by_agent.len() == 1 {
+        // The whole design is one model checking another. A single reviewer is
+        // a materially weaker result, not a footnote, so it is said loudly and
+        // marked on every finding in the comment.
+        crate::logging::warn(format!(
+            "only {} answered on PR #{}. Nothing was cross-checked, so these findings carry one \
+             model's judgement rather than two.",
+            by_agent[0].0, pr.number
+        ));
         state
             .notes
             .push("only one reviewer answered, so nothing was cross-checked".into());

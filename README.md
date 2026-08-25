@@ -452,12 +452,20 @@ command = ["mytool", ["-m", "{model}"], "--prompt", "{prompt}"]
 output  = "text"            # text | jsonl | json
 ```
 
-Placeholders: `{prompt}` `{system}` `{model}` `{effort}` `{cwd}` `{schema_file}`.
+Placeholders: `{prompt}` `{system}` `{model}` `{effort}` `{cwd}` `{schema}`
+`{schema_file}`.
 
 An argument group whose placeholder is unset is dropped whole, so omitting
-`model` drops the `-m` flag rather than passing an empty string. Include
-`{schema_file}` and spar uses the CLI's native structured output; leave it out
-and spar asks for JSON in the prompt and parses it back.
+`model` drops the `-m` flag rather than passing an empty string.
+
+Include `{schema}` or `{schema_file}` and spar uses the CLI's native structured
+output. This is worth doing rather than optional: without it spar asks for JSON
+in the prompt and parses whatever comes back, and a long answer that hits the
+model's output limit stops mid-object, which costs you that agent's whole review.
+`{schema}` passes the schema as an argument, `{schema_file}` passes a path to it,
+and a CLI that supports either is enough. When a structured answer is unusable
+anyway, spar asks once more with the parser's complaint attached before giving
+up on that agent.
 
 For a CLI that emits an event stream rather than plain text, say where the
 answer lives:

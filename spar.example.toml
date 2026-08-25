@@ -45,9 +45,13 @@ effort = "ultra"      # Codex does not list these in its help. Your
 #   output  = "text"
 #   timeout = 3600            # a slow model on a large repo
 #
-# Placeholders: {prompt} {system} {model} {effort} {cwd} {schema_file}
-# Include {schema_file} and spar uses the CLI's native structured output; leave
-# it out and spar asks for JSON in the prompt and parses it back.
+# Placeholders: {prompt} {system} {model} {effort} {cwd} {schema} {schema_file}
+#
+# Include {schema} or {schema_file} and spar uses the CLI's native structured
+# output, which is worth doing: without it spar asks for JSON in the prompt and
+# parses whatever comes back, and a long answer that hits the model's output
+# limit stops mid-object and is lost. {schema} passes the schema as an argument
+# (Claude Code), {schema_file} passes a path to it (Codex).
 #
 # For a CLI that emits an event stream rather than plain text, say where the
 # answer lives:

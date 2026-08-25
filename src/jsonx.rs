@@ -21,6 +21,23 @@ pub fn extract_json(text: &str) -> Result<Value> {
     if text.trim().is_empty() {
         return Err(SparError::new("empty response, expected JSON"));
     }
+    candidates(text)
+        .into_iter()
+        .next()
+        .ok_or_else(|| SparError::new(format!("no JSON found in response:\n{}", head(text, 800))))
+}
+
+/// Every JSON value plausibly present in a model response, most likely first.
+///
+/// Fenced blocks come first because a model that fences its answer means it,
+/// then whole objects matched backwards from the end.
+pub fn candidates(text: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut push = |value: Value| {
+        if !out.contains(&value) {
+            out.push(value);
+        }
+    };
 
     let fenced: Vec<&str> = FENCE
         .captures_iter(text)
@@ -28,12 +45,10 @@ pub fn extract_json(text: &str) -> Result<Value> {
         .collect();
     for blob in fenced.iter().rev() {
         if let Ok(value) = serde_json::from_str::<Value>(blob) {
-            return Ok(value);
+            push(value);
         }
     }
 
-    // Delimiters are ASCII and UTF-8 is self synchronising, so byte scanning
-    // can never land inside a multi byte character.
     let bytes = text.as_bytes();
     for (opener, closer) in [(b'{', b'}'), (b'[', b']')] {
         let mut end = rfind_byte(bytes, closer, bytes.len());
@@ -53,28 +68,79 @@ pub fn extract_json(text: &str) -> Result<Value> {
             }
             if let Some(s) = start {
                 if let Ok(value) = serde_json::from_str::<Value>(&text[s..=e]) {
-                    return Ok(value);
+                    push(value);
                 }
             }
             end = rfind_byte(bytes, closer, e);
         }
     }
+    out
+}
 
-    Err(SparError::new(format!(
-        "no JSON found in response:\n{}",
-        head(text, 800)
-    )))
+/// Whether a response looks cut off rather than merely malformed.
+///
+/// A model with an output limit stops mid-object on a long answer. The braces
+/// it opened outnumber the ones it closed, and every complete object left is
+/// something nested inside the one it was building.
+pub fn looks_truncated(text: &str) -> bool {
+    let mut opened = 0i64;
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in text.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => opened += 1,
+            '}' if !in_string => opened -= 1,
+            _ => {}
+        }
+    }
+    opened > 0
 }
 
 /// Parse a model response straight into a typed value.
+///
+/// Tries every candidate rather than only the last one found. A review cut off
+/// before its outer object closed used to yield the last *nested* finding,
+/// which parsed as JSON perfectly well and then failed to be a review, and the
+/// error blamed the shape rather than the truncation.
 pub fn extract_into<T: serde::de::DeserializeOwned>(text: &str) -> Result<T> {
-    let value = extract_json(text)?;
-    serde_json::from_value(value.clone()).map_err(|e| {
-        SparError::new(format!(
-            "response did not match the expected shape ({e}).\nGot: {}",
-            head(&value.to_string(), 600)
-        ))
-    })
+    let found = candidates(text);
+    if found.is_empty() {
+        return Err(SparError::new(if looks_truncated(text) {
+            format!(
+                "the response was cut off before any complete JSON:\n{}",
+                head(text, 400)
+            )
+        } else {
+            format!("no JSON found in response:\n{}", head(text, 800))
+        }));
+    }
+
+    let mut last_error = None;
+    for value in &found {
+        match serde_json::from_value::<T>(value.clone()) {
+            Ok(parsed) => return Ok(parsed),
+            Err(e) => last_error = Some((e, value)),
+        }
+    }
+
+    let (error, value) = last_error.expect("non-empty");
+    if looks_truncated(text) {
+        return Err(SparError::new(format!(
+            "the response was cut off before the answer was complete, so only fragments of it \
+             parsed ({error}). Ask for less in one go, or give this agent a CLI flag for native \
+             structured output."
+        )));
+    }
+    Err(SparError::new(format!(
+        "response did not match the expected shape ({error}).\nGot: {}",
+        head(&value.to_string(), 600)
+    )))
 }
 
 fn rfind_byte(haystack: &[u8], needle: u8, before: usize) -> Option<usize> {
@@ -206,5 +272,84 @@ mod tests {
         let key = finding_key("anything", "file.rs");
         assert_eq!(12, key.len());
         assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct Review {
+        verdict: String,
+        findings: Vec<Finding>,
+    }
+    #[derive(Debug, Deserialize)]
+    struct Finding {
+        title: String,
+    }
+
+    /// What actually happened on a real pull request. A long review hit the
+    /// model's output limit and stopped before its outer object closed, so the
+    /// last complete JSON in the response was a nested finding. It parsed, it
+    /// was not a review, and the error blamed the shape.
+    const TRUNCATED: &str = r#"Here is my review.
+{"verdict":"changes_requested","next_action":"hand_back","summary":"Two problems.",
+ "findings":[
+   {"severity":"blocking","title":"First","detail":"one","file":"a.ts","in_scope":true},
+   {"severity":"non-blocking","title":"Second","detail":"numbers unnamed keys by position"#;
+
+    #[test]
+    fn a_truncated_review_is_reported_as_truncated_not_as_the_wrong_shape() {
+        let err = extract_into::<Review>(TRUNCATED).unwrap_err().to_string();
+        assert!(err.contains("cut off"), "{err}");
+        assert!(!err.contains("did not match the expected shape"), "{err}");
+    }
+
+    #[test]
+    fn truncation_is_detected_from_the_unclosed_braces() {
+        assert!(looks_truncated(TRUNCATED));
+        assert!(!looks_truncated(r#"{"a":1}"#));
+        // A brace inside a string is not an open brace.
+        assert!(!looks_truncated(r#"{"a":"a { in a string"}"#));
+        assert!(!looks_truncated(r#"{"a":"an escaped \" quote { here"}"#));
+    }
+
+    /// The fix that matters: the right object is found even when it is not the
+    /// last one in the response.
+    #[test]
+    fn the_review_is_found_even_with_nested_objects_after_it() {
+        let text = r#"Thinking out loud first.
+{"verdict":"approve","next_action":"merge","summary":"Fine.","findings":[{"severity":"nit","title":"Wording","detail":"d","file":"a.ts","in_scope":true}]}
+And here is a stray object afterwards: {"title":"not the review"}"#;
+        let review: Review = extract_into(text).unwrap();
+        assert_eq!("approve", review.verdict);
+        assert_eq!(1, review.findings.len());
+        assert_eq!("Wording", review.findings[0].title);
+    }
+
+    #[test]
+    fn candidates_are_offered_most_likely_first() {
+        let text = "```json\n{\"verdict\":\"approve\",\"findings\":[]}\n```\ntrailing {\"x\":1}";
+        let review: Review = extract_into(text).unwrap();
+        assert_eq!("approve", review.verdict);
+    }
+
+    #[test]
+    fn a_genuinely_wrong_shape_still_says_so() {
+        let err = extract_into::<Review>(r#"{"colour":"blue"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did not match the expected shape"), "{err}");
+        assert!(!err.contains("cut off"), "{err}");
+    }
+
+    #[test]
+    fn nothing_parseable_is_still_reported_plainly() {
+        let err = extract_into::<Review>("no json at all")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no JSON found"), "{err}");
     }
 }

@@ -82,12 +82,38 @@ pub fn review() -> Value {
                             "type": "string",
                             "description": "Path, with a line number if you have one. Empty string if the finding is general."
                         },
+                        "problem": {
+                            "type": ["string", "null"],
+                            "description": "Only when in_scope is false, null otherwise. What is wrong, with the specifics: the function, the call it does not make, the condition it does not check. Name things in backticks. This becomes the Problem section of an issue somebody picks up cold, so write what they need rather than what fits on a line."
+                        },
+                        "reproduction": {
+                            "type": ["string", "null"],
+                            "description": "Only when in_scope is false, null otherwise. Numbered steps to reproduce it, then a short 'Actual result:' list of what happens. If part of what happens is correct and only part is the defect, say which, so nobody chases the wrong thing."
+                        },
+                        "impact": {
+                            "type": ["string", "null"],
+                            "description": "Only when in_scope is false, null otherwise. What it costs somebody: what an operator or a user can do, or loses, because of this. One short paragraph."
+                        },
+                        "expected": {
+                            "type": ["string", "null"],
+                            "description": "Only when in_scope is false, null otherwise. What it should do instead, as a list of requirements specific enough to implement and to test. Say if the behaviour predates this branch."
+                        },
                         "in_scope": {
                             "type": "boolean",
                             "description": "False only for a real defect that exists, that this PR did not cause, and that is worth somebody stopping to fix. It becomes a tracked item a maintainer has to read and triage, so the bar is a defect, not an observation. A thorough reviewer can always find something adjacent; that is not a reason to file it. If you are not sure it is worth a maintainer's time, leave this true and say your piece in the finding."
                         }
                     },
-                    "required": ["severity", "title", "detail", "file", "in_scope"]
+                    "required": [
+                        "severity",
+                        "title",
+                        "detail",
+                        "file",
+                        "in_scope",
+                        "problem",
+                        "reproduction",
+                        "impact",
+                        "expected"
+                    ]
                 }
             }
         },
@@ -253,6 +279,84 @@ mod tests {
                 }
                 assert_eq!(props.len(), required.len(), "{path}: required has extras");
             }
+        }
+    }
+
+    /// The guard that was missing. A schema field can be added to the struct
+    /// and forgotten in the schema, and every test still passes: the tests
+    /// build the struct in Rust, so they never notice the model was never
+    /// asked. That shipped once, as four bug-report fields the agents were
+    /// never told about, which quietly did nothing.
+    #[test]
+    fn the_review_schema_asks_for_every_field_a_finding_holds() {
+        use crate::model::Finding;
+
+        let asked: Vec<String> = review()["properties"]["findings"]["items"]["properties"]
+            .as_object()
+            .expect("finding properties")
+            .keys()
+            .cloned()
+            .collect();
+
+        // Round-tripping a fully populated Finding names every field serde
+        // knows about, without repeating the list here to drift out of date.
+        let populated = Finding {
+            problem: Some("p".into()),
+            reproduction: Some("r".into()),
+            impact: Some("i".into()),
+            expected: Some("e".into()),
+            ..Finding::default()
+        };
+        let held: Vec<String> = serde_json::to_value(&populated)
+            .expect("serialisable")
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect();
+
+        for field in &held {
+            assert!(
+                asked.contains(field),
+                "a Finding holds `{field}` and the schema never asks for it, so the model will \
+                 not fill it and the code reading it will always see nothing"
+            );
+        }
+    }
+
+    /// Same guard for the other direction of the same exchange.
+    #[test]
+    fn the_response_schema_asks_for_every_field_a_disposition_holds() {
+        use crate::model::{Action, Disposition};
+
+        let asked: Vec<String> = response()["properties"]["dispositions"]["items"]["properties"]
+            .as_object()
+            .expect("disposition properties")
+            .keys()
+            .cloned()
+            .collect();
+
+        let populated = Disposition {
+            title: "t".into(),
+            file: "f".into(),
+            action: Action::Fixed,
+            reasoning: "r".into(),
+            new_issue_title: Some("t".into()),
+            new_issue_body: Some("b".into()),
+        };
+        let held: Vec<String> = serde_json::to_value(&populated)
+            .expect("serialisable")
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect();
+
+        for field in &held {
+            assert!(
+                asked.contains(field),
+                "a Disposition holds `{field}`, unasked for"
+            );
         }
     }
 

@@ -15,7 +15,7 @@ use crate::config::{AgentSpec, CommandPart, OutputMode, SystemVia};
 use crate::error::{Result, SparError};
 use crate::jsonx;
 use crate::proc::{self, ExecOpts};
-use crate::{bail, logdim, spar_err};
+use crate::{bail, logdim, logwarn, spar_err};
 
 /// Injected into every request. Prompting alone is not sufficient for any of
 /// these, which is why each one is also enforced deterministically on the way
@@ -295,7 +295,11 @@ impl Agent {
                 }
                 Err(e) => {
                     if attempt < ATTEMPTS {
-                        logdim!("{}: {}, asking again", self.spec.name, e.first_line());
+                        // The whole error, not its first line. The first line is
+                        // the command; the reason is in the stderr underneath
+                        // it, and printing only the first line made a retry
+                        // impossible to diagnose from the log.
+                        logwarn!("{} failed, asking again.\n{e}", self.spec.name);
                     }
                     last = Some(e);
                 }

@@ -26,7 +26,9 @@ effort = "ultra"      # Codex does not list these in its help. Your
 #   effort       = "high"       # omit to use the CLI's own default
 #   command      = [...]        # a template of your own, instead of a preset
 #   output       = "text"       # text | jsonl | json
-#   timeout      = 1800         # seconds one call may take before spar gives up
+#   timeout      = 3600         # seconds one call may take before spar gives up.
+#                               # A timeout costs the whole call and is never
+#                               # retried, so err long.
 #   search_paths = ["~/.local/bin"]   # extra places to look for the binary
 #   system_via   = "prompt"     # prompt | placeholder. Where the style rules go
 #   message_path = "item.text"  # jsonl only: where the answer lives
@@ -43,7 +45,7 @@ effort = "ultra"      # Codex does not list these in its help. Your
 #   [agents.custom]
 #   command = ["mytool", ["-m", "{model}"], "--prompt", "{prompt}"]
 #   output  = "text"
-#   timeout = 3600            # a slow model on a large repo
+#   timeout = 7200            # a slow model on a large repo
 #
 # Placeholders: {prompt} {system} {model} {effort} {cwd} {schema} {schema_file}
 #

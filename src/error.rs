@@ -4,16 +4,45 @@
 
 use std::fmt;
 
+/// Why a call failed, where the answer changes what to do about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ErrorKind {
+    #[default]
+    Other,
+    /// The call ran past its deadline and was killed. Worth its own kind
+    /// because asking again means waiting exactly as long again, which is the
+    /// one failure where a retry costs more than it can possibly win.
+    TimedOut,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SparError {
     message: String,
+    kind: ErrorKind,
 }
 
 impl SparError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            kind: ErrorKind::Other,
         }
+    }
+
+    pub fn timed_out(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: ErrorKind::TimedOut,
+        }
+    }
+
+    pub fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+
+    /// Whether asking the same thing again could plausibly go better.
+    pub fn worth_retrying(&self) -> bool {
+        self.kind != ErrorKind::TimedOut
     }
 
     pub fn message(&self) -> &str {

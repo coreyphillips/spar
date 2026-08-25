@@ -1,6 +1,6 @@
 [package]
 name = "spar-cli"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 rust-version = "1.85"
 description = "Two AI coding agents alternate implementing and reviewing GitHub issues until a PR converges."

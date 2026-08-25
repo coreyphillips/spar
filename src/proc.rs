@@ -16,7 +16,18 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Result, SparError};
 
-pub const DEFAULT_TIMEOUT_SECS: u64 = 1800;
+/// How long one agent call may run before it is killed.
+///
+/// An hour, because thirty minutes was not enough: a review at the highest
+/// effort setting on a large repository, running the test suite as it went,
+/// ran past it. A timeout costs the whole call, so the default errs long and
+/// `timeout` on an agent shortens it.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 3600;
+
+/// Thirty minutes was not enough for a deep review of a large repository, and a
+/// timeout costs the whole call. Checked at compile time rather than in a test,
+/// since shortening it is a decision worth stopping the build for.
+const _: () = assert!(DEFAULT_TIMEOUT_SECS >= 3600);
 
 #[derive(Debug, Clone)]
 pub struct ExecOpts {
@@ -160,9 +171,10 @@ pub fn exec(argv: &[String], opts: &ExecOpts) -> Result<Output> {
     let stderr = err_reader.collect(DRAIN_GRACE);
 
     if timed_out {
-        return Err(SparError::new(format!(
+        return Err(SparError::timed_out(format!(
             "timed out after {}s: {}\nRaise `timeout` on this agent in spar.toml if the model \
-             legitimately needs longer.",
+             legitimately needs longer. Not retried: asking again would wait exactly as long a \
+             second time.",
             opts.timeout.as_secs(),
             abbreviate(argv)
         )));
@@ -533,5 +545,41 @@ mod tests {
         assert_eq!(PathBuf::from("/home/someone/bin"), expand_tilde("~/bin"));
         assert_eq!(PathBuf::from("/absolute"), expand_tilde("/absolute"));
         assert_eq!(PathBuf::from("~notauser/x"), expand_tilde("~notauser/x"));
+    }
+}
+
+#[cfg(test)]
+mod timeout_kind_tests {
+    use super::*;
+    use crate::error::ErrorKind;
+
+    /// A deadline is not a bad answer. Retrying one buys another wait of
+    /// exactly the same length, which on a review at the highest effort
+    /// setting turned a thirty minute failure into an hour of it.
+    #[test]
+    fn a_timeout_is_marked_as_one_and_is_not_worth_retrying() {
+        let err = run(
+            &["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            &ExecOpts::new().timeout_secs(1),
+        )
+        .unwrap_err();
+
+        assert_eq!(ErrorKind::TimedOut, err.kind());
+        assert!(!err.worth_retrying());
+        assert!(err.to_string().contains("Not retried"), "{err}");
+    }
+
+    /// Everything else still is: a model that returned nonsense usually
+    /// returns something usable when told what was wrong.
+    #[test]
+    fn an_ordinary_failure_is_still_worth_retrying() {
+        let err = run(
+            &["sh".to_string(), "-c".to_string(), "exit 1".to_string()],
+            &ExecOpts::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(ErrorKind::Other, err.kind());
+        assert!(err.worth_retrying());
     }
 }

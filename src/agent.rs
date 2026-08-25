@@ -293,6 +293,10 @@ impl Agent {
                     }
                     return Ok(parsed);
                 }
+                // A deadline is not a bad answer. Asking again buys another
+                // wait of exactly the same length, which on a long review is
+                // the most expensive way to learn nothing.
+                Err(e) if !e.worth_retrying() => return Err(e),
                 Err(e) => {
                     if attempt < ATTEMPTS {
                         // The whole error, not its first line. The first line is

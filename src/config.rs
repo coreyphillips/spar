@@ -244,8 +244,21 @@ pub struct LoopCfg {
     pub state_store: StateStore,
     #[serde(default)]
     pub branch_prefix: String,
-    #[serde(default = "followups_issues")]
+    #[serde(default = "followups_local")]
     pub followups: Followups,
+    /// File a non-blocking finding as a follow-up.
+    ///
+    /// Off by default, and this is the setting that stops a run breeding. A
+    /// thorough reviewer always finds improvements, and turning each one into a
+    /// tracker item made a single issue spawn ten, which spawned more: mean
+    /// offspring above one never terminates. Not gating a merge is not the same
+    /// as being worth somebody's triage queue.
+    #[serde(default)]
+    pub file_non_blocking: bool,
+    /// Most follow-ups one run may record before it stops and says what it
+    /// dropped. A backstop, not a target.
+    #[serde(default = "five")]
+    pub max_followups: usize,
     /// Nits stay in the PR thread by default. A filed nit is somebody else's
     /// notification: a run on a production codebase once opened an issue titled
     /// "Log wording".
@@ -292,8 +305,11 @@ fn yes() -> bool {
 fn store_local() -> StateStore {
     StateStore::Local
 }
-fn followups_issues() -> Followups {
-    Followups::Issues
+fn followups_local() -> Followups {
+    Followups::Local
+}
+fn five() -> usize {
+    5
 }
 
 impl Default for LoopCfg {
@@ -307,7 +323,9 @@ impl Default for LoopCfg {
             keep_worktrees: false,
             state_store: StateStore::Local,
             branch_prefix: String::new(),
-            followups: Followups::Issues,
+            followups: Followups::Local,
+            file_non_blocking: false,
+            max_followups: 5,
             file_nits: false,
             close_skipped: true,
             parallel_triage: true,
@@ -836,7 +854,15 @@ model = "gpt-5.6-sol"
             "a filed nit is somebody else's triage queue"
         );
         assert_eq!(3, cfg.loop_cfg.max_rounds);
-        assert_eq!(Followups::Issues, cfg.loop_cfg.followups);
+        assert_eq!(
+            Followups::Local,
+            cfg.loop_cfg.followups,
+            "the tracker is somebody's queue; the default must not write to it"
+        );
+        assert!(
+            !cfg.loop_cfg.file_non_blocking,
+            "a suggestion is not a tracker item"
+        );
         assert_eq!(StateStore::Local, cfg.loop_cfg.state_store);
         assert!(cfg.style.terse);
     }

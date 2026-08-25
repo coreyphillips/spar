@@ -27,7 +27,7 @@ use crate::model::{
 };
 use crate::repo::Repo;
 use crate::style::{self, Style};
-use crate::{log, logdim, schema, spar_err};
+use crate::{log, logdim, logwarn, schema, spar_err};
 
 // ---------------------------------------------------------------------------
 // Prompts
@@ -73,8 +73,16 @@ one you never raised: it stalls a good PR and teaches the author to stop
 believing you. If you suspect a problem but could not confirm it, say so and
 label it non-blocking.
 
-Set in_scope=false for a real problem that exists but is not caused by this PR.
-Those become follow-up issues rather than review comments.
+Set in_scope=false for a real defect that exists, that this PR did not cause, and
+that is worth somebody stopping to fix. Each one becomes a tracked item a
+maintainer has to read and triage, so the bar is a defect and not an observation.
+A thorough reviewer can always find something adjacent to what it is reading;
+that is not a reason to file it. If you are not sure it is worth a maintainer's
+time, leave in_scope true and say your piece in the finding.
+
+Reviewing one issue should not manufacture ten more. If you find yourself with
+several out of scope findings, keep the ones that would bite somebody and drop
+the rest.
 
 Then choose next_action:
 - merge: no blocking findings, the PR is good.
@@ -467,14 +475,8 @@ fn review_loop(
         // Filed every round, not only on approval: a run that escalates or runs
         // out of rounds would otherwise drop these on the floor. Filing
         // deduplicates by title, so repeats across rounds are free.
-        file_out_of_scope(repo, &review.findings, ctx.subject, state);
-        file_nonblocking(
-            repo,
-            &review.findings,
-            ctx.subject,
-            state,
-            cfg.loop_cfg.file_nits,
-        );
+        file_out_of_scope(repo, &review.findings, ctx.subject, state, cfg);
+        file_nonblocking(repo, &review.findings, ctx.subject, state, cfg);
 
         if check_relitigation(ledger, &blocking, state) {
             state.status = Status::Escalated;
@@ -546,6 +548,7 @@ fn review_loop(
             )?;
             apply_dispositions(
                 repo,
+                cfg,
                 &response,
                 &blocking,
                 ledger,
@@ -683,6 +686,7 @@ fn matching_finding<'a>(findings: &'a [Finding], title: &str) -> Option<&'a Find
 #[allow(clippy::too_many_arguments)]
 fn apply_dispositions(
     repo: &Repo,
+    cfg: &Config,
     response: &ResponseDoc,
     blocking: &[Finding],
     ledger: &mut Ledger,
@@ -741,7 +745,8 @@ fn apply_dispositions(
                     .clone()
                     .filter(|b| !b.trim().is_empty())
                     .unwrap_or_else(|| d.reasoning.clone());
-                if let Some(url) = file_followup(repo, &new_title, &new_body, subject) {
+                let recorded = file_followup(repo, &new_title, &new_body, subject, cfg, state);
+                if let Some(url) = recorded {
                     state.filed.push(url.clone());
                     filed.push(url);
                 }
@@ -770,8 +775,26 @@ fn apply_dispositions(
 /// that is not yours it is somebody else's notification and somebody else's
 /// triage queue, so `local` keeps the same information in `.spar/followups.md`
 /// and `none` drops it.
-fn file_followup(repo: &Repo, title: &str, body: &str, source: i64) -> Option<String> {
+fn file_followup(
+    repo: &Repo,
+    title: &str,
+    body: &str,
+    source: i64,
+    cfg: &Config,
+    state: &IssueRun,
+) -> Option<String> {
     if repo.followups == Followups::None {
+        return None;
+    }
+    // A backstop against a run that will not stop finding things. Silent
+    // truncation is not on offer: what was dropped is said out loud.
+    if state.filed.len() >= cfg.loop_cfg.max_followups {
+        logwarn!(
+            "already recorded {} follow-ups, not recording '{}'. Raise max_followups if you want \
+             them all.",
+            state.filed.len(),
+            style::title(title, &repo.style)
+        );
         return None;
     }
     // The exact string that will land on GitHub. Searching for anything else
@@ -830,9 +853,16 @@ fn file_followup(repo: &Repo, title: &str, body: &str, source: i64) -> Option<St
     }
 }
 
-fn file_out_of_scope(repo: &Repo, findings: &[Finding], subject: i64, state: &mut IssueRun) {
+fn file_out_of_scope(
+    repo: &Repo,
+    findings: &[Finding],
+    subject: i64,
+    state: &mut IssueRun,
+    cfg: &Config,
+) {
     for finding in findings.iter().filter(|f| !f.in_scope) {
-        if let Some(url) = file_followup(repo, &finding.title, &finding.detail, subject) {
+        if let Some(url) = file_followup(repo, &finding.title, &finding.detail, subject, cfg, state)
+        {
             state.filed.push(url);
         }
     }
@@ -849,18 +879,19 @@ fn file_nonblocking(
     findings: &[Finding],
     subject: i64,
     state: &mut IssueRun,
-    file_nits: bool,
+    cfg: &Config,
 ) {
     for finding in findings {
         let keep = match finding.severity {
-            Severity::NonBlocking => true,
-            Severity::Nit => file_nits,
+            Severity::NonBlocking => cfg.loop_cfg.file_non_blocking,
+            Severity::Nit => cfg.loop_cfg.file_nits,
             Severity::Blocking => false,
         };
         if !keep || !finding.in_scope {
             continue;
         }
-        if let Some(url) = file_followup(repo, &finding.title, &finding.detail, subject) {
+        if let Some(url) = file_followup(repo, &finding.title, &finding.detail, subject, cfg, state)
+        {
             state.filed.push(url);
         }
     }
@@ -1847,6 +1878,111 @@ mod filed_reference_tests {
         assert_eq!(
             None,
             filed_issue_number("https://github.com/you/thing/issues/")
+        );
+    }
+}
+
+#[cfg(test)]
+mod followup_restraint_tests {
+    use super::*;
+    use crate::model::Severity;
+
+    fn cfg_with(followups: Followups, non_blocking: bool, nits: bool, cap: usize) -> Config {
+        let mut cfg =
+            crate::config::parse("[agents.a]\ncommand = [\"x\"]\n[agents.b]\ncommand = [\"y\"]\n")
+                .unwrap();
+        cfg.loop_cfg.followups = followups;
+        cfg.loop_cfg.file_non_blocking = non_blocking;
+        cfg.loop_cfg.file_nits = nits;
+        cfg.loop_cfg.max_followups = cap;
+        cfg
+    }
+
+    fn finding(severity: Severity, title: &str, in_scope: bool) -> Finding {
+        Finding {
+            severity,
+            title: title.into(),
+            detail: "d".into(),
+            file: "a.rs".into(),
+            in_scope,
+        }
+    }
+
+    /// The defaults are what let one issue spawn ten, which spawned more. A
+    /// thorough reviewer always finds improvements; not gating a merge is not
+    /// the same as deserving somebody's triage queue.
+    #[test]
+    fn a_non_blocking_finding_is_not_a_tracker_item_by_default() {
+        let cfg = cfg_with(Followups::Issues, false, false, 5);
+        assert!(!cfg.loop_cfg.file_non_blocking);
+        assert!(!cfg.loop_cfg.file_nits);
+    }
+
+    #[test]
+    fn follow_ups_stay_off_the_tracker_by_default() {
+        let cfg =
+            crate::config::parse("[agents.a]\ncommand = [\"x\"]\n[agents.b]\ncommand = [\"y\"]\n")
+                .unwrap();
+        assert_eq!(
+            Followups::Local,
+            cfg.loop_cfg.followups,
+            "the tracker is somebody's queue; the default must not write to it"
+        );
+        assert_eq!(5, cfg.loop_cfg.max_followups);
+    }
+
+    /// Which severities survive the filter, at the defaults and when opened up.
+    #[test]
+    fn only_out_of_scope_defects_qualify_at_the_defaults() {
+        let cfg = cfg_with(Followups::Issues, false, false, 5);
+        let qualifies = |f: &Finding| match f.severity {
+            Severity::NonBlocking => cfg.loop_cfg.file_non_blocking && f.in_scope,
+            Severity::Nit => cfg.loop_cfg.file_nits && f.in_scope,
+            Severity::Blocking => false,
+        } || !f.in_scope;
+
+        assert!(qualifies(&finding(
+            Severity::Blocking,
+            "pre-existing",
+            false
+        )));
+        assert!(!qualifies(&finding(
+            Severity::NonBlocking,
+            "improvement",
+            true
+        )));
+        assert!(!qualifies(&finding(Severity::Nit, "taste", true)));
+        assert!(!qualifies(&finding(
+            Severity::Blocking,
+            "fix it here",
+            true
+        )));
+    }
+
+    #[test]
+    fn opening_it_up_lets_non_blocking_findings_through_again() {
+        let cfg = cfg_with(Followups::Issues, true, false, 5);
+        assert!(cfg.loop_cfg.file_non_blocking);
+    }
+
+    /// A run that will not stop finding things is stopped, and says so.
+    #[test]
+    fn the_cap_is_a_real_backstop() {
+        let cfg = cfg_with(Followups::Issues, false, false, 3);
+        let mut state = IssueRun::new(1, "t");
+        state.filed = (0..3).map(|n| format!("url{n}")).collect();
+        assert!(state.filed.len() >= cfg.loop_cfg.max_followups);
+    }
+
+    /// The number that matters. Reviewing one issue produced ten follow-ups on
+    /// a real repository, each of which could be run in turn: mean offspring
+    /// above one never terminates.
+    #[test]
+    fn the_cap_bounds_what_one_run_can_spawn() {
+        let cfg = cfg_with(Followups::Issues, false, false, 5);
+        assert!(
+            cfg.loop_cfg.max_followups <= 5,
+            "a run that can file ten follow-ups is a branching process"
         );
     }
 }

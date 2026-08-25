@@ -84,7 +84,7 @@ pub fn review() -> Value {
                         },
                         "in_scope": {
                             "type": "boolean",
-                            "description": "False for a real problem that exists but is not caused by this PR. Those become follow up issues rather than review comments."
+                            "description": "False only for a real defect that exists, that this PR did not cause, and that is worth somebody stopping to fix. It becomes a tracked item a maintainer has to read and triage, so the bar is a defect, not an observation. A thorough reviewer can always find something adjacent; that is not a reason to file it. If you are not sure it is worth a maintainer's time, leave this true and say your piece in the finding."
                         }
                     },
                     "required": ["severity", "title", "detail", "file", "in_scope"]

@@ -89,10 +89,19 @@ absorb_new_issues = 0        # waves of newly filed follow-ups to fold back into
                              # next one. 0 is off. Each wave is triaged like any
                              # other issue, so both agents still have to agree.
                              # Multiplies what a run costs.
-followups         = "issues" # issues | local | none. Where out-of-scope findings
-                             # go. Use local on a repo that is not yours: notes
-                             # land in .spar/followups.md instead of the tracker
-file_nits         = false    # nits stay in the PR thread, never the tracker
+followups         = "local"  # issues | local | none. Where a follow-up goes.
+                             # local writes .spar/followups.md and leaves the
+                             # tracker alone, which is the default because a
+                             # thorough reviewer always finds something and a
+                             # tracker is somebody's queue.
+file_non_blocking = false    # file a non-blocking finding as a follow-up. Off,
+                             # and this is the setting that stops a run breeding:
+                             # with it on, one issue produced ten follow-ups,
+                             # four of which produced more. Not gating a merge is
+                             # not the same as deserving a triage queue.
+file_nits         = false    # nits stay in the PR thread, never a follow-up
+max_followups     = 5        # most one run may record before it stops and says
+                             # what it dropped. A backstop, not a target.
 state_store       = "local"  # local | pr | both. local keeps resume state in
                              # .spar/state and off the PR
 

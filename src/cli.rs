@@ -807,7 +807,10 @@ fn cmd_init(out: &Path, force: bool) -> Result<i32> {
          first_implementor = \"{}\"\n\
          worktrees         = true       # false works in the main checkout\n\
          close_skipped     = true       # close an issue both reviewers declined\n\
-         followups         = \"issues\"   # issues | local | none\n\
+         followups         = \"local\"    # issues | local | none. local writes\n\
+         #                                .spar/followups.md, not the tracker\n\
+         # file_non_blocking = false    # a suggestion is not a tracker item\n\
+         # max_followups     = 5        # backstop on what one run can spawn\n\
          # keep_worktrees  = false      # true leaves them behind to inspect\n\
          # min_number      = 0          # ignore anything numbered below this when\n\
          #                                picking for itself. 0 is no floor.\n\
@@ -1053,6 +1056,13 @@ fn report(results: &[IssueRun], cfg: &Config) -> i32 {
 
     if !cfg.loop_cfg.auto_merge && results.iter().any(|r| r.status == Status::Approved) {
         println!("\nApproved PRs are waiting on you to merge.");
+    }
+    let recorded: usize = results.iter().map(|r| r.filed.len()).sum();
+    if recorded > 0 && cfg.loop_cfg.followups == crate::config::Followups::Local {
+        println!(
+            "\n{recorded} follow-up(s) recorded in .spar/followups.md, not on the tracker. \
+             Set followups = \"issues\" to file them."
+        );
     }
     if results.iter().all(IssueRun::succeeded) {
         0

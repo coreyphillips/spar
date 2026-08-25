@@ -259,6 +259,14 @@ pub struct LoopCfg {
     /// triage, so there is nothing to serialise.
     #[serde(default = "yes")]
     pub parallel_triage: bool,
+    /// Waves of newly filed follow-ups to fold back into the same run, rather
+    /// than leaving them for the next one.
+    ///
+    /// Off by default because it multiplies what a run costs, and because each
+    /// wave can file follow-ups of its own. Every wave is triaged like any
+    /// other issue, so both agents still have to agree it is worth doing.
+    #[serde(default)]
+    pub absorb_new_issues: u32,
     #[serde(default)]
     pub effort_schedule: EffortSchedule,
 }
@@ -294,6 +302,7 @@ impl Default for LoopCfg {
             file_nits: false,
             close_skipped: true,
             parallel_triage: true,
+            absorb_new_issues: 0,
             effort_schedule: EffortSchedule::default(),
         }
     }

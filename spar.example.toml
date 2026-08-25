@@ -77,6 +77,11 @@ branch_prefix     = ""       # branches are issue-N and pr-N. Set e.g. "spar/"
 close_skipped     = true     # close an issue both agents independently declined,
                              # after posting the shared reasoning
 parallel_triage   = true     # both agents triage at once; they only read
+absorb_new_issues = 0        # waves of newly filed follow-ups to fold back into
+                             # the same run rather than leaving them for the
+                             # next one. 0 is off. Each wave is triaged like any
+                             # other issue, so both agents still have to agree.
+                             # Multiplies what a run costs.
 followups         = "issues" # issues | local | none. Where out-of-scope findings
                              # go. Use local on a repo that is not yours: notes
                              # land in .spar/followups.md instead of the tracker

@@ -89,6 +89,7 @@ spar run 42 --base develop  # base branch, if origin/HEAD is not what you want
 spar run 42 --plan-out /tmp/plan.json      # where the triage plan is written
 spar run 42 --no-close-skipped   # comment on a declined issue but leave it open
 spar run 42 --close-skipped      # close it (the default, so rarely needed)
+spar run 42 --absorb 1      # work the follow-ups this run files, in this run
 
 spar review 108             # review a PR without touching it, fork or not
 spar review 108 --dry-run   # print the review instead of posting it
@@ -142,6 +143,18 @@ more, because a person looked at it and chose to continue. Round numbers keep
 counting up (4, 5, 6) so the refutation ledger and the PR history stay coherent,
 and the escalation comment says both how many rounds this run spent and how many
 the PR has seen in total.
+
+**Follow-ups.** A review that finds something real but out of scope files it as
+its own issue. Before filing, spar looks for an issue that already describes the
+same defect, comparing titles and bodies rather than matching strings, because
+two agents never word one defect the same way. If it finds one it adds whatever
+the new pass learned as a comment there instead of opening a second issue, and
+says nothing if the new pass learned nothing.
+
+By default those follow-ups wait for the next run. `absorb_new_issues` folds them
+back into the current one instead, a wave at a time, each wave triaged like any
+other issue so both agents still have to agree it is worth doing. It is off by
+default because it multiplies what a run costs.
 
 **Convergence.** Only `blocking` findings gate the merge. Everything else is
 filed as a follow-up issue and the PR proceeds. This matters: a competent

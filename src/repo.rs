@@ -12,6 +12,7 @@ use crate::error::Result;
 use crate::model::{Issue, IssueRef, ItemKind, PersistedState, PrRef, PrView};
 use crate::proc::{self, ExecOpts};
 use crate::style::{self, Style};
+use crate::textsim;
 use crate::{bail, logdim, spar_err};
 
 /// gh returns newest first, so its `--limit` cannot be used to take the lowest
@@ -770,6 +771,79 @@ impl Repo {
             .gh(&["issue", "create", "--title", &title, "--body", &body])?
             .trim()
             .to_string())
+    }
+}
+
+/// An issue that already covers what spar was about to file.
+#[derive(Debug, Clone)]
+pub struct ExistingIssue {
+    pub number: i64,
+    pub url: String,
+    pub title: String,
+    pub body: String,
+    pub open: bool,
+}
+
+impl Repo {
+    /// An issue that already describes this defect, however it was worded.
+    ///
+    /// Exact title matching let duplicates through: two agents, or two runs a
+    /// week apart, never word one defect identically. A real run filed two
+    /// duplicates that way, and each had to be closed by hand afterwards.
+    /// Titles alone are too thin to match on, so this compares titles and
+    /// bodies together.
+    pub fn find_similar_issue(&self, title: &str, body: &str) -> Option<ExistingIssue> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Row {
+            number: i64,
+            #[serde(default)]
+            title: String,
+            #[serde(default)]
+            url: String,
+            #[serde(default)]
+            body: String,
+            #[serde(default)]
+            state: String,
+        }
+        if title.trim().is_empty() {
+            return None;
+        }
+        // Search on the title's own words: GitHub's index is the cheap way to
+        // narrow the field before comparing properly.
+        let query: String = title
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\'' | '\n' | '\r'))
+            .take(120)
+            .collect();
+        let text = self.gh_try(&[
+            "issue",
+            "list",
+            "--state",
+            "all",
+            "--limit",
+            "100",
+            "--search",
+            query.trim(),
+            "--json",
+            "number,title,url,body,state",
+        ]);
+        let rows: Vec<Row> = serde_json::from_str(text.trim()).unwrap_or_default();
+        let wanted = format!("{title} {body}");
+
+        rows.into_iter()
+            .find(|row| {
+                let theirs = format!("{} {}", row.title, row.body);
+                row.title.trim().eq_ignore_ascii_case(title.trim())
+                    || textsim::same_subject(&wanted, &theirs)
+            })
+            .map(|row| ExistingIssue {
+                number: row.number,
+                url: row.url,
+                title: row.title,
+                open: row.state.eq_ignore_ascii_case("open"),
+                body: row.body,
+            })
     }
 
     /// Avoid filing a duplicate when a follow-up already exists.

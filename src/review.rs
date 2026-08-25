@@ -795,10 +795,30 @@ fn file_followup(repo: &Repo, title: &str, body: &str, source: i64) -> Option<St
     if repo.followups == Followups::Local {
         return repo.append_local_followup(&title, &body);
     }
-    if let Some(existing) = repo.find_issue_by_title(&title) {
-        logdim!("follow-up already exists: {existing}");
-        return None;
+
+    // An issue that already covers this, however it was worded. Filing a second
+    // one is the complaint; silently dropping the new wording is not much
+    // better, because a later run often carries evidence the first did not.
+    if let Some(existing) = repo.find_similar_issue(&title, &body) {
+        let known = format!("{} {}", existing.title, existing.body);
+        if !existing.open {
+            logdim!(
+                "#{} already covers '{title}' and is closed, leaving it alone",
+                existing.number
+            );
+            return None;
+        }
+        if crate::textsim::adds_information(&body, &known) {
+            match repo.comment_issue(existing.number, &body) {
+                Ok(()) => log!("added to #{}: {title}", existing.number),
+                Err(e) => logdim!("could not add to #{}: {e}", existing.number),
+            }
+        } else {
+            logdim!("#{} already says this, nothing added", existing.number);
+        }
+        return Some(existing.url);
     }
+
     match repo.create_issue(&title, &body) {
         Ok(url) => Some(url),
         Err(e) => {
@@ -930,6 +950,16 @@ fn refutation_of(finding: &Finding, state: &IssueRun, ledger: &Ledger) -> Option
 
 /// `#123` from a filed issue URL, falling back to the URL when it does not look
 /// like one. Shorter, and GitHub renders it as a link either way.
+/// The issue number a filed follow-up URL points at, when it is one. Local
+/// notes and anything unparseable yield nothing.
+pub fn filed_issue_number(filed: &str) -> Option<i64> {
+    filed
+        .rsplit('/')
+        .next()
+        .and_then(|tail| tail.parse::<i64>().ok())
+        .filter(|n| *n > 0)
+}
+
 fn as_reference(url: &str) -> String {
     match url.rsplit('/').next().and_then(|n| n.parse::<u64>().ok()) {
         Some(number) => format!("#{number}"),
@@ -1173,13 +1203,14 @@ pub fn disposition_comment(
 /// the issue. Duplicates are collapsed, since two reviewers reaching the same
 /// conclusion often reach it in the same words.
 pub fn skip_comment(item: &SkippedItem, style: &Style) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    for reason in item.reasons.values() {
-        let text = style::sentence(reason, style);
-        if !text.is_empty() && !lines.iter().any(|seen| same_point(seen, &text)) {
-            lines.push(text);
-        }
-    }
+    let reasons = item
+        .reasons
+        .values()
+        .map(|reason| style::sentence(reason, style));
+    // Two reviewers declining one issue almost always decline it for the same
+    // reason, worded differently. On the run that prompted this, both cited the
+    // issue it duplicated and the reader saw the point twice.
+    let lines = crate::textsim::dedupe_by(reasons, crate::textsim::same_reason);
     bullets(&lines)
 }
 
@@ -1769,5 +1800,30 @@ mod outcome_tests {
             as_reference("https://github.com/you/thing/issues/485")
         );
         assert_eq!("note: something", as_reference("note: something"));
+    }
+}
+
+#[cfg(test)]
+mod filed_reference_tests {
+    use super::*;
+
+    #[test]
+    fn an_issue_url_yields_its_number() {
+        assert_eq!(
+            Some(485),
+            filed_issue_number("https://github.com/you/thing/issues/485")
+        );
+    }
+
+    /// Local mode records a note rather than a URL, and a run with
+    /// followups = "local" must not try to absorb it as an issue.
+    #[test]
+    fn a_local_note_yields_nothing() {
+        assert_eq!(None, filed_issue_number("note: Retry is unbounded"));
+        assert_eq!(None, filed_issue_number(""));
+        assert_eq!(
+            None,
+            filed_issue_number("https://github.com/you/thing/issues/")
+        );
     }
 }

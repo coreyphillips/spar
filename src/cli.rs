@@ -1,5 +1,6 @@
 //! The command line.
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -168,6 +169,10 @@ pub struct LoopFlags {
     /// Leave worktrees in place after a run, for inspection.
     #[arg(long)]
     pub keep_worktrees: bool,
+    /// Waves of newly filed follow-ups to fold back into this run instead of
+    /// leaving them for the next one. Each wave is triaged like any issue.
+    #[arg(long, value_name = "N")]
+    pub absorb: Option<u32>,
 }
 
 /// Only `run` triages, so only `run` can decline an issue. Offering these on
@@ -304,12 +309,47 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
             let sorted = classify(&repo, &numbers)?;
             let mut results = Vec::new();
+            let mut ledger = Ledger::new();
+            let mut handled: BTreeSet<i64> = BTreeSet::new();
+            let mut wave = sorted.issues.clone();
 
-            if !sorted.issues.is_empty() {
-                let fetched = repo.fetch_issues(&sorted.issues)?;
-                let plan = make_plan(&agents, &cfg, &repo, &fetched, &plan_out)?;
+            // Wave 0 is what was asked for. Each further wave is the follow-ups
+            // the previous one filed, folded back in rather than left for the
+            // next run. Every wave is triaged like anything else, so both
+            // agents still have to agree each one is worth doing.
+            for round in 0..=cfg.loop_cfg.absorb_new_issues {
+                wave.retain(|n| !handled.contains(n));
+                if wave.is_empty() {
+                    break;
+                }
+                if round > 0 {
+                    log!(
+                        "absorbing {} newly filed issue(s): {}",
+                        wave.len(),
+                        wave.iter()
+                            .map(|n| format!("#{n}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                handled.extend(wave.iter().copied());
+
+                let fetched = match repo.fetch_issues(&wave) {
+                    Ok(fetched) => fetched,
+                    Err(e) => {
+                        logdim!("could not read the next wave: {e}");
+                        break;
+                    }
+                };
+                let plan_path = if round == 0 {
+                    plan_out.clone()
+                } else {
+                    plan_out.with_extension(format!("wave{round}.json"))
+                };
+                let plan = make_plan(&agents, &cfg, &repo, &fetched, &plan_path)?;
                 act_on_plan(&cfg, &repo, &plan);
-                let mut ledger = Ledger::new();
+
+                let before = results.len();
                 for item in &plan.order {
                     let Some(issue) = fetched.iter().find(|i| i.number == item.issue) else {
                         continue;
@@ -323,6 +363,25 @@ fn dispatch(cli: Cli) -> Result<i32> {
                         &mut ledger,
                     ));
                 }
+
+                // Whatever this wave filed becomes the next one.
+                wave = results[before..]
+                    .iter()
+                    .flat_map(|r| r.filed.iter())
+                    .filter_map(|url| review::filed_issue_number(url))
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+            }
+            if !wave.is_empty() && cfg.loop_cfg.absorb_new_issues > 0 {
+                log!(
+                    "{} issue(s) filed in the last wave were left for a later run: {}",
+                    wave.len(),
+                    wave.iter()
+                        .map(|n| format!("#{n}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
 
             for number in sorted.prs {
@@ -416,6 +475,7 @@ struct Overrides {
     keep_worktrees: Option<bool>,
     worktrees: Option<bool>,
     close_skipped: Option<bool>,
+    absorb: Option<u32>,
 }
 
 impl From<&LoopFlags> for Overrides {
@@ -426,6 +486,7 @@ impl From<&LoopFlags> for Overrides {
             keep_worktrees: flags.keep_worktrees.then_some(true),
             worktrees: None,
             close_skipped: None,
+            absorb: flags.absorb,
         }
     }
 }
@@ -460,6 +521,9 @@ fn prepare(common: &Common, overrides: Option<Overrides>) -> Result<(Config, Rep
         }
         if let Some(v) = over.close_skipped {
             cfg.loop_cfg.close_skipped = v;
+        }
+        if let Some(v) = over.absorb {
+            cfg.loop_cfg.absorb_new_issues = v;
         }
     }
 
@@ -725,6 +789,8 @@ fn cmd_init(out: &Path, force: bool) -> Result<i32> {
          followups         = \"issues\"   # issues | local | none\n\
          # keep_worktrees  = false      # true leaves them behind to inspect\n\
          # parallel_triage = true       # false asks the agents one at a time\n\
+         # absorb_new_issues = 0        # waves of newly filed follow-ups to fold\n\
+         #                                back into this run. Costs more.\n\
          # file_nits       = false      # true files nits as issues too\n\
          # base_branch     = \"main\"     # only a fallback; origin/HEAD wins\n\
          # branch_prefix   = \"\"         # e.g. \"spar/\" to namespace branches\n\
@@ -1153,5 +1219,33 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod absorb_tests {
+    use super::*;
+
+    #[test]
+    fn absorb_is_off_unless_asked_for() {
+        match Cli::parse_from(["spar", "run"]).command {
+            Command::Run { loop_flags, .. } => assert_eq!(None, loop_flags.absorb),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn absorb_takes_a_wave_count() {
+        match Cli::parse_from(["spar", "run", "--absorb", "2"]).command {
+            Command::Run { loop_flags, .. } => assert_eq!(Some(2), loop_flags.absorb),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn absorb_is_only_offered_where_issues_are_worked() {
+        assert!(Cli::try_parse_from(["spar", "run", "--absorb", "1"]).is_ok());
+        assert!(Cli::try_parse_from(["spar", "resume", "--absorb", "1"]).is_ok());
+        assert!(Cli::try_parse_from(["spar", "review", "--absorb", "1"]).is_err());
     }
 }

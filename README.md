@@ -57,6 +57,45 @@ cargo install --path .
 tells you which is missing. Presets are compiled into the binary, so there is
 nothing to copy alongside it.
 
+### After upgrading
+
+`spar init` will not touch a config that already exists, so a release that adds a
+setting would otherwise be invisible. `doctor` lists every setting your file does
+not mention, with its default, and `init --update` appends them as comments
+without changing a line of what is already there:
+
+```bash
+spar doctor                 # says what is new since you wrote your config
+spar init --update          # appends those settings, commented out
+```
+
+## Trying it without letting it do anything
+
+Every command that writes has a way to not write. Worth knowing before the first
+run on a repository you care about:
+
+```bash
+spar triage 42              # judges the issue, writes plan.json, touches nothing
+spar review 108 --dry-run   # full two agent review, printed, nothing posted
+spar run 42 --no-close-skipped   # will not close an issue it declines
+```
+
+`--dry-run` is on `review` only, because `review` is the command whose whole
+output is a comment. There is no `--dry-run` on `run`, since `run` writes code:
+`triage` is its read-only half.
+
+For something persistent rather than per invocation, these live in `spar.toml`:
+
+```toml
+[loop]
+followups   = "local"   # the default. Records to .spar/followups.md, never the
+                        # tracker. "none" drops them entirely.
+
+[style]
+pr_comments = "none"    # never comment on a pull request, in any mode.
+                        # The standing equivalent of --dry-run.
+```
+
 ## Quick start
 
 ```bash

@@ -129,6 +129,9 @@ terse              = true
 #   rounds   a comment per review and per response, an audit trail
 #   none     never comment on a PR; everything goes to the terminal
 pr_comments        = "outcome"
+                             # Set this to "none" and spar never comments on a
+                             # pull request in any mode, which is the standing
+                             # equivalent of `spar review --dry-run`.
 max_title_chars    = 140     # a finding, issue, or PR title. Never ellipsised:
                              # a title ending in "..." reads as broken.
 max_summary_chars  = 1200    # a verdict or a refutation's argument

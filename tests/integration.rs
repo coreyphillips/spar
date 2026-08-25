@@ -1106,3 +1106,82 @@ fn a_model_outside_the_hint_list_is_still_accepted() {
         cfg.spec("a").unwrap().model.as_deref()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Upgrading a config that already exists
+// ---------------------------------------------------------------------------
+
+/// `spar init` will not touch an existing config, so without this a release
+/// that adds a setting is invisible to anyone already using spar.
+#[test]
+fn init_update_appends_new_settings_without_touching_the_old_ones() {
+    let dir = unique("initupdate");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("spar.toml");
+    let original = "# my own comment, kept\n[agents.a]\ncommand = [\"/bin/echo\"]\n\
+                    [agents.b]\ncommand = [\"/bin/cat\"]\n\n[loop]\nmax_rounds = 7\n";
+    std::fs::write(&out, original).unwrap();
+
+    let (ok, stdout, _) = spar(&["init", "--out", out.to_str().unwrap(), "--update"], &dir);
+    assert!(ok, "{stdout}");
+
+    let after = std::fs::read_to_string(&out).unwrap();
+    assert!(after.starts_with(original), "existing content was rewritten:\n{after}");
+    assert!(after.contains("# my own comment, kept"));
+    assert!(after.contains("max_rounds = 7"), "a set value must survive untouched");
+    // The appended settings are commented, so nothing takes effect by surprise.
+    assert!(after.contains("# followups ="), "{after}");
+    assert!(after.contains("# pr_comments ="), "{after}");
+
+    // Still parses, and the value the user set still wins.
+    let cfg = spar::config::load(Some(&out)).unwrap();
+    assert_eq!(7, cfg.loop_cfg.max_rounds);
+
+    // Idempotent: a second run has nothing to add.
+    let (ok, stdout, _) = spar(&["init", "--out", out.to_str().unwrap(), "--update"], &dir);
+    assert!(ok);
+    assert!(stdout.contains("already mentions every setting"), "{stdout}");
+    assert_eq!(after, std::fs::read_to_string(&out).unwrap(), "second run changed the file");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_update_refuses_to_lengthen_a_broken_config() {
+    let dir = unique("initupdatebroken");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("spar.toml");
+    std::fs::write(&out, "[agents.a]\nthis is not toml\n").unwrap();
+    let before = std::fs::read_to_string(&out).unwrap();
+
+    let (ok, _, err) = spar(&["init", "--out", out.to_str().unwrap(), "--update"], &dir);
+    assert!(!ok);
+    assert!(err.contains("does not parse"), "{err}");
+    assert_eq!(before, std::fs::read_to_string(&out).unwrap(), "it wrote anyway");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn doctor_names_the_settings_a_config_has_never_heard_of() {
+    let dir = unique("doctorunset");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("spar.toml");
+    std::fs::write(
+        &out,
+        "[agents.a]\ncommand = [\"/bin/echo\"]\n[agents.b]\ncommand = [\"/bin/cat\"]\n",
+    )
+    .unwrap();
+
+    let (_, stdout, _) = spar(&["doctor", "--config", out.to_str().unwrap()], &dir);
+    assert!(stdout.contains("does not mention"), "{stdout}");
+    assert!(stdout.contains("pr_comments"), "{stdout}");
+    assert!(stdout.contains("init --update"), "it should say how to fix it:\n{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The example config is the one file that should already mention everything.
+#[test]
+fn the_example_config_mentions_every_setting() {
+    let unset = spar::config::unmentioned_options(EXAMPLE_CONFIG);
+    let names: Vec<String> = unset.iter().map(|o| o.key.clone()).collect();
+    assert!(names.is_empty(), "spar.example.toml never mentions: {names:?}");
+}

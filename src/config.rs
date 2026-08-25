@@ -630,6 +630,61 @@ fn build_spec(name: &str, raw: &Value) -> Result<AgentSpec> {
 // Loading
 // ---------------------------------------------------------------------------
 
+/// One option the parser accepts, with the value it takes when unset.
+#[derive(Debug, Clone)]
+pub struct OptionInfo {
+    pub section: &'static str,
+    pub key: String,
+    pub default: String,
+}
+
+/// Every option a config file may set, with its default.
+///
+/// Derived from the defaults themselves rather than written out by hand, so an
+/// option added to the code cannot go missing here. That is what lets `doctor`
+/// tell somebody upgrading which settings are new since they wrote their file.
+pub fn known_options() -> Vec<OptionInfo> {
+    fn lines<T: Serialize>(section: &'static str, value: &T) -> Vec<OptionInfo> {
+        toml::to_string(value)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.split_once(" = "))
+            .map(|(key, default)| OptionInfo {
+                section,
+                key: key.trim().to_string(),
+                default: default.trim().to_string(),
+            })
+            .collect()
+    }
+    let mut out = lines("loop", &LoopCfg::default());
+    out.extend(lines("style", &StyleCfg::default()));
+    out.extend(lines(
+        "loop.effort_schedule",
+        &EffortSchedule {
+            round_1: Some("high".into()),
+            rest: Some("low".into()),
+        },
+    ));
+    out
+}
+
+/// Whether a config file mentions an option at all, set or commented out.
+pub fn mentions(config_text: &str, key: &str) -> bool {
+    config_text.lines().any(|line| {
+        let bare = line.trim_start().trim_start_matches('#').trim_start();
+        bare.starts_with(&format!("{key} ")) || bare.starts_with(&format!("{key}="))
+    })
+}
+
+/// Options this config file has never heard of, which is what somebody who
+/// upgraded wants to know.
+pub fn unmentioned_options(config_text: &str) -> Vec<OptionInfo> {
+    known_options()
+        .into_iter()
+        .filter(|o| !mentions(config_text, &o.key))
+        .collect()
+}
+
 pub const CONFIG_NAMES: &[&str] = &["spar.toml", ".spar.toml"];
 
 /// Find a config: an explicit path, then the working directory, then

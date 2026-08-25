@@ -444,9 +444,17 @@ fn finish(
     }
 
     let comment = verdict_comment(judged, &repo.style);
-    if dry_run {
+    // `pr_comments = "none"` promises spar will not comment on a pull request.
+    // Review mode used to post regardless, which made the promise false and left
+    // --dry-run as the only way to keep it.
+    let silent = dry_run || repo.style.pr_comments == crate::config::PrComments::None;
+    if silent {
         println!("\n{comment}\n");
-        log!("dry run, nothing posted to PR #{}", pr.number);
+        if dry_run {
+            log!("dry run, nothing posted to PR #{}", pr.number);
+        } else {
+            log!("pr_comments is none, review printed rather than posted");
+        }
         return Ok(());
     }
     match repo.comment_pr(pr.number, &comment) {

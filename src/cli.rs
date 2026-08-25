@@ -103,12 +103,19 @@ pub enum Command {
     },
 
     /// Detect installed agent CLIs and write a spar.toml.
+    ///
+    /// On an existing config, `--update` appends any settings it does not
+    /// mention, which is how to pick up options added by a newer release.
     Init {
         #[arg(long, default_value = "spar.toml")]
         out: PathBuf,
         /// Overwrite an existing config.
         #[arg(long)]
         force: bool,
+        /// Append settings the existing config does not mention, as comments.
+        /// Nothing already in the file is changed.
+        #[arg(long, conflicts_with = "force")]
+        update: bool,
     },
 
     /// Remove worktrees, branches, and state whose PR is merged or closed.
@@ -258,7 +265,13 @@ fn dispatch(cli: Cli) -> Result<i32> {
             Ok(report(&results, &cfg))
         }
 
-        Command::Init { out, force } => cmd_init(&out, force),
+        Command::Init { out, force, update } => {
+            if update {
+                cmd_init_update(&out)
+            } else {
+                cmd_init(&out, force)
+            }
+        }
         Command::Clean {
             repo,
             config,
@@ -720,10 +733,59 @@ fn cmd_clean(
     Ok(0)
 }
 
+/// Append the settings a config does not mention, commented out.
+///
+/// Append only by design. Rewriting somebody's config to insert options would
+/// take their comments and their ordering with it, and `--force` already exists
+/// for anyone who wants the generated file back.
+fn cmd_init_update(out: &Path) -> Result<i32> {
+    let text = std::fs::read_to_string(out)
+        .map_err(|e| spar_err!("could not read {}: {e}", out.display()))?;
+    // Refuse to append to something that does not parse, rather than making a
+    // broken config longer.
+    config::parse(&text).map_err(|e| spar_err!("{} does not parse: {e}", out.display()))?;
+
+    let unset = config::unmentioned_options(&text);
+    if unset.is_empty() {
+        println!("{} already mentions every setting.", out.display());
+        return Ok(0);
+    }
+
+    let mut block = String::new();
+    if !text.ends_with('\n') {
+        block.push('\n');
+    }
+    block.push_str("\n# Added by `spar init --update`: settings this file did not mention,\n");
+    block.push_str("# shown at their defaults. Uncomment one to change it.\n");
+    let mut section = "";
+    for option in &unset {
+        if option.section != section {
+            section = option.section;
+            block.push_str(&format!("# [{section}]\n"));
+        }
+        block.push_str(&format!("# {} = {}\n", option.key, option.default));
+    }
+
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(out)
+        .and_then(|mut f| f.write_all(block.as_bytes()))
+        .map_err(|e| spar_err!("could not append to {}: {e}", out.display()))?;
+
+    println!(
+        "added {} setting(s) to {} as comments",
+        unset.len(),
+        out.display()
+    );
+    Ok(0)
+}
+
 fn cmd_init(out: &Path, force: bool) -> Result<i32> {
     if out.exists() && !force {
         logging::error(format!(
-            "{} already exists, pass --force to overwrite",
+            "{} already exists. `--update` appends any settings it does not mention, \
+             `--force` overwrites it.",
             out.display()
         ));
         return Ok(1);
@@ -1013,6 +1075,29 @@ fn cmd_doctor(config_path: Option<&Path>) -> Result<i32> {
         cfg.loop_cfg.followups,
         cfg.style.terse
     );
+    // What somebody upgrading wants to know. `spar init` refuses to touch an
+    // existing config, so without this there is no way to learn that a release
+    // added a setting short of reading the source.
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let unset = config::unmentioned_options(&text);
+        if !unset.is_empty() {
+            println!(
+                "\n  {} setting(s) this config does not mention, all at their defaults:",
+                unset.len()
+            );
+            for option in &unset {
+                println!(
+                    "      [{}] {} = {}",
+                    option.section, option.key, option.default
+                );
+            }
+            println!(
+                "  `spar init --update {}` appends them as comments.",
+                path.display()
+            );
+        }
+    }
+
     println!(
         "{}",
         if ok {

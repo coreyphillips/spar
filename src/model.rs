@@ -320,6 +320,67 @@ pub struct Finding {
     /// rather than review comments, so they cannot gate an unrelated merge.
     #[serde(default = "yes", deserialize_with = "de_bool_default_true")]
     pub in_scope: bool,
+
+    // -- the parts of a bug report ---------------------------------------
+    //
+    // Filled when a finding is going to become an issue somebody picks up
+    // cold. `detail` is the one line the pull request thread shows; these are
+    // what a person needs when the thread is not in front of them. All
+    // optional: a finding that stays in the thread has no use for them.
+    /// What is wrong, with the specifics.
+    #[serde(default)]
+    pub problem: Option<String>,
+    /// Steps to reproduce it, and what actually happens.
+    #[serde(default)]
+    pub reproduction: Option<String>,
+    /// What it costs somebody.
+    #[serde(default)]
+    pub impact: Option<String>,
+    /// What it should do instead.
+    #[serde(default)]
+    pub expected: Option<String>,
+}
+
+impl Default for Finding {
+    /// A blank finding, for building one field at a time.
+    ///
+    /// Severity is spelled out here rather than derived, because a severity
+    /// arriving by default is exactly the mistake this codebase refuses
+    /// elsewhere: it is the field that decides whether a merge is gated, and
+    /// the least severe value is the only safe thing to assume.
+    fn default() -> Self {
+        Self {
+            severity: Severity::Nit,
+            title: String::new(),
+            detail: String::new(),
+            file: String::new(),
+            in_scope: true,
+            problem: None,
+            reproduction: None,
+            impact: None,
+            expected: None,
+        }
+    }
+}
+
+impl Finding {
+    /// The parts of a bug report this finding carries, in the order they are
+    /// written, skipping the ones it does not.
+    pub fn report_sections(&self) -> Vec<(&'static str, &str)> {
+        [
+            ("Problem", self.problem.as_deref()),
+            ("Reproduction", self.reproduction.as_deref()),
+            ("Impact", self.impact.as_deref()),
+            ("Expected behavior", self.expected.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(heading, text)| {
+            text.map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(|t| (heading, t))
+        })
+        .collect()
+    }
 }
 
 fn yes() -> bool {

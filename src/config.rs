@@ -367,16 +367,16 @@ fn outcome_only() -> PrComments {
 }
 
 fn d320() -> usize {
-    2000
+    6000
 }
 fn d200() -> usize {
-    1200
-}
-fn d900() -> usize {
     2000
 }
-fn d4000() -> usize {
+fn d900() -> usize {
     8000
+}
+fn d4000() -> usize {
+    20000
 }
 fn d90() -> usize {
     140
@@ -388,10 +388,10 @@ impl Default for StyleCfg {
             ban_em_dash: true,
             ban_ai_attribution: true,
             terse: true,
-            max_detail_chars: 2000,
-            max_summary_chars: 1200,
-            max_body_chars: 2000,
-            max_issue_body_chars: 8000,
+            max_detail_chars: 6000,
+            max_summary_chars: 2000,
+            max_body_chars: 8000,
+            max_issue_body_chars: 20000,
             max_title_chars: 140,
             pr_comments: PrComments::Outcome,
         }

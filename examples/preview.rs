@@ -24,6 +24,7 @@ fn finding(severity: &str, title: &str, detail: &str, file: &str, in_scope: bool
         detail: detail.into(),
         file: file.into(),
         in_scope,
+        ..Default::default()
     }
 }
 

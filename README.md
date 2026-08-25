@@ -357,6 +357,30 @@ Set `pr_comments = "rounds"` for a comment per review and per response, which is
 an audit trail at the cost of a thread nobody wants to read, or `"none"` to keep
 GitHub out of it entirely.
 
+**A filed issue is written as a bug report.** The agents are asked for the parts
+of one separately, and spar assembles them under headings, skipping any that do
+not apply:
+
+```markdown
+## Problem
+What is wrong, with the specifics: the function, the call it does not make.
+
+## Reproduction
+Numbered steps, then an Actual result list. If part of what happens is correct
+and only part is the defect, which.
+
+## Impact
+What an operator or a user can do, or loses, because of this.
+
+## Expected behavior
+Requirements specific enough to implement and to test.
+
+Found while working on #400.
+```
+
+A finding that stays in the pull request thread carries none of that and is just
+its one line, so nothing sprouts empty headings for the sake of a format.
+
 **A filed issue is not a comment, and is not held to a comment's budget.** A
 comment is read with the diff in front of you; an issue is picked up cold, months
 later, by somebody who was not there. So issues get `max_issue_body_chars`,

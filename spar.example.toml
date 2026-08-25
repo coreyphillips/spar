@@ -138,10 +138,10 @@ pr_comments        = "outcome"
                              # equivalent of `spar review --dry-run`.
 max_title_chars    = 140     # a finding, issue, or PR title. Never ellipsised:
                              # a title ending in "..." reads as broken.
-max_summary_chars  = 1200    # a verdict or a refutation's argument
-max_detail_chars   = 2000    # a blocking finding's explanation, in the thread
-max_body_chars     = 2000    # a PR body
-max_issue_body_chars = 8000  # a filed issue's body. Far larger on purpose: a
+max_summary_chars  = 2000    # a verdict or a refutation's argument
+max_detail_chars   = 6000    # a blocking finding's explanation, in the thread
+max_body_chars     = 8000    # a PR body
+max_issue_body_chars = 20000 # a filed issue's body. Far larger on purpose: a
                              # comment is read with the diff in front of you,
                              # an issue is picked up cold months later. Fenced
                              # code blocks are never truncated and never count

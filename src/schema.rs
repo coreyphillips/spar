@@ -133,7 +133,7 @@ pub fn response() -> Value {
                         },
                         "new_issue_body": {
                             "type": ["string", "null"],
-                            "description": "Only for filed_issue, null otherwise. This becomes the issue body, so write what somebody picking it up months from now needs and nobody will be there to ask: what goes wrong, how to reproduce it, the file and line, and what would fix it. A fenced code block is welcome and is never truncated."
+                            "description": "Only for filed_issue, null otherwise. This becomes an issue body somebody picks up cold, so use these markdown sections, skipping any that do not apply: `## Problem` with the specifics, `## Reproduction` with numbered steps and an Actual result list, `## Impact` with what it costs somebody, and `## Expected behavior` as requirements specific enough to implement and to test. Substance rather than length: no preamble, no restating the title. A fenced code block is welcome and is never truncated."
                         }
                     },
                     "required": ["title", "file", "action", "reasoning", "new_issue_title", "new_issue_body"]

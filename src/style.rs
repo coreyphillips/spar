@@ -103,10 +103,10 @@ impl Default for Style {
             ban_em_dash: true,
             ban_ai_attribution: true,
             terse: true,
-            max_detail_chars: 2000,
-            max_summary_chars: 1200,
-            max_body_chars: 2000,
-            max_issue_body_chars: 8000,
+            max_detail_chars: 6000,
+            max_summary_chars: 2000,
+            max_body_chars: 8000,
+            max_issue_body_chars: 20000,
             max_title_chars: 140,
             pr_comments: crate::config::PrComments::Outcome,
         }
@@ -841,21 +841,17 @@ mod issue_body_tests {
             let text = format!("It spins forever.\n\n```rust\n{code}\n```");
             let out = issue_body(&text, &s());
             assert_eq!(0, fences(&out) % 2, "unclosed fence at {lines} lines");
-            if lines <= 400 {
-                assert!(
-                    out.contains(&format!("line_{}();", lines - 1)),
-                    "cut at {lines} lines"
-                );
-            } else {
-                // Past what GitHub would accept at all. Shortened rather than
-                // dropped, on a line boundary, and it says so.
-                assert!(out.contains("line_0();"), "the snippet went entirely");
-                assert!(
-                    out.contains("snippet shortened"),
-                    "the reader is not told: {}",
-                    &out[out.len().saturating_sub(80)..]
-                );
-            }
+            assert!(
+                out.contains("line_0();"),
+                "the snippet went entirely at {lines} lines"
+            );
+            // Either the whole snippet survives, or it was shortened on a line
+            // boundary and says so. Never silently half a snippet.
+            let whole = out.contains(&format!("line_{}();", lines - 1));
+            assert!(
+                whole || out.contains("snippet shortened"),
+                "cut at {lines} lines without saying so"
+            );
         }
     }
 

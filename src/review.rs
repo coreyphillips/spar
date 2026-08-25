@@ -861,11 +861,38 @@ fn file_out_of_scope(
     cfg: &Config,
 ) {
     for finding in findings.iter().filter(|f| !f.in_scope) {
-        if let Some(url) = file_followup(repo, &finding.title, &finding.detail, subject, cfg, state)
-        {
+        let body = issue_report(finding);
+        if let Some(url) = file_followup(repo, &finding.title, &body, subject, cfg, state) {
             state.filed.push(url);
         }
     }
+}
+
+/// A finding written as a bug report, when it carries the parts of one.
+///
+/// The thread gets one line; an issue gets the whole thing under headings, in
+/// the order somebody reads a bug report: what is wrong, how to see it, what it
+/// costs, what it should do instead. A finding with none of those falls back to
+/// its detail, which is every finding that was never going to be filed.
+pub fn issue_report(finding: &Finding) -> String {
+    let sections = finding.report_sections();
+    if sections.is_empty() {
+        return finding.detail.clone();
+    }
+    let mut out: Vec<String> = sections
+        .iter()
+        .map(|(heading, text)| format!("## {heading}\n\n{text}"))
+        .collect();
+    // Keep the one line summary when it says something the sections do not,
+    // rather than dropping it or repeating it.
+    if !finding.detail.trim().is_empty()
+        && !sections
+            .iter()
+            .any(|(_, text)| crate::textsim::same_point(text, &finding.detail))
+    {
+        out.insert(0, finding.detail.trim().to_string());
+    }
+    out.join("\n\n")
 }
 
 /// Non-blocking findings become follow-ups so they do not gate the merge.
@@ -1285,6 +1312,7 @@ mod tests {
             detail: detail.into(),
             file: file.into(),
             in_scope,
+            ..Default::default()
         }
     }
 
@@ -1558,7 +1586,11 @@ mod tests {
             &review(&long, vec![finding("blocking", "T", &long, "a.rs", true)]),
             &style(),
         );
-        assert!(text.len() < 8000, "review comment was {} chars", text.len());
+        assert!(
+            text.len() < 30_000,
+            "review comment was {} chars",
+            text.len()
+        );
     }
 
     #[test]
@@ -1729,6 +1761,7 @@ mod outcome_tests {
             detail: "d".into(),
             file: file.into(),
             in_scope: true,
+            ..Default::default()
         }
     }
 
@@ -1905,6 +1938,7 @@ mod followup_restraint_tests {
             detail: "d".into(),
             file: "a.rs".into(),
             in_scope,
+            ..Default::default()
         }
     }
 
@@ -1984,5 +2018,134 @@ mod followup_restraint_tests {
             cfg.loop_cfg.max_followups <= 5,
             "a run that can file ten follow-ups is a branching process"
         );
+    }
+}
+
+#[cfg(test)]
+mod issue_report_tests {
+    use super::*;
+    use crate::model::Severity;
+
+    /// Shaped after a bug report written by hand that reads the way one should:
+    /// what is wrong, how to see it, what it costs, what it should do instead.
+    fn reported() -> Finding {
+        Finding {
+            severity: Severity::Blocking,
+            title: "sendPaymentAsync bypasses drain mode and spending limits".into(),
+            detail: "The async path skips every admission check payInvoice applies.".into(),
+            file: "src/node.ts:412".into(),
+            in_scope: false,
+            problem: Some(
+                "`BeignetNode.sendPaymentAsync()` submits a payment directly to the Lightning \
+                 engine without applying the safeguards used by `payInvoice()`.\n\nThe async path \
+                 does not:\n\n- call `_checkDraining()`\n- call `_checkSpendLimit()`"
+                    .into(),
+            ),
+            reproduction: Some(
+                "1. Create a `BeignetNode` with `dailySpendLimitSats: 1`.\n2. Enable drain mode.\n\
+                 3. Submit a 1,000 sat invoice.\n\nActual result:\n\n- The engine is called.\n\
+                 - `spentSats` remains 0."
+                    .into(),
+            ),
+            impact: Some(
+                "An authorized client can submit async payments up to the available outbound \
+                 liquidity despite the configured limits."
+                    .into(),
+            ),
+            expected: Some(
+                "- Reject new payments while draining.\n- Enforce the per-payment limit before \
+                 submission.\n- Cover both paths with regression tests.\n\nThis predates the \
+                 current branch."
+                    .into(),
+            ),
+        }
+    }
+
+    #[test]
+    fn a_reported_finding_becomes_a_bug_report() {
+        let body = issue_report(&reported());
+        for heading in [
+            "## Problem",
+            "## Reproduction",
+            "## Impact",
+            "## Expected behavior",
+        ] {
+            assert!(body.contains(heading), "missing {heading}:\n{body}");
+        }
+        // In the order somebody reads a bug report.
+        let at = |h: &str| body.find(h).unwrap();
+        assert!(at("## Problem") < at("## Reproduction"));
+        assert!(at("## Reproduction") < at("## Impact"));
+        assert!(at("## Impact") < at("## Expected behavior"));
+    }
+
+    #[test]
+    fn the_substance_survives_the_outbound_gates() {
+        let repo_style = Style::default();
+        let body = crate::style::issue_body(&issue_report(&reported()), &repo_style);
+        for kept in [
+            "_checkDraining()",
+            "Actual result:",
+            "outbound liquidity",
+            "regression tests",
+            "predates the current branch",
+        ] {
+            assert!(body.contains(kept), "the gate ate {kept:?}:\n{body}");
+        }
+        assert!(!body.contains("..."), "something was cut:\n{body}");
+    }
+
+    /// A finding that was never going to be filed carries none of this, and
+    /// must not gain empty headings for the sake of a format.
+    #[test]
+    fn an_ordinary_finding_is_still_just_its_detail() {
+        let plain = Finding {
+            severity: Severity::NonBlocking,
+            title: "Name is vague".into(),
+            detail: "The variable could say what it holds.".into(),
+            file: "a.rs".into(),
+            in_scope: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            "The variable could say what it holds.",
+            issue_report(&plain)
+        );
+    }
+
+    /// Partial reports are normal: a defect with no useful reproduction should
+    /// not sprout an empty Reproduction heading.
+    #[test]
+    fn only_the_sections_that_were_written_appear() {
+        let partial = Finding {
+            problem: Some("The guard is inverted.".into()),
+            expected: Some("It should reject rather than accept.".into()),
+            ..reported()
+        };
+        let partial = Finding {
+            reproduction: None,
+            impact: None,
+            ..partial
+        };
+        let body = issue_report(&partial);
+        assert!(body.contains("## Problem") && body.contains("## Expected behavior"));
+        assert!(!body.contains("## Reproduction"), "{body}");
+        assert!(!body.contains("## Impact"), "{body}");
+    }
+
+    /// The one line the thread shows is not repeated when a section already
+    /// says it.
+    #[test]
+    fn the_summary_line_is_not_printed_twice() {
+        let echoed = Finding {
+            detail: "The guard is inverted so it rejects valid input.".into(),
+            problem: Some("The guard is inverted so it rejects valid input.".into()),
+            reproduction: None,
+            impact: None,
+            expected: None,
+            ..reported()
+        };
+        let body = issue_report(&echoed);
+        assert_eq!(1, body.matches("The guard is inverted").count(), "{body}");
     }
 }

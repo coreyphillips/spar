@@ -680,6 +680,7 @@ mod tests {
             detail: "why it matters".into(),
             file: file.into(),
             in_scope: true,
+            ..Default::default()
         }
     }
 
@@ -926,7 +927,7 @@ mod tests {
         let mut j = judged(Standing::Corroborated, "blocking", "A real problem");
         j.finding.detail = "filler ".repeat(20_000);
         let text = verdict_comment(&[j], &Style::default());
-        assert!(text.len() < 6000, "{} chars", text.len());
+        assert!(text.len() < 20_000, "{} chars", text.len());
     }
 
     #[test]

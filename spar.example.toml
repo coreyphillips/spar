@@ -111,4 +111,10 @@ pr_comments        = "outcome"
 max_title_chars    = 90      # a finding, issue, or PR title
 max_summary_chars  = 200     # a one-line verdict or refutation
 max_detail_chars   = 320     # a blocking finding's explanation, in the thread
-max_body_chars     = 900     # a filed issue's body
+max_body_chars     = 900     # a PR body
+max_issue_body_chars = 4000  # a filed issue's body. Far larger on purpose: a
+                             # comment is read with the diff in front of you,
+                             # an issue is picked up cold months later. Fenced
+                             # code blocks are never truncated and never count
+                             # against this at all, so steps to reproduce and
+                             # the offending snippet always survive.

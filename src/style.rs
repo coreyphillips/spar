@@ -80,8 +80,10 @@ pub struct Style {
     pub max_detail_chars: usize,
     /// A one-line verdict or disposition summary.
     pub max_summary_chars: usize,
-    /// A filed issue's body, or a PR body.
+    /// A PR body.
     pub max_body_chars: usize,
+    /// A filed issue's body.
+    pub max_issue_body_chars: usize,
     /// A finding title, issue title, or PR title.
     pub max_title_chars: usize,
     /// How much of its own working spar narrates into a pull request thread.
@@ -97,6 +99,7 @@ impl Default for Style {
             max_detail_chars: 320,
             max_summary_chars: 200,
             max_body_chars: 900,
+            max_issue_body_chars: 4000,
             max_title_chars: 90,
             pr_comments: crate::config::PrComments::Outcome,
         }
@@ -278,6 +281,111 @@ pub fn tighten(text: &str, max: usize, style: &Style) -> String {
         return text.trim().to_string();
     }
     clip(&strip_empty_sections(text), max)
+}
+
+/// A filed issue's body.
+///
+/// An issue is a work item. Somebody picks it up cold, possibly months later,
+/// with none of the context the pull request thread had, so the rules that keep
+/// a comment short are the wrong rules here. Two things follow.
+///
+/// A fenced code block is never truncated and never counts against the budget.
+/// A snippet cut in half is worse than useless: it is broken markdown and a
+/// misleading fragment of code. Steps to reproduce, a stack trace, the offending
+/// function: those are the reason the issue is worth filing at all.
+///
+/// And when prose does have to be dropped, whole blocks go from the end rather
+/// than a sentence being cut mid-word. What survives is complete.
+pub fn issue_body(text: &str, style: &Style) -> String {
+    if !style.terse {
+        return text.trim().to_string();
+    }
+    let cleaned = strip_empty_sections(text);
+    let blocks = split_blocks(&cleaned);
+
+    // A runaway model pasting an entire file is still worth stopping, so code
+    // is exempt from the prose budget but not from a far looser ceiling.
+    let ceiling = style.max_issue_body_chars.saturating_mul(4);
+
+    let mut kept: Vec<&Block> = Vec::new();
+    let mut prose = 0usize;
+    let mut total = 0usize;
+    for block in &blocks {
+        let len = block.text.chars().count();
+        let over_prose = !block.code && prose + len > style.max_issue_body_chars;
+        let over_ceiling = total + len > ceiling;
+        if (over_prose || over_ceiling) && !kept.is_empty() {
+            break;
+        }
+        if !block.code {
+            prose += len;
+        }
+        total += len;
+        kept.push(block);
+    }
+
+    kept.iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+        .trim()
+        .to_string()
+}
+
+struct Block {
+    text: String,
+    code: bool,
+}
+
+/// Split into paragraphs, keeping every fenced code block whole however many
+/// blank lines it contains.
+fn split_blocks(text: &str) -> Vec<Block> {
+    let mut blocks = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    let mut in_fence = false;
+    let mut fence_block = false;
+
+    let flush = |lines: &mut Vec<&str>, code: bool, out: &mut Vec<Block>| {
+        let joined = lines.join("\n");
+        if !joined.trim().is_empty() {
+            out.push(Block {
+                text: joined.trim_end().to_string(),
+                code,
+            });
+        }
+        lines.clear();
+    };
+
+    for line in text.lines() {
+        let fence = line.trim_start().starts_with("```");
+        if fence {
+            if in_fence {
+                current.push(line);
+                in_fence = false;
+                flush(&mut current, true, &mut blocks);
+                fence_block = false;
+                continue;
+            }
+            // A fence starts here, so whatever came before is its own block.
+            flush(&mut current, false, &mut blocks);
+            in_fence = true;
+            fence_block = true;
+            current.push(line);
+            continue;
+        }
+        if in_fence {
+            current.push(line);
+            continue;
+        }
+        if line.trim().is_empty() {
+            flush(&mut current, false, &mut blocks);
+        } else {
+            current.push(line);
+        }
+    }
+    // An unterminated fence is still kept whole rather than split.
+    flush(&mut current, fence_block, &mut blocks);
+    blocks
 }
 
 /// A finding title, issue title, or PR title: always one line, always short.
@@ -606,5 +714,146 @@ mod sentence_tests {
     #[test]
     fn a_multibyte_first_character_does_not_panic() {
         assert_eq!("Ärger", sentence("ärger", &Style::default()));
+    }
+}
+
+#[cfg(test)]
+mod issue_body_tests {
+    use super::*;
+
+    fn s() -> Style {
+        Style::default()
+    }
+
+    fn fences(text: &str) -> usize {
+        text.lines()
+            .filter(|l| l.trim_start().starts_with("```"))
+            .count()
+    }
+
+    /// The whole point. A snippet cut in half is broken markdown and a
+    /// misleading fragment of the code somebody is being asked to fix.
+    #[test]
+    fn a_code_block_is_never_truncated() {
+        let code = (0..400)
+            .map(|n| format!("    line_{n}();"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!("It spins forever.\n\n```rust\n{code}\n```\n\nThat is the loop.");
+        let out = issue_body(&text, &s());
+
+        assert!(
+            out.contains("line_0();") && out.contains("line_399();"),
+            "the block was cut"
+        );
+        assert_eq!(0, fences(&out) % 2, "left an unclosed fence:\n{out}");
+    }
+
+    /// Why there are two functions rather than one budget. The comment path
+    /// cuts wherever the character count runs out, which on a snippet means an
+    /// unclosed fence and a misleading half of the code.
+    #[test]
+    fn the_comment_budget_would_have_mangled_the_same_snippet() {
+        let code = (0..400)
+            .map(|n| format!("    line_{n}();"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!("It spins forever.\n\n```rust\n{code}\n```");
+
+        let as_comment = body(&text, &s());
+        assert_ne!(0, fences(&as_comment) % 2, "a comment cuts the fence open");
+
+        let as_issue = issue_body(&text, &s());
+        assert_eq!(0, fences(&as_issue) % 2, "an issue keeps it closed");
+    }
+
+    /// Code is exempt from the budget, so a long snippet cannot squeeze out the
+    /// prose that explains it.
+    #[test]
+    fn a_long_snippet_does_not_evict_the_explanation() {
+        let code = "x();\n".repeat(1500);
+        let text = format!(
+            "Reproduction:\n\n1. Call connect twice.\n2. Watch the retry count.\n\n```\n{code}```\n\nSuggested fix: bound the loop."
+        );
+        let out = issue_body(&text, &s());
+        assert!(out.contains("Call connect twice"), "{out}");
+        assert!(out.contains("Suggested fix"), "the tail survived");
+    }
+
+    #[test]
+    fn steps_to_reproduce_survive_intact() {
+        let text = "The retry never fires.\n\n1. Start the daemon.\n2. Kill the peer.\n3. Observe connectedToElectrum stays true.\n\nsrc/electrum/index.ts:289 is where the guard is.";
+        assert_eq!(text, issue_body(text, &s()));
+    }
+
+    #[test]
+    fn a_body_within_budget_is_untouched() {
+        let text = "One paragraph.\n\nAnd another.";
+        assert_eq!(text, issue_body(text, &s()));
+    }
+
+    /// When prose does have to go, whole blocks go from the end. Nothing is cut
+    /// mid-sentence and nothing gains an ellipsis.
+    #[test]
+    fn overlong_prose_drops_whole_blocks_from_the_end() {
+        let para = |n: usize| format!("Paragraph {n}. {}", "filler words here. ".repeat(30));
+        let text = (0..20).map(para).collect::<Vec<_>>().join("\n\n");
+        let out = issue_body(&text, &s());
+
+        assert!(out.starts_with("Paragraph 0."), "{out}");
+        assert!(!out.contains("..."), "no mid-sentence cut: {out}");
+        assert!(
+            out.trim_end().ends_with('.'),
+            "ends on a complete block: {out}"
+        );
+        assert!(
+            out.chars().count() <= s().max_issue_body_chars + 400,
+            "{}",
+            out.chars().count()
+        );
+    }
+
+    /// An issue gets far more room than a pull request comment, because it is
+    /// read cold by somebody with none of the context.
+    #[test]
+    fn an_issue_gets_much_more_room_than_a_comment() {
+        let text = "word ".repeat(500);
+        assert!(issue_body(&text, &s()).len() > body(&text, &s()).len() * 2);
+    }
+
+    #[test]
+    fn a_single_block_over_budget_is_kept_rather_than_mangled() {
+        let text = format!("```\n{}\n```", "y();\n".repeat(3000));
+        let out = issue_body(&text, &s());
+        assert!(!out.is_empty());
+        assert_eq!(0, fences(&out) % 2, "{}", &out[..80.min(out.len())]);
+    }
+
+    #[test]
+    fn an_unterminated_fence_is_still_kept_whole() {
+        let text = "Here is the code:\n\n```rust\nfn broken() {\n    loop {}";
+        let out = issue_body(text, &s());
+        assert!(out.contains("fn broken()"), "{out}");
+    }
+
+    #[test]
+    fn terse_off_leaves_an_issue_body_completely_alone() {
+        let loose = Style {
+            terse: false,
+            ..s()
+        };
+        let text = "a".repeat(50_000);
+        assert_eq!(text, issue_body(&text, &loose));
+    }
+
+    #[test]
+    fn issue_body_is_idempotent() {
+        let text = format!(
+            "Explanation.\n\n```\n{}\n```\n\n{}",
+            "z();\n".repeat(50),
+            "more prose. ".repeat(600)
+        );
+        let once = issue_body(&text, &s());
+        assert_eq!(once, issue_body(&once, &s()));
     }
 }

@@ -323,6 +323,11 @@ pub struct StyleCfg {
     pub max_summary_chars: usize,
     #[serde(default = "d900")]
     pub max_body_chars: usize,
+    /// A filed issue's body. Far larger than a PR comment's on purpose: a
+    /// comment is read with the diff in front of you, an issue is picked up
+    /// cold months later by somebody who needs the whole story.
+    #[serde(default = "d4000")]
+    pub max_issue_body_chars: usize,
     #[serde(default = "d90")]
     pub max_title_chars: usize,
     #[serde(default = "outcome_only")]
@@ -342,6 +347,9 @@ fn d200() -> usize {
 fn d900() -> usize {
     900
 }
+fn d4000() -> usize {
+    4000
+}
 fn d90() -> usize {
     90
 }
@@ -355,6 +363,7 @@ impl Default for StyleCfg {
             max_detail_chars: 320,
             max_summary_chars: 200,
             max_body_chars: 900,
+            max_issue_body_chars: 4000,
             max_title_chars: 90,
             pr_comments: PrComments::Outcome,
         }
@@ -370,6 +379,7 @@ impl StyleCfg {
             max_detail_chars: self.max_detail_chars,
             max_summary_chars: self.max_summary_chars,
             max_body_chars: self.max_body_chars,
+            max_issue_body_chars: self.max_issue_body_chars,
             max_title_chars: self.max_title_chars,
             pr_comments: self.pr_comments,
         }

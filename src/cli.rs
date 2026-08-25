@@ -806,7 +806,9 @@ fn cmd_init(out: &Path, force: bool) -> Result<i32> {
          # max_title_chars   = 90     # a finding, issue, or PR title\n\
          # max_summary_chars = 200    # a one line verdict or refutation\n\
          # max_detail_chars  = 320    # a blocking finding, in the PR thread\n\
-         # max_body_chars    = 900    # a filed issue's body\n",
+         # max_body_chars    = 900    # a PR body\n\
+         # max_issue_body_chars = 4000 # a filed issue's body. Code blocks in\n\
+         #                               it are never truncated.\n",
         chosen[0].0
     ));
 

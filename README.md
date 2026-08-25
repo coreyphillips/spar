@@ -282,6 +282,18 @@ Set `pr_comments = "rounds"` for a comment per review and per response, which is
 an audit trail at the cost of a thread nobody wants to read, or `"none"` to keep
 GitHub out of it entirely.
 
+**A filed issue is not a comment, and is not held to a comment's budget.** A
+comment is read with the diff in front of you; an issue is picked up cold, months
+later, by somebody who was not there. So issues get `max_issue_body_chars`,
+several times a comment's allowance, and the agents are asked for what a person
+picking one up actually needs: what goes wrong, how to reproduce it, the file and
+line, and what would fix it.
+
+Fenced code blocks in an issue are **never truncated and never count against the
+budget at all**. A snippet cut in half is broken markdown and a misleading
+fragment of the code somebody is being asked to fix. When prose does have to be
+dropped, whole blocks go from the end, so what survives is complete.
+
 Budgets live in `[style]` and every one is configurable. Set `terse = false` to
 turn the whole thing off. To see exactly what spar would post, before spending a
 token on it:

@@ -787,9 +787,11 @@ fn file_followup(repo: &Repo, title: &str, body: &str, source: i64) -> Option<St
     if title.trim().is_empty() {
         return None;
     }
+    // Not style::body: that is the budget for a pull request comment, read with
+    // the diff in front of you. This is a work item somebody picks up cold.
     let body = format!(
         "{}\n\nFound while working on #{source}.",
-        style::body(body, &repo.style)
+        style::issue_body(body, &repo.style)
     );
 
     if repo.followups == Followups::Local {

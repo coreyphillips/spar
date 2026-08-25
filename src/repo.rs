@@ -135,6 +135,11 @@ impl Repo {
         self.clean(&style::body(text, &self.style))
     }
 
+    /// The same, with an issue's far larger budget and its exemption for code.
+    pub fn clean_issue_body(&self, text: &str) -> Result<String> {
+        self.clean(&style::issue_body(text, &self.style))
+    }
+
     /// The single transform every outbound title goes through.
     ///
     /// Scrub first, clip second, and never the other way round. Clipping first
@@ -766,7 +771,7 @@ impl Repo {
 
     pub fn create_issue(&self, title: &str, body: &str) -> Result<String> {
         let title = self.clean_title(title)?;
-        let body = self.clean_body(body)?;
+        let body = self.clean_issue_body(body)?;
         Ok(self
             .gh(&["issue", "create", "--title", &title, "--body", &body])?
             .trim()

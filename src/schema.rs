@@ -76,7 +76,7 @@ pub fn review() -> Value {
                         },
                         "detail": {
                             "type": "string",
-                            "description": "At most two sentences. For a blocking finding, say what you did to confirm it. No restating the title."
+                            "description": "Say what goes wrong, how to reproduce it, and where in the code. For a blocking finding, say what you did to confirm it. Do not restate the title. Lead with one sentence that stands on its own: a shortened form of this appears in the pull request thread, while the full text becomes the body if this is filed as its own issue. A fenced code block is welcome and is never truncated."
                         },
                         "file": {
                             "type": "string",
@@ -133,7 +133,7 @@ pub fn response() -> Value {
                         },
                         "new_issue_body": {
                             "type": ["string", "null"],
-                            "description": "Only for filed_issue, null otherwise. Under 600 characters."
+                            "description": "Only for filed_issue, null otherwise. This becomes the issue body, so write what somebody picking it up months from now needs and nobody will be there to ask: what goes wrong, how to reproduce it, the file and line, and what would fix it. A fenced code block is welcome and is never truncated."
                         }
                     },
                     "required": ["title", "file", "action", "reasoning", "new_issue_title", "new_issue_body"]

@@ -193,17 +193,15 @@ What comes out is sorted by how well it is attested, so a maintainer can see at 
 glance which findings carry two independent signatures:
 
 ```
-Two independent reviews: 1 blocking, 1 non-blocking, 1 disputed.
-
-A further point was raised and withdrawn on a second look, and is not listed.
+Two independent reviews.
 
 needs changing before merge
 - Retry loop never terminates when max_attempts is unset (src/net.rs:88) [both].
   Both reviewers reproduced this: the guard on line 91 compares against Some(0).
 
 the reviewers disagree, your call
-- Config loader swallows a parse error (src/config.rs:210). claude says yes; the
-  other says the caller validates against the schema first
+- Config loader swallows a parse error (src/config.rs:210). Objection: the
+  caller validates against the schema first. Answer: the validation runs after.
 ```
 
 Nothing is committed, pushed, merged, or closed. `--max-rounds` picks how far it
@@ -230,32 +228,46 @@ paragraphs where one sentence would do, and asking nicely for brevity has the
 same reliability problem as asking for no em-dashes.
 
 So spar does not forward what a model wrote. It asks for structured findings,
-composes every comment itself, and clips each field to a budget. A clean review
-is two lines:
+composes every comment itself, and clips each field to a budget. It also never
+narrates its own working: no agent names, no round numbers, no counts of things
+listed on the next line. A reader wants to know about the code, not about the
+tool. A review with work to do gives the detail only for what blocks, and lists
+the rest by title:
 
 ```
-codex round 1: no findings.
-
-The retry path is correct and the test covers the 429 case.
-```
-
-A review with work to do leads with the counts, gives the detail only for what
-blocks, and lists everything else by title because it has been filed as an issue
-where the detail can actually be acted on:
-
-```
-codex round 2: 1 blocking, 2 non-blocking.
-
 One real problem, the rest are follow-ups.
 
 blocking
 - Retry loop never terminates (src/net.rs:88). Confirmed by running the 429 test
   with max_attempts unset: it spins.
 
-non-blocking, filed as follow-ups
+non-blocking
 - Timeout is not configurable (src/net.rs)
 - Error message does not name the host (src/net.rs)
 ```
+
+spar is also quiet while it works. The agents never read the PR thread, they get
+findings through their prompts, so nothing in the loop depends on any of it being
+posted. A run leaves **one** comment, and only when it has something to say:
+
+```
+Not signed off: the last round of fixes was pushed but has not been reviewed.
+
+Raised and refuted:
+- Config loader swallows a parse error. The caller validates against the schema
+  before load_config is reached.
+
+Filed separately: #485, #486
+```
+
+A run that converged cleanly and filed nothing posts nothing at all. The absence
+of objections is the message, and the diff already records what was fixed. What
+survives is what is unrecoverable elsewhere: what is still unresolved, what was
+argued down and why, and where the follow-ups went.
+
+Set `pr_comments = "rounds"` for a comment per review and per response, which is
+an audit trail at the cost of a thread nobody wants to read, or `"none"` to keep
+GitHub out of it entirely.
 
 Budgets live in `[style]` and every one is configurable. Set `terse = false` to
 turn the whole thing off. To see exactly what spar would post, before spending a

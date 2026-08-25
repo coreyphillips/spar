@@ -250,6 +250,7 @@ fn corroborate(by_agent: &[(String, Vec<Finding>)]) -> Vec<Judged> {
                     raised_by: name.clone(),
                     standing: Standing::Unverified,
                     counterpoint: None,
+                    defence: None,
                 }),
             }
         }
@@ -407,12 +408,9 @@ fn rebut(
                 continue;
             };
             if verdict.agrees {
-                // Stands by it. Attach the evidence so a person can weigh both.
-                let defence = style::summary(&verdict.reasoning, &repo.style);
-                target.counterpoint = Some(match target.counterpoint.take() {
-                    Some(objection) => format!("{objection} | answered: {defence}"),
-                    None => defence,
-                });
+                // Stands by it. Kept separate from the objection so a person
+                // can weigh the two arguments rather than read them spliced.
+                target.defence = Some(style::sentence(&verdict.reasoning, &repo.style));
             } else {
                 target.standing = Standing::Withdrawn;
             }
@@ -513,34 +511,15 @@ pub fn verdict_comment(judged: &[Judged], style: &Style) -> String {
         .filter(|j| j.standing == Standing::Withdrawn)
         .count();
 
-    let headline = if blocking.is_empty() {
-        "nothing blocking a merge".to_string()
+    // "Two independent reviews" stays: it is the only thing that makes [both],
+    // [one reviewer only] and the disagreement heading below mean anything. The
+    // counts go, because everything they count is listed immediately after.
+    let mut out = vec![if blocking.is_empty() && disputed.is_empty() {
+        "Two independent reviews, nothing blocking a merge.".to_string()
     } else {
-        format!("{} blocking", blocking.len())
-    };
-    let mut counts = vec![headline];
-    if !non_blocking.is_empty() {
-        counts.push(format!("{} non-blocking", non_blocking.len()));
-    }
-    if !nits.is_empty() {
-        counts.push(format!("{} nit", nits.len()));
-    }
-    if !disputed.is_empty() {
-        counts.push(format!("{} disputed", disputed.len()));
-    }
-
-    let mut out = vec![format!("Two independent reviews: {}.", counts.join(", "))];
-    if withdrawn == 1 {
-        out.push(
-            "A further point was raised and withdrawn on a second look, and is not listed."
-                .to_string(),
-        );
-    } else if withdrawn > 1 {
-        out.push(format!(
-            "{withdrawn} further points were raised and withdrawn on a second look, and are \
-             not listed."
-        ));
-    }
+        "Two independent reviews.".to_string()
+    }];
+    let _ = withdrawn;
 
     let line = |j: &Judged| -> String {
         let where_at = match j.finding.where_at() {
@@ -604,13 +583,21 @@ pub fn verdict_comment(judged: &[Judged], style: &Style) -> String {
         let lines: Vec<String> = disputed
             .iter()
             .map(|j| {
-                format!(
-                    "- {} ({}). {} says yes; the other says {}",
+                let mut line = format!(
+                    "- {} ({})",
                     style::title(&j.finding.title, style),
-                    j.finding.where_at(),
-                    j.raised_by,
-                    style::summary(j.counterpoint.as_deref().unwrap_or("no"), style)
-                )
+                    j.finding.where_at()
+                );
+                if let Some(objection) = &j.counterpoint {
+                    line.push_str(&format!(
+                        ". Objection: {}",
+                        style::sentence(objection, style)
+                    ));
+                }
+                if let Some(defence) = &j.defence {
+                    line.push_str(&format!(" Answer: {}", style::sentence(defence, style)));
+                }
+                line
             })
             .collect();
         out.push(format!(
@@ -618,9 +605,7 @@ pub fn verdict_comment(judged: &[Judged], style: &Style) -> String {
             lines.join("\n")
         ));
     }
-    if blocking.is_empty() && disputed.is_empty() {
-        out.push("Both reviewers are happy for this to merge.".to_string());
-    }
+
     out.join("\n\n")
 }
 
@@ -785,6 +770,7 @@ mod tests {
             raised_by: "claude".into(),
             standing,
             counterpoint: None,
+            defence: None,
         }
     }
 
@@ -792,10 +778,9 @@ mod tests {
     fn a_clean_pr_says_so_in_one_breath() {
         let text = verdict_comment(&[], &Style::default());
         assert!(
-            text.starts_with("Two independent reviews: nothing blocking a merge."),
+            text.starts_with("Two independent reviews, nothing blocking a merge."),
             "{text}"
         );
-        assert!(text.contains("happy for this to merge"), "{text}");
     }
 
     #[test]
@@ -810,7 +795,6 @@ mod tests {
         );
         assert!(text.contains("needs changing before merge"), "{text}");
         assert!(text.contains("[both]"), "{text}");
-        assert!(!text.contains("happy for this to merge"), "{text}");
     }
 
     #[test]
@@ -852,35 +836,10 @@ mod tests {
         );
         assert!(!text.contains("Wrong on a second look"), "{text}");
         assert!(
-            text.contains("raised and withdrawn"),
-            "the count is still owned up to: {text}"
+            !text.to_lowercase().contains("withdrawn"),
+            "a point nobody can see or act on is not worth a sentence: {text}"
         );
         assert!(text.contains("nothing blocking a merge"), "{text}");
-    }
-
-    #[test]
-    fn one_withdrawn_point_reads_as_english() {
-        let text = verdict_comment(
-            &[judged(Standing::Withdrawn, "blocking", "Wrong")],
-            &Style::default(),
-        );
-        assert!(
-            text.contains("A further point was raised and withdrawn"),
-            "{text}"
-        );
-        assert!(!text.contains("point(s)"), "{text}");
-    }
-
-    #[test]
-    fn several_withdrawn_points_read_as_english_too() {
-        let text = verdict_comment(
-            &[
-                judged(Standing::Withdrawn, "blocking", "Wrong one"),
-                judged(Standing::Withdrawn, "nit", "Wrong two"),
-            ],
-            &Style::default(),
-        );
-        assert!(text.contains("2 further points were raised"), "{text}");
     }
 
     #[test]
@@ -889,8 +848,10 @@ mod tests {
         j.counterpoint = Some("the caller already validates the file".into());
         let text = verdict_comment(&[j], &Style::default());
         assert!(text.contains("the reviewers disagree, your call"), "{text}");
-        assert!(text.contains("claude says yes"), "{text}");
-        assert!(text.contains("the caller already validates"), "{text}");
+        assert!(
+            text.contains("Objection: The caller already validates"),
+            "{text}"
+        );
         assert!(
             !text.contains("needs changing before merge"),
             "disputed does not block: {text}"
@@ -907,7 +868,10 @@ mod tests {
             ],
             &Style::default(),
         );
-        assert!(text.contains("1 blocking, 1 non-blocking, 1 nit"), "{text}");
+        assert!(
+            !text.contains("1 blocking"),
+            "counts are listed below, not above: {text}"
+        );
         assert!(text.contains("needs changing before merge"), "{text}");
         assert!(text.contains("worth doing, does not block"), "{text}");
         assert!(text.contains("nits"), "{text}");

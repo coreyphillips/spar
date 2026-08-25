@@ -168,6 +168,34 @@ impl std::fmt::Display for Followups {
     }
 }
 
+/// How much of its own working spar narrates into a pull request thread.
+///
+/// The agents never read the PR: they receive findings through their prompts,
+/// so nothing in the loop depends on any of this being posted. It exists purely
+/// for the person who reads the thread later, which is why the default is the
+/// outcome rather than the play by play.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrComments {
+    /// One comment when the run finishes, and only if it has something to say.
+    Outcome,
+    /// A comment per review and per response, as it happens. An audit trail,
+    /// at the cost of a thread nobody wants to read.
+    Rounds,
+    /// Never comment on a pull request. Everything goes to the terminal.
+    None,
+}
+
+impl std::fmt::Display for PrComments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PrComments::Outcome => "outcome",
+            PrComments::Rounds => "rounds",
+            PrComments::None => "none",
+        })
+    }
+}
+
 /// Where resume state lives. Local keeps the PR clean and costs no API calls;
 /// writing to the PR only buys anything if a run might be resumed from a
 /// different checkout.
@@ -288,6 +316,12 @@ pub struct StyleCfg {
     pub max_body_chars: usize,
     #[serde(default = "d90")]
     pub max_title_chars: usize,
+    #[serde(default = "outcome_only")]
+    pub pr_comments: PrComments,
+}
+
+fn outcome_only() -> PrComments {
+    PrComments::Outcome
 }
 
 fn d320() -> usize {
@@ -313,6 +347,7 @@ impl Default for StyleCfg {
             max_summary_chars: 200,
             max_body_chars: 900,
             max_title_chars: 90,
+            pr_comments: PrComments::Outcome,
         }
     }
 }
@@ -327,6 +362,7 @@ impl StyleCfg {
             max_summary_chars: self.max_summary_chars,
             max_body_chars: self.max_body_chars,
             max_title_chars: self.max_title_chars,
+            pr_comments: self.pr_comments,
         }
     }
 }

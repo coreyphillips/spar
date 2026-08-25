@@ -8,9 +8,12 @@
 //! prints is what a reviewer would actually read.
 
 use spar::model::{
-    Finding, Judged, NextAction, ResponseDoc, Review, Severity, SkippedItem, Standing, Verdict,
+    Dispute, Finding, IssueRun, Judged, NextAction, ResponseDoc, Review, Severity, SkippedItem,
+    Standing, Verdict,
 };
-use spar::review::{disposition_comment, pr_body, review_comment, skip_comment};
+use spar::review::{
+    disposition_comment, outcome_comment, pr_body, review_comment, skip_comment, Ending,
+};
 use spar::review_only::verdict_comment;
 use spar::style::Style;
 
@@ -149,10 +152,31 @@ fn main() {
         pr_body(
             478,
             "Retry a 429 with exponential backoff instead of failing the request.",
-            "2 files changed, 34 insertions(+), 6 deletions(-)",
             &style
         )
     );
+
+    rule("What a whole run leaves on the PR (the default, one comment)");
+    let mut ended = IssueRun::new(482, "t");
+    ended.disputes = vec![Dispute {
+        title: "Config loader swallows a parse error".into(),
+        reasoning: "the caller validates against the schema before load_config is reached".into(),
+    }];
+    ended.filed = vec![
+        "https://github.com/you/thing/issues/485".into(),
+        "https://github.com/you/thing/issues/486".into(),
+    ];
+    println!(
+        "{}",
+        outcome_comment(
+            &ended,
+            &spar::model::Ledger::new(),
+            &Ending::OutOfRounds,
+            &style
+        )
+        .unwrap_or_default()
+    );
+    println!("\n  (and a clean run that filed nothing posts no comment at all)");
 
     rule("A review of somebody else's pull request (spar review)");
     let judged = |standing, severity, title: &str, detail: &str, file: &str, by: &str| Judged {
@@ -160,6 +184,7 @@ fn main() {
         raised_by: by.to_string(),
         standing,
         counterpoint: None,
+        defence: None,
     };
     let mut disputed = judged(
         Standing::Disputed,

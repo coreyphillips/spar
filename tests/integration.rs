@@ -382,22 +382,32 @@ fn a_local_followup_is_written_once_and_only_once() {
     let fx = repo("followup");
     let repo = Repo::open(&fx.work, &cfg()).unwrap();
 
+    // The caller stamps provenance into the body, exactly as file_followup does.
+    let body = |n: i64| format!("why it matters\n\nFound while working on #{n}.");
+
     assert!(repo
-        .append_local_followup("Retry is unbounded", "body", 42)
+        .append_local_followup("Retry is unbounded", &body(42))
         .is_some());
     assert!(
-        repo.append_local_followup("Retry is unbounded", "body", 43)
+        repo.append_local_followup("Retry is unbounded", &body(43))
             .is_none(),
         "a repeat across rounds must not file twice"
     );
     assert!(repo
-        .append_local_followup("A different thing", "body", 44)
+        .append_local_followup("A different thing", &body(44))
         .is_some());
 
     let notes = std::fs::read_to_string(fx.work.join(".spar").join("followups.md")).unwrap();
     assert_eq!(1, notes.matches("## Retry is unbounded").count(), "{notes}");
     assert!(notes.contains("## A different thing"), "{notes}");
-    assert!(notes.contains("From #42"), "{notes}");
+    // Once, in one wording. It used to appear twice: "From #42." added here and
+    // "Found while working on #42." already in the body the caller passed in.
+    assert_eq!(
+        1,
+        notes.matches("#42").count(),
+        "provenance is written once: {notes}"
+    );
+    assert!(!notes.contains("From #42."), "{notes}");
 }
 
 #[test]
@@ -621,7 +631,7 @@ fn spar_excludes_its_own_scratch_directories_from_git_status() {
 
     // And the repo really is clean once spar has written its state there.
     let repo = Repo::open(&fx.work, &cfg()).unwrap();
-    repo.append_local_followup("A note", "body", 1);
+    repo.append_local_followup("A note", "body");
     repo.record_branch("issue-1", "issue", 1);
     assert_eq!("", git(&fx.work, &["status", "--porcelain"]).trim());
 }

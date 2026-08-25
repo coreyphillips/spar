@@ -96,6 +96,13 @@ ban_ai_attribution = true
 # and holds each one to a budget, so a model that writes three paragraphs where
 # one sentence would do cannot put them on your PR.
 terse              = true
+
+# How much of its own working spar narrates into a PR thread. The agents never
+# read the thread, so none of this affects the loop.
+#   outcome  one comment at the end, and only if it has something to say
+#   rounds   a comment per review and per response, an audit trail
+#   none     never comment on a PR; everything goes to the terminal
+pr_comments        = "outcome"
 max_title_chars    = 90      # a finding, issue, or PR title
 max_summary_chars  = 200     # a one-line verdict or refutation
 max_detail_chars   = 320     # a blocking finding's explanation, in the thread

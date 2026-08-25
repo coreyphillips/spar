@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::agent::{self, Agent};
-use crate::config::{Config, Followups};
+use crate::config::{Config, Followups, PrComments};
 use crate::error::{Result, SparError};
 use crate::jsonx::finding_key;
 use crate::model::{
@@ -218,8 +218,7 @@ fn implement_and_review(
         state.status = Status::Abandoned;
         let reason = style::body(&out, &repo.style);
         state.notes.push(reason.clone());
-        let comment = format!("No PR opened.\n\n{reason}");
-        if let Err(e) = repo.comment_issue(number, &comment) {
+        if let Err(e) = repo.comment_issue(number, &reason) {
             logdim!("could not comment on #{number}: {e}");
         }
         return Ok(());
@@ -232,12 +231,7 @@ fn implement_and_review(
         Some(existing) => existing,
         None => {
             let summary = extract_summary(&out).unwrap_or_else(|| item.title.clone());
-            let body = pr_body(
-                number,
-                &summary,
-                &repo.diff_stat(work_dir, &base),
-                &repo.style,
-            );
+            let body = pr_body(number, &summary, &repo.style);
             repo.create_pr(
                 work_dir,
                 branch,
@@ -461,11 +455,13 @@ fn review_loop(
             .cloned()
             .collect();
 
-        if let Err(e) = repo.comment_pr(
-            ctx.pr_number,
-            &review_comment(&holder, round, &review, &repo.style),
-        ) {
-            logdim!("could not post the review comment: {e}");
+        if repo.style.pr_comments == PrComments::Rounds {
+            if let Err(e) = repo.comment_pr(
+                ctx.pr_number,
+                &review_comment(&holder, round, &review, &repo.style),
+            ) {
+                logdim!("could not post the review comment: {e}");
+            }
         }
 
         // Filed every round, not only on approval: a run that escalates or runs
@@ -482,16 +478,13 @@ fn review_loop(
 
         if check_relitigation(ledger, &blocking, state) {
             state.status = Status::Escalated;
-            let titles: Vec<String> = blocking
-                .iter()
-                .map(|f| style::title(&f.title, &repo.style))
-                .collect();
-            let note = format!(
-                "Escalating: a point already refuted was raised again twice. Needs a human \
-                 decision.\n\n{}",
-                bullets(&titles)
+            post_outcome(
+                repo,
+                ctx.pr_number,
+                state,
+                ledger,
+                Ending::Deadlocked(&blocking),
             );
-            let _ = repo.comment_pr(ctx.pr_number, &note);
             persist(
                 repo,
                 ctx.pr_number,
@@ -505,6 +498,7 @@ fn review_loop(
 
         if blocking.is_empty() {
             state.status = Status::Approved;
+            post_outcome(repo, ctx.pr_number, state, ledger, Ending::Approved);
             persist(
                 repo,
                 ctx.pr_number,
@@ -573,10 +567,7 @@ fn review_loop(
     state
         .notes
         .push(exhausted_note(ctx.start_round, last_round));
-    let _ = repo.comment_pr(
-        ctx.pr_number,
-        &exhausted_comment(ctx.start_round, last_round),
-    );
+    post_outcome(repo, ctx.pr_number, state, ledger, Ending::OutOfRounds);
     persist(repo, ctx.pr_number, state, ledger, last_round, &holder);
     Ok(())
 }
@@ -603,20 +594,6 @@ fn exhausted_note(start_round: u32, last_round: u32) -> String {
         format!("no convergence after {this_run} rounds")
     } else {
         format!("no convergence after {this_run} more rounds ({total} in total)")
-    }
-}
-
-fn exhausted_comment(start_round: u32, last_round: u32) -> String {
-    let (this_run, total) = spent(start_round, last_round);
-    if this_run == total {
-        format!(
-            "Stopping after {this_run} review rounds without convergence. Needs a human decision."
-        )
-    } else {
-        format!(
-            "Stopping after {this_run} more review rounds without convergence, {total} in total. \
-             Needs a human decision."
-        )
     }
 }
 
@@ -773,10 +750,12 @@ fn apply_dispositions(
         }
     }
 
-    let comment = disposition_comment(author, response, &fixed, &refuted, &filed, &repo.style);
-    if let Some(text) = comment {
-        if let Err(e) = repo.comment_pr(pr_number, &text) {
-            logdim!("could not post the disposition comment: {e}");
+    if repo.style.pr_comments == PrComments::Rounds {
+        let comment = disposition_comment(author, response, &fixed, &refuted, &filed, &repo.style);
+        if let Some(text) = comment {
+            if let Err(e) = repo.comment_pr(pr_number, &text) {
+                logdim!("could not post the disposition comment: {e}");
+            }
         }
     }
 }
@@ -814,7 +793,7 @@ fn file_followup(repo: &Repo, title: &str, body: &str, source: i64) -> Option<St
     );
 
     if repo.followups == Followups::Local {
-        return repo.append_local_followup(&title, &body, source);
+        return repo.append_local_followup(&title, &body);
     }
     if let Some(existing) = repo.find_issue_by_title(&title) {
         logdim!("follow-up already exists: {existing}");
@@ -890,16 +869,162 @@ fn located(finding: &Finding, style: &Style) -> String {
     }
 }
 
+/// How the run ended, which is the only thing about the run a reader needs.
+pub enum Ending<'a> {
+    /// Nothing blocks a merge.
+    Approved,
+    /// The round budget ran out. The last round's fixes were pushed but never
+    /// reviewed, which is the part a maintainer has to know.
+    OutOfRounds,
+    /// A point was refuted and raised again anyway. Nobody is going to break
+    /// the tie but a person.
+    Deadlocked(&'a [Finding]),
+}
+
+/// Post the one comment a run leaves behind, if it has anything to say.
+///
+/// Everything spar used to write here was an account of its own working: which
+/// agent spoke, which round it was, how many findings of each severity, that it
+/// had stopped. None of that is about the code. Worse, the running commentary
+/// could contradict itself, ending a thread with "5 fixed" immediately followed
+/// by "no convergence", which reads as a failure rather than as fixes nobody
+/// has checked yet.
+///
+/// So the loop is silent and this says what is left: what is unresolved, what
+/// was argued down, and where the follow-ups went.
+pub fn post_outcome(
+    repo: &Repo,
+    pr_number: i64,
+    state: &IssueRun,
+    ledger: &Ledger,
+    ending: Ending<'_>,
+) {
+    if repo.style.pr_comments != PrComments::Outcome {
+        return;
+    }
+    let Some(text) = outcome_comment(state, ledger, &ending, &repo.style) else {
+        return;
+    };
+    if let Err(e) = repo.comment_pr(pr_number, &text) {
+        logdim!("could not post the outcome comment: {e}");
+    }
+}
+
+/// Why a point was refuted: this run's disputes first, then the ledger, which
+/// is what survives across a resume.
+fn refutation_of(finding: &Finding, state: &IssueRun, ledger: &Ledger) -> Option<String> {
+    if let Some(d) = state
+        .disputes
+        .iter()
+        .find(|d| same_point(&d.title, &finding.title))
+    {
+        if !d.reasoning.trim().is_empty() {
+            return Some(d.reasoning.clone());
+        }
+    }
+    ledger
+        .get(&finding_key(&finding.title, &finding.file))
+        .map(|entry| entry.reasoning.clone())
+        .filter(|r| !r.trim().is_empty())
+}
+
+/// `#123` from a filed issue URL, falling back to the URL when it does not look
+/// like one. Shorter, and GitHub renders it as a link either way.
+fn as_reference(url: &str) -> String {
+    match url.rsplit('/').next().and_then(|n| n.parse::<u64>().ok()) {
+        Some(number) => format!("#{number}"),
+        None => url.to_string(),
+    }
+}
+
+pub fn outcome_comment(
+    state: &IssueRun,
+    ledger: &Ledger,
+    ending: &Ending<'_>,
+    style: &Style,
+) -> Option<String> {
+    let mut out: Vec<String> = Vec::new();
+    // Points rendered in the deadlock block, so the refutation list below does
+    // not print the same title a second time.
+    let mut already: Vec<String> = Vec::new();
+
+    match ending {
+        Ending::Approved => {
+            if state.disputes.is_empty() && state.filed.is_empty() {
+                // A clean approval with nothing outstanding needs no comment.
+                // The absence of objections is the message.
+                return None;
+            }
+            out.push("Reviewed, nothing blocking a merge.".into());
+        }
+        Ending::OutOfRounds => out.push(
+            "Not signed off: the last round of fixes was pushed but has not been reviewed.".into(),
+        ),
+        Ending::Deadlocked(points) => {
+            // Rendered once, with the argument attached. A deadlocked point is
+            // by definition one that was refuted earlier, so the reasoning is
+            // the whole reason a person is being asked to look. On a resumed
+            // run `state.disputes` is empty (only `filed` is restored), so the
+            // ledger is the only place that argument survives.
+            let lines: Vec<String> = points
+                .iter()
+                .map(|f| {
+                    let where_at = match f.where_at() {
+                        "general" => String::new(),
+                        file => format!(" ({file})"),
+                    };
+                    let title = style::title(&f.title, style);
+                    already.push(title.clone());
+                    match refutation_of(f, state, ledger) {
+                        Some(reason) => format!(
+                            "{title}{where_at}. Refuted as: {}",
+                            style::summary(&reason, style)
+                        ),
+                        None => format!("{title}{where_at}"),
+                    }
+                })
+                .collect();
+            out.push("Needs your decision. The reviewers could not settle this:".into());
+            out.push(bullets(&lines));
+        }
+    }
+
+    let disputes: Vec<&crate::model::Dispute> = state
+        .disputes
+        .iter()
+        .filter(|d| !already.iter().any(|t| same_point(t, &d.title)))
+        .collect();
+    if !disputes.is_empty() {
+        // The one thing invisible anywhere else. The diff shows what was fixed;
+        // nothing shows what was argued down, or why.
+        let lines: Vec<String> = disputes
+            .iter()
+            .map(|d| {
+                format!(
+                    "{}. {}",
+                    style::title(&d.title, style),
+                    style::sentence(&d.reasoning, style)
+                )
+            })
+            .collect();
+        out.push(format!("Raised and refuted:\n{}", bullets(&lines)));
+    }
+
+    if !state.filed.is_empty() {
+        let refs: Vec<String> = state.filed.iter().map(|u| as_reference(u)).collect();
+        out.push(format!("Filed separately: {}", refs.join(", ")));
+    }
+
+    Some(out.join("\n\n"))
+}
+
 /// The PR body: what it closes, one sentence of what changed, and the diffstat.
 /// GitHub already shows the file list, so repeating it is noise.
-pub fn pr_body(issue: i64, summary: &str, stat: &str, style: &Style) -> String {
+pub fn pr_body(issue: i64, summary: &str, style: &Style) -> String {
     let mut parts = vec![format!("Closes #{issue}")];
     let summary = style::summary(summary, style);
     if !summary.is_empty() {
         parts.push(summary);
-    }
-    if !stat.trim().is_empty() {
-        parts.push(stat.trim().to_string());
     }
     parts.join("\n\n")
 }
@@ -958,7 +1083,8 @@ pub fn review_comment(holder: &str, round: u32, review: &Review, style: &Style) 
         counts.join(", ")
     };
 
-    let mut out = vec![format!("{holder} round {round}: {headline}.")];
+    let _ = (holder, round, headline);
+    let mut out = Vec::new();
     let summary = style::summary(&review.summary, style);
     if !summary.is_empty() {
         out.push(summary);
@@ -982,9 +1108,9 @@ pub fn review_comment(holder: &str, round: u32, review: &Review, style: &Style) 
     // Everything below is filed as a follow-up, so the thread only needs the
     // title: the detail lives on the issue where it can be acted on.
     for (label, group) in [
-        ("non-blocking, filed as follow-ups", &non_blocking),
+        ("non-blocking", &non_blocking),
         ("nits", &nits),
-        ("out of scope, filed separately", &out_of_scope),
+        ("out of scope", &out_of_scope),
     ] {
         if group.is_empty() {
             continue;
@@ -1021,7 +1147,8 @@ pub fn disposition_comment(
         counts.push(format!("{} filed", filed.len()));
     }
 
-    let mut out = vec![format!("{author}: {}.", counts.join(", "))];
+    let _ = (author, counts);
+    let mut out = Vec::new();
     let summary = style::summary(&response.summary, style);
     if !summary.is_empty() {
         out.push(summary);
@@ -1039,16 +1166,21 @@ pub fn disposition_comment(
 }
 
 /// What is posted on an issue both agents declined.
+/// What is posted on an issue both reviewers declined.
+///
+/// Just the reasons. GitHub already shows that it was closed as not planned,
+/// and which model held which opinion is a fact about the run rather than about
+/// the issue. Duplicates are collapsed, since two reviewers reaching the same
+/// conclusion often reach it in the same words.
 pub fn skip_comment(item: &SkippedItem, style: &Style) -> String {
-    let lines: Vec<String> = item
-        .reasons
-        .iter()
-        .map(|(name, reason)| format!("{name}: {}", style::summary(reason, style)))
-        .collect();
-    format!(
-        "Reviewed by two independent reviewers and not scheduled for a PR.\n\n{}",
-        bullets(&lines)
-    )
+    let mut lines: Vec<String> = Vec::new();
+    for reason in item.reasons.values() {
+        let text = style::sentence(reason, style);
+        if !text.is_empty() && !lines.iter().any(|seen| same_point(seen, &text)) {
+            lines.push(text);
+        }
+    }
+    bullets(&lines)
 }
 
 /// Findings as a model should see them: full detail, since this one is not for
@@ -1174,26 +1306,6 @@ mod tests {
         assert_eq!(vec![(1, 3), (4, 6), (7, 9)], seen);
     }
 
-    #[test]
-    fn a_fresh_run_reports_its_rounds_plainly() {
-        assert_eq!("no convergence after 3 rounds", exhausted_note(1, 3));
-        assert!(exhausted_comment(1, 3).contains("after 3 review rounds"));
-        assert!(!exhausted_comment(1, 3).contains("in total"));
-    }
-
-    /// A resumed PR that stops at round 10 did not have ten rounds of budget,
-    /// and saying so would misreport both the cost and the history.
-    #[test]
-    fn a_resumed_run_distinguishes_this_run_from_the_total() {
-        assert_eq!(
-            "no convergence after 5 more rounds (10 in total)",
-            exhausted_note(6, 10)
-        );
-        let comment = exhausted_comment(6, 10);
-        assert!(comment.contains("5 more review rounds"), "{comment}");
-        assert!(comment.contains("10 in total"), "{comment}");
-    }
-
     // -- the ledger ------------------------------------------------------
 
     fn ledger_with(title: &str, file: &str) -> Ledger {
@@ -1299,9 +1411,11 @@ mod tests {
     // -- brevity ---------------------------------------------------------
 
     #[test]
-    fn a_clean_review_is_two_lines() {
+    /// No agent name, no round number, and no count of things listed below.
+    /// The reader wants the review, not an account of who produced it.
+    fn a_clean_review_is_just_the_verdict() {
         let text = review_comment("codex", 1, &review("Looks correct.", vec![]), &style());
-        assert_eq!("codex round 1: no findings.\n\nLooks correct.", text);
+        assert_eq!("Looks correct.", text);
     }
 
     #[test]
@@ -1325,10 +1439,9 @@ mod tests {
             ),
             &style(),
         );
-        assert!(
-            text.starts_with("codex round 2: 1 blocking, 1 non-blocking, 1 nit."),
-            "{text}"
-        );
+        assert!(text.starts_with("One real problem."), "{text}");
+        assert!(!text.contains("codex"), "no agent name: {text}");
+        assert!(!text.contains("round 2"), "no round number: {text}");
     }
 
     /// Only blocking findings carry their detail into the thread. Everything
@@ -1394,8 +1507,8 @@ mod tests {
             ),
             &style(),
         );
-        assert!(text.contains("1 out of scope"), "{text}");
-        assert!(!text.contains("1 blocking"), "{text}");
+        assert!(text.contains("out of scope"), "{text}");
+        assert!(text.contains("Old bug"), "{text}");
     }
 
     #[test]
@@ -1413,7 +1526,8 @@ mod tests {
             &style(),
         )
         .unwrap();
-        assert!(text.starts_with("claude: 1 fixed, 1 refuted."), "{text}");
+        assert!(text.starts_with("Two of three were right."), "{text}");
+        assert!(!text.contains("claude"), "no agent name: {text}");
         assert!(
             text.contains("Because the caller already checks."),
             "{text}"
@@ -1430,22 +1544,16 @@ mod tests {
     }
 
     #[test]
-    fn a_pr_body_is_three_short_parts() {
-        let body = pr_body(
-            42,
-            "Retry on a 429 instead of failing.",
-            "2 files changed, 30 insertions(+)",
-            &style(),
-        );
-        assert_eq!(
-            "Closes #42\n\nRetry on a 429 instead of failing.\n\n2 files changed, 30 insertions(+)",
-            body
-        );
+    /// Two parts, not three. GitHub renders the file count and the plus and
+    /// minus figures in the header, immediately above whatever spar writes.
+    fn a_pr_body_is_what_it_closes_and_what_changed() {
+        let body = pr_body(42, "Retry on a 429 instead of failing.", &style());
+        assert_eq!("Closes #42\n\nRetry on a 429 instead of failing.", body);
     }
 
     #[test]
     fn a_pr_body_survives_a_missing_summary_and_diffstat() {
-        assert_eq!("Closes #7", pr_body(7, "", "", &style()));
+        assert_eq!("Closes #7", pr_body(7, "", &style()));
     }
 
     #[test]
@@ -1477,7 +1585,7 @@ mod tests {
     }
 
     #[test]
-    fn a_skip_comment_names_both_reviewers() {
+    fn a_skip_comment_is_only_the_reasoning() {
         let item = SkippedItem {
             issue: 3,
             title: "t".into(),
@@ -1489,9 +1597,14 @@ mod tests {
             .collect(),
         };
         let text = skip_comment(&item, &style());
-        assert!(text.contains("claude: Already fixed in 1.2."), "{text}");
-        assert!(text.contains("codex: Duplicate of #2."), "{text}");
-        assert!(text.lines().count() <= 5, "{text}");
+        assert!(text.contains("Already fixed in 1.2."), "{text}");
+        assert!(text.contains("Duplicate of #2."), "{text}");
+        assert!(
+            !text.contains("claude") && !text.contains("codex"),
+            "{text}"
+        );
+        assert!(!text.to_lowercase().contains("not scheduled"), "{text}");
+        assert!(text.lines().count() <= 3, "{text}");
     }
 
     #[test]
@@ -1507,5 +1620,154 @@ mod tests {
     #[test]
     fn findings_for_a_model_are_never_empty() {
         assert_eq!("(none)", findings_for_prompt(&[]));
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use crate::model::{Dispute, Severity};
+
+    fn style() -> Style {
+        Style::default()
+    }
+
+    fn state_with(disputes: Vec<(&str, &str)>, filed: Vec<&str>) -> IssueRun {
+        let mut s = IssueRun::new(482, "t");
+        s.disputes = disputes
+            .into_iter()
+            .map(|(title, reasoning)| Dispute {
+                title: title.into(),
+                reasoning: reasoning.into(),
+            })
+            .collect();
+        s.filed = filed.into_iter().map(String::from).collect();
+        s
+    }
+
+    fn finding(title: &str, file: &str) -> Finding {
+        Finding {
+            severity: Severity::Blocking,
+            title: title.into(),
+            detail: "d".into(),
+            file: file.into(),
+            in_scope: true,
+        }
+    }
+
+    /// The absence of objections is the message. A PR that reviewed cleanly and
+    /// filed nothing should leave no trace in the thread at all.
+    #[test]
+    fn a_clean_approval_says_nothing() {
+        let state = state_with(vec![], vec![]);
+        assert!(outcome_comment(&state, &Ledger::new(), &Ending::Approved, &style()).is_none());
+    }
+
+    #[test]
+    fn an_approval_that_filed_follow_ups_links_them() {
+        let state = state_with(
+            vec![],
+            vec![
+                "https://github.com/you/thing/issues/485",
+                "https://github.com/you/thing/issues/486",
+            ],
+        );
+        let text = outcome_comment(&state, &Ledger::new(), &Ending::Approved, &style()).unwrap();
+        assert!(text.contains("Filed separately: #485, #486"), "{text}");
+    }
+
+    /// The real PR ended with "5 fixed" followed by "no convergence", which
+    /// reads as a contradiction. What a maintainer needs is that the fixes went
+    /// in and nobody checked them.
+    #[test]
+    fn running_out_of_rounds_says_what_that_means_for_the_reader() {
+        let state = state_with(vec![], vec![]);
+        let text = outcome_comment(&state, &Ledger::new(), &Ending::OutOfRounds, &style()).unwrap();
+        assert!(text.contains("has not been reviewed"), "{text}");
+        assert!(
+            !text.to_lowercase().contains("round 3"),
+            "no round numbers: {text}"
+        );
+        assert!(!text.to_lowercase().contains("convergence"), "{text}");
+    }
+
+    #[test]
+    fn a_deadlock_names_the_point_they_could_not_settle() {
+        let state = state_with(vec![], vec![]);
+        let points = [finding("Retry loop never terminates", "src/net.rs:88")];
+        let text = outcome_comment(
+            &state,
+            &Ledger::new(),
+            &Ending::Deadlocked(&points),
+            &style(),
+        )
+        .unwrap();
+        assert!(
+            text.contains("Retry loop never terminates (src/net.rs:88)"),
+            "{text}"
+        );
+        assert!(text.contains("could not settle"), "{text}");
+    }
+
+    /// The diff records what was fixed. Nothing records what was argued down.
+    #[test]
+    fn refutations_survive_because_nothing_else_carries_them() {
+        let state = state_with(
+            vec![(
+                "Error is swallowed",
+                "the caller already validates the file",
+            )],
+            vec![],
+        );
+        let text = outcome_comment(&state, &Ledger::new(), &Ending::Approved, &style()).unwrap();
+        assert!(text.contains("Raised and refuted:"), "{text}");
+        assert!(
+            text.contains("The caller already validates the file"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn no_agent_names_counts_or_round_numbers_reach_the_thread() {
+        let state = state_with(
+            vec![("A point", "a reason")],
+            vec!["https://github.com/you/thing/issues/485"],
+        );
+        for ending in [Ending::Approved, Ending::OutOfRounds] {
+            let text = outcome_comment(&state, &Ledger::new(), &ending, &style()).unwrap();
+            let lower = text.to_lowercase();
+            for banned in ["claude", "codex", "blocking,", "nit,", " fixed."] {
+                assert!(
+                    !lower.contains(banned),
+                    "{banned:?} leaked into the thread:\n{text}"
+                );
+            }
+            // "the last round of fixes" is prose. "round 3" is narration.
+            for n in 1..9 {
+                assert!(
+                    !lower.contains(&format!("round {n}")),
+                    "a round number leaked into the thread:\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_whole_comment_stays_short() {
+        let state = state_with(
+            vec![("A point", &"long reasoning ".repeat(40))],
+            vec!["https://github.com/you/thing/issues/485"],
+        );
+        let text = outcome_comment(&state, &Ledger::new(), &Ending::OutOfRounds, &style()).unwrap();
+        assert!(text.len() < 600, "{} chars:\n{text}", text.len());
+    }
+
+    #[test]
+    fn a_url_that_is_not_an_issue_link_is_left_alone() {
+        assert_eq!(
+            "#485",
+            as_reference("https://github.com/you/thing/issues/485")
+        );
+        assert_eq!("note: something", as_reference("note: something"));
     }
 }

@@ -84,6 +84,8 @@ pub struct Style {
     pub max_body_chars: usize,
     /// A finding title, issue title, or PR title.
     pub max_title_chars: usize,
+    /// How much of its own working spar narrates into a pull request thread.
+    pub pr_comments: crate::config::PrComments,
 }
 
 impl Default for Style {
@@ -96,6 +98,7 @@ impl Default for Style {
             max_summary_chars: 200,
             max_body_chars: 900,
             max_title_chars: 90,
+            pr_comments: crate::config::PrComments::Outcome,
         }
     }
 }
@@ -284,6 +287,17 @@ pub fn title(text: &str, style: &Style) -> String {
         clip(&flat, style.max_title_chars)
     } else {
         flat
+    }
+}
+
+/// Capitalise the first letter, so a model's fragment reads as a sentence when
+/// spar sets it after one of its own.
+pub fn sentence(text: &str, style: &Style) -> String {
+    let one = summary(text, style);
+    let mut chars = one.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => one,
     }
 }
 
@@ -561,5 +575,36 @@ mod tests {
             out.chars().count()
         );
         assert!(out.contains("real content here"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod sentence_tests {
+    use super::*;
+
+    #[test]
+    fn a_fragment_reads_as_a_sentence() {
+        assert_eq!(
+            "The caller already validates it.",
+            sentence("the caller already validates it.", &Style::default())
+        );
+    }
+
+    #[test]
+    fn an_already_capitalised_one_is_untouched() {
+        assert_eq!(
+            "Already fine.",
+            sentence("Already fine.", &Style::default())
+        );
+    }
+
+    #[test]
+    fn empty_stays_empty_rather_than_panicking() {
+        assert_eq!("", sentence("   ", &Style::default()));
+    }
+
+    #[test]
+    fn a_multibyte_first_character_does_not_panic() {
+        assert_eq!("Ärger", sentence("ärger", &Style::default()));
     }
 }

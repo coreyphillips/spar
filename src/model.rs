@@ -406,6 +406,11 @@ pub struct Judged {
     pub standing: Standing,
     /// The other reviewer's reasoning, when they had something to say.
     pub counterpoint: Option<String>,
+    /// What the reviewer who raised it said when the objection came back.
+    /// Kept apart from the objection: running both together behind a single
+    /// "the other says" turns the most valuable content in the comment into
+    /// one unreadable sentence.
+    pub defence: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

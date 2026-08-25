@@ -836,8 +836,9 @@ impl Repo {
     /// Append a follow-up to a local note instead of the tracker.
     ///
     /// Deduplicated on the title, matching the issue path. Returns a display
-    /// string, or None when it was already recorded.
-    pub fn append_local_followup(&self, title: &str, body: &str, source: i64) -> Option<String> {
+    /// string, or None when it was already recorded. The body arrives with its
+    /// provenance already stamped by the caller, so nothing is added here.
+    pub fn append_local_followup(&self, title: &str, body: &str) -> Option<String> {
         let path = self.root.join(STATE_DIR).join("followups.md");
         let heading = format!("## {}", title.trim());
         if let Ok(existing) = std::fs::read_to_string(&path) {
@@ -850,7 +851,9 @@ impl Repo {
             let _ = std::fs::create_dir_all(parent);
         }
         use std::io::Write;
-        let entry = format!("{heading}\n\nFrom #{source}.\n\n{}\n\n", body.trim());
+        // The caller already stamped the provenance into the body. Adding
+        // "From #N." here as well printed it twice, in two different wordings.
+        let entry = format!("{heading}\n\n{}\n\n", body.trim());
         match std::fs::OpenOptions::new()
             .create(true)
             .append(true)

@@ -1208,3 +1208,126 @@ fn the_example_config_mentions_every_setting() {
         "spar.example.toml never mentions: {names:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Agreeing with a dry run without paying for it twice
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_saved_review_round_trips_through_the_repo() {
+    let fx = repo("pending");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+
+    assert!(
+        repo.read_pending_comment(366).is_none(),
+        "nothing saved yet"
+    );
+
+    let review = "Two independent reviews.\n\nneeds changing before merge\n- Something real.";
+    let path = repo.save_pending_comment(366, review).unwrap();
+    assert!(path.ends_with("pr-366.md"), "{}", path.display());
+    assert_eq!(Some(review.to_string()), repo.read_pending_comment(366));
+
+    // It lives under .spar, which spar keeps out of the target repo's status.
+    assert_eq!("", git(&fx.work, &["status", "--porcelain"]).trim());
+}
+
+#[test]
+fn post_says_so_when_there_is_nothing_saved() {
+    let fx = repo("postmissing");
+    std::fs::write(fx.work.join("spar.toml"), TWO_AGENTS).unwrap();
+    let (ok, _, err) = spar(
+        &[
+            "post",
+            "366",
+            "--repo",
+            fx.work.to_str().unwrap(),
+            "--config",
+            "spar.toml",
+        ],
+        &fx.work,
+    );
+    assert!(!ok);
+    assert!(err.contains("no saved review"), "{err}");
+    assert!(
+        err.contains("--dry-run"),
+        "it should say how to produce one: {err}"
+    );
+}
+
+/// The point of the feature: read it, then post exactly what you read, without
+/// running the agents again.
+#[test]
+fn post_dry_run_prints_the_saved_review_without_touching_github() {
+    let fx = repo("postdry");
+    std::fs::write(fx.work.join("spar.toml"), TWO_AGENTS).unwrap();
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    repo.save_pending_comment(366, "needs changing before merge\n- A real defect.")
+        .unwrap();
+
+    let (ok, out, _) = spar(
+        &[
+            "post",
+            "366",
+            "--repo",
+            fx.work.to_str().unwrap(),
+            "--config",
+            "spar.toml",
+            "--dry-run",
+        ],
+        &fx.work,
+    );
+    assert!(ok, "{out}");
+    assert!(out.contains("A real defect."), "{out}");
+}
+
+/// An edited file is still spar's output, so it goes through the same gate.
+#[test]
+fn posting_a_file_that_breaks_the_style_rules_is_refused() {
+    let fx = repo("poststyle");
+    std::fs::write(fx.work.join("spar.toml"), TWO_AGENTS).unwrap();
+    let edited = fx.work.join("edited.md");
+    std::fs::write(&edited, "I rewrote this \u{2014} with an em dash.").unwrap();
+
+    let (_, _, err) = spar(
+        &[
+            "post",
+            "366",
+            "--repo",
+            fx.work.to_str().unwrap(),
+            "--config",
+            "spar.toml",
+            "--file",
+            edited.to_str().unwrap(),
+        ],
+        &fx.work,
+    );
+    // gh will fail here for lack of a GitHub remote, but the em dash must not
+    // be what reaches it: the scrub runs first and turns it into a comma.
+    assert!(
+        !err.contains('\u{2014}'),
+        "an em dash reached the API call: {err}"
+    );
+}
+
+#[test]
+fn post_refuses_a_file_for_several_pull_requests() {
+    let fx = repo("postmany");
+    std::fs::write(fx.work.join("spar.toml"), TWO_AGENTS).unwrap();
+    let (ok, _, err) = spar(
+        &[
+            "post",
+            "1",
+            "2",
+            "--repo",
+            fx.work.to_str().unwrap(),
+            "--config",
+            "spar.toml",
+            "--file",
+            "x.md",
+        ],
+        &fx.work,
+    );
+    assert!(!ok);
+    assert!(err.contains("one pull request"), "{err}");
+}

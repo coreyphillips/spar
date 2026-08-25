@@ -458,10 +458,19 @@ fn finish(
     let silent = dry_run || repo.style.pr_comments == crate::config::PrComments::None;
     if silent {
         println!("\n{comment}\n");
-        if dry_run {
-            log!("dry run, nothing posted to PR #{}", pr.number);
+        let why = if dry_run {
+            "dry run"
         } else {
-            log!("pr_comments is none, review printed rather than posted");
+            "pr_comments is none"
+        };
+        match repo.save_pending_comment(pr.number, &comment) {
+            Ok(path) => log!(
+                "{why}, nothing posted. Saved to {}. Post it with `spar post {}`, or edit that \
+                 file first.",
+                path.display(),
+                pr.number
+            ),
+            Err(e) => logdim!("{why}, nothing posted, and could not save it: {e}"),
         }
         return Ok(());
     }

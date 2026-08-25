@@ -969,6 +969,34 @@ impl Repo {
     // ran spar. State is kept on disk by default and can additionally travel in
     // a PR comment, which is what lets a run be resumed from another machine.
 
+    /// Where a comment spar produced but did not post is kept.
+    pub fn pending_comment_path(&self, number: i64) -> PathBuf {
+        self.root
+            .join(STATE_DIR)
+            .join("reviews")
+            .join(format!("pr-{number}.md"))
+    }
+
+    /// Keep a comment spar decided not to post.
+    ///
+    /// A dry run that prints and forgets means agreeing with what you read
+    /// costs a second full review. Saving it makes the whole point of reading
+    /// it first: look, edit if you like, then post what you already paid for.
+    pub fn save_pending_comment(&self, number: i64, text: &str) -> Result<PathBuf> {
+        let path = self.pending_comment_path(number);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| spar_err!("could not create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&path, text)
+            .map_err(|e| spar_err!("could not write {}: {e}", path.display()))?;
+        Ok(path)
+    }
+
+    pub fn read_pending_comment(&self, number: i64) -> Option<String> {
+        std::fs::read_to_string(self.pending_comment_path(number)).ok()
+    }
+
     pub fn state_path(&self, number: i64) -> PathBuf {
         self.root
             .join(STATE_DIR)

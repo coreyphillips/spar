@@ -244,6 +244,26 @@ spar review 108             # any PR, fork or not
 spar review 108 --dry-run   # see it before it is posted
 ```
 
+### Agreeing with a dry run
+
+A dry run keeps what it produced, so liking it does not mean paying for a second
+review:
+
+```bash
+spar review 108 --dry-run   # prints it, and saves it under .spar/reviews/
+spar post 108               # posts exactly that, agents not run again
+```
+
+`spar post 108 --dry-run` shows what would go up. The saved file is plain
+markdown, so editing it before posting is the expected thing rather than a
+trick: strike the finding you disagree with, then post. Anything you post still
+goes through the style gate, so an edit that reintroduces an em dash is caught
+rather than published. `spar post 108 --file notes.md` posts something else
+entirely.
+
+The same saving happens when `pr_comments = "none"` suppresses a comment, so
+nothing spar spent money producing is thrown away.
+
 The loop is different here, and deliberately so. The custody loop converges
 because the diff changes between rounds. In review only mode nothing changes, so
 more rounds would just re-litigate the same unchanged code. It is three passes:

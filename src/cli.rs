@@ -102,6 +102,26 @@ pub enum Command {
         max_rounds: Option<u32>,
     },
 
+    /// Post a review a dry run produced, without running the agents again.
+    ///
+    /// `spar review <pr> --dry-run` saves what it produced. Read it, edit the
+    /// file if you like, then post exactly that.
+    Post {
+        /// Pull request numbers whose saved review should be posted.
+        #[arg(required = true)]
+        prs: Vec<i64>,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Post this file instead of the saved review.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        /// Print what would be posted and stop.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Detect installed agent CLIs and write a spar.toml.
     ///
     /// On an existing config, `--update` appends any settings it does not
@@ -264,6 +284,20 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
             Ok(report(&results, &cfg))
         }
+
+        Command::Post {
+            prs,
+            repo: repo_path,
+            config,
+            file,
+            dry_run,
+        } => cmd_post(
+            &prs,
+            &repo_path,
+            config.as_deref(),
+            file.as_deref(),
+            dry_run,
+        ),
 
         Command::Init { out, force, update } => {
             if update {
@@ -731,6 +765,61 @@ fn cmd_clean(
         }
     }
     Ok(0)
+}
+
+/// Post a review that was produced earlier and not sent.
+fn cmd_post(
+    prs: &[i64],
+    repo_path: &Path,
+    config_path: Option<&Path>,
+    file: Option<&Path>,
+    dry_run: bool,
+) -> Result<i32> {
+    let cfg = config::load(config_path)?;
+    let repo = Repo::open(repo_path, &cfg)?;
+
+    if file.is_some() && prs.len() > 1 {
+        bail!("--file posts one review, so give it one pull request number");
+    }
+
+    let mut failed = false;
+    for number in prs {
+        let text = match file {
+            Some(path) => std::fs::read_to_string(path)
+                .map_err(|e| spar_err!("could not read {}: {e}", path.display()))?,
+            None => match repo.read_pending_comment(*number) {
+                Some(text) => text,
+                None => {
+                    logging::error(format!(
+                        "no saved review for PR #{number}. `spar review {number} --dry-run` \
+                         produces one, or pass --file."
+                    ));
+                    failed = true;
+                    continue;
+                }
+            },
+        };
+        if text.trim().is_empty() {
+            logging::error(format!("the saved review for PR #{number} is empty"));
+            failed = true;
+            continue;
+        }
+        if dry_run {
+            println!("\n{}\n", text.trim());
+            log!("would post the above to PR #{number}");
+            continue;
+        }
+        // Through the style gate like anything else spar sends, so an edit that
+        // reintroduces a banned dash is caught rather than published.
+        match repo.comment_pr(*number, &text) {
+            Ok(()) => log!("posted to PR #{number}"),
+            Err(e) => {
+                logging::error(format!("could not post to PR #{number}: {e}"));
+                failed = true;
+            }
+        }
+    }
+    Ok(if failed { 1 } else { 0 })
 }
 
 /// Append the settings a config does not mention, commented out.

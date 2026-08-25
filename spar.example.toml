@@ -104,9 +104,14 @@ rest    = "high"             # later rounds only see a small delta
 ban_em_dash        = true
 ban_ai_attribution = true
 
-# The concision gate. spar composes every comment itself from structured fields
-# and holds each one to a budget, so a model that writes three paragraphs where
-# one sentence would do cannot put them on your PR.
+# What made a PR thread unreadable was never the length of the findings, it was
+# spar narrating itself. So spar composes every comment from structured fields,
+# and that is where brevity comes from.
+#
+# The lengths below are safety valves, not editors. They are sized so real
+# content is never touched, and when one does fire it finishes the sentence in
+# progress rather than stopping mid thought. A reader who cannot act on a
+# finding has been given nothing, and the characters saved bought nothing.
 terse              = true
 
 # How much of its own working spar narrates into a PR thread. The agents never
@@ -115,11 +120,12 @@ terse              = true
 #   rounds   a comment per review and per response, an audit trail
 #   none     never comment on a PR; everything goes to the terminal
 pr_comments        = "outcome"
-max_title_chars    = 90      # a finding, issue, or PR title
-max_summary_chars  = 200     # a one-line verdict or refutation
-max_detail_chars   = 320     # a blocking finding's explanation, in the thread
-max_body_chars     = 900     # a PR body
-max_issue_body_chars = 4000  # a filed issue's body. Far larger on purpose: a
+max_title_chars    = 140     # a finding, issue, or PR title. Never ellipsised:
+                             # a title ending in "..." reads as broken.
+max_summary_chars  = 1200    # a verdict or a refutation's argument
+max_detail_chars   = 2000    # a blocking finding's explanation, in the thread
+max_body_chars     = 2000    # a PR body
+max_issue_body_chars = 8000  # a filed issue's body. Far larger on purpose: a
                              # comment is read with the diff in front of you,
                              # an issue is picked up cold months later. Fenced
                              # code blocks are never truncated and never count

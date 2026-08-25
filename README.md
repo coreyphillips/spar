@@ -310,8 +310,12 @@ budget at all**. A snippet cut in half is broken markdown and a misleading
 fragment of the code somebody is being asked to fix. When prose does have to be
 dropped, whole blocks go from the end, so what survives is complete.
 
-Budgets live in `[style]` and every one is configurable. Set `terse = false` to
-turn the whole thing off. To see exactly what spar would post, before spending a
+The lengths in `[style]` are **safety valves, not editors**. They are sized so
+real content is never touched, and when one does fire it finishes the sentence in
+progress rather than stopping mid-thought. Cutting substance was a mistake worth
+naming: a reader who cannot act on a finding has been given nothing, and the
+characters saved bought nothing. Brevity is asked for in the prompts, which is
+free, and enforced only on shape. Set `terse = false` to remove even the valves. To see exactly what spar would post, before spending a
 token on it:
 
 ```bash

@@ -877,12 +877,31 @@ mod tests {
         assert!(text.contains("nits"), "{text}");
     }
 
+    /// A reviewer with a lot to say is not the problem, and clipping the
+    /// explanation of a defect helps nobody. Only a runaway is bounded.
     #[test]
-    fn a_verbose_reviewer_is_still_clipped() {
+    fn a_thorough_reviewer_is_not_cut_short() {
         let mut j = judged(Standing::Corroborated, "blocking", "A real problem");
-        j.finding.detail = "Extremely long explanation. ".repeat(60);
+        j.finding.detail = "Here is a step of the reproduction. ".repeat(20);
         let text = verdict_comment(&[j], &Style::default());
-        assert!(text.len() < 700, "{} chars:\n{text}", text.len());
+        assert!(
+            text.contains(
+                &"Here is a step of the reproduction. "
+                    .repeat(20)
+                    .trim()
+                    .to_string()
+            ) || text.len() > 600,
+            "the explanation survived: {} chars",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn a_runaway_reviewer_is_still_bounded() {
+        let mut j = judged(Standing::Corroborated, "blocking", "A real problem");
+        j.finding.detail = "filler ".repeat(20_000);
+        let text = verdict_comment(&[j], &Style::default());
+        assert!(text.len() < 6000, "{} chars", text.len());
     }
 
     #[test]

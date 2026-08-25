@@ -1498,23 +1498,36 @@ mod tests {
     }
 
     #[test]
-    fn a_verbose_model_is_clipped_not_forwarded() {
-        let long_summary = "This is a very thorough summary. ".repeat(40);
-        let long_detail = "Here is an extremely long explanation. ".repeat(40);
+    /// A finding's explanation is what the author acts on. Cutting it to save
+    /// characters leaves them nothing to act on and saves nothing worth having.
+    fn a_thorough_explanation_reaches_the_author_intact() {
+        let detail = "Reproduced by running the 429 test with max_attempts unset. ".repeat(8);
         let text = review_comment(
             "codex",
             1,
             &review(
-                &long_summary,
-                vec![finding("blocking", "T", &long_detail, "a.rs", true)],
+                "One problem.",
+                vec![finding("blocking", "T", &detail, "a.rs", true)],
             ),
             &style(),
         );
         assert!(
-            text.len() < 900,
-            "review comment was {} chars:\n{text}",
-            text.len()
+            text.contains(detail.trim()),
+            "the explanation was cut:\n{text}"
         );
+    }
+
+    /// A runaway is still bounded, just nowhere near tightly.
+    #[test]
+    fn a_runaway_model_is_still_bounded() {
+        let long = "filler words. ".repeat(20_000);
+        let text = review_comment(
+            "codex",
+            1,
+            &review(&long, vec![finding("blocking", "T", &long, "a.rs", true)]),
+            &style(),
+        );
+        assert!(text.len() < 8000, "review comment was {} chars", text.len());
     }
 
     #[test]
@@ -1786,13 +1799,21 @@ mod outcome_tests {
     }
 
     #[test]
-    fn the_whole_comment_stays_short() {
+    /// A refutation is an argument, and an argument that stops mid clause is
+    /// not one. Bounded, but with room to make the case.
+    fn a_refutation_is_allowed_to_make_its_case() {
+        let reasoning = "The caller validates against the schema first. \
+                         The discarded error is therefore unreachable in practice. ";
         let state = state_with(
-            vec![("A point", &"long reasoning ".repeat(40))],
+            vec![("A point", &reasoning.repeat(6))],
             vec!["https://github.com/you/thing/issues/485"],
         );
         let text = outcome_comment(&state, &Ledger::new(), &Ending::OutOfRounds, &style()).unwrap();
-        assert!(text.len() < 600, "{} chars:\n{text}", text.len());
+        assert!(
+            !text.contains("..."),
+            "nothing was cut mid thought:\n{text}"
+        );
+        assert!(text.len() < 4000, "{} chars", text.len());
     }
 
     #[test]

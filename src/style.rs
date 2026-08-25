@@ -5,11 +5,18 @@
 //! message, PR body, and comment is scrubbed deterministically and then
 //! re-verified. A leak is a hard error, not a warning.
 //!
-//! **Concision.** The reader of a PR is a human with other work. Model prose
-//! defaults to three paragraphs where one sentence would do, and asking nicely
-//! has the same reliability problem as asking for no em-dashes. So spar
-//! composes every comment itself from structured fields and clips each field to
-//! a budget, rather than forwarding whatever the model felt like writing.
+//! **Shape.** The reader of a PR is a human with other work. What made a thread
+//! unreadable was never the length of the findings, it was spar narrating
+//! itself: which agent spoke, which round it was, counts of things listed on the
+//! next line. So spar composes every comment itself from structured fields, and
+//! that is where brevity comes from.
+//!
+//! The length budgets below are safety valves, not editors. They are sized so
+//! that real content is never touched, and when one does fire it completes the
+//! sentence in progress rather than stopping mid-thought. Cutting substance was
+//! a mistake worth naming: a reader who cannot act on a finding has been given
+//! nothing, and the characters saved bought nothing. Brevity is asked for in the
+//! prompts, which is free, and enforced only on shape.
 
 use std::sync::LazyLock;
 
@@ -96,11 +103,11 @@ impl Default for Style {
             ban_em_dash: true,
             ban_ai_attribution: true,
             terse: true,
-            max_detail_chars: 320,
-            max_summary_chars: 200,
-            max_body_chars: 900,
-            max_issue_body_chars: 4000,
-            max_title_chars: 90,
+            max_detail_chars: 2000,
+            max_summary_chars: 1200,
+            max_body_chars: 2000,
+            max_issue_body_chars: 8000,
+            max_title_chars: 140,
             pr_comments: crate::config::PrComments::Outcome,
         }
     }
@@ -175,12 +182,29 @@ pub fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Truncate to `max` characters, preferring a sentence boundary.
+/// How far past a budget it is worth going to finish the sentence in progress.
 ///
-/// Cutting mid-sentence and marking it with an ellipsis is a last resort: a
-/// clipped finding still has to be actionable, and the first sentence of a
-/// review comment almost always is.
+/// A budget is a target, not a guillotine. Stopping mid-clause costs the reader
+/// the point being made and gains a handful of characters, which is a bad
+/// trade: a real close comment ended "and surviving instances already reconnect
+/// and..." and told nobody anything.
+const OVERSHOOT: usize = 240;
+
+/// Truncate to roughly `max` characters, ending on a complete sentence.
 pub fn clip(text: &str, max: usize) -> String {
+    clip_marked(text, max, "...")
+}
+
+/// The same, without an ellipsis when it does have to cut.
+///
+/// For a title, where a trailing "..." reads as broken rather than as
+/// shortened. Two issues were filed on a real repository with titles ending in
+/// a literal ellipsis, which is how this was found.
+pub fn clip_bare(text: &str, max: usize) -> String {
+    clip_marked(text, max, "")
+}
+
+fn clip_marked(text: &str, max: usize, marker: &str) -> String {
     let trimmed = text.trim();
     if max == 0 {
         return trimmed.to_string();
@@ -190,24 +214,20 @@ pub fn clip(text: &str, max: usize) -> String {
         return trimmed.to_string();
     }
 
-    let window = &chars[..max];
+    let ends_sentence = |i: usize| -> bool {
+        matches!(chars[i], '.' | '!' | '?')
+            // Look at the real next character, not the end of some window: a
+            // period landing on the budget has text after it, and treating that
+            // as the end of a sentence cuts a file path in half.
+            && chars.get(i + 1).is_none_or(|n| n.is_whitespace())
+    };
 
-    // The last sentence end inside the budget, if it keeps enough of the text
-    // to still be worth reading.
-    let mut sentence_end = None;
-    for (i, c) in window.iter().enumerate() {
-        // Look at the real next character, not `window`'s. A period landing on
-        // the last budget character has text after it; treating the end of the
-        // window as the end of a sentence cuts mid-path with no ellipsis, so
-        // "src/repo.rs:412" is silently served as "src/repo." and reads as
-        // finished prose.
-        if matches!(c, '.' | '!' | '?') && chars.get(i + 1).is_none_or(|n| n.is_whitespace()) {
-            sentence_end = Some(i + 1);
-        }
-    }
-    if let Some(cut) = sentence_end {
-        if cut * 2 >= max {
-            return window[..cut]
+    // The last sentence that ends at or before the budget, if it keeps enough
+    // of the text to be worth reading.
+    let within = (0..max).rfind(|i| ends_sentence(*i));
+    if let Some(cut) = within {
+        if (cut + 1) * 2 >= max {
+            return chars[..=cut]
                 .iter()
                 .collect::<String>()
                 .trim_end()
@@ -215,27 +235,44 @@ pub fn clip(text: &str, max: usize) -> String {
         }
     }
 
-    // Otherwise the last word boundary, marked so the reader knows there is
-    // more where this came from. The mark is inside the budget, never added to
-    // it: a caller that asked for at most N characters gets at most N.
-    const MARK: &str = "...";
-    if max <= MARK.len() {
-        return window.iter().collect::<String>().trim_end().to_string();
+    // Otherwise finish the sentence that is in progress, so long as it ends
+    // somewhere reasonable rather than running on forever. Bounded by the
+    // budget as well as by a constant, so a small budget cannot be doubled and
+    // doubled again by one long sentence.
+    let ceiling = (max + OVERSHOOT.min(max)).min(chars.len());
+    if let Some(cut) = (max..ceiling).find(|i| ends_sentence(*i)) {
+        return chars[..=cut]
+            .iter()
+            .collect::<String>()
+            .trim_end()
+            .to_string();
     }
-    let budget = max - MARK.len();
-    let mut end = budget;
-    while end > 0 && !window[end - 1].is_whitespace() {
+
+    // A short complete sentence still beats a long severed one.
+    if let Some(cut) = within {
+        return chars[..=cut]
+            .iter()
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+    }
+
+    // No sentence in sight. Cut at a word boundary, and say so unless the
+    // caller would rather not.
+    let budget = max.saturating_sub(marker.chars().count()).max(1);
+    let mut end = budget.min(chars.len());
+    while end > 0 && !chars[end - 1].is_whitespace() {
         end -= 1;
     }
     if end == 0 {
-        end = budget;
+        end = budget.min(chars.len());
     }
-    let mut out: String = window[..end]
+    let mut out: String = chars[..end]
         .iter()
         .collect::<String>()
         .trim_end()
         .to_string();
-    out.push_str(MARK);
+    out.push_str(marker);
     out
 }
 
@@ -307,29 +344,65 @@ pub fn issue_body(text: &str, style: &Style) -> String {
     // is exempt from the prose budget but not from a far looser ceiling.
     let ceiling = style.max_issue_body_chars.saturating_mul(4);
 
-    let mut kept: Vec<&Block> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
     let mut prose = 0usize;
     let mut total = 0usize;
     for block in &blocks {
         let len = block.text.chars().count();
-        let over_prose = !block.code && prose + len > style.max_issue_body_chars;
-        let over_ceiling = total + len > ceiling;
-        if (over_prose || over_ceiling) && !kept.is_empty() {
+        if !block.code && prose + len > style.max_issue_body_chars && !kept.is_empty() {
+            break;
+        }
+        if total + len > ceiling {
+            // Past the point GitHub itself would take. Shortening a snippet at
+            // a line boundary with the fence closed still leaves something
+            // usable; dropping it leaves nothing.
+            if block.code {
+                if let Some(short) = shorten_code(&block.text, ceiling.saturating_sub(total)) {
+                    kept.push(short);
+                }
+            }
             break;
         }
         if !block.code {
             prose += len;
         }
         total += len;
-        kept.push(block);
+        kept.push(block.text.clone());
     }
 
-    kept.iter()
-        .map(|b| b.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n")
-        .trim()
-        .to_string()
+    kept.join("\n\n").trim().to_string()
+}
+
+/// Keep as many whole lines of a fenced block as fit, and close the fence.
+///
+/// Only ever reached by a snippet large enough that GitHub would refuse the
+/// comment outright. Cutting on a line boundary keeps the code readable and
+/// keeps the markdown valid, and the note says plainly that there was more.
+fn shorten_code(block: &str, room: usize) -> Option<String> {
+    const NOTE: &str = "(snippet shortened)";
+    if room < 80 {
+        return None;
+    }
+    let mut lines = block.lines();
+    let opener = lines.next()?.to_string();
+    let mut out = vec![opener];
+    let mut used = out[0].chars().count() + NOTE.len() + 8;
+
+    for line in lines {
+        if line.trim_start().starts_with("```") {
+            break;
+        }
+        let len = line.chars().count() + 1;
+        if used + len > room {
+            break;
+        }
+        used += len;
+        out.push(line.to_string());
+    }
+    out.push("```".to_string());
+    out.push(String::new());
+    out.push(NOTE.to_string());
+    Some(out.join("\n"))
 }
 
 struct Block {
@@ -392,7 +465,7 @@ fn split_blocks(text: &str) -> Vec<Block> {
 pub fn title(text: &str, style: &Style) -> String {
     let flat = one_line(text);
     if style.terse {
-        clip(&flat, style.max_title_chars)
+        clip_bare(&flat, style.max_title_chars)
     } else {
         flat
     }
@@ -559,10 +632,13 @@ mod tests {
     }
 
     #[test]
-    fn clip_never_exceeds_the_budget() {
+    /// The budget is a target that rounds up to the end of a sentence, so it
+    /// can be exceeded on purpose. What must hold is that the overshoot is
+    /// bounded: a budget cannot be run away with.
+    fn clip_overshoots_only_within_bounds() {
         for max in 1..60 {
             let out = clip("one two three four five six seven eight nine ten.", max);
-            assert!(out.chars().count() <= max, "max={max} out={out:?}");
+            assert!(out.chars().count() <= max * 2 + 3, "max={max} out={out:?}");
         }
     }
 
@@ -753,18 +829,34 @@ mod issue_body_tests {
     /// cuts wherever the character count runs out, which on a snippet means an
     /// unclosed fence and a misleading half of the code.
     #[test]
-    fn the_comment_budget_would_have_mangled_the_same_snippet() {
-        let code = (0..400)
-            .map(|n| format!("    line_{n}();"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let text = format!("It spins forever.\n\n```rust\n{code}\n```");
-
-        let as_comment = body(&text, &s());
-        assert_ne!(0, fences(&as_comment) % 2, "a comment cuts the fence open");
-
-        let as_issue = issue_body(&text, &s());
-        assert_eq!(0, fences(&as_issue) % 2, "an issue keeps it closed");
+    /// However long the snippet, an issue keeps the fence closed. A comment
+    /// budget is character counted and knows nothing about fences, which is why
+    /// issues do not go through it.
+    fn an_issue_keeps_the_fence_closed_however_long_the_snippet() {
+        for lines in [50, 400, 4000] {
+            let code = (0..lines)
+                .map(|n| format!("    line_{n}();"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let text = format!("It spins forever.\n\n```rust\n{code}\n```");
+            let out = issue_body(&text, &s());
+            assert_eq!(0, fences(&out) % 2, "unclosed fence at {lines} lines");
+            if lines <= 400 {
+                assert!(
+                    out.contains(&format!("line_{}();", lines - 1)),
+                    "cut at {lines} lines"
+                );
+            } else {
+                // Past what GitHub would accept at all. Shortened rather than
+                // dropped, on a line boundary, and it says so.
+                assert!(out.contains("line_0();"), "the snippet went entirely");
+                assert!(
+                    out.contains("snippet shortened"),
+                    "the reader is not told: {}",
+                    &out[out.len().saturating_sub(80)..]
+                );
+            }
+        }
     }
 
     /// Code is exempt from the budget, so a long snippet cannot squeeze out the
@@ -817,8 +909,13 @@ mod issue_body_tests {
     /// read cold by somebody with none of the context.
     #[test]
     fn an_issue_gets_much_more_room_than_a_comment() {
-        let text = "word ".repeat(500);
-        assert!(issue_body(&text, &s()).len() > body(&text, &s()).len() * 2);
+        let text = "word ".repeat(4000);
+        assert!(
+            issue_body(&text, &s()).len() > body(&text, &s()).len() * 2,
+            "issue {} vs comment {}",
+            issue_body(&text, &s()).len(),
+            body(&text, &s()).len()
+        );
     }
 
     #[test]
@@ -855,5 +952,105 @@ mod issue_body_tests {
         );
         let once = issue_body(&text, &s());
         assert_eq!(once, issue_body(&once, &s()));
+    }
+}
+
+#[cfg(test)]
+mod sentence_completion_tests {
+    use super::*;
+
+    fn s() -> Style {
+        Style::default()
+    }
+
+    /// The real close comment from beignet#493, which stopped mid-clause and
+    /// told the reader nothing.
+    const REAL: &str = "Disconnect() deliberately drops the instance's restore debt and stops \
+        its poll, so re-arming _restoreOwed there would leave a field nothing consumes, and \
+        surviving instances already reconnect and restore every remaining hash on their own.";
+
+    #[test]
+    fn the_real_comment_now_finishes_its_sentence() {
+        let out = summary(REAL, &s());
+        assert!(!out.ends_with("..."), "{out}");
+        assert!(out.ends_with('.'), "{out}");
+        assert!(out.contains("on their own"), "the thought completes: {out}");
+    }
+
+    /// The point of the overshoot: a budget is a target, not a guillotine.
+    #[test]
+    fn a_sentence_running_just_past_the_budget_is_finished_not_cut() {
+        let text = format!("{} and then it ends here.", "word ".repeat(78));
+        let out = clip(&text, 400);
+        assert!(out.ends_with("and then it ends here."), "{out}");
+        assert!(out.chars().count() > 400, "it overshot on purpose");
+    }
+
+    /// But not forever. Prose with no sentence end in sight still gets cut.
+    #[test]
+    fn a_sentence_that_never_ends_is_still_cut() {
+        let text = "word ".repeat(400);
+        let out = clip(&text, 200);
+        assert!(out.ends_with("..."), "{out}");
+        assert!(out.chars().count() <= 200, "{}", out.chars().count());
+    }
+
+    /// Overshoot is for a sentence straddling the budget, not a licence to
+    /// ignore it. Where sentences end regularly, it stops within budget.
+    #[test]
+    fn it_stops_within_budget_when_a_sentence_ends_there() {
+        let text = "This sentence is complete. ".repeat(30);
+        let out = clip(&text, 400);
+        assert!(out.ends_with("complete."), "{out}");
+        assert!(out.chars().count() <= 400, "{}", out.chars().count());
+    }
+
+    /// And a small budget cannot be run away with by one long sentence.
+    #[test]
+    fn overshoot_never_more_than_doubles_the_budget() {
+        let text = format!("Short. {}", "word ".repeat(400));
+        let out = clip(&text, 60);
+        assert!(out.chars().count() <= 120, "{}", out.chars().count());
+    }
+
+    /// Two issues were filed on a real repository with titles ending in a
+    /// literal ellipsis. A title is not a place for one.
+    #[test]
+    fn a_title_never_wears_an_ellipsis() {
+        let long = "disconnect() stops electrum for clients.network rather than \
+                    this.electrumNetwork and records the stop against a key nothing reads back"
+            .to_string();
+        let out = title(&long, &s());
+        assert!(!out.ends_with("..."), "{out}");
+        assert!(!out.contains("..."), "{out}");
+    }
+
+    /// The two real titles that were truncated were 85 and 89 characters after
+    /// spar cut them. The raised budget keeps titles of that length whole.
+    #[test]
+    fn the_titles_that_were_cut_would_now_survive() {
+        for real in [
+            "Public subscribeToHeader/subscribeToAddresses re-register an instance disconnect() \
+             deliberately dropped",
+            "disconnect() stops electrum for clients.network, not this.electrumNetwork, and \
+             records the stop against the wrong key",
+        ] {
+            let out = title(real, &s());
+            assert_eq!(one_line(real), out, "still truncated: {out}");
+        }
+    }
+
+    #[test]
+    fn the_budgets_leave_room_to_finish_a_thought() {
+        let d = s();
+        assert!(d.max_summary_chars >= 400, "a one line reason needs room");
+        assert!(d.max_detail_chars >= 500);
+        assert!(d.max_title_chars >= 140);
+    }
+
+    #[test]
+    fn a_short_text_is_still_left_completely_alone() {
+        assert_eq!("Already short.", clip("Already short.", 400));
+        assert_eq!("Already short.", clip_bare("Already short.", 400));
     }
 }

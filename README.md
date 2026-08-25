@@ -79,6 +79,7 @@ spar run                    # triage every open issue, then work them in order
 spar run 42 51 60           # or name the ones you care about
 spar triage                 # triage only, write plan.json, touch nothing
 spar run --limit 50         # raise the cap on how many open issues to take
+spar run --min-number 480   # ignore anything numbered below #480
 spar run 42 --auto-merge    # merge when no blocking findings remain
 spar run 42 --max-rounds 5  # allow more review rounds before escalating
 spar run 42                 # if 42 already has an open PR, continues that
@@ -107,6 +108,21 @@ spar run 42 --quiet         # suppress progress; warnings and errors still print
 With no numbers given, spar takes the 20 lowest numbered open items. It says
 which ones it picked, and says so explicitly when there were more than the cap
 rather than quietly truncating. Raise it with `--limit`.
+
+Because it takes the **lowest** numbered items, a repository that has been going
+a while walks straight into a tail of old issues nobody is going to reach.
+`min_number` puts a floor under that:
+
+```bash
+spar run --min-number 480      # or min_number = 480 in spar.toml
+```
+
+The floor is applied before the cap, which is the part that matters: filtering
+afterwards would fill the cap with the oldest items and then discard them all,
+leaving nothing. So `--min-number 480 --limit 20` gives you the twenty lowest
+numbered items **at or above** #480, and spar says how many it skipped. A number
+you name explicitly is always honoured, floor or not, because naming it is the
+point.
 
 Works on any GitHub repo you have cloned with push access. It follows `gh`
 conventions: the repo comes from the checkout you point at, and the base branch

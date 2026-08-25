@@ -259,6 +259,15 @@ pub struct LoopCfg {
     /// triage, so there is nothing to serialise.
     #[serde(default = "yes")]
     pub parallel_triage: bool,
+    /// Ignore issues and pull requests numbered below this when spar is picking
+    /// for itself. 0 is no floor.
+    ///
+    /// A repository that has been going a while carries a tail of old issues
+    /// nobody is going to reach, and since spar takes the lowest numbered open
+    /// items it walks straight into them. A number you name explicitly is still
+    /// honoured: naming it is the point.
+    #[serde(default)]
+    pub min_number: i64,
     /// Waves of newly filed follow-ups to fold back into the same run, rather
     /// than leaving them for the next one.
     ///
@@ -302,6 +311,7 @@ impl Default for LoopCfg {
             file_nits: false,
             close_skipped: true,
             parallel_triage: true,
+            min_number: 0,
             absorb_new_issues: 0,
             effort_schedule: EffortSchedule::default(),
         }

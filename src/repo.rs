@@ -574,7 +574,12 @@ impl Repo {
         Ok(issues)
     }
 
-    fn open_numbers(&self, kind: &str, limit: usize) -> Result<Vec<i64>> {
+    /// Open items, lowest numbered first, from `min_number` upward.
+    ///
+    /// The floor exists because a long lived repository accumulates a tail of
+    /// old issues nobody is going to get to, and taking the lowest numbered
+    /// open items means walking straight into them.
+    fn open_numbers(&self, kind: &str, limit: usize, min_number: i64) -> Result<Vec<i64>> {
         #[derive(Deserialize)]
         struct Row {
             number: i64,
@@ -594,7 +599,15 @@ impl Repo {
         numbers.sort_unstable();
 
         let noun = if kind == "issue" { "issues" } else { "PRs" };
-        if numbers.len() >= FETCH_CEILING {
+        let found = numbers.len();
+        if min_number > 0 {
+            numbers.retain(|n| *n >= min_number);
+            let skipped = found - numbers.len();
+            if skipped > 0 {
+                crate::log!("{skipped} open {noun} below #{min_number} skipped");
+            }
+        }
+        if found >= FETCH_CEILING {
             crate::log!(
                 "more than {FETCH_CEILING} open {noun}; only the first {FETCH_CEILING} were \
                  considered."
@@ -612,12 +625,12 @@ impl Repo {
     }
 
     /// Open issues, lowest numbered first. `gh issue list` excludes PRs.
-    pub fn list_open_issues(&self, limit: usize) -> Result<Vec<i64>> {
-        self.open_numbers("issue", limit)
+    pub fn list_open_issues(&self, limit: usize, min_number: i64) -> Result<Vec<i64>> {
+        self.open_numbers("issue", limit, min_number)
     }
 
-    pub fn list_open_prs(&self, limit: usize) -> Result<Vec<i64>> {
-        self.open_numbers("pr", limit)
+    pub fn list_open_prs(&self, limit: usize, min_number: i64) -> Result<Vec<i64>> {
+        self.open_numbers("pr", limit, min_number)
     }
 
     pub fn pr_for_branch(&self, branch: &str) -> Option<PrRef> {
@@ -1703,5 +1716,47 @@ mod linked_pr_tests {
                 .unwrap()
                 .is_cross_repository
         );
+    }
+}
+
+#[cfg(test)]
+mod min_number_tests {
+    /// The floor is applied before the cap, which is the order that matters.
+    /// spar takes the *lowest* numbered open items, so a repository with a tail
+    /// of old issues would otherwise spend its whole run in the tail: the cap
+    /// would be filled by the oldest items and the floor would never be
+    /// reached. Filtering first is what makes the setting do anything.
+    fn pick(open: &[i64], limit: usize, min_number: i64) -> Vec<i64> {
+        let mut numbers: Vec<i64> = open.to_vec();
+        numbers.sort_unstable();
+        if min_number > 0 {
+            numbers.retain(|n| *n >= min_number);
+        }
+        numbers.truncate(limit);
+        numbers
+    }
+
+    #[test]
+    fn the_floor_is_applied_before_the_cap_not_after() {
+        let open = [12, 13, 14, 480, 481, 482];
+        assert_eq!(vec![480, 481], pick(&open, 2, 480));
+        // Capping first would have returned the two oldest and then filtered
+        // them all away, leaving nothing.
+        assert!(!pick(&open, 2, 480).is_empty());
+    }
+
+    #[test]
+    fn no_floor_keeps_the_old_behaviour() {
+        assert_eq!(vec![12, 13], pick(&[12, 13, 14, 480], 2, 0));
+    }
+
+    #[test]
+    fn the_floor_is_inclusive() {
+        assert_eq!(vec![480, 481], pick(&[479, 480, 481], 10, 480));
+    }
+
+    #[test]
+    fn a_floor_above_everything_open_yields_nothing() {
+        assert!(pick(&[1, 2, 3], 10, 9999).is_empty());
     }
 }

@@ -76,6 +76,13 @@ branch_prefix     = ""       # branches are issue-N and pr-N. Set e.g. "spar/"
                              # to namespace them
 close_skipped     = true     # close an issue both agents independently declined,
                              # after posting the shared reasoning
+min_number        = 0        # ignore issues and PRs numbered below this when
+                             # spar is picking for itself. 0 is no floor. A long
+                             # lived repo carries a tail of old issues nobody is
+                             # going to reach, and spar takes the LOWEST numbered
+                             # open items, so without a floor it walks straight
+                             # into them. A number you name explicitly is always
+                             # honoured.
 parallel_triage   = true     # both agents triage at once; they only read
 absorb_new_issues = 0        # waves of newly filed follow-ups to fold back into
                              # the same run rather than leaving them for the

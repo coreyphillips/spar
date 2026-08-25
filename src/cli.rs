@@ -155,6 +155,10 @@ pub struct Common {
     /// Cap on how many open items to take when none are named.
     #[arg(long, default_value_t = 20)]
     pub limit: usize,
+    /// Ignore issues and pull requests numbered below this when picking for
+    /// itself. A number you name explicitly is always honoured.
+    #[arg(long, value_name = "N")]
+    pub min_number: Option<i64>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -221,7 +225,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             };
             let (cfg, repo, agents) = prepare(&common, Some(overrides))?;
             let numbers = if items.is_empty() {
-                let found = repo.list_open_prs(common.limit)?;
+                let found = repo.list_open_prs(common.limit, cfg.loop_cfg.min_number)?;
                 if found.is_empty() {
                     log!("no open PRs");
                     return Ok(0);
@@ -267,7 +271,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             plan_out,
         } => {
             let (cfg, repo, agents) = prepare(&common, None)?;
-            let numbers = pick_issues(&repo, issues, common.limit)?;
+            let numbers = pick_issues(&repo, issues, common.limit, cfg.loop_cfg.min_number)?;
             if numbers.is_empty() {
                 return Ok(0);
             }
@@ -303,7 +307,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                     _ => None,
                 };
             let (cfg, repo, agents) = prepare(&common, Some(overrides))?;
-            let numbers = pick_issues(&repo, issues, common.limit)?;
+            let numbers = pick_issues(&repo, issues, common.limit, cfg.loop_cfg.min_number)?;
             if numbers.is_empty() {
                 return Ok(0);
             }
@@ -407,7 +411,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 }
             }
             let numbers = if prs.is_empty() {
-                let found = repo.list_open_prs(common.limit)?;
+                let found = repo.list_open_prs(common.limit, cfg.loop_cfg.min_number)?;
                 if found.is_empty() {
                     log!("no open PRs");
                     return Ok(0);
@@ -503,6 +507,9 @@ fn prepare(common: &Common, overrides: Option<Overrides>) -> Result<(Config, Rep
     if let Some(base) = &common.base {
         cfg.loop_cfg.base_branch = base.clone();
     }
+    if let Some(min) = common.min_number {
+        cfg.loop_cfg.min_number = min;
+    }
     if let Some(over) = overrides {
         if let Some(v) = over.max_rounds {
             if v == 0 {
@@ -559,11 +566,25 @@ fn prepare(common: &Common, overrides: Option<Overrides>) -> Result<(Config, Rep
     Ok((cfg, repo, agents))
 }
 
-fn pick_issues(repo: &Repo, given: Vec<i64>, limit: usize) -> Result<Vec<i64>> {
+fn pick_issues(repo: &Repo, given: Vec<i64>, limit: usize, min_number: i64) -> Result<Vec<i64>> {
     if !given.is_empty() {
+        // Naming a number is the point, so a floor never overrides it.
+        if min_number > 0 {
+            let below: Vec<String> = given
+                .iter()
+                .filter(|n| **n < min_number)
+                .map(|n| format!("#{n}"))
+                .collect();
+            if !below.is_empty() {
+                logdim!(
+                    "{} below the #{min_number} floor, taking them because you named them",
+                    below.join(", ")
+                );
+            }
+        }
         return Ok(given);
     }
-    let found = repo.list_open_issues(limit)?;
+    let found = repo.list_open_issues(limit, min_number)?;
     if found.is_empty() {
         log!("no open issues");
         return Ok(found);
@@ -788,6 +809,8 @@ fn cmd_init(out: &Path, force: bool) -> Result<i32> {
          close_skipped     = true       # close an issue both reviewers declined\n\
          followups         = \"issues\"   # issues | local | none\n\
          # keep_worktrees  = false      # true leaves them behind to inspect\n\
+         # min_number      = 0          # ignore anything numbered below this when\n\
+         #                                picking for itself. 0 is no floor.\n\
          # parallel_triage = true       # false asks the agents one at a time\n\
          # absorb_new_issues = 0        # waves of newly filed follow-ups to fold\n\
          #                                back into this run. Costs more.\n\
@@ -1249,5 +1272,36 @@ mod absorb_tests {
         assert!(Cli::try_parse_from(["spar", "run", "--absorb", "1"]).is_ok());
         assert!(Cli::try_parse_from(["spar", "resume", "--absorb", "1"]).is_ok());
         assert!(Cli::try_parse_from(["spar", "review", "--absorb", "1"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod min_number_tests {
+    use super::*;
+
+    fn read(argv: &[&str]) -> Option<i64> {
+        match Cli::parse_from(argv).command {
+            Command::Run { common, .. }
+            | Command::Triage { common, .. }
+            | Command::Resume { common, .. }
+            | Command::Review { common, .. } => common.min_number,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn there_is_no_floor_unless_one_is_asked_for() {
+        assert_eq!(None, read(&["spar", "run"]));
+    }
+
+    #[test]
+    fn every_command_that_picks_for_itself_accepts_a_floor() {
+        for cmd in ["run", "triage", "resume", "review"] {
+            assert_eq!(
+                Some(480),
+                read(&["spar", cmd, "--min-number", "480"]),
+                "{cmd}"
+            );
+        }
     }
 }

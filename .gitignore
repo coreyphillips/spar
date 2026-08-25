@@ -2,6 +2,14 @@
 **/*.rs.bk
 Cargo.lock.orig
 
+# Editor and OS cruft. Kept out of git so `cargo publish` does not refuse over
+# it, and out of the published crate so nobody downloads somebody's IDE config.
+.idea/
+.vscode/
+*.iml
+.DS_Store
+*.swp
+
 # spar's own working state, when spar is run on this repo
 /spar.toml
 /plan.json

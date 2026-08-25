@@ -9,7 +9,7 @@ repository = "https://github.com/coreyphillips/spar"
 readme = "README.md"
 keywords = ["github", "code-review", "agents", "automation", "cli"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = ["/.github", "/target"]
+exclude = ["/.github", "/target", "/.idea", "/.vscode"]
 
 # The crate is `spar-cli` because `spar` is taken on crates.io by an unrelated
 # config parser. The binary is `spar`, which is what you actually type.

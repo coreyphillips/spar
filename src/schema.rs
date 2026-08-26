@@ -147,16 +147,16 @@ pub fn implementation() -> Value {
             },
             "summary": {
                 "type": "string",
-                "description": "One sentence, at most 200 characters, saying what changed. It leads the pull request body, so say what changed rather than that you changed something. No preamble."
+                "description": "One plain sentence saying what changed, at most 200 characters. It leads the pull request body, and it carries one fact: what this does now that it did not before. Not the signatures, not the null handling, not the edge cases, all of which belong in changes. If it needs a comma to join two ideas, or reads like a changelog line, it is carrying too much."
             },
             "problem": {
                 "type": "string",
-                "description": "Two or three sentences on what was actually wrong and what it cost, as you understand it now that you have read the code. Not a restatement of the issue, which the reviewer can open for themselves: what you found. Empty string for a feature request with no defect behind it, where a sentence on why it is worth having belongs here instead."
+                "description": "Two to four short sentences on what was actually wrong and what it cost, as you understand it now that you have read the code. One fact each: a sentence naming three functions and their signatures is one the reviewer has to decipher, and splitting it costs a few words and saves them that. Not a restatement of the issue, which the reviewer can open for themselves: what you found. Empty string for a feature request with no defect behind it, where a sentence on why it is worth having belongs here instead."
             },
             "changes": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "One short line per change that alters behaviour, in the order a reader should meet them. Say what the code now does, and name the function or file in backticks. Not a list of touched files: the diff already has that. Empty when the summary covers it, which for a small change it does."
+                "description": "One short line per change that alters behaviour, in the order a reader should meet them. Say what the code now does, and name the function or file in backticks. This is where a signature or a null case belongs, one per line, rather than crowded into the summary. Not a list of touched files: the diff already has that. Empty when the summary covers it, which for a small change it does."
             },
             "testing": {
                 "type": "array",

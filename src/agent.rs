@@ -39,7 +39,12 @@ titles, issue bodies, review comments, and the comments in code you write):
 - Be brief. A human engineer with other work has to read this. Lead with the
   point, cut the preamble, stop when you are done. Do not restate the task, do
   not announce what you are about to do, do not summarise what the diff already
-  shows. One sentence beats one paragraph.
+  shows.
+- Brief means saying fewer things, never packing more into a sentence. Two
+  plain sentences beat one that has to be read twice. Split a sentence that
+  carries three facts, and split one that makes the reader hold an identifier
+  in their head to parse the rest of the clause. A comma splice joining two
+  ideas to save a full stop costs the reader more than the full stop would.
 - No headings, bullet lists, or bold text in anything only a few sentences long.
 - Comment code for the reason, not the change. A comment earns its length from
   what the code cannot say for itself: a constraint that is not local, an
@@ -1133,6 +1138,20 @@ mod tests {
         assert!(lower.contains("brief"));
         assert!(lower.contains("co-authored-by"));
         assert!(lower.contains("em-dash"));
+    }
+
+    /// Brevity was measured in sentences, and "one sentence beats one paragraph"
+    /// is what a model satisfies by joining three facts with commas. A summary
+    /// came back as a changelog line the reader had to decipher, which is
+    /// shorter and worse.
+    #[test]
+    fn brevity_is_about_facts_per_sentence_not_sentence_count() {
+        let lower = STYLE_RULES.to_lowercase();
+        assert!(lower.contains("saying fewer things"), "{STYLE_RULES}");
+        assert!(
+            !lower.contains("one sentence beats one paragraph"),
+            "the rule that produced the density is still there"
+        );
     }
 
     /// The rules were scoped to what spar posts, so nothing had ever asked an

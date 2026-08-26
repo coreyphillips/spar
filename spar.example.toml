@@ -33,6 +33,23 @@ effort = "ultra"      # Codex does not list these in its help. Your
 #   system_via   = "prompt"     # prompt | placeholder. Where the style rules go
 #   message_path = "item.text"  # jsonl only: where the answer lives
 #   [agents.NAME.message_match] # jsonl only: which event carries the answer
+#   [agents.NAME.fallback]      # a stand in for when this CLI cannot answer
+#
+# A fallback is a whole agent, preset and all, and it is not a third opinion. It
+# never reviews alongside the pair: it answers in place of the agent that
+# failed, holding that agent's turn, so neither agent ever reviews its own most
+# recent edit. Without one, a CLI that is down, out of quota, or refusing the
+# request on policy grounds takes the whole run with it.
+#
+#   [agents.codex.fallback]
+#   preset = "cursor"
+#   model  = "kimi-k3"
+#
+# It fires once the primary has spent its own retries, and on a deadline too: a
+# different CLI is a different question. `spar doctor` shows it under the agent
+# it stands in for, and SPAR_CODEX_FALLBACK_BIN points it somewhere else. One
+# that is not installed warns at startup and is otherwise ignored, because a
+# missing backup should not stop a run whose pair is fine.
 #
 # Any two agents work. To pair different CLIs, point at other presets:
 #   [agents.gemini]

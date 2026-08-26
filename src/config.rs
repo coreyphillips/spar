@@ -23,6 +23,7 @@ pub const BUILTIN_PRESETS: &[(&str, &str)] = &[
     ("aider", include_str!("../presets/aider.toml")),
     ("claude", include_str!("../presets/claude.toml")),
     ("codex", include_str!("../presets/codex.toml")),
+    ("cursor", include_str!("../presets/cursor.toml")),
     ("gemini", include_str!("../presets/gemini.toml")),
 ];
 
@@ -109,6 +110,18 @@ pub struct AgentSpec {
     pub system_via: SystemVia,
     #[serde(default = "default_timeout")]
     pub timeout: u64,
+    /// A stand in for when this agent cannot answer at all: a CLI that is down,
+    /// out of quota, or refusing the request on policy grounds.
+    ///
+    /// Declared as a nested table rather than by naming a third agent, because
+    /// spar takes exactly two and a backup is not a third opinion. It never
+    /// reviews alongside the pair, it only answers in place of the one that
+    /// failed, so the alternation the design rests on is unchanged.
+    ///
+    /// Built by `build_spec` from the `[agents.NAME.fallback]` table, never
+    /// deserialized directly, so a preset of its own still resolves.
+    #[serde(skip)]
+    pub fallback: Option<Box<AgentSpec>>,
 
     // -- hints, inert at runtime -----------------------------------------
     //
@@ -599,6 +612,9 @@ fn build_spec(name: &str, raw: &Value) -> Result<AgentSpec> {
         .cloned()
         .ok_or_else(|| spar_err!("agent '{name}' must be a table"))?;
     merged_table.remove("preset");
+    // Lifted out before the spec is deserialized: a fallback is a whole agent,
+    // preset and all, and only this function knows how to resolve a preset.
+    let fallback_raw = merged_table.remove("fallback");
 
     if !merged_table.contains_key("command") {
         bail!(
@@ -623,6 +639,25 @@ fn build_spec(name: &str, raw: &Value) -> Result<AgentSpec> {
             "agent '{name}': output = \"jsonl\" needs a message_path saying where the answer lives"
         );
     }
+
+    if let Some(raw) = fallback_raw {
+        if !raw.is_table() {
+            bail!(
+                "agent '{name}': fallback is a whole agent, so write it as a table:\n                   [agents.{name}.fallback]\n  preset = \"cursor\""
+            );
+        }
+        // Named for the env override it answers to, SPAR_<NAME>_FALLBACK_BIN,
+        // and so a log line says which agent stood in for which.
+        let backup = build_spec(&format!("{name}-fallback"), &raw)?;
+        if backup.fallback.is_some() {
+            bail!(
+                "agent '{name}': a fallback may not have a fallback of its own. Each one costs \
+                 another full timeout on a call that has already failed once."
+            );
+        }
+        spec.fallback = Some(Box::new(backup));
+    }
+
     Ok(spec)
 }
 
@@ -789,6 +824,50 @@ preset = "codex"
 model = "gpt-5.6-sol"
 "#;
 
+    // -- fallback --------------------------------------------------------
+
+    #[test]
+    fn a_fallback_is_a_whole_agent_with_its_own_preset() {
+        let text = format!(
+            "{TWO_AGENTS}\n[agents.codex.fallback]\npreset = \"cursor\"\nmodel = \"kimi-k3\"\n"
+        );
+        let cfg = parse(&text).expect("parses");
+        // Still a pair. A backup is not a third opinion.
+        assert_eq!(2, cfg.agents.len());
+        let codex = cfg.spec("codex").expect("codex");
+        let backup = codex.fallback.as_ref().expect("fallback");
+        assert_eq!("codex-fallback", backup.name);
+        assert_eq!(Some("kimi-k3"), backup.model.as_deref());
+        assert_eq!(
+            Some(&CommandPart::One("cursor-agent".into())),
+            backup.command.first()
+        );
+    }
+
+    #[test]
+    fn the_agent_without_a_fallback_does_not_grow_one() {
+        let cfg = parse(TWO_AGENTS).expect("parses");
+        assert!(cfg.agents.iter().all(|a| a.fallback.is_none()));
+    }
+
+    #[test]
+    fn a_fallback_may_not_have_one_of_its_own() {
+        let text = format!(
+            "{TWO_AGENTS}\n[agents.codex.fallback]\npreset = \"cursor\"\n\
+             [agents.codex.fallback.fallback]\npreset = \"gemini\"\n"
+        );
+        let err = parse(&text).expect_err("rejected");
+        assert!(err.message().contains("may not have a fallback"), "{err}");
+    }
+
+    #[test]
+    fn a_fallback_written_as_a_string_says_what_it_should_be() {
+        let text = "[agents.claude]\npreset = \"claude\"\n\n\
+                    [agents.codex]\npreset = \"codex\"\nfallback = \"cursor\"\n";
+        let err = parse(text).expect_err("rejected");
+        assert!(err.message().contains("[agents.codex.fallback]"), "{err}");
+    }
+
     #[test]
     fn every_builtin_preset_parses() {
         for (name, _) in BUILTIN_PRESETS {
@@ -954,6 +1033,7 @@ model = "gpt-5.6-sol"
             search_paths: vec![],
             system_via: SystemVia::Prompt,
             timeout: 60,
+            fallback: None,
             models: vec![],
             efforts: vec![],
             options_note: None,

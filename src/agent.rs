@@ -15,7 +15,7 @@ use crate::config::{AgentSpec, CommandPart, OutputMode, SystemVia};
 use crate::error::{Result, SparError};
 use crate::jsonx;
 use crate::proc::{self, ExecOpts};
-use crate::{bail, logdim, logwarn, spar_err};
+use crate::{bail, log, logdim, logwarn, spar_err};
 
 /// Injected into every request. Prompting alone is not sufficient for any of
 /// these, which is why each one is also enforced deterministically on the way
@@ -40,6 +40,10 @@ schema. No prose, no markdown fences, no commentary before or after:";
 
 pub struct Agent {
     pub spec: AgentSpec,
+    /// Answers in this agent's place when it cannot answer at all. Never
+    /// alongside it: the pair is still two, and the fallback only ever holds
+    /// the turn the failed agent was already holding.
+    fallback: Option<Box<Agent>>,
     resolved: OnceLock<PathBuf>,
 }
 
@@ -51,14 +55,41 @@ impl std::fmt::Debug for Agent {
 
 impl Agent {
     pub fn new(spec: AgentSpec) -> Self {
+        let fallback = spec
+            .fallback
+            .clone()
+            .map(|backup| Box::new(Agent::new(*backup)));
         Self {
             spec,
+            fallback,
             resolved: OnceLock::new(),
         }
     }
 
     pub fn name(&self) -> &str {
         &self.spec.name
+    }
+
+    /// The stand in, if one is configured.
+    pub fn fallback(&self) -> Option<&Agent> {
+        self.fallback.as_deref()
+    }
+
+    /// The program the template names, before any resolution. What somebody
+    /// has to install when spar reports it missing.
+    pub fn program(&self) -> &str {
+        match self.spec.command.first() {
+            Some(CommandPart::One(program)) => program,
+            _ => self.name(),
+        }
+    }
+
+    /// The environment variable that points this agent's binary somewhere else.
+    pub fn env_key(&self) -> String {
+        format!(
+            "SPAR_{}_BIN",
+            self.spec.name.to_uppercase().replace('-', "_")
+        )
     }
 
     /// Used by the tests, and by `doctor` when it wants to report a path it
@@ -91,10 +122,7 @@ impl Agent {
             _ => bail!("agent '{}' has no command configured", self.spec.name),
         };
 
-        let env_key = format!(
-            "SPAR_{}_BIN",
-            self.spec.name.to_uppercase().replace('-', "_")
-        );
+        let env_key = self.env_key();
         let env_override = std::env::var(&env_key)
             .ok()
             .filter(|v| !v.trim().is_empty());
@@ -227,7 +255,48 @@ impl Agent {
     // -- the two operations everything else is built from -------------------
 
     pub fn ask(&self, prompt: &str, cwd: &Path, effort: Option<&str>) -> Result<String> {
-        self.ask_inner(prompt, cwd, effort, None, None)
+        match self.ask_inner(prompt, cwd, effort, None, None) {
+            Ok(text) => Ok(text),
+            Err(e) => self.hand_over(e, |backup| backup.ask(prompt, cwd, None)),
+        }
+    }
+
+    /// Give a failed call to the fallback, if there is one.
+    ///
+    /// Every failure qualifies, a deadline included. Asking the same CLI again
+    /// after a timeout buys another wait of the same length for the same
+    /// answer, which is why `ask_json` does not; asking a different CLI is a
+    /// different question, and the alternative here is losing the run.
+    ///
+    /// The scheduled effort is deliberately not passed on. Effort words are
+    /// each CLI's own vocabulary, and the one in hand belongs to the agent that
+    /// just failed, so the fallback uses whatever its own config asked for.
+    fn hand_over<T>(&self, primary: SparError, run: impl FnOnce(&Agent) -> Result<T>) -> Result<T> {
+        let Some(backup) = self.fallback() else {
+            return Err(primary);
+        };
+        logwarn!(
+            "{} could not answer. Handing the call to {}.\n{primary}",
+            self.name(),
+            backup.name()
+        );
+        match run(backup) {
+            Ok(answer) => {
+                log!("{} answered in place of {}", backup.name(), self.name());
+                Ok(answer)
+            }
+            // Both messages, primary first. The fallback's failure is usually
+            // the less interesting of the two, and is often just "not
+            // installed", which explains nothing about why the run stopped.
+            Err(second) => Err(spar_err!(
+                "agent '{}' failed and its fallback '{}' could not stand in.\n{}\n\n{}: {}",
+                self.name(),
+                backup.name(),
+                primary.message(),
+                backup.name(),
+                second.message()
+            )),
+        }
     }
 
     fn ask_inner(
@@ -263,6 +332,22 @@ impl Agent {
     /// exposes one, otherwise by asking for JSON in the prompt and parsing it
     /// back out.
     pub fn ask_json<T: serde::de::DeserializeOwned>(
+        &self,
+        prompt: &str,
+        schema: &Value,
+        cwd: &Path,
+        effort: Option<&str>,
+    ) -> Result<T> {
+        match self.ask_json_retrying(prompt, schema, cwd, effort) {
+            Ok(parsed) => Ok(parsed),
+            Err(e) => self.hand_over(e, |backup| {
+                backup.ask_json_retrying::<T>(prompt, schema, cwd, None)
+            }),
+        }
+    }
+
+    /// The same question, asked at most twice of this agent alone.
+    fn ask_json_retrying<T: serde::de::DeserializeOwned>(
         &self,
         prompt: &str,
         schema: &Value,
@@ -568,6 +653,18 @@ pub fn build(cfg: &crate::config::Config) -> Result<Vec<Agent>> {
     let agents: Vec<Agent> = cfg.agents.iter().cloned().map(Agent::new).collect();
     for agent in &agents {
         agent.resolve_bin()?;
+        // A backup that is not installed must not stop a run whose pair is
+        // fine. Said once here, at the start, rather than an hour in at the
+        // moment it was needed and could not be reached.
+        if let Some(backup) = agent.fallback() {
+            if backup.resolve_bin().is_err() {
+                logwarn!(
+                    "{} has a fallback ({}) that is not installed, so it will not stand in",
+                    agent.name(),
+                    backup.program()
+                );
+            }
+        }
     }
     Ok(agents)
 }
@@ -603,6 +700,7 @@ mod tests {
             search_paths: vec![],
             system_via: SystemVia::Prompt,
             timeout: 60,
+            fallback: None,
             models: vec![],
             efforts: vec![],
             options_note: None,
@@ -920,6 +1018,86 @@ mod tests {
         assert!(lower.contains("co-authored-by"));
         assert!(lower.contains("em-dash"));
     }
+
+    // -- fallback --------------------------------------------------------
+
+    /// An agent whose command is a literal shell line, so a test can make the
+    /// call succeed or fail on purpose.
+    fn shell(name: &str, line: &str) -> AgentSpec {
+        let mut spec = spec(vec![one("sh"), one("-c"), one(line)]);
+        spec.name = name.into();
+        spec
+    }
+
+    fn with_fallback(mut primary: AgentSpec, backup: AgentSpec) -> Agent {
+        primary.fallback = Some(Box::new(backup));
+        Agent::with_bin(primary, "/bin/sh")
+    }
+
+    #[test]
+    fn a_failed_call_is_answered_by_the_fallback() {
+        let agent = with_fallback(
+            shell("primary", "echo refused >&2; exit 1"),
+            shell("backup", "echo stood in"),
+        );
+        let answer = agent.ask("hi", Path::new("."), None).expect("fallback");
+        assert_eq!("stood in", answer);
+    }
+
+    #[test]
+    fn without_a_fallback_the_original_error_is_what_surfaces() {
+        let agent = Agent::with_bin(shell("primary", "echo refused >&2; exit 1"), "/bin/sh");
+        let err = agent
+            .ask("hi", Path::new("."), None)
+            .expect_err("no backup");
+        assert!(err.message().contains("refused"), "{err}");
+    }
+
+    /// The reason the run stopped is the primary's, not the backup's, so it
+    /// leads. A backup that is simply not installed explains nothing.
+    #[test]
+    fn both_failing_reports_the_primary_first() {
+        let agent = with_fallback(
+            shell("primary", "echo policy refusal >&2; exit 1"),
+            shell("backup", "echo out of quota >&2; exit 1"),
+        );
+        let err = agent
+            .ask("hi", Path::new("."), None)
+            .expect_err("both fail");
+        let text = err.message();
+        let primary_at = text.find("policy refusal").expect("primary reason");
+        let backup_at = text.find("out of quota").expect("backup reason");
+        assert!(primary_at < backup_at, "{text}");
+        assert!(
+            text.contains("primary") && text.contains("backup"),
+            "{text}"
+        );
+    }
+
+    /// A deadline is not worth asking the same CLI again, and `ask_json` does
+    /// not. A different CLI is a different question, and the alternative is
+    /// losing the run.
+    #[test]
+    fn a_timeout_still_reaches_the_fallback() {
+        let mut primary = shell("primary", "sleep 30");
+        primary.timeout = 1;
+        let agent = with_fallback(primary, shell("backup", "echo stood in"));
+        assert_eq!(
+            "stood in",
+            agent.ask("hi", Path::new("."), None).expect("fallback")
+        );
+    }
+
+    /// The fallback is built with the agent, not looked up later, so a spec
+    /// that carries one produces an agent that carries one.
+    #[test]
+    fn the_fallback_is_built_alongside_the_agent() {
+        let mut primary = shell("primary", "true");
+        primary.fallback = Some(Box::new(shell("backup", "true")));
+        let agent = Agent::new(primary);
+        assert_eq!(Some("backup"), agent.fallback().map(Agent::name));
+        assert!(Agent::new(shell("solo", "true")).fallback().is_none());
+    }
 }
 
 #[cfg(test)]
@@ -939,6 +1117,7 @@ mod schema_placeholder_tests {
             search_paths: vec![],
             system_via: SystemVia::Prompt,
             timeout: 60,
+            fallback: None,
             models: vec![],
             efforts: vec![],
             options_note: None,

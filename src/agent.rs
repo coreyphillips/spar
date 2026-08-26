@@ -17,12 +17,21 @@ use crate::jsonx;
 use crate::proc::{self, ExecOpts};
 use crate::{bail, log, logdim, logwarn, spar_err};
 
-/// Injected into every request. Prompting alone is not sufficient for any of
-/// these, which is why each one is also enforced deterministically on the way
-/// out, but a model that was asked produces less for the gate to fix.
+/// Injected into every request.
+///
+/// Prompting alone is not sufficient, which is why the rules about what spar
+/// posts are also enforced deterministically on the way out; a model that was
+/// asked leaves the gate less to fix.
+///
+/// The rule about comments in the code is the exception, and it is worth being
+/// honest that it is one. Nothing can mechanically judge whether a comment
+/// earned its length, so that rule is only ever asked for. It is here rather
+/// than in the implement prompt because a reviewer that fixes a finding itself
+/// writes code too, and a rule that applies to one and not the other produces a
+/// file commented two ways.
 pub const STYLE_RULES: &str = "\
 Style rules for every artifact you produce (commits, PR titles, PR bodies, issue
-titles, issue bodies, review comments):
+titles, issue bodies, review comments, and the comments in code you write):
 - Never use em-dashes or en-dashes. Use commas, colons, or parentheses.
 - Never mention Claude, Codex, OpenAI, ChatGPT, Anthropic, AI, or any tooling
   used to produce the work.
@@ -32,6 +41,12 @@ titles, issue bodies, review comments):
   not announce what you are about to do, do not summarise what the diff already
   shows. One sentence beats one paragraph.
 - No headings, bullet lists, or bold text in anything only a few sentences long.
+- Comment code for the reason, not the change. A comment earns its length from
+  what the code cannot say for itself: a constraint that is not local, an
+  alternative that was tried and does not work, a surprise the next reader would
+  otherwise trip on. Write the reason that holds now, not the investigation that
+  found it. A paragraph above a three line change is almost always the debugging
+  story, and the reader wants the conclusion of it.
 Write as a human engineer would, because the reader neither knows nor cares what
 produced the work.";
 
@@ -1118,6 +1133,20 @@ mod tests {
         assert!(lower.contains("brief"));
         assert!(lower.contains("co-authored-by"));
         assert!(lower.contains("em-dash"));
+    }
+
+    /// The rules were scoped to what spar posts, so nothing had ever asked an
+    /// agent for anything about the comments it writes in the code. A three
+    /// line change came back under eight lines of comment, most of it the
+    /// debugging story rather than the reason.
+    #[test]
+    fn the_style_rules_reach_the_code_and_not_only_what_is_posted() {
+        let lower = STYLE_RULES.to_lowercase();
+        assert!(lower.contains("comments in code you write"), "not in scope");
+        assert!(
+            lower.contains("comment code for the reason"),
+            "no rule for it"
+        );
     }
 
     // -- a failure said in the agent's own terms ---------------------------

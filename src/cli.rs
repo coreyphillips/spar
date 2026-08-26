@@ -1139,24 +1139,35 @@ fn settings_block(first_implementor: &str) -> String {
 /// onto continuation lines that stay in the column rather than running off the
 /// edge or restarting at the margin.
 fn option_lines(options: &[Setting], value: &dyn Fn(&str) -> String) -> String {
-    const WIDTH: usize = 78;
-
-    let assignments: Vec<String> = options
+    let rows: Vec<(String, String)> = options
         .iter()
-        .map(|(commented, key, _)| {
+        .map(|(commented, key, note)| {
             let lead = if *commented { "# " } else { "" };
-            format!("{lead}{key} = {}", value(key))
+            (format!("{lead}{key} = {}", value(key)), note.to_string())
         })
         .collect();
-    let column = assignments
+    aligned(&rows)
+}
+
+/// Assignments with their notes lined up in one column, a long note wrapping
+/// onto continuation lines that stay in the column rather than running off the
+/// edge or restarting at the margin.
+///
+/// Shared by the `[loop]` and `[style]` blocks and by an agent's own, which is
+/// how a list of eight effort levels beside a long model name stays inside a
+/// line somebody can read.
+fn aligned(rows: &[(String, String)]) -> String {
+    const WIDTH: usize = 78;
+
+    let column = rows
         .iter()
-        .map(|a| a.chars().count())
+        .map(|(assignment, _)| assignment.chars().count())
         .max()
         .unwrap_or(0)
         + 2;
 
     let mut out = String::new();
-    for (assignment, (_, _, note)) in assignments.iter().zip(options) {
+    for (assignment, note) in rows {
         if note.is_empty() {
             out.push_str(assignment);
             out.push('\n');
@@ -1232,27 +1243,21 @@ fn agent_block(name: &str, spec: &config::AgentSpec) -> String {
             named.join(" or ")
         ));
 
-        let assignments: Vec<String> = offered
+        // The alternatives sit beside the suggestion, so somebody editing the
+        // file can see what else the CLI takes without going to look it up.
+        // Nothing beside a single choice: there is nothing to choose.
+        let rows: Vec<(String, String)> = offered
             .iter()
-            .map(|(key, choices)| format!("# {key} = \"{}\"", choices[0]))
+            .map(|(key, choices)| {
+                let note = if choices.len() > 1 {
+                    choices.join(" | ")
+                } else {
+                    String::new()
+                };
+                (format!("# {key} = \"{}\"", choices[0]), note)
+            })
             .collect();
-        // Line the comments up, so the file reads as a column rather than a
-        // jumble.
-        let column = assignments
-            .iter()
-            .map(|a| a.chars().count())
-            .max()
-            .unwrap_or(0)
-            + 3;
-        for (assignment, (_, choices)) in assignments.iter().zip(&offered) {
-            out.push_str(assignment);
-            if choices.len() > 1 {
-                let pad = column.saturating_sub(assignment.chars().count());
-                out.push_str(&" ".repeat(pad));
-                out.push_str(&format!("# {}", choices.join(" | ")));
-            }
-            out.push('\n');
-        }
+        out.push_str(&aligned(&rows));
     }
 
     if let Some(note) = &spec.options_note {
@@ -1895,6 +1900,34 @@ mod agent_block_tests {
 
     /// Alternatives are listed beside the suggestion, and a single choice is
     /// not padded out with a column that has nothing in it.
+    /// A long list wraps into its column rather than running off the edge, so
+    /// codex's eight effort levels beside a long model name stay readable.
+    #[test]
+    fn a_long_list_of_choices_wraps_into_its_column() {
+        let block = agent_block(
+            "codex",
+            &spec(
+                &[
+                    "gpt-5.6-sol",
+                    "gpt-5.6-terra",
+                    "gpt-5.6-luna",
+                    "gpt-5.6-pro",
+                ],
+                &[
+                    "ultra", "max", "xhigh", "high", "medium", "low", "minimal", "none",
+                ],
+            ),
+        );
+        assert!(
+            block.lines().all(|l| l.chars().count() <= 80),
+            "a line runs off the edge:\n{block}"
+        );
+        // Every choice survives the wrapping.
+        for choice in ["gpt-5.6-pro", "minimal", "none"] {
+            assert!(block.contains(choice), "{choice} was lost:\n{block}");
+        }
+    }
+
     #[test]
     fn alternatives_are_listed_only_when_there_are_any() {
         assert!(agent_block("a", &spec(&["one", "two"], &[])).contains("# one | two"));

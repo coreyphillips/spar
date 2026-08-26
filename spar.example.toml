@@ -11,10 +11,15 @@ effort = "high"       # high | low | medium | xhigh | max
 
 [agents.codex]
 preset = "codex"
-model  = "gpt-5.6-sol"
-effort = "ultra"      # Codex does not list these in its help. Your
-                      # ~/.codex/config.toml is the source of truth, and effort
-                      # is passed through as -c model_reasoning_effort=...
+model  = "gpt-5.6-sol"  # gpt-5.6-sol | gpt-5.6-terra | gpt-5.6-luna |
+                        # gpt-5.6-pro | gpt-5.5
+effort = "ultra"        # ultra | max | xhigh | high | medium | low | minimal |
+                        # none
+                        # Codex lists neither set in its help, so these were
+                        # read out of the binary. Your ~/.codex/config.toml is
+                        # the source of truth for what your account can call,
+                        # and effort passes through as
+                        # -c model_reasoning_effort=...
 
 # Everything a preset supplies can be overridden per agent. The full set:
 #

@@ -948,46 +948,7 @@ fn cmd_init(out: &Path, force: bool) -> Result<i32> {
     for (name, _, spec) in &chosen {
         text.push_str(&agent_block(name, spec));
     }
-    text.push_str(&format!(
-        "[loop]\n\
-         max_rounds        = 3          # review rounds ONE invocation may spend.\n\
-         #                                Resuming grants a fresh budget, so this\n\
-         #                                is not a lifetime cap on a PR.\n\
-         auto_merge        = false      # off on purpose: two models agreeing is\n\
-         #                                not the same as being right\n\
-         first_implementor = \"{}\"\n\
-         worktrees         = true       # false works in the main checkout\n\
-         close_skipped     = true       # close an issue both reviewers declined\n\
-         followups         = \"local\"    # issues | local | none. local writes\n\
-         #                                .spar/followups.md, not the tracker\n\
-         # file_non_blocking = false    # a suggestion is not a tracker item\n\
-         # max_followups     = 5        # backstop on what one run can spawn\n\
-         # keep_worktrees  = false      # true leaves them behind to inspect\n\
-         # min_number      = 0          # ignore anything numbered below this when\n\
-         #                                picking for itself. 0 is no floor.\n\
-         # parallel_triage = true       # false asks the agents one at a time\n\
-         # absorb_new_issues = 0        # waves of newly filed follow-ups to fold\n\
-         #                                back into this run. Costs more.\n\
-         # file_nits       = false      # true files nits as issues too\n\
-         # base_branch     = \"main\"     # only a fallback; origin/HEAD wins\n\
-         # branch_prefix   = \"\"         # e.g. \"spar/\" to namespace branches\n\
-         # state_store     = \"local\"    # local | pr | both\n\n\
-         [loop.effort_schedule]\n\
-         # Values are whatever each agent's own CLI accepts, listed above.\n\
-         # round_1 = \"high\"   # the deep first review\n\
-         # rest    = \"low\"    # later rounds only see a small delta\n\n\
-         [style]\n\
-         ban_em_dash        = true\n\
-         ban_ai_attribution = true\n\
-         terse              = true    # hold model prose to a length budget\n\
-         # max_title_chars   = 90     # a finding, issue, or PR title\n\
-         # max_summary_chars = 200    # a one line verdict or refutation\n\
-         # max_detail_chars  = 320    # a blocking finding, in the PR thread\n\
-         # max_body_chars    = 900    # a PR body\n\
-         # max_issue_body_chars = 4000 # a filed issue's body. Code blocks in\n\
-         #                               it are never truncated.\n",
-        chosen[0].0
-    ));
+    text.push_str(&settings_block(&chosen[0].0));
 
     std::fs::write(out, text).map_err(|e| spar_err!("could not write {}: {e}", out.display()))?;
     println!("\nwrote {}", out.display());
@@ -1016,6 +977,212 @@ fn report_fallback(agent: &Agent) {
             backup.env_key()
         ),
     }
+}
+
+/// One settable option: whether the generated config leaves it commented out,
+/// its key, and the note beside it.
+///
+/// The value is deliberately absent. Every value comes from the defaults
+/// themselves, because a value typed in here is a second copy of a number that
+/// lives somewhere else, and the second copy is the one that goes stale. This
+/// one did: the generated config offered a title budget of 90, a summary of
+/// 200, a detail of 320, a body of 900 and an issue body of 4000, long after
+/// those became 140, 2000, 6000, 8000 and 20000. Uncommenting a line to see
+/// what it did cut every comment spar posts to a fifth of its length.
+type Setting = (bool, &'static str, &'static str);
+
+const LOOP_OPTIONS: &[Setting] = &[
+    (
+        false,
+        "max_rounds",
+        "review rounds ONE invocation may spend. Resuming grants a fresh budget, so this is not a lifetime cap on a PR.",
+    ),
+    (
+        false,
+        "auto_merge",
+        "off on purpose: two models agreeing is not the same as being right",
+    ),
+    (false, "first_implementor", ""),
+    (false, "worktrees", "false works in the main checkout"),
+    (
+        false,
+        "close_skipped",
+        "close an issue both reviewers declined",
+    ),
+    (
+        false,
+        "followups",
+        "issues | local | none. local writes .spar/followups.md, not the tracker",
+    ),
+    (
+        true,
+        "file_non_blocking",
+        "a suggestion is not a tracker item",
+    ),
+    (
+        true,
+        "max_followups",
+        "backstop on what one run can spawn",
+    ),
+    (
+        true,
+        "keep_worktrees",
+        "true leaves them behind to inspect",
+    ),
+    (
+        true,
+        "min_number",
+        "ignore anything numbered below this when picking for itself. 0 is no floor.",
+    ),
+    (
+        true,
+        "parallel_triage",
+        "false asks the agents one at a time",
+    ),
+    (
+        true,
+        "absorb_new_issues",
+        "waves of newly filed follow-ups to fold back into this run. Costs more.",
+    ),
+    (true, "file_nits", "true files nits as issues too"),
+    (
+        true,
+        "base_branch",
+        "only a fallback; origin/HEAD wins when it resolves",
+    ),
+    (
+        true,
+        "branch_prefix",
+        "e.g. \"spar/\" to namespace the branches spar creates",
+    ),
+    (true, "state_store", "local | pr | both"),
+];
+
+const STYLE_OPTIONS: &[Setting] = &[
+    (false, "ban_em_dash", ""),
+    (false, "ban_ai_attribution", ""),
+    (
+        false,
+        "terse",
+        "hold model prose to a length budget. false removes the valves entirely",
+    ),
+    (
+        true,
+        "pr_comments",
+        "outcome | rounds | none. How much of its own working spar narrates into a PR thread. none never comments at all.",
+    ),
+    (
+        true,
+        "max_title_chars",
+        "a finding, issue, or PR title. Never ellipsised",
+    ),
+    (
+        true,
+        "max_summary_chars",
+        "a one line verdict or refutation",
+    ),
+    (
+        true,
+        "max_detail_chars",
+        "a blocking finding, in the PR thread",
+    ),
+    (true, "max_body_chars", "a PR body"),
+    (
+        true,
+        "max_issue_body_chars",
+        "a filed issue's body. Far larger on purpose: an issue is picked up cold. Fenced code blocks in one are never truncated and never count against this.",
+    ),
+];
+
+/// The `[loop]` and `[style]` blocks of a generated config.
+///
+/// Safety valves, not editors: the length budgets here are sized so real
+/// content is never touched, which is why they read as large numbers.
+fn settings_block(first_implementor: &str) -> String {
+    let defaults: std::collections::BTreeMap<String, String> = config::known_options()
+        .into_iter()
+        .map(|option| (option.key, option.default))
+        .collect();
+    // first_implementor has no default: it is whichever agent was written
+    // first, and until there is a config there is no answer to give.
+    let value = |key: &str| match key {
+        "first_implementor" => format!("\"{first_implementor}\""),
+        other => defaults.get(other).cloned().unwrap_or_default(),
+    };
+
+    let mut out = String::from("[loop]\n");
+    out.push_str(&option_lines(LOOP_OPTIONS, &value));
+    out.push_str(concat!(
+        "\n[loop.effort_schedule]\n",
+        "# Values are whatever each agent's own CLI accepts, listed above, so\n",
+        "# these are examples rather than defaults. Left out, each agent uses\n",
+        "# the effort its own block asked for.\n",
+        "# round_1 = \"high\"   # the deep first review\n",
+        "# rest    = \"low\"    # later rounds only see a small delta\n\n",
+    ));
+    out.push_str("[style]\n");
+    out.push_str(&option_lines(STYLE_OPTIONS, &value));
+    out
+}
+
+/// Option lines with their notes lined up in a column, a long note wrapping
+/// onto continuation lines that stay in the column rather than running off the
+/// edge or restarting at the margin.
+fn option_lines(options: &[Setting], value: &dyn Fn(&str) -> String) -> String {
+    const WIDTH: usize = 78;
+
+    let assignments: Vec<String> = options
+        .iter()
+        .map(|(commented, key, _)| {
+            let lead = if *commented { "# " } else { "" };
+            format!("{lead}{key} = {}", value(key))
+        })
+        .collect();
+    let column = assignments
+        .iter()
+        .map(|a| a.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 2;
+
+    let mut out = String::new();
+    for (assignment, (_, _, note)) in assignments.iter().zip(options) {
+        if note.is_empty() {
+            out.push_str(assignment);
+            out.push('\n');
+            continue;
+        }
+        let mut first = true;
+        let mut line = String::new();
+        for word in note.split_whitespace() {
+            let would_be = column + 2 + line.chars().count() + 1 + word.chars().count();
+            if !line.is_empty() && would_be > WIDTH {
+                out.push_str(&noted(assignment, &line, column, &mut first));
+                line.clear();
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        if !line.is_empty() {
+            out.push_str(&noted(assignment, &line, column, &mut first));
+        }
+    }
+    out
+}
+
+/// One rendered line: the assignment and the start of its note, then the rest
+/// of the note alone, indented to the same column so it reads as one paragraph.
+fn noted(assignment: &str, note: &str, column: usize, first: &mut bool) -> String {
+    let lead = if *first {
+        let pad = column.saturating_sub(assignment.chars().count());
+        format!("{assignment}{}", " ".repeat(pad))
+    } else {
+        " ".repeat(column)
+    };
+    *first = false;
+    format!("{lead}# {note}\n")
 }
 
 /// One prerequisite check: a label and something that either reports a version
@@ -1519,5 +1686,129 @@ mod min_number_tests {
                 "{cmd}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod settings_block_tests {
+    use super::*;
+
+    /// The value a config line offers, with its trailing note removed. Quote
+    /// aware, since a note is free to contain a `#` and several do.
+    fn written(line: &str) -> String {
+        let after = line.split_once('=').expect("an assignment").1;
+        let mut quoted = false;
+        for (i, c) in after.char_indices() {
+            match c {
+                '"' => quoted = !quoted,
+                '#' if !quoted => return after[..i].trim().to_string(),
+                _ => {}
+            }
+        }
+        after.trim().to_string()
+    }
+
+    fn line_for(text: &str, key: &str) -> String {
+        text.lines()
+            .find(|l| {
+                let bare = l.trim_start().trim_start_matches('#').trim_start();
+                bare.starts_with(&format!("{key} ")) || bare.starts_with(&format!("{key}="))
+            })
+            .unwrap_or_else(|| panic!("{key} is not offered at all:\n{text}"))
+            .to_string()
+    }
+
+    /// The guard that was missing. Every number in the generated config used to
+    /// be typed in beside its comment, which is a second copy of a default that
+    /// lives in the code, and the copies stopped agreeing: it offered a title
+    /// budget of 90 against a real 140, a body of 900 against 8000, and three
+    /// more like it. Uncommenting one to see what it did cut every comment spar
+    /// posts to a fifth of its length.
+    #[test]
+    fn every_value_it_offers_is_the_default_it_actually_has() {
+        let text = settings_block("claude");
+        for option in config::known_options() {
+            // The effort words are per CLI, so the schedule's are examples of
+            // what one accepts rather than defaults. There is no default
+            // effort: an agent that names none uses its own CLI's.
+            if option.section == "loop.effort_schedule" {
+                continue;
+            }
+            let line = line_for(&text, &option.key);
+            assert_eq!(
+                option.default,
+                written(&line),
+                "the generated config offers `{}`, but the default is {}",
+                line.trim(),
+                option.default
+            );
+        }
+    }
+
+    /// `doctor` reports what a config does not mention, so a generated one
+    /// should send nobody to that list on the day it was written. pr_comments
+    /// was missing from it for exactly that long.
+    #[test]
+    fn it_offers_every_option_the_parser_knows_about() {
+        let text = settings_block("claude");
+        let missing: Vec<String> = config::unmentioned_options(&text)
+            .into_iter()
+            .map(|o| format!("[{}] {}", o.section, o.key))
+            .collect();
+        assert!(missing.is_empty(), "not offered: {}", missing.join(", "));
+    }
+
+    /// The strongest of these: every line the file suggests has to be a line
+    /// that works. A commented option is an invitation to uncomment it, and one
+    /// that then fails to load is worse than never having offered it.
+    #[test]
+    fn every_option_it_offers_can_be_uncommented_and_still_load() {
+        let mut text = String::from(
+            "[agents.claude]\ncommand = [\"claude\"]\n\n\
+             [agents.codex]\ncommand = [\"codex\"]\n\n",
+        );
+        for line in settings_block("claude").lines() {
+            text.push_str(uncomment(line).unwrap_or(line));
+            text.push('\n');
+        }
+        let cfg = config::parse(&text).expect("a config of its own suggestions");
+        assert_eq!("claude", cfg.first_implementor);
+    }
+
+    /// A commented assignment with its `#` removed, or None for a line of
+    /// prose, which stays a comment.
+    fn uncomment(line: &str) -> Option<&str> {
+        let bare = line.trim_start().strip_prefix('#')?.trim_start();
+        // An assignment, not a wrapped note that happens to contain an `=`:
+        // the key has to be one bare word.
+        let key = bare.split_once('=')?.0.trim();
+        let named = !key.is_empty()
+            && key
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        named.then_some(bare)
+    }
+
+    #[test]
+    fn the_agent_that_goes_first_is_the_one_that_was_chosen() {
+        assert!(settings_block("codex").contains("first_implementor = \"codex\""));
+    }
+
+    /// A note long enough to wrap stays in its column rather than restarting at
+    /// the margin, where it would read as a new option.
+    #[test]
+    fn a_wrapped_note_stays_in_its_column() {
+        let text = settings_block("claude");
+        let column = text
+            .lines()
+            .find(|l| l.starts_with("max_rounds"))
+            .and_then(|l| l.find('#'))
+            .expect("a note on max_rounds");
+        let continuation = text
+            .lines()
+            .find(|l| l.starts_with("    ") && l.trim_start().starts_with('#'))
+            .expect("a wrapped note");
+        assert_eq!(Some(column), continuation.find('#'));
+        assert!(text.lines().all(|l| l.chars().count() <= 80), "{text}");
     }
 }

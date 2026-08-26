@@ -238,26 +238,20 @@ pub struct EffortSchedule {
     pub rest: Option<String>,
 }
 
+/// Every field takes its value from `LoopCfg::default()` when a config does not
+/// mention it, rather than from a per-field function saying the same thing in a
+/// second place. Two places is how a default goes stale.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct LoopCfg {
-    #[serde(default = "three")]
     pub max_rounds: u32,
-    #[serde(default)]
     pub auto_merge: bool,
-    #[serde(default)]
     pub first_implementor: Option<String>,
-    #[serde(default = "main_branch")]
     pub base_branch: String,
-    #[serde(default = "yes")]
     pub worktrees: bool,
-    #[serde(default)]
     pub keep_worktrees: bool,
-    #[serde(default = "store_local")]
     pub state_store: StateStore,
-    #[serde(default)]
     pub branch_prefix: String,
-    #[serde(default = "followups_local")]
     pub followups: Followups,
     /// File a non-blocking finding as a follow-up.
     ///
@@ -266,24 +260,19 @@ pub struct LoopCfg {
     /// tracker item made a single issue spawn ten, which spawned more: mean
     /// offspring above one never terminates. Not gating a merge is not the same
     /// as being worth somebody's triage queue.
-    #[serde(default)]
     pub file_non_blocking: bool,
     /// Most follow-ups one run may record before it stops and says what it
     /// dropped. A backstop, not a target.
-    #[serde(default = "five")]
     pub max_followups: usize,
     /// Nits stay in the PR thread by default. A filed nit is somebody else's
     /// notification: a run on a production codebase once opened an issue titled
     /// "Log wording".
-    #[serde(default)]
     pub file_nits: bool,
     /// Close an issue that both agents independently declined, after posting
     /// the shared reasoning. One agent's opinion is never enough.
-    #[serde(default = "yes")]
     pub close_skipped: bool,
     /// Ask both agents to triage at the same time. They only read during
     /// triage, so there is nothing to serialise.
-    #[serde(default = "yes")]
     pub parallel_triage: bool,
     /// Ignore issues and pull requests numbered below this when spar is picking
     /// for itself. 0 is no floor.
@@ -292,7 +281,6 @@ pub struct LoopCfg {
     /// nobody is going to reach, and since spar takes the lowest numbered open
     /// items it walks straight into them. A number you name explicitly is still
     /// honoured: naming it is the point.
-    #[serde(default)]
     pub min_number: i64,
     /// Waves of newly filed follow-ups to fold back into the same run, rather
     /// than leaving them for the next one.
@@ -300,29 +288,8 @@ pub struct LoopCfg {
     /// Off by default because it multiplies what a run costs, and because each
     /// wave can file follow-ups of its own. Every wave is triaged like any
     /// other issue, so both agents still have to agree it is worth doing.
-    #[serde(default)]
     pub absorb_new_issues: u32,
-    #[serde(default)]
     pub effort_schedule: EffortSchedule,
-}
-
-fn three() -> u32 {
-    3
-}
-fn main_branch() -> String {
-    "main".to_string()
-}
-fn yes() -> bool {
-    true
-}
-fn store_local() -> StateStore {
-    StateStore::Local
-}
-fn followups_local() -> Followups {
-    Followups::Local
-}
-fn five() -> usize {
-    5
 }
 
 impl Default for LoopCfg {
@@ -350,63 +317,44 @@ impl Default for LoopCfg {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct StyleCfg {
-    #[serde(default = "yes")]
     pub ban_em_dash: bool,
-    #[serde(default = "yes")]
     pub ban_ai_attribution: bool,
-    #[serde(default = "yes")]
     pub terse: bool,
-    #[serde(default = "d320")]
     pub max_detail_chars: usize,
-    #[serde(default = "d200")]
     pub max_summary_chars: usize,
-    #[serde(default = "d900")]
     pub max_body_chars: usize,
     /// A filed issue's body. Far larger than a PR comment's on purpose: a
     /// comment is read with the diff in front of you, an issue is picked up
     /// cold months later by somebody who needs the whole story.
-    #[serde(default = "d4000")]
     pub max_issue_body_chars: usize,
-    #[serde(default = "d90")]
     pub max_title_chars: usize,
-    #[serde(default = "outcome_only")]
     pub pr_comments: PrComments,
 }
 
-fn outcome_only() -> PrComments {
-    PrComments::Outcome
-}
-
-fn d320() -> usize {
-    6000
-}
-fn d200() -> usize {
-    2000
-}
-fn d900() -> usize {
-    8000
-}
-fn d4000() -> usize {
-    20000
-}
-fn d90() -> usize {
-    140
-}
-
 impl Default for StyleCfg {
+    /// Taken from `Style`, which is where the budgets are decided, rather than
+    /// written out again here.
+    ///
+    /// They were written out again here, and they drifted. The functions
+    /// supplying them to serde were still named `d90`, `d200`, `d320`, `d900`
+    /// and `d4000` while returning 140, 2000, 6000, 8000 and 20000, and the
+    /// config `spar init` generated offered the old numbers as though they
+    /// were current. Uncommenting one of those lines to see what it did cut
+    /// every comment spar posts to a fifth of its length.
     fn default() -> Self {
+        let style = Style::default();
         Self {
-            ban_em_dash: true,
-            ban_ai_attribution: true,
-            terse: true,
-            max_detail_chars: 6000,
-            max_summary_chars: 2000,
-            max_body_chars: 8000,
-            max_issue_body_chars: 20000,
-            max_title_chars: 140,
-            pr_comments: PrComments::Outcome,
+            ban_em_dash: style.ban_em_dash,
+            ban_ai_attribution: style.ban_ai_attribution,
+            terse: style.terse,
+            max_detail_chars: style.max_detail_chars,
+            max_summary_chars: style.max_summary_chars,
+            max_body_chars: style.max_body_chars,
+            max_issue_body_chars: style.max_issue_body_chars,
+            max_title_chars: style.max_title_chars,
+            pr_comments: style.pr_comments,
         }
     }
 }
@@ -866,6 +814,32 @@ model = "gpt-5.6-sol"
                     [agents.codex]\npreset = \"codex\"\nfallback = \"cursor\"\n";
         let err = parse(text).expect_err("rejected");
         assert!(err.message().contains("[agents.codex.fallback]"), "{err}");
+    }
+
+    /// A block that names one setting keeps the defaults for every setting it
+    /// did not name. That is what the container level serde default buys: each
+    /// field used to carry its own default function repeating a number that
+    /// also lived in `Default`, and the two copies stopped agreeing.
+    #[test]
+    fn a_partial_block_keeps_the_defaults_it_did_not_name() {
+        let text = format!("{TWO_AGENTS}\n[loop]\nmax_rounds = 9\n\n[style]\nterse = false\n");
+        let cfg = parse(&text).expect("parses");
+
+        assert_eq!(9, cfg.loop_cfg.max_rounds);
+        assert_eq!(LoopCfg::default().followups, cfg.loop_cfg.followups);
+        assert_eq!(LoopCfg::default().close_skipped, cfg.loop_cfg.close_skipped);
+
+        assert!(!cfg.style.terse);
+        assert_eq!(Style::default().max_body_chars, cfg.style.max_body_chars);
+        assert_eq!(Style::default().max_title_chars, cfg.style.max_title_chars);
+    }
+
+    /// The budgets are decided in `Style` and read from there by the config
+    /// layer. When they were written out in both places they drifted, and the
+    /// generated config offered the older set for months.
+    #[test]
+    fn the_config_layer_does_not_keep_its_own_copy_of_the_budgets() {
+        assert_eq!(Style::default(), StyleCfg::default().to_style());
     }
 
     #[test]

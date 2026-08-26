@@ -8,8 +8,8 @@
 //! prints is what a reviewer would actually read.
 
 use spar::model::{
-    Dispute, Finding, IssueRun, Judged, NextAction, ResponseDoc, Review, Severity, SkippedItem,
-    Standing, Verdict,
+    Dispute, Finding, Implementation, IssueRun, Judged, NextAction, ResponseDoc, Review, Severity,
+    SkippedItem, Standing, Verdict,
 };
 use spar::review::{
     disposition_comment, outcome_comment, pr_body, review_comment, skip_comment, Ending,
@@ -152,7 +152,40 @@ fn main() {
         "{}",
         pr_body(
             478,
-            "Retry a 429 with exponential backoff instead of failing the request.",
+            &Implementation {
+                summary: "Retry a 429 with exponential backoff instead of failing the request."
+                    .into(),
+                problem: "A rate limited response was treated as fatal, so a single throttled \
+                          call ended a run that had hours of work left in it. The retry path \
+                          existed but only covered connection errors, and nothing in the logs \
+                          said which of the two had happened."
+                    .into(),
+                changes: vec![
+                    "`send` now retries a 429, honouring `Retry-After` when the server sets it \
+                     and backing off exponentially when it does not"
+                        .into(),
+                    "the retry budget is bounded at five attempts, so a permanent 429 still \
+                     ends the call rather than spinning"
+                        .into(),
+                    "a retry logs the status it is retrying, which is what made the original \
+                     failure impossible to tell apart from a dropped connection"
+                        .into(),
+                ],
+                testing: vec![
+                    "`cargo test retries_a_rate_limited_request`, which fakes a 429 with a \
+                     `Retry-After` of 2 and asserts the wait"
+                        .into(),
+                    "point it at a throttled endpoint and watch a run finish rather than stop \
+                     on the first 429"
+                        .into(),
+                ],
+                notes: Some(
+                    "Streaming calls do not go through `send` and are unchanged, which is worth \
+                     a follow-up but not this one."
+                        .into()
+                ),
+                ..Implementation::default()
+            },
             &style
         )
     );

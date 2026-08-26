@@ -577,7 +577,7 @@ model  = "gpt-5.6-sol"
 
 [agents.codex.fallback]
 preset = "cursor"
-model  = "kimi-k3"
+model  = "kimi-k3-max"
 ```
 
 A fallback is a whole agent, preset and all, and it is not a third opinion. It
@@ -601,8 +601,22 @@ The cursor preset drives [Cursor's CLI](https://cursor.com/docs/cli), which is
 installed separately from the editor and serves whichever models your
 subscription carries. It has no structured output flag, so spar asks for JSON in
 the prompt and parses it back, which is why it makes a better backup than a
-primary. `cursor-agent --list-models` is the source of truth for what `model`
-will accept.
+primary. It has no effort flag either: effort is a `-low`, `-high` or `-max`
+suffix on the model name, so `effort` in a cursor block does nothing.
+
+`cursor-agent models` is the source of truth for what `model` accepts. Prefer a
+family neither of your agents already runs, since an uncorrelated backup is the
+whole reason the pair is two models rather than one. Cursor also serves Claude
+and GPT: pointing a fallback at the same family as your *other* agent means
+that when the primary fails you get two of the same model reviewing each other,
+which is what the pair exists to prevent, and the correlation warning does not
+look at fallbacks.
+
+Then check your plan covers it, because a model being listed is not the same as
+being callable. A metered one answers until the month's allowance runs out and
+then refuses every call, which is the failure the primary already had. Cursor's
+own models are covered by the plan itself, so `composer-2.5` is the safer
+choice when a certain reply matters more than an independent one.
 
 Every option a preset supplies can be overridden per agent, including `timeout`
 (seconds one call may take before spar gives up), `search_paths`, and

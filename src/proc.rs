@@ -257,7 +257,7 @@ impl Reader {
 pub fn run(argv: &[String], opts: &ExecOpts) -> Result<String> {
     let out = exec(argv, opts)?;
     if opts.check && !out.ok() {
-        return Err(SparError::new(failure_message(argv, &out)));
+        return Err(SparError::call_failed(failure_message(argv, &out)));
     }
     Ok(out.stdout)
 }
@@ -569,17 +569,21 @@ mod timeout_kind_tests {
         assert!(err.to_string().contains("Not retried"), "{err}");
     }
 
-    /// Everything else still is: a model that returned nonsense usually
-    /// returns something usable when told what was wrong.
+    /// A non-zero exit is the CLI reporting that it could not answer, which is
+    /// a different thing from an answer that arrived and could not be parsed.
+    /// Only the second is what the retry exists for.
     #[test]
-    fn an_ordinary_failure_is_still_worth_retrying() {
+    fn a_non_zero_exit_is_the_call_failing_rather_than_the_answer() {
         let err = run(
             &["sh".to_string(), "-c".to_string(), "exit 1".to_string()],
             &ExecOpts::new(),
         )
         .unwrap_err();
 
-        assert_eq!(ErrorKind::Other, err.kind());
+        assert_eq!(ErrorKind::CallFailed, err.kind());
+        // Not hopeless in the abstract, since it could have been transient.
+        // Whether to spend a second call on it is `Agent`'s decision, and it
+        // turns on whether there is a stand in to send the call to instead.
         assert!(err.worth_retrying());
     }
 }

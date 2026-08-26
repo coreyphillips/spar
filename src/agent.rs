@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 use serde_json::Value;
 
 use crate::config::{AgentSpec, CommandPart, OutputMode, SystemVia};
-use crate::error::{Result, SparError};
+use crate::error::{ErrorKind, Result, SparError};
 use crate::jsonx;
 use crate::proc::{self, ExecOpts};
 use crate::{bail, log, logdim, logwarn, spar_err};
@@ -247,7 +247,13 @@ impl Agent {
         }
 
         if messages.is_empty() && !errors.is_empty() {
-            bail!("agent '{}' failed: {}", self.spec.name, errors.join("; "));
+            // The CLI reported failure rather than answering badly, so this is
+            // not something asking again corrects.
+            return Err(SparError::call_failed(format!(
+                "agent '{}' failed: {}",
+                self.spec.name,
+                errors.join("; ")
+            )));
         }
         Ok(messages.join("\n").trim().to_string())
     }
@@ -346,6 +352,26 @@ impl Agent {
         }
     }
 
+    /// Whether to spend a second call on this same agent.
+    ///
+    /// The retry exists for an answer that arrived and could not be parsed.
+    /// Models correct a shape error readily when told what was wrong, which is
+    /// why the parser's own complaint goes back with the question.
+    ///
+    /// Two failures are not that. A deadline never is: the wait is the same
+    /// length for the same answer. And a failure the CLI itself reported is not
+    /// either, once there is a stand in to send the call to, because a
+    /// different CLI is a different question while the same one twice is a
+    /// refusal, a quota, or a crash repeated at full price. With no stand in
+    /// configured the retry is the only thing left, so it still happens.
+    fn worth_asking_again(&self, e: &SparError) -> bool {
+        match e.kind() {
+            ErrorKind::TimedOut => false,
+            ErrorKind::CallFailed => self.fallback().is_none(),
+            ErrorKind::Other => true,
+        }
+    }
+
     /// The same question, asked at most twice of this agent alone.
     fn ask_json_retrying<T: serde::de::DeserializeOwned>(
         &self,
@@ -381,7 +407,7 @@ impl Agent {
                 // A deadline is not a bad answer. Asking again buys another
                 // wait of exactly the same length, which on a long review is
                 // the most expensive way to learn nothing.
-                Err(e) if !e.worth_retrying() => return Err(e),
+                Err(e) if !self.worth_asking_again(&e) => return Err(e),
                 Err(e) => {
                     if attempt < ATTEMPTS {
                         // The whole error, not its first line. The first line is
@@ -1072,6 +1098,87 @@ mod tests {
             text.contains("primary") && text.contains("backup"),
             "{text}"
         );
+    }
+
+    /// A counter file, so a test can say how many times the CLI was actually
+    /// run rather than only what came back.
+    fn attempts(name: &str) -> (PathBuf, String) {
+        let path = std::env::temp_dir().join(format!("spar-attempts-{name}"));
+        let _ = std::fs::remove_file(&path);
+        let line = format!("echo x >> {}", path.display());
+        (path, line)
+    }
+
+    fn counted(path: &Path) -> usize {
+        std::fs::read_to_string(path)
+            .map(|t| t.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// The failure that prompted this. A policy refusal came back twice, at
+    /// full effort, before the stand in was given the call. The second was
+    /// never going to be different: nothing about a refusal, a quota, or a
+    /// crash is corrected by being asked the same thing again.
+    #[test]
+    fn a_cli_that_could_not_answer_is_not_asked_twice_when_there_is_a_stand_in() {
+        let (path, count) = attempts("refused-with-standin");
+        let agent = with_fallback(
+            shell("primary", &format!("{count}; echo refused >&2; exit 1")),
+            shell("backup", "echo '{}'"),
+        );
+        let answer: Value = agent
+            .ask_json(
+                "q",
+                &serde_json::json!({"type": "object"}),
+                Path::new("."),
+                None,
+            )
+            .expect("the stand in answers");
+        assert!(answer.is_object());
+        assert_eq!(1, counted(&path), "the primary was asked more than once");
+    }
+
+    /// With nowhere to send the call, the retry is the only thing left, so it
+    /// still happens. A transient failure is the case it was there for.
+    #[test]
+    fn with_no_stand_in_a_failed_call_is_still_retried() {
+        let (path, count) = attempts("refused-alone");
+        let agent = Agent::with_bin(
+            shell("solo", &format!("{count}; echo refused >&2; exit 1")),
+            "/bin/sh",
+        );
+        let err = agent
+            .ask_json::<Value>(
+                "q",
+                &serde_json::json!({"type": "object"}),
+                Path::new("."),
+                None,
+            )
+            .expect_err("nothing answers");
+        assert!(err.message().contains("twice"), "{err}");
+        assert_eq!(2, counted(&path));
+    }
+
+    /// The retry that must survive. An answer that arrived and could not be
+    /// parsed is exactly what it is for, and a model corrects a shape error
+    /// readily when handed the parser's complaint.
+    #[test]
+    fn an_unusable_answer_is_still_worth_asking_again() {
+        let (path, count) = attempts("unparsable");
+        let agent = with_fallback(
+            shell("primary", &format!("{count}; echo not json at all")),
+            shell("backup", "echo '{}'"),
+        );
+        let answer: Value = agent
+            .ask_json(
+                "q",
+                &serde_json::json!({"type": "object"}),
+                Path::new("."),
+                None,
+            )
+            .expect("the stand in answers in the end");
+        assert!(answer.is_object());
+        assert_eq!(2, counted(&path), "a shape error is worth one more ask");
     }
 
     /// A deadline is not worth asking the same CLI again, and `ask_json` does

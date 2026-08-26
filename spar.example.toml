@@ -127,6 +127,22 @@ max_followups     = 5        # most one run may record before it stops and says
                              # what it dropped. A backstop, not a target.
 state_store       = "local"  # local | pr | both. local keeps resume state in
                              # .spar/state and off the PR
+max_issue_chars   = 60000    # most of ONE issue body that reaches a prompt.
+                             # Sized so nothing a person wrote is ever cut. It
+                             # was 2000 for triage and 6000 for implement, and
+                             # silent: an agent handed half an issue judges and
+                             # builds the half it saw, with no way to know the
+                             # rest existed. A cut is now said out loud, in the
+                             # log and in the prompt, and never lands mid line
+                             # or inside a code fence.
+max_triage_chars  = 200000   # most every issue body TOGETHER may add to one
+                             # triage prompt. Triage reads the whole queue at
+                             # once, so the queue is the only unbounded thing
+                             # here. Past this, whole issues wait for the next
+                             # run rather than every issue losing its tail: a
+                             # verdict is posted on the issue and can close it,
+                             # so judging one on part of what it says is worse
+                             # than not having reached it yet.
 
 [loop.effort_schedule]
 round_1 = "ultra"            # the deep first review

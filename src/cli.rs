@@ -1056,6 +1056,16 @@ const LOOP_OPTIONS: &[Setting] = &[
         "e.g. \"spar/\" to namespace the branches spar creates",
     ),
     (true, "state_store", "local | pr | both"),
+    (
+        true,
+        "max_issue_chars",
+        "most of one issue body a prompt carries. Sized so nothing a person wrote is cut, and a cut is said out loud when it happens.",
+    ),
+    (
+        true,
+        "max_triage_chars",
+        "most every issue body together may add to one triage prompt. Past it, whole issues wait for the next run rather than all of them losing their tails.",
+    ),
 ];
 
 const STYLE_OPTIONS: &[Setting] = &[

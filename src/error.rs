@@ -13,6 +13,12 @@ pub enum ErrorKind {
     /// because asking again means waiting exactly as long again, which is the
     /// one failure where a retry costs more than it can possibly win.
     TimedOut,
+    /// The CLI itself could not answer: a non-zero exit, or an error event in
+    /// place of a message. Distinct from an answer that arrived and could not
+    /// be parsed, which is what the retry exists for and which a model
+    /// corrects readily when told what was wrong. Nothing about a refusal, a
+    /// quota, or a crash is corrected by being asked the same thing again.
+    CallFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +39,14 @@ impl SparError {
         Self {
             message: message.into(),
             kind: ErrorKind::TimedOut,
+        }
+    }
+
+    /// The CLI could not answer at all, as opposed to answering unusably.
+    pub fn call_failed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: ErrorKind::CallFailed,
         }
     }
 

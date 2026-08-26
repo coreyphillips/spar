@@ -595,12 +595,17 @@ never reviews alongside the pair. It answers in place of the agent that failed,
 holding that agent's turn, so neither agent ever reviews its own most recent
 edit and nothing else about the loop changes.
 
-It fires once the primary has spent its own retries, and on a deadline too:
-asking the same CLI again after a timeout buys the same wait for the same
-answer, but asking a different one is a different question, and the alternative
-is losing the run. The scheduled effort is not passed on, because effort words
-are each CLI's own vocabulary; the fallback uses whatever its own block asked
-for.
+It fires as soon as another call on the primary would buy nothing. A deadline
+never is: the wait is the same length for the same answer. Neither is a failure
+the CLI itself reported, a refusal or a quota or a crash, because a different
+CLI is a different question while the same one twice is the same refusal at
+full price. What still earns a second ask is an answer that arrived and could
+not be parsed, which is what the retry was always for and which a model
+corrects readily when handed the parser's complaint. With no fallback
+configured the retry is the only thing left, so it happens either way.
+
+The scheduled effort is not passed on, because effort words are each CLI's own
+vocabulary; the fallback uses whatever its own block asked for.
 
 If both fail you get both reasons, the primary's first. `spar doctor` shows the
 fallback under the agent it stands in for, and `SPAR_CODEX_FALLBACK_BIN` points

@@ -3,9 +3,17 @@
 #
 #   curl https://cursor.com/install -fsS | bash
 #
+# The installer symlinks both `agent` and `cursor-agent` to the same binary.
+# This preset asks for the longer one: `agent` is a common enough word to be
+# something else on a PATH, and being wrong about that is silent.
+#
 # Models come from your Cursor subscription rather than from a key you hold, so
-# the roster changes without spar knowing. `cursor-agent --list-models` is the
-# source of truth.
+# the roster changes without spar knowing, and what your plan covers is not the
+# same as what it lists. `cursor-agent models` is the source of truth.
+#
+# There is no effort flag. Effort is part of the model name instead, as a
+# `-low`, `-high` or `-max` suffix, which is why the template has no {effort}
+# group and why `effort` in an agent block does nothing here.
 #
 # No structured output flag, so spar asks for JSON in the prompt and parses it
 # back out. That is the one thing this preset gives up against codex and claude,
@@ -31,8 +39,29 @@ search_paths = [
 ]
 
 # Hints for `spar init`. Never validated against, only written as comments.
-models = ["kimi-k3", "auto"]
-options_note = "Cursor picks the model from your subscription, and the roster changes. Check the current set with: cursor-agent --list-models. 'auto' lets Cursor choose."
+#
+# Kimi leads because it shares no training with Claude or with Codex, and an
+# uncorrelated backup is the whole reason the pair is two models rather than
+# one. A backup that thinks like the agent it stands in for is a spare tyre
+# with the same puncture.
+#
+# It is metered rather than covered by a Cursor plan, so it needs a spend limit
+# set or an allowance that has not run out. Without one it returns "You've hit
+# your usage limit" for every call, which is the failure the primary already
+# had. composer-2.5 and auto are covered by the plan itself and are the answer
+# when being certain of a reply matters more than being certain of a second
+# opinion.
+#
+# Cursor also serves Claude and GPT, and neither is listed here on purpose. A
+# fallback running the same family as the OTHER agent turns one CLI failing
+# into two of the same model reviewing each other, which is the single thing
+# the pair exists to prevent, and nothing catches it: `correlation_warning`
+# compares the two configured agents and never their fallbacks, and it matches
+# on resolved binary and model string, so Claude through cursor-agent and
+# Claude through claude do not look alike to it. Naming one here would be
+# recommending it.
+models = ["kimi-k3-max", "composer-2.5", "auto"]
+options_note = "Run 'cursor-agent models' for the set your account actually has: it is long, it changes, and a model being listed is not the same as your plan covering it. Effort is a suffix on the model name (-low, -high, -max), not a separate setting."
 
 # The terminal event carries the whole answer. The assistant events carry the
 # same text as it streams, and matching those instead would hand spar the

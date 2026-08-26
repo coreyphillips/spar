@@ -1197,33 +1197,52 @@ type Probe = Box<dyn Fn() -> Result<String>>;
 /// worse than no hint at all.
 fn agent_block(name: &str, spec: &config::AgentSpec) -> String {
     let mut out = format!("[agents.{name}]\npreset = \"{name}\"\n");
-    out.push_str("# Omit model or effort to use the CLI's own default.\n");
 
+    // Only what the preset has hints for. An option with none used to be
+    // written as `# effort = "..."`, and a placeholder is not a working value:
+    // the line fails the moment somebody takes the file at its word and
+    // uncomments it. Cursor has no effort setting at all, so for that agent the
+    // line should not exist rather than exist and be wrong.
+    //
     // The first entry of each list is the one written as the suggested value,
     // which is why the presets put the sensible default there rather than in
     // whatever order a CLI's help happens to print.
-    fn suggested(choices: &[String]) -> &str {
-        choices.first().map(String::as_str).unwrap_or("...")
-    }
-    let assignments = [
-        format!("# model  = \"{}\"", suggested(&spec.models)),
-        format!("# effort = \"{}\"", suggested(&spec.efforts)),
-    ];
-    // Line the comments up, so the file reads as a column rather than a jumble.
-    let column = assignments
-        .iter()
-        .map(|a| a.chars().count())
-        .max()
-        .unwrap_or(0)
-        + 3;
-    for (assignment, choices) in assignments.iter().zip([&spec.models, &spec.efforts]) {
-        out.push_str(assignment);
-        if choices.len() > 1 {
-            let pad = column.saturating_sub(assignment.chars().count());
-            out.push_str(&" ".repeat(pad));
-            out.push_str(&format!("# {}", choices.join(" | ")));
+    let offered: Vec<(&str, &[String])> = [
+        ("model ", spec.models.as_slice()),
+        ("effort", spec.efforts.as_slice()),
+    ]
+    .into_iter()
+    .filter(|(_, choices)| !choices.is_empty())
+    .collect();
+
+    if !offered.is_empty() {
+        let named: Vec<&str> = offered.iter().map(|(key, _)| key.trim()).collect();
+        out.push_str(&format!(
+            "# Omit {} to use the CLI's own default.\n",
+            named.join(" or ")
+        ));
+
+        let assignments: Vec<String> = offered
+            .iter()
+            .map(|(key, choices)| format!("# {key} = \"{}\"", choices[0]))
+            .collect();
+        // Line the comments up, so the file reads as a column rather than a
+        // jumble.
+        let column = assignments
+            .iter()
+            .map(|a| a.chars().count())
+            .max()
+            .unwrap_or(0)
+            + 3;
+        for (assignment, (_, choices)) in assignments.iter().zip(&offered) {
+            out.push_str(assignment);
+            if choices.len() > 1 {
+                let pad = column.saturating_sub(assignment.chars().count());
+                out.push_str(&" ".repeat(pad));
+                out.push_str(&format!("# {}", choices.join(" | ")));
+            }
+            out.push('\n');
         }
-        out.push('\n');
     }
 
     if let Some(note) = &spec.options_note {
@@ -1810,5 +1829,66 @@ mod settings_block_tests {
             .expect("a wrapped note");
         assert_eq!(Some(column), continuation.find('#'));
         assert!(text.lines().all(|l| l.chars().count() <= 80), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod agent_block_tests {
+    use super::*;
+
+    fn spec(models: &[&str], efforts: &[&str]) -> config::AgentSpec {
+        let mut spec: config::AgentSpec =
+            toml::Value::Table(toml::from_str("command = [\"x\"]").expect("a minimal preset"))
+                .try_into()
+                .expect("builds");
+        spec.models = models.iter().map(|s| s.to_string()).collect();
+        spec.efforts = efforts.iter().map(|s| s.to_string()).collect();
+        spec
+    }
+
+    /// A placeholder is not a working value. `# effort = "..."` was written for
+    /// every preset that lists no efforts, and taking the file at its word by
+    /// uncommenting it passes `...` to the CLI as a real setting.
+    #[test]
+    fn an_option_with_no_hints_is_left_out_rather_than_guessed_at() {
+        let block = agent_block("cursor", &spec(&["composer-2.5", "auto"], &[]));
+        assert!(!block.contains("..."), "{block}");
+        assert!(!block.contains("effort"), "{block}");
+        assert!(block.contains("# model  = \"composer-2.5\""), "{block}");
+    }
+
+    /// The header has to name what is actually below it. Saying "model or
+    /// effort" over a block with no effort line sends somebody looking for a
+    /// setting the CLI does not have.
+    #[test]
+    fn the_header_names_only_the_options_that_follow() {
+        assert!(agent_block("cursor", &spec(&["auto"], &[])).contains("Omit model to use"));
+        assert!(
+            agent_block("claude", &spec(&["fable"], &["high"])).contains("Omit model or effort")
+        );
+    }
+
+    /// A preset with no hints at all still has to produce a loadable block,
+    /// which is every preset that has never listed any: gemini and aider.
+    #[test]
+    fn a_preset_with_no_hints_still_writes_a_usable_block() {
+        let block = agent_block("gemini", &spec(&[], &[]));
+        assert!(!block.contains("..."), "{block}");
+        assert!(!block.contains("Omit"), "{block}");
+        assert!(
+            block.starts_with("[agents.gemini]\npreset = \"gemini\"\n"),
+            "{block}"
+        );
+        // What the block does still carry is unaffected.
+        assert!(block.contains("[agents.gemini.fallback]"), "{block}");
+    }
+
+    /// Alternatives are listed beside the suggestion, and a single choice is
+    /// not padded out with a column that has nothing in it.
+    #[test]
+    fn alternatives_are_listed_only_when_there_are_any() {
+        assert!(agent_block("a", &spec(&["one", "two"], &[])).contains("# one | two"));
+        let single = agent_block("b", &spec(&["only"], &[]));
+        assert!(!single.contains('|'), "{single}");
     }
 }

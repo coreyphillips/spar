@@ -43,7 +43,7 @@ effort = "ultra"      # Codex does not list these in its help. Your
 #
 #   [agents.codex.fallback]
 #   preset = "cursor"
-#   model  = "kimi-k3"
+#   model  = "kimi-k3-max"
 #
 # It fires once the primary has spent its own retries, and on a deadline too: a
 # different CLI is a different question. `spar doctor` shows it under the agent

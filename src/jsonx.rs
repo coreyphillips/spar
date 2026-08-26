@@ -121,15 +121,28 @@ pub fn extract_into<T: serde::de::DeserializeOwned>(text: &str) -> Result<T> {
         }));
     }
 
-    let mut last_error = None;
+    // Which failure to report is not the same question as which candidate to
+    // parse. Any candidate that parses wins, and a stray object never will,
+    // because every schema here requires fields it does not have. But when
+    // nothing parses, this error is handed straight back to the model on the
+    // retry, so it has to be about the answer the model meant.
+    //
+    // Neither end of the list is that. The order here is really last-closing
+    // first, so the last object a response happens to contain leads, and a
+    // model that wrote its answer and then a sentence with an object in it gets
+    // told about the sentence. The biggest candidate is the better guess: an
+    // answer is longer than the fragments around it.
+    let mut failures: Vec<(serde_json::Error, &Value)> = Vec::new();
     for value in &found {
         match serde_json::from_value::<T>(value.clone()) {
             Ok(parsed) => return Ok(parsed),
-            Err(e) => last_error = Some((e, value)),
+            Err(e) => failures.push((e, value)),
         }
     }
-
-    let (error, value) = last_error.expect("non-empty");
+    let (error, value) = failures
+        .into_iter()
+        .max_by_key(|(_, value)| value.to_string().len())
+        .expect("non-empty");
     if looks_truncated(text) {
         return Err(SparError::new(format!(
             "the response was cut off before the answer was complete, so only fragments of it \
@@ -138,9 +151,28 @@ pub fn extract_into<T: serde::de::DeserializeOwned>(text: &str) -> Result<T> {
         )));
     }
     Err(SparError::new(format!(
-        "response did not match the expected shape ({error}).\nGot: {}",
+        "response did not match the expected shape ({error}).{}\nGot: {}",
+        envelope_hint(value),
         head(&value.to_string(), 600)
     )))
+}
+
+/// An extra sentence when serde's own message would send the model to the wrong
+/// place.
+///
+/// serde maps a JSON array onto a struct's fields by position, so a bare array
+/// of findings tried as a review fails on field zero: "invalid type: map,
+/// expected a string", where the string is `verdict`. A model told that goes
+/// looking at a field, and the field is not what is wrong. Every schema here
+/// asks for one object, so an array is always the envelope rather than the
+/// contents.
+fn envelope_hint(value: &Value) -> &'static str {
+    if value.is_array() {
+        " The answer was a JSON array, and the schema asks for a single object: \
+         the array belongs in a field of it."
+    } else {
+        ""
+    }
 }
 
 fn rfind_byte(haystack: &[u8], needle: u8, before: usize) -> Option<usize> {
@@ -343,6 +375,51 @@ And here is a stray object afterwards: {"title":"not the review"}"#;
             .to_string();
         assert!(err.contains("did not match the expected shape"), "{err}");
         assert!(!err.contains("cut off"), "{err}");
+    }
+
+    /// What a real round two review produced. The model wrote a review object
+    /// and a findings array, the object failed to parse, and the complaint that
+    /// went back to it described the array: "invalid type: map, expected a
+    /// string", which is field zero of a struct serde had mapped an array onto
+    /// by position. The model was sent to look at a field, and the field was
+    /// not what was wrong.
+    #[test]
+    fn the_complaint_is_about_the_answer_the_model_meant() {
+        let text = r#"Here is my review.
+{"verdict":"changes_requested","next_action":"hand_back","summary":"Two problems.","findings":"should have been a list"}
+Supporting detail: [{"detail":"The working tree bumps 0.5.9 to 0.5.10."}]"#;
+        let err = extract_into::<Review>(text).unwrap_err().to_string();
+        // The review object is what failed, and its own field is named.
+        assert!(err.contains("findings"), "{err}");
+        assert!(
+            err.contains("changes_requested"),
+            "the object is shown:\n{err}"
+        );
+        assert!(
+            !err.contains("The working tree"),
+            "the stray array leaked in:\n{err}"
+        );
+    }
+
+    /// serde maps a JSON array onto a struct by position, so a bare array of
+    /// findings fails on the first field and says "expected a string". Left at
+    /// that, the model reads it as a field problem.
+    #[test]
+    fn a_bare_array_is_named_as_the_envelope_problem() {
+        let err = extract_into::<Review>(r#"[{"title":"First"},{"title":"Second"}]"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("JSON array"), "{err}");
+        assert!(err.contains("single object"), "{err}");
+    }
+
+    /// And an object that is merely the wrong shape says nothing about arrays.
+    #[test]
+    fn a_wrong_object_is_not_told_it_was_an_array() {
+        let err = extract_into::<Review>(r#"{"colour":"blue"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("JSON array"), "{err}");
     }
 
     #[test]

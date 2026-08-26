@@ -293,6 +293,10 @@ pub struct TriageVerdict {
     pub issue: i64,
     #[serde(deserialize_with = "de_bool")]
     pub worth_doing: bool,
+    /// The issue holds context for work filed elsewhere. Never opened, and
+    /// never closed either.
+    #[serde(default, deserialize_with = "de_bool")]
+    pub tracker: bool,
     #[serde(default, deserialize_with = "de_string")]
     pub reason: String,
     pub complexity: Complexity,
@@ -553,6 +557,15 @@ pub struct SkippedItem {
     pub title: String,
     /// Keyed by agent name, so the plan file says who said what.
     pub reasons: BTreeMap<String, String>,
+    /// An umbrella or epic, which spar comments on and leaves open.
+    ///
+    /// Set when *either* agent said so, unlike everything else here, which
+    /// needs both. Closing already requires agreement, on the principle that
+    /// one agent's opinion is not enough to close somebody's report; one agent
+    /// saying the issue is not finished is the same principle from the other
+    /// side.
+    #[serde(default)]
+    pub tracker: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

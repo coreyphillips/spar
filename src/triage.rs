@@ -16,7 +16,7 @@ use crate::model::{
     TriageVerdict,
 };
 use crate::repo::Repo;
-use crate::{log, schema, spar_err};
+use crate::{log, logwarn, schema, spar_err};
 
 const TRIAGE_PROMPT: &str = "\
 You are triaging GitHub issues for the repository in your working directory.
@@ -37,17 +37,89 @@ sentence a maintainer would be happy to have their name on.
 Issues:
 ";
 
+/// Every issue as the prompt carries it, and what would not fit.
+struct Rendered {
+    text: String,
+    /// Left for a later run, because the queue did not fit in one prompt.
+    deferred: Vec<i64>,
+    /// Included, but with the tail of the body left off.
+    shortened: Vec<i64>,
+}
+
+/// Render the queue, under two budgets that do different jobs.
+///
+/// One issue is shortened only past `max_issue_chars`, which nothing a person
+/// wrote reaches. The queue as a whole is bounded by `max_triage_chars`,
+/// because triage reads every open issue at once and the queue is the only
+/// unbounded thing here.
+///
+/// Past that, whole issues are left for the next run rather than every issue
+/// losing its tail. A triage verdict is posted on the issue and can close it,
+/// so judging one on part of what it says is worse than not having reached it
+/// yet. Everything from the first issue that does not fit is deferred together,
+/// so what was read is always a prefix of the queue rather than whichever
+/// issues happened to be small.
+fn render(issues: &[Issue], cfg: &Config) -> Rendered {
+    let mut parts: Vec<String> = Vec::new();
+    let mut deferred = Vec::new();
+    let mut shortened = Vec::new();
+    let mut total = 0usize;
+
+    for issue in issues {
+        if !deferred.is_empty() {
+            deferred.push(issue.number);
+            continue;
+        }
+        let (body, cut) = issue.body_for_prompt(cfg.loop_cfg.max_issue_chars);
+        let entry = format!("#{}: {}\n{body}", issue.number, issue.title);
+        let len = entry.chars().count();
+        // The first issue goes in whatever its size. A queue of one that does
+        // not fit is a run that does nothing, forever.
+        if !parts.is_empty() && total + len > cfg.loop_cfg.max_triage_chars {
+            deferred.push(issue.number);
+            continue;
+        }
+        if cut {
+            shortened.push(issue.number);
+        }
+        total += len;
+        parts.push(entry);
+    }
+
+    Rendered {
+        text: parts.join("\n\n"),
+        deferred,
+        shortened,
+    }
+}
+
+fn numbers(items: &[i64]) -> String {
+    items
+        .iter()
+        .map(|n| format!("#{n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Ask both agents, then reconcile.
 pub fn triage(agents: &[Agent], cfg: &Config, repo: &Repo, issues: &[Issue]) -> Result<Plan> {
-    let rendered: String = issues
-        .iter()
-        .map(|i| {
-            let body: String = i.body_text().trim().chars().take(2000).collect();
-            format!("#{}: {}\n{body}", i.number, i.title)
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let prompt = format!("{TRIAGE_PROMPT}{rendered}");
+    let rendered = render(issues, cfg);
+    // Never silently. An agent cannot report a gap it was not told about, and
+    // a verdict on part of an issue looks exactly like a verdict on all of it.
+    if !rendered.shortened.is_empty() {
+        logwarn!(
+            "issue body shortened to fit the prompt: {}. Raise max_issue_chars if these matter.",
+            numbers(&rendered.shortened)
+        );
+    }
+    if !rendered.deferred.is_empty() {
+        logwarn!(
+            "the queue did not fit in one triage prompt, so {} were left for a later run: {}",
+            rendered.deferred.len(),
+            numbers(&rendered.deferred)
+        );
+    }
+    let prompt = format!("{TRIAGE_PROMPT}{}", rendered.text);
     let schema = schema::triage();
 
     let answers = if cfg.loop_cfg.parallel_triage && agents.len() > 1 {
@@ -293,6 +365,88 @@ pub fn order(items: Vec<PlanItem>) -> Vec<PlanItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg_with(max_issue: usize, max_total: usize) -> Config {
+        let text = "[agents.a]\ncommand = [\"x\"]\n[agents.b]\ncommand = [\"y\"]\n";
+        let mut cfg = crate::config::parse(text).expect("a config");
+        cfg.loop_cfg.max_issue_chars = max_issue;
+        cfg.loop_cfg.max_triage_chars = max_total;
+        cfg
+    }
+
+    fn issue_of(number: i64, body: &str) -> Issue {
+        let mut i: Issue = serde_json::from_value(serde_json::json!({
+            "number": number, "title": "t", "state": "open", "url": "u"
+        }))
+        .expect("an issue");
+        i.body = Some(body.to_string());
+        i
+    }
+
+    /// The case that is every real queue. Nothing is cut, nothing is deferred,
+    /// and every issue reaches the prompt entire.
+    #[test]
+    fn an_ordinary_queue_is_rendered_whole() {
+        let issues = vec![issue_of(1, "first body"), issue_of(2, "second body")];
+        let out = render(&issues, &cfg_with(60_000, 200_000));
+        assert!(out.deferred.is_empty() && out.shortened.is_empty());
+        assert!(out.text.contains("first body") && out.text.contains("second body"));
+    }
+
+    /// A verdict is posted on the issue and can close it, so an issue judged on
+    /// part of its body is worse than one not reached yet. Past the budget,
+    /// whole issues wait rather than every issue losing its tail.
+    #[test]
+    fn a_queue_that_does_not_fit_defers_whole_issues() {
+        let issues = vec![
+            issue_of(1, &"a".repeat(80)),
+            issue_of(2, &"b".repeat(80)),
+            issue_of(3, &"c".repeat(80)),
+        ];
+        let out = render(&issues, &cfg_with(60_000, 120));
+        assert_eq!(vec![2, 3], out.deferred);
+        assert!(out.shortened.is_empty(), "no issue lost its tail");
+        assert!(out.text.contains(&"a".repeat(80)));
+        assert!(!out.text.contains(&"b".repeat(80)));
+    }
+
+    /// Everything from the first issue that does not fit is deferred together,
+    /// so what was read is a prefix of the queue rather than whichever issues
+    /// happened to be small enough to slot in.
+    #[test]
+    fn deferral_is_a_prefix_and_does_not_pick_the_small_ones() {
+        let issues = vec![
+            issue_of(1, &"a".repeat(80)),
+            issue_of(2, &"b".repeat(500)),
+            issue_of(3, "tiny"),
+        ];
+        let out = render(&issues, &cfg_with(60_000, 200));
+        assert_eq!(vec![2, 3], out.deferred);
+        assert!(
+            !out.text.contains("tiny"),
+            "a later small issue must not jump the queue"
+        );
+    }
+
+    /// A queue of one that does not fit would be a run that does nothing,
+    /// forever, so the first issue goes in whatever its size.
+    #[test]
+    fn the_first_issue_is_never_deferred() {
+        let issues = vec![issue_of(1, &"a".repeat(500))];
+        let out = render(&issues, &cfg_with(60_000, 10));
+        assert!(out.deferred.is_empty());
+        assert!(out.text.contains(&"a".repeat(500)));
+    }
+
+    /// Past the per issue budget the body is shortened and the issue is named,
+    /// rather than the queue quietly carrying a fragment.
+    #[test]
+    fn an_oversized_body_is_shortened_and_reported() {
+        let issues = vec![issue_of(7, &"word\n".repeat(400))];
+        let out = render(&issues, &cfg_with(100, 200_000));
+        assert_eq!(vec![7], out.shortened);
+        assert!(out.text.contains("Shortened to fit"), "{}", out.text);
+    }
 
     fn item(n: i64, complexity: &str, deps: &[i64]) -> PlanItem {
         PlanItem {

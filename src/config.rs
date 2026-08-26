@@ -289,6 +289,22 @@ pub struct LoopCfg {
     /// wave can file follow-ups of its own. Every wave is triaged like any
     /// other issue, so both agents still have to agree it is worth doing.
     pub absorb_new_issues: u32,
+    /// The most of one issue body that reaches a prompt.
+    ///
+    /// Sized so that no issue a person wrote is ever cut. It was 2000 for
+    /// triage and 6000 for implement, silently, and both were small enough to
+    /// clip an ordinary bug report: an agent given half an issue judges and
+    /// implements the half it saw and has no way to know the rest existed.
+    /// When this does fire it is said out loud, in the log and in the prompt.
+    pub max_issue_chars: usize,
+    /// The most every issue body together may add to one triage prompt.
+    ///
+    /// Triage reads the whole queue at once, so the only unbounded thing here
+    /// is the queue. Past this, whole issues are left for the next run rather
+    /// than every issue being shortened: a verdict is posted on the issue and
+    /// can close it, so judging one on part of its body is worse than not
+    /// reaching it yet.
+    pub max_triage_chars: usize,
     pub effort_schedule: EffortSchedule,
 }
 
@@ -311,6 +327,8 @@ impl Default for LoopCfg {
             parallel_triage: true,
             min_number: 0,
             absorb_new_issues: 0,
+            max_issue_chars: 60_000,
+            max_triage_chars: 200_000,
             effort_schedule: EffortSchedule::default(),
         }
     }

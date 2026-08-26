@@ -690,6 +690,34 @@ impl Issue {
         self.body.as_deref().unwrap_or("")
     }
 
+    /// The body as a prompt carries it, and whether anything was left off.
+    ///
+    /// Shortened only past `max`, which is sized so that nothing a person
+    /// wrote ever reaches it. When it does fire the cut is announced in the
+    /// text itself: an agent handed a fragment with no marker has no way to
+    /// tell it from an issue that simply ended there, so it judges the part it
+    /// saw and reports the confidence of having seen all of it.
+    ///
+    /// The cut lands on a line boundary, and an unbalanced code fence is closed
+    /// rather than left hanging. Broken markdown reads as a defect in the issue
+    /// and costs the model attention to rule out.
+    pub fn body_for_prompt(&self, max: usize) -> (String, bool) {
+        let body = self.body_text().trim();
+        if body.chars().count() <= max {
+            return (body.to_string(), false);
+        }
+        let clipped: String = body.chars().take(max).collect();
+        let mut kept = match clipped.rfind('\n') {
+            Some(at) => clipped[..at].to_string(),
+            None => clipped,
+        };
+        if kept.matches("```").count() % 2 == 1 {
+            kept.push_str("\n```");
+        }
+        kept.push_str("\n\n[Shortened to fit. The rest of this issue was not included.]");
+        (kept, true)
+    }
+
     pub fn is_closed(&self) -> bool {
         self.state.eq_ignore_ascii_case("closed")
     }
@@ -864,5 +892,59 @@ mod tests {
         let text = serde_json::to_string(&run).unwrap();
         let back: IssueRun = serde_json::from_str(&text).unwrap();
         assert_eq!(Status::Pending, back.status);
+    }
+}
+
+#[cfg(test)]
+mod body_for_prompt_tests {
+    use super::*;
+
+    fn issue(body: &str) -> Issue {
+        let mut i: Issue = serde_json::from_value(serde_json::json!({
+            "number": 1, "title": "t", "state": "open", "url": "u"
+        }))
+        .expect("an issue");
+        i.body = Some(body.to_string());
+        i
+    }
+
+    /// The case that is every real issue: nothing is touched and nothing is
+    /// claimed to be.
+    #[test]
+    fn an_issue_that_fits_is_handed_over_whole() {
+        let (body, cut) = issue("The guard is inverted.").body_for_prompt(60_000);
+        assert_eq!("The guard is inverted.", body);
+        assert!(!cut);
+    }
+
+    /// A fragment with no marker is indistinguishable from an issue that ended
+    /// there, so the agent judges what it saw with the confidence of having
+    /// seen everything. That is what the silent caps did.
+    #[test]
+    fn a_shortened_body_says_so_in_the_text() {
+        let long = "line of text\n".repeat(500);
+        let (body, cut) = issue(&long).body_for_prompt(200);
+        assert!(cut);
+        assert!(body.contains("Shortened to fit"), "{body}");
+        assert!(body.len() < long.len());
+    }
+
+    /// Broken markdown reads as a defect in the issue, and costs the model
+    /// attention to rule out.
+    #[test]
+    fn a_cut_never_leaves_a_code_fence_open() {
+        let body = format!("intro\n\n```rust\n{}\n```\n", "let x = 1;\n".repeat(200));
+        let (out, cut) = issue(&body).body_for_prompt(120);
+        assert!(cut);
+        assert_eq!(0, out.matches("```").count() % 2, "{out}");
+    }
+
+    /// Cutting mid-word turns the last thing the agent reads into nonsense.
+    #[test]
+    fn a_cut_lands_on_a_line_boundary() {
+        let body = "aaaa bbbb cccc\n".repeat(100);
+        let (out, _) = issue(&body).body_for_prompt(100);
+        let kept = out.split("\n\n[Shortened").next().expect("the kept part");
+        assert!(kept.ends_with("cccc"), "{kept:?}");
     }
 }

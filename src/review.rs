@@ -214,7 +214,17 @@ fn implement_and_review(
     let base = cfg.base_branch().to_string();
 
     log!("#{number}: {holder} implementing");
-    let body: String = issue.body_text().trim().chars().take(6000).collect();
+    // Fixing triage alone would have been worse than fixing neither: an issue
+    // correctly judged worth doing on its whole text, then built from the first
+    // few thousand characters of it, raises confidence without raising
+    // fidelity.
+    let (body, shortened) = issue.body_for_prompt(cfg.loop_cfg.max_issue_chars);
+    if shortened {
+        logwarn!(
+            "#{number}: the issue body was shortened to fit the prompt. Raise max_issue_chars if \
+             the rest matters."
+        );
+    }
     let prompt = IMPLEMENT_PROMPT
         .replace("{number}", &number.to_string())
         .replace("{title}", &item.title)

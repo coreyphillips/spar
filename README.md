@@ -468,6 +468,16 @@ repo should be considered required, not optional, if you turn it on.
 Every commit message, PR body, and comment is scrubbed deterministically and
 then re-verified. A leak is a hard error, not a warning.
 
+**An issue read in part.** An agent handed half an issue judges and builds the
+half it saw, and reports it with the confidence of having read all of it.
+Nothing about the output looks wrong. So an issue body reaches a prompt entire:
+`max_issue_chars` is sized past anything a person writes, a cut is said out loud
+in the log and marked in the prompt, and it never lands mid-line or inside a code
+fence. Triage reads the whole queue at once, so `max_triage_chars` bounds that
+too, and past it whole issues wait for the next run rather than every issue
+losing its tail. A verdict is posted on the issue and can close it, so judging
+one on part of what it says is worse than not having reached it yet.
+
 **Two agents that are secretly one.** Config keys are arbitrary, so `alpha` and
 `beta` can both be Claude on the same model. spar compares the resolved binary
 (by inode, so a symlink does not fool it) and the configured model, and warns

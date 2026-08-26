@@ -38,8 +38,13 @@ const IMPLEMENT_PROMPT: &str = "\
 Implement GitHub issue #{number} in this repository.
 
 Title: {title}
+URL: {url}
 
 {body}
+
+That is the issue body as filed. The discussion since is not included, so read
+the thread at the URL above if the body leaves anything open. If you cannot
+reach the network, work from what is here.
 
 Do the work, then commit it on the current branch. Make focused commits with
 clear messages. Do not push, do not open a PR, and do not merge; the harness
@@ -225,10 +230,7 @@ fn implement_and_review(
              the rest matters."
         );
     }
-    let prompt = IMPLEMENT_PROMPT
-        .replace("{number}", &number.to_string())
-        .replace("{title}", &item.title)
-        .replace("{body}", &body);
+    let prompt = implement_prompt(number, &item.title, &issue.url, &body);
     let mut work: Implementation = implementor.ask_json(
         &prompt,
         &schema::implementation(),
@@ -1128,6 +1130,21 @@ pub fn outcome_comment(
     Some(out.join("\n\n"))
 }
 
+/// What the implementor is asked, with the issue in front of it.
+///
+/// The body is passed rather than only the link, because one of the two agents
+/// cannot follow a link: codex runs under `-s workspace-write`, which has no
+/// network at all, so a URL alone would leave it judging the title. The link is
+/// there for the agent that can follow it, and for the comments spar does not
+/// fetch.
+fn implement_prompt(number: i64, title: &str, url: &str, body: &str) -> String {
+    IMPLEMENT_PROMPT
+        .replace("{number}", &number.to_string())
+        .replace("{title}", title)
+        .replace("{url}", url)
+        .replace("{body}", body)
+}
+
 /// The pull request body.
 ///
 /// What it closes, then the change in one sentence, then what was wrong, then
@@ -1705,6 +1722,50 @@ mod tests {
             dispositions: vec![],
         };
         assert!(disposition_comment("claude", &response, &[], &[], &[], &style()).is_none());
+    }
+
+    /// Both, not either. The link is how an agent that can reach the network
+    /// reads the discussion spar does not fetch, and the body is what the one
+    /// that cannot works from: codex runs with no network, so a link alone
+    /// would leave it building from the title.
+    #[test]
+    fn the_implementor_is_given_the_link_and_the_body() {
+        let prompt = implement_prompt(
+            42,
+            "Retry a 429",
+            "https://github.com/o/r/issues/42",
+            "A rate limited response was treated as fatal.",
+        );
+        assert!(
+            prompt.contains("https://github.com/o/r/issues/42"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("A rate limited response was treated as fatal."),
+            "{prompt}"
+        );
+        assert!(prompt.contains("#42"), "{prompt}");
+        assert!(prompt.contains("Retry a 429"), "{prompt}");
+        // Nothing left unsubstituted.
+        assert!(!prompt.contains('{'), "{prompt}");
+    }
+
+    /// An agent that cannot reach the link is told what it is missing, so it
+    /// works from the body rather than assuming the body is everything.
+    #[test]
+    fn the_prompt_says_the_discussion_is_not_included() {
+        let prompt = implement_prompt(1, "t", "u", "b");
+        // Flattened, so the assertion does not turn on where the prompt wraps.
+        let lower = prompt
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        assert!(
+            lower.contains("discussion since is not included"),
+            "{prompt}"
+        );
+        assert!(lower.contains("cannot reach the network"), "{prompt}");
     }
 
     /// A fully reported implementation, for the body tests.

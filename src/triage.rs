@@ -22,6 +22,12 @@ const TRIAGE_PROMPT: &str = "\
 You are triaging GitHub issues for the repository in your working directory.
 Read the codebase as needed before judging. Do not modify anything.
 
+Each issue below is its number, title, URL, and body as filed. The discussion
+since it was filed is not included. Where a body leaves the judgement genuinely
+unclear, read that one issue's thread before deciding; read the ones that need
+it rather than all of them, because the queue is long and most will not. If you
+cannot reach the network, judge on what is here.
+
 For each issue decide:
 - worth_doing: is this a real, valid, actionable issue worth a PR? Say false for
   duplicates, stale requests, things already fixed, vague reports with nothing
@@ -71,7 +77,10 @@ fn render(issues: &[Issue], cfg: &Config) -> Rendered {
             continue;
         }
         let (body, cut) = issue.body_for_prompt(cfg.loop_cfg.max_issue_chars);
-        let entry = format!("#{}: {}\n{body}", issue.number, issue.title);
+        // The URL is what makes the comments reachable to an agent that can
+        // reach them, without spar fetching every thread in the queue on the
+        // chance one of them matters.
+        let entry = format!("#{}: {}\n{}\n{body}", issue.number, issue.title, issue.url);
         let len = entry.chars().count();
         // The first issue goes in whatever its size. A queue of one that does
         // not fit is a run that does nothing, forever.
@@ -391,6 +400,23 @@ mod tests {
         let out = render(&issues, &cfg_with(60_000, 200_000));
         assert!(out.deferred.is_empty() && out.shortened.is_empty());
         assert!(out.text.contains("first body") && out.text.contains("second body"));
+    }
+
+    /// The body is what an agent judges on, and the link is how one that can
+    /// reach the network reads the discussion spar does not fetch. Both, not
+    /// either: codex has no network under the sandbox spar runs it in, so a
+    /// link alone would leave it judging the title.
+    #[test]
+    fn every_issue_carries_its_link_as_well_as_its_body() {
+        let mut issue = issue_of(1, "the body");
+        issue.url = "https://github.com/o/r/issues/1".into();
+        let out = render(&[issue], &cfg_with(60_000, 200_000));
+        assert!(
+            out.text.contains("https://github.com/o/r/issues/1"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("the body"), "{}", out.text);
     }
 
     /// A verdict is posted on the issue and can close it, so an issue judged on

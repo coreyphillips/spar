@@ -222,7 +222,6 @@ impl Agent {
 
     fn extract_jsonl(&self, stdout: &str) -> Result<String> {
         let mut messages: Vec<String> = Vec::new();
-        let mut errors: Vec<String> = Vec::new();
 
         for line in stdout.lines() {
             let line = line.trim();
@@ -238,24 +237,91 @@ impl Agent {
                         messages.push(text);
                     }
                 }
-            } else if matches!(
-                event.get("type").and_then(Value::as_str),
-                Some("turn.failed") | Some("error")
-            ) {
-                errors.push(truncate(&event.to_string(), 400));
             }
         }
 
-        if messages.is_empty() && !errors.is_empty() {
-            // The CLI reported failure rather than answering badly, so this is
-            // not something asking again corrects.
-            return Err(SparError::call_failed(format!(
-                "agent '{}' failed: {}",
-                self.spec.name,
-                errors.join("; ")
-            )));
+        if messages.is_empty() {
+            let reasons = self.error_events(stdout);
+            if !reasons.is_empty() {
+                // The CLI reported failure rather than answering badly, so this
+                // is not something asking again corrects.
+                return Err(SparError::call_failed(format!(
+                    "agent '{}' failed: {}",
+                    self.spec.name,
+                    reasons.join("; ")
+                )));
+            }
         }
         Ok(messages.join("\n").trim().to_string())
+    }
+
+    /// Why an event stream says it failed, in words rather than as JSON.
+    ///
+    /// The reason a CLI gives is a field inside the event, not the event, and
+    /// printing the object around it is what made a failure unreadable. Two
+    /// shapes cover what the CLIs here emit: a `message` on the event, and a
+    /// `message` on an `error` inside it.
+    ///
+    /// Deduplicated, because one refusal reported as an `error` twice and a
+    /// `turn.failed` once is one reason and not three.
+    fn error_events(&self, stdout: &str) -> Vec<String> {
+        let mut reasons: Vec<String> = Vec::new();
+        for line in stdout.lines() {
+            let line = line.trim();
+            if !line.starts_with('{') {
+                continue;
+            }
+            let Ok(event) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if !matches!(
+                event.get("type").and_then(Value::as_str),
+                Some("turn.failed") | Some("error")
+            ) {
+                continue;
+            }
+            let reason = dig(&event, "message")
+                .or_else(|| dig(&event, "error.message"))
+                .and_then(as_text)
+                .unwrap_or_else(|| truncate(&event.to_string(), 400));
+            if !reason.trim().is_empty() && !reasons.contains(&reason) {
+                reasons.push(reason);
+            }
+        }
+        reasons
+    }
+
+    /// Why the call failed, said in the agent's own terms.
+    ///
+    /// For a `jsonl` agent the streams are an event log, and `proc` tailing
+    /// 1500 characters of one starts mid object: the reason is in there, after
+    /// a thousand characters of whatever a tool call happened to return. The
+    /// adapter already knows how to find the error events, so it finds them
+    /// here too and the raw dump is what happens when there are none.
+    ///
+    /// stderr is kept either way. It is short, and it is where one CLI reports
+    /// the condition that led to the refusal while the refusal itself goes to
+    /// stdout.
+    fn call_failure(&self, argv: &[String], out: &proc::Output) -> SparError {
+        if self.spec.output != OutputMode::Jsonl {
+            return SparError::call_failed(proc::failure_message(argv, out));
+        }
+        let reasons = self.error_events(&out.stdout);
+        if reasons.is_empty() {
+            return SparError::call_failed(proc::failure_message(argv, out));
+        }
+        let mut text = format!(
+            "agent '{}' could not answer (exit {}): {}",
+            self.spec.name,
+            out.code,
+            reasons.join("; ")
+        );
+        let stderr = out.stderr.trim();
+        if !stderr.is_empty() {
+            text.push_str(&format!("\n--- stderr ---\n{stderr}"));
+        }
+        text.push_str(&format!("\n--- command ---\n{}", proc::abbreviate(argv)));
+        SparError::call_failed(text)
     }
 
     // -- the two operations everything else is built from -------------------
@@ -329,9 +395,18 @@ impl Agent {
             schema: schema.map(str::to_string),
         };
         let argv = self.render(&values)?;
-        let opts = ExecOpts::new().cwd(cwd).timeout_secs(self.spec.timeout);
-        let stdout = proc::run(&argv, &opts)?;
-        self.extract(&stdout)
+        // `check(false)` so the whole output is still in hand when the call
+        // fails: `proc::run` would hand back a tail of it as a message, and a
+        // tail of an event stream is the part this agent can read least.
+        let opts = ExecOpts::new()
+            .cwd(cwd)
+            .timeout_secs(self.spec.timeout)
+            .check(false);
+        let out = proc::exec(&argv, &opts)?;
+        if !out.ok() {
+            return Err(self.call_failure(&argv, &out));
+        }
+        self.extract(&out.stdout)
     }
 
     /// Structured output through the CLI's own mechanism when the template
@@ -1043,6 +1118,132 @@ mod tests {
         assert!(lower.contains("brief"));
         assert!(lower.contains("co-authored-by"));
         assert!(lower.contains("em-dash"));
+    }
+
+    // -- a failure said in the agent's own terms ---------------------------
+
+    /// The event stream from the run that prompted this: a wall of file
+    /// contents a tool call returned, with the reason as the last two lines.
+    fn refusal_stream() -> String {
+        let noise = "{\"type\":\"item.completed\",\"item\":{\"id\":\"i\",\"type\":\"command_execution\",\"output\":\"".to_string()
+            + &"const x = 1;\\n".repeat(200)
+            + "\"}}";
+        [
+            noise.as_str(),
+            r#"{"type":"error","message":"This content was flagged for possible cybersecurity risk."}"#,
+            r#"{"type":"error","message":"This content was flagged for possible cybersecurity risk."}"#,
+            r#"{"type":"turn.failed","error":{"message":"This content was flagged for possible cybersecurity risk."}}"#,
+        ]
+        .join("\n")
+    }
+
+    fn jsonl_agent(name: &str) -> Agent {
+        let mut spec = spec(vec![one("codex")]);
+        spec.name = name.into();
+        spec.output = OutputMode::Jsonl;
+        spec.message_path = Some("item.text".into());
+        Agent::with_bin(spec, "/fake/codex")
+    }
+
+    fn failed(stdout: &str, stderr: &str) -> proc::Output {
+        proc::Output {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            code: 1,
+        }
+    }
+
+    /// The reason a CLI gives is a field inside the event, not the event.
+    /// Printing the object around it is what buried it.
+    #[test]
+    fn a_jsonl_failure_reports_the_reason_and_not_the_stream() {
+        let agent = jsonl_agent("codex");
+        let err = agent.call_failure(&["codex".to_string()], &failed(&refusal_stream(), ""));
+        let text = err.message();
+        assert!(
+            text.contains("flagged for possible cybersecurity risk"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("const x = 1;"),
+            "the stream leaked in:\n{text}"
+        );
+        assert!(text.len() < 400, "still {} characters:\n{text}", text.len());
+    }
+
+    /// One refusal reported as two errors and a turn.failed is one reason.
+    #[test]
+    fn the_same_reason_reported_three_times_is_said_once() {
+        let agent = jsonl_agent("codex");
+        let err = agent.call_failure(&["codex".to_string()], &failed(&refusal_stream(), ""));
+        assert_eq!(
+            1,
+            err.message().matches("flagged for possible").count(),
+            "{}",
+            err.message()
+        );
+    }
+
+    /// stderr is where one CLI reports the condition behind the refusal, and it
+    /// is short, so it survives whatever stdout turns out to hold.
+    #[test]
+    fn stderr_is_kept_because_it_is_where_the_other_half_arrives() {
+        let agent = jsonl_agent("codex");
+        let err = agent.call_failure(
+            &["codex".to_string()],
+            &failed(
+                &refusal_stream(),
+                "ERROR router: agent thread limit reached",
+            ),
+        );
+        assert!(
+            err.message().contains("agent thread limit reached"),
+            "{}",
+            err.message()
+        );
+    }
+
+    /// A CLI that dies without emitting an error event leaves nothing else to
+    /// go on, so the raw dump is still what happens.
+    #[test]
+    fn a_stream_with_no_error_event_falls_back_to_the_raw_output() {
+        let agent = jsonl_agent("codex");
+        let err = agent.call_failure(
+            &["codex".to_string()],
+            &failed("{\"type\":\"system\"}", "segmentation fault"),
+        );
+        assert!(
+            err.message().contains("segmentation fault"),
+            "{}",
+            err.message()
+        );
+        assert!(
+            err.message().starts_with("command failed"),
+            "{}",
+            err.message()
+        );
+    }
+
+    /// A text agent has no events to read, so nothing changes for it.
+    #[test]
+    fn a_text_agent_is_reported_exactly_as_before() {
+        let agent = agent(vec![one("mytool")]);
+        let err = agent.call_failure(&["mytool".to_string()], &failed("some prose", "boom"));
+        assert!(
+            err.message().starts_with("command failed"),
+            "{}",
+            err.message()
+        );
+        assert!(err.message().contains("some prose"), "{}", err.message());
+    }
+
+    /// Whatever the shape, it is still the CLI failing rather than answering
+    /// badly, so it still goes straight to the stand in.
+    #[test]
+    fn a_reworded_failure_is_still_a_failed_call() {
+        let agent = jsonl_agent("codex");
+        let err = agent.call_failure(&["codex".to_string()], &failed(&refusal_stream(), ""));
+        assert_eq!(ErrorKind::CallFailed, err.kind());
     }
 
     // -- fallback --------------------------------------------------------

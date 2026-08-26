@@ -1,0 +1,41 @@
+# Cursor CLI, headless. Installed separately from the Cursor editor, which
+# ships no agent binary of its own:
+#
+#   curl https://cursor.com/install -fsS | bash
+#
+# Models come from your Cursor subscription rather than from a key you hold, so
+# the roster changes without spar knowing. `cursor-agent --list-models` is the
+# source of truth.
+#
+# No structured output flag, so spar asks for JSON in the prompt and parses it
+# back out. That is the one thing this preset gives up against codex and claude,
+# and it is why cursor is a better backup than it is a primary.
+command = [
+  "cursor-agent", "--print",
+  ["--model", "{model}"],
+  # Headless, in a throwaway worktree: nothing is going to answer a prompt.
+  # Without --force the agent proposes edits and applies none of them, which
+  # looks exactly like a model that did no work.
+  "--force",
+  "--trust",
+  "--output-format", "stream-json",
+  "{prompt}",
+]
+output = "jsonl"
+message_path = "result"
+search_paths = [
+  "~/.local/bin",
+  "~/.cursor/bin",
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+]
+
+# Hints for `spar init`. Never validated against, only written as comments.
+models = ["kimi-k3", "auto"]
+options_note = "Cursor picks the model from your subscription, and the roster changes. Check the current set with: cursor-agent --list-models. 'auto' lets Cursor choose."
+
+# The terminal event carries the whole answer. The assistant events carry the
+# same text as it streams, and matching those instead would hand spar the
+# answer several times over.
+[message_match]
+type = "result"

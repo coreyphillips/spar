@@ -995,6 +995,29 @@ fn cmd_init(out: &Path, force: bool) -> Result<i32> {
     Ok(0)
 }
 
+/// An agent's stand in, under the agent it stands in for.
+///
+/// Never counted against `doctor`'s exit code, deliberately. A fallback that is
+/// not installed does not stop a run either, and a check that disagrees with
+/// the runtime teaches people to ignore it.
+fn report_fallback(agent: &Agent) {
+    let Some(backup) = agent.fallback() else {
+        return;
+    };
+    match backup.resolve_bin() {
+        Ok(bin) => println!(
+            "        fallback    {}  ({})",
+            bin.display(),
+            backup.spec.describe()
+        ),
+        Err(_) => println!(
+            "        fallback    {} not found, so it will not stand in. Set {} to its path.",
+            backup.program(),
+            backup.env_key()
+        ),
+    }
+}
+
 /// One prerequisite check: a label and something that either reports a version
 /// or explains what is missing.
 type Probe = Box<dyn Fn() -> Result<String>>;
@@ -1039,6 +1062,14 @@ fn agent_block(name: &str, spec: &config::AgentSpec) -> String {
     if let Some(note) = &spec.options_note {
         out.push_str(&wrap_comment(note));
     }
+    // Anything but this agent's own preset: a CLI that has just refused is not
+    // a stand in for itself.
+    let backup = if name == "cursor" { "gemini" } else { "cursor" };
+    out.push_str("# A stand in for when this CLI refuses, stalls, or runs out of quota.\n");
+    out.push_str("# It answers in place of this agent, never alongside it.\n");
+    out.push_str(&format!(
+        "# [agents.{name}.fallback]\n# preset = \"{backup}\"\n"
+    ));
     out.push('\n');
     out
 }
@@ -1141,6 +1172,7 @@ fn cmd_doctor(config_path: Option<&Path>) -> Result<i32> {
                     bin.display(),
                     spec.describe()
                 );
+                report_fallback(&agent);
                 resolved.push(agent);
             }
             Err(e) => {

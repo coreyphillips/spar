@@ -446,6 +446,7 @@ which is worse than no review at all.
   missing  aider
   found    claude     /Users/you/.local/bin/claude
   found    codex      /Applications/ChatGPT.app/Contents/Resources/codex
+  found    cursor     /Users/you/.local/bin/cursor-agent
   missing  gemini
 
 wrote spar.toml
@@ -486,7 +487,8 @@ reasoning.
 
 An agent is a command template plus an output adapter, not a class. Supporting a
 new CLI is a preset file, not a code change. Presets ship for claude, codex,
-gemini, and aider; any two can be paired, and agent names are arbitrary.
+cursor, gemini, and aider; any two can be paired, and agent names are
+arbitrary.
 
 To wire up something with no preset, declare it inline:
 
@@ -525,6 +527,46 @@ type        = "item.completed"
 
 Binaries are located by walking `SPAR_<NAME>_BIN`, then PATH, then the preset's
 `search_paths`. Nothing is hardcoded, and a miss reports every location tried.
+
+### A backup for when one CLI will not answer
+
+A CLI that is down, out of quota, or refusing the request on policy grounds
+takes the run with it: the pair is two, and one of them has stopped existing.
+Give an agent a stand in and the call goes there instead.
+
+```toml
+[agents.codex]
+preset = "codex"
+model  = "gpt-5.6-sol"
+
+[agents.codex.fallback]
+preset = "cursor"
+model  = "kimi-k3"
+```
+
+A fallback is a whole agent, preset and all, and it is not a third opinion. It
+never reviews alongside the pair. It answers in place of the agent that failed,
+holding that agent's turn, so neither agent ever reviews its own most recent
+edit and nothing else about the loop changes.
+
+It fires once the primary has spent its own retries, and on a deadline too:
+asking the same CLI again after a timeout buys the same wait for the same
+answer, but asking a different one is a different question, and the alternative
+is losing the run. The scheduled effort is not passed on, because effort words
+are each CLI's own vocabulary; the fallback uses whatever its own block asked
+for.
+
+If both fail you get both reasons, the primary's first. `spar doctor` shows the
+fallback under the agent it stands in for, and `SPAR_CODEX_FALLBACK_BIN` points
+it somewhere else. One that is not installed warns at startup and is otherwise
+ignored, because a missing backup should not stop a run whose pair is fine.
+
+The cursor preset drives [Cursor's CLI](https://cursor.com/docs/cli), which is
+installed separately from the editor and serves whichever models your
+subscription carries. It has no structured output flag, so spar asks for JSON in
+the prompt and parses it back, which is why it makes a better backup than a
+primary. `cursor-agent --list-models` is the source of truth for what `model`
+will accept.
 
 Every option a preset supplies can be overridden per agent, including `timeout`
 (seconds one call may take before spar gives up), `search_paths`, and

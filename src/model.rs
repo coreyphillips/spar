@@ -489,6 +489,42 @@ pub enum Standing {
     Unverified,
 }
 
+/// What the implementor did, and what the pull request body is built from.
+///
+/// Structured for the reason every other exchange here is structured: a model
+/// asked for a description writes a paragraph about having written one, while a
+/// model asked for a problem, a change list, and a way to check them answers
+/// each of those. The body's substance comes from the fields being asked for
+/// separately, and its brevity from spar composing them rather than the model
+/// narrating.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Implementation {
+    /// The issue should not be implemented. No commits, and `reason` says why.
+    #[serde(default, deserialize_with = "de_bool")]
+    pub not_worth_doing: bool,
+    /// Only when declining. Posted on the issue, so it is written for whoever
+    /// opened it rather than for the harness.
+    #[serde(default, deserialize_with = "de_string")]
+    pub reason: String,
+    /// One sentence saying what changed. Leads the body.
+    #[serde(default, deserialize_with = "de_string")]
+    pub summary: String,
+    /// What was actually wrong, as understood after reading the code. Not a
+    /// restatement of the issue: the reviewer can follow the link.
+    #[serde(default, deserialize_with = "de_string")]
+    pub problem: String,
+    /// One line per change that alters behaviour.
+    #[serde(default)]
+    pub changes: Vec<String>,
+    /// How a reviewer confirms the change works.
+    #[serde(default)]
+    pub testing: Vec<String>,
+    /// Anything the reviewer would otherwise have to ask about: a deliberate
+    /// omission, a decision worth defending, a risk. Usually nothing.
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseDoc {
     #[serde(default, deserialize_with = "de_string")]

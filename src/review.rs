@@ -22,8 +22,9 @@ use crate::config::{Config, Followups, PrComments};
 use crate::error::{Result, SparError};
 use crate::jsonx::finding_key;
 use crate::model::{
-    Action, Dispute, Finding, Issue, IssueRun, Ledger, LedgerEntry, NextAction, PersistedState,
-    PlanItem, PrView, ResponseDoc, Review, Severity, SkippedItem, Status, STATE_VERSION,
+    Action, Dispute, Finding, Implementation, Issue, IssueRun, Ledger, LedgerEntry, NextAction,
+    PersistedState, PlanItem, PrView, ResponseDoc, Review, Severity, SkippedItem, Status,
+    STATE_VERSION,
 };
 use crate::repo::Repo;
 use crate::style::{self, Style};
@@ -44,14 +45,13 @@ Do the work, then commit it on the current branch. Make focused commits with
 clear messages. Do not push, do not open a PR, and do not merge; the harness
 handles that.
 
-End your final message with a line of exactly this form:
-SUMMARY: <one sentence under 120 characters saying what changed>
-That line becomes the PR description, so write it for the reviewer who has to
-read it, and say what changed rather than that you changed something.
+Then report it. Your answer becomes the pull request description, and the
+reviewer reads that cold, with nothing but the diff and a link to the issue:
+say what you found wrong, what the change does about it, and how they confirm
+it for themselves. Say what you actually ran, not what could be run.
 
 If after reading the code you conclude this issue should not be implemented,
-make no commits and explain why in your final message, beginning with
-NOT_WORTH_DOING.";
+make no commits and set not_worth_doing, with the reason.";
 
 const REVIEW_PROMPT: &str = "\
 Review the changes on this branch against `{base}`. They implement issue
@@ -219,20 +219,28 @@ fn implement_and_review(
         .replace("{number}", &number.to_string())
         .replace("{title}", &item.title)
         .replace("{body}", &body);
-    let out = implementor.ask(
+    let mut work: Implementation = implementor.ask_json(
         &prompt,
+        &schema::implementation(),
         work_dir,
         cfg.effort_for_round(&implementor.spec, 1).as_deref(),
     )?;
 
-    if out.to_uppercase().contains("NOT_WORTH_DOING") || !repo.has_changes(work_dir, &base) {
+    if work.not_worth_doing || !repo.has_changes(work_dir, &base) {
         state.status = Status::Abandoned;
-        let reason = style::body(&out, &repo.style);
+        let reason = no_pr_note(&work, &repo.style);
         state.notes.push(reason.clone());
         if let Err(e) = repo.comment_issue(number, &reason) {
             logdim!("could not comment on #{number}: {e}");
         }
         return Ok(());
+    }
+
+    // A body that leads with nothing is a body nobody reads past. The issue
+    // title is a poor substitute for a sentence about the change, and a better
+    // one than a blank first line.
+    if work.summary.trim().is_empty() {
+        work.summary = item.title.clone();
     }
 
     repo.rewrite_commits_if_needed(work_dir, &base)?;
@@ -241,8 +249,7 @@ fn implement_and_review(
     let pr = match repo.pr_for_branch(branch) {
         Some(existing) => existing,
         None => {
-            let summary = extract_summary(&out).unwrap_or_else(|| item.title.clone());
-            let body = pr_body(number, &summary, &repo.style);
+            let body = pr_body(number, &work, &repo.style);
             repo.create_pr(
                 work_dir,
                 branch,
@@ -1111,34 +1118,69 @@ pub fn outcome_comment(
     Some(out.join("\n\n"))
 }
 
-/// The PR body: what it closes, one sentence of what changed, and the diffstat.
-/// GitHub already shows the file list, so repeating it is noise.
-pub fn pr_body(issue: i64, summary: &str, style: &Style) -> String {
+/// The pull request body.
+///
+/// What it closes, then the change in one sentence, then what was wrong, then
+/// only the sections that have something in them. The lead is two paragraphs
+/// rather than two headings: a heading over a single sentence is a label on a
+/// label, and those two parts are the ones every body has.
+///
+/// GitHub renders the file count and the plus and minus figures immediately
+/// above this, so neither appears here.
+pub fn pr_body(issue: i64, work: &Implementation, style: &Style) -> String {
     let mut parts = vec![format!("Closes #{issue}")];
-    let summary = style::summary(summary, style);
-    if !summary.is_empty() {
-        parts.push(summary);
+
+    for lead in [&work.summary, &work.problem] {
+        let text = style::sentence(lead, style);
+        if !text.is_empty() {
+            parts.push(text);
+        }
     }
-    parts.join("\n\n")
+    parts.extend(section("What changed", &work.changes, style));
+    parts.extend(section("How to test", &work.testing, style));
+
+    let notes = style::sentence(work.notes.as_deref().unwrap_or_default(), style);
+    if !notes.is_empty() {
+        parts.push(format!("## Notes\n\n{notes}"));
+    }
+
+    style::body(&parts.join("\n\n"), style)
 }
 
-/// The last `SUMMARY:` line an implementor emitted, if it left one.
-pub fn extract_summary(text: &str) -> Option<String> {
-    text.lines()
-        .rev()
-        .find_map(|line| {
-            let trimmed = line.trim().trim_start_matches(['*', '#', '-', ' ']);
-            trimmed
-                .strip_prefix("SUMMARY:")
-                .or_else(|| trimmed.strip_prefix("Summary:"))
-        })
-        .map(|s| {
-            s.trim()
-                .trim_start_matches(['*', '_', ':', ' '])
-                .trim()
-                .to_string()
-        })
-        .filter(|s| !s.is_empty())
+/// A headed list, or nothing at all when there is nothing to list.
+///
+/// Nothing at all on purpose. A heading with an empty body under it reads as a
+/// section somebody forgot to write, which is worse than the absence, and a
+/// small change that needs no change list should not be made to look like one
+/// that is missing its.
+fn section(heading: &str, lines: &[String], style: &Style) -> Option<String> {
+    let items: Vec<String> = lines
+        .iter()
+        .map(|line| style::summary(line, style))
+        .filter(|line| !line.is_empty())
+        .collect();
+    if items.is_empty() {
+        return None;
+    }
+    Some(format!("## {heading}\n\n{}", bullets(&items)))
+}
+
+/// What gets posted on an issue that produced no pull request.
+///
+/// The agent's own reason when it gave one, since that is the part written for
+/// the person who opened the issue. Never the summary: an issue that produced
+/// no commits has no change for a summary to describe, and one that claims
+/// otherwise is worse than a flat sentence saying nothing happened.
+fn no_pr_note(work: &Implementation, style: &Style) -> String {
+    let reason = style::sentence(&work.reason, style);
+    if !reason.is_empty() {
+        return reason;
+    }
+    if work.not_worth_doing {
+        "Left alone after reading the code, with no reason given.".to_string()
+    } else {
+        "Nothing was committed, so there is nothing to review.".to_string()
+    }
 }
 
 /// One review, as a reviewer would write it if they were in a hurry: a count
@@ -1655,45 +1697,126 @@ mod tests {
         assert!(disposition_comment("claude", &response, &[], &[], &[], &style()).is_none());
     }
 
+    /// A fully reported implementation, for the body tests.
+    fn worked() -> Implementation {
+        Implementation {
+            summary: "Retry a 429 instead of failing the run.".into(),
+            problem: "A rate limited response was treated as fatal, so one throttled call ended \
+                      a run that had hours of work left in it."
+                .into(),
+            changes: vec![
+                "`send` retries a 429 with the delay the header asks for".into(),
+                "the retry budget is bounded, so a permanent 429 still ends".into(),
+            ],
+            testing: vec![
+                "`cargo test retries_a_429`".into(),
+                "point it at a throttled endpoint and watch it finish".into(),
+            ],
+            ..Implementation::default()
+        }
+    }
+
     #[test]
-    /// Two parts, not three. GitHub renders the file count and the plus and
-    /// minus figures in the header, immediately above whatever spar writes.
+    /// GitHub renders the file count and the plus and minus figures in the
+    /// header, immediately above whatever spar writes, so neither is here.
     fn a_pr_body_is_what_it_closes_and_what_changed() {
-        let body = pr_body(42, "Retry on a 429 instead of failing.", &style());
-        assert_eq!("Closes #42\n\nRetry on a 429 instead of failing.", body);
-    }
-
-    #[test]
-    fn a_pr_body_survives_a_missing_summary_and_diffstat() {
-        assert_eq!("Closes #7", pr_body(7, "", &style()));
-    }
-
-    #[test]
-    fn the_summary_line_is_lifted_out_of_the_final_message() {
-        let out = "I did some work.\n\nSUMMARY: Retry on a 429 instead of failing.\n";
+        let body = pr_body(42, &worked(), &style());
         assert_eq!(
-            Some("Retry on a 429 instead of failing.".to_string()),
-            extract_summary(out)
+            "Closes #42\n\n\
+             Retry a 429 instead of failing the run.\n\n\
+             A rate limited response was treated as fatal, so one throttled call \
+             ended a run that had hours of work left in it.\n\n\
+             ## What changed\n\n\
+             - `send` retries a 429 with the delay the header asks for\n\
+             - the retry budget is bounded, so a permanent 429 still ends\n\n\
+             ## How to test\n\n\
+             - `cargo test retries_a_429`\n\
+             - point it at a throttled endpoint and watch it finish",
+            body
+        );
+    }
+
+    /// The sections are optional and the lead is not. A one line fix should
+    /// read as one, not as a form with most of it left blank.
+    #[test]
+    fn a_body_with_nothing_to_list_carries_no_empty_headings() {
+        let work = Implementation {
+            summary: "Retry a 429 instead of failing the run.".into(),
+            ..Implementation::default()
+        };
+        assert_eq!(
+            "Closes #42\n\nRetry a 429 instead of failing the run.",
+            pr_body(42, &work, &style())
         );
     }
 
     #[test]
-    fn a_decorated_summary_line_still_parses() {
+    fn a_pr_body_survives_an_implementor_that_said_nothing() {
         assert_eq!(
-            Some("Did a thing.".to_string()),
-            extract_summary("**SUMMARY:** Did a thing.")
+            "Closes #7",
+            pr_body(7, &Implementation::default(), &style())
+        );
+    }
+
+    /// Blank entries are the model's, not the reader's problem. A heading whose
+    /// only bullet was an empty string used to be possible.
+    #[test]
+    fn blank_list_entries_do_not_earn_a_heading() {
+        let work = Implementation {
+            summary: "Did a thing.".into(),
+            changes: vec![String::new(), "   ".into()],
+            ..Implementation::default()
+        };
+        let body = pr_body(42, &work, &style());
+        assert!(!body.contains("What changed"), "{body}");
+    }
+
+    #[test]
+    fn notes_appear_only_when_there_is_something_to_note() {
+        let mut work = worked();
+        assert!(!pr_body(42, &work, &style()).contains("## Notes"));
+        work.notes = Some("The retry is not applied to streaming calls.".into());
+        let body = pr_body(42, &work, &style());
+        assert!(body.contains("## Notes"), "{body}");
+        assert!(body.contains("streaming calls"), "{body}");
+    }
+
+    /// An issue that produced no commits is told so. Never the summary, which
+    /// describes a change that is not in the branch.
+    #[test]
+    fn declining_posts_the_reason_and_not_the_summary() {
+        let work = Implementation {
+            not_worth_doing: true,
+            reason: "Already fixed in 1.2, and the report predates it.".into(),
+            summary: "Nothing to do.".into(),
+            ..Implementation::default()
+        };
+        assert_eq!(
+            "Already fixed in 1.2, and the report predates it.",
+            no_pr_note(&work, &style())
         );
     }
 
     #[test]
-    fn a_missing_summary_line_is_none() {
-        assert_eq!(None, extract_summary("no marker here"));
+    fn reporting_work_and_committing_none_says_that_rather_than_the_summary() {
+        let work = Implementation {
+            summary: "Retry a 429 instead of failing the run.".into(),
+            ..Implementation::default()
+        };
+        let note = no_pr_note(&work, &style());
+        assert_eq!(
+            "Nothing was committed, so there is nothing to review.",
+            note
+        );
     }
 
     #[test]
-    fn the_last_summary_line_wins() {
-        let out = "SUMMARY: first draft\nmore work\nSUMMARY: final answer";
-        assert_eq!(Some("final answer".to_string()), extract_summary(out));
+    fn declining_without_a_reason_still_says_something() {
+        let work = Implementation {
+            not_worth_doing: true,
+            ..Implementation::default()
+        };
+        assert!(no_pr_note(&work, &style()).contains("no reason given"));
     }
 
     #[test]

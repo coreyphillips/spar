@@ -357,6 +357,42 @@ Set `pr_comments = "rounds"` for a comment per review and per response, which is
 an audit trail at the cost of a thread nobody wants to read, or `"none"` to keep
 GitHub out of it entirely.
 
+**A pull request says what it is for.** The body used to be `Closes #42` and one
+scraped sentence, which told a reviewer opening the diff cold nothing: not what
+was wrong, not what the change does about it, not how to check it. The
+implementor is asked for those separately, and spar composes the body from the
+fields, so the substance comes from what was asked for and the brevity from spar
+rather than from the model:
+
+```markdown
+Closes #478
+
+Retry a 429 with exponential backoff instead of failing the request.
+
+A rate limited response was treated as fatal, so a single throttled call ended a
+run that had hours of work left in it. The retry path existed but only covered
+connection errors.
+
+## What changed
+
+- `send` now retries a 429, honouring `Retry-After` when the server sets it
+- the retry budget is bounded at five attempts, so a permanent 429 still ends
+
+## How to test
+
+- `cargo test retries_a_rate_limited_request`, which fakes a 429 and asserts the wait
+- point it at a throttled endpoint and watch a run finish
+
+## Notes
+
+Streaming calls do not go through `send` and are unchanged.
+```
+
+Everything below the first two paragraphs is optional and disappears when it is
+empty, so a one line fix reads as one rather than as a form with most of it left
+blank. The lead is two paragraphs rather than two headings, because a heading
+over a single sentence is a label on a label.
+
 **A filed issue is written as a bug report.** The agents are asked for the parts
 of one separately, and spar assembles them under headings, skipping any that do
 not apply:

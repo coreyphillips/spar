@@ -121,6 +121,53 @@ pub fn review() -> Value {
     })
 }
 
+/// What the implementor reports back, and the pull request body it becomes.
+///
+/// The body used to be one scraped `SUMMARY:` line under a `Closes #N`, which
+/// told a reviewer opening the diff cold nothing: not what was wrong, not what
+/// the change does about it, not how to check it. Asking for those separately
+/// is what puts them there, and composing the body from the fields rather than
+/// from the model's prose is what keeps it short enough to read.
+pub fn implementation() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "not_worth_doing": {
+                "type": "boolean",
+                "description": "True if, having read the code, this should not be implemented: a duplicate, already fixed, too vague to act on, or a change that would make the codebase worse. Make no commits when this is true."
+            },
+            "reason": {
+                "type": "string",
+                "description": "Only when not_worth_doing is true, empty string otherwise. One or two sentences, posted verbatim on the issue, so write it for the person who opened it."
+            },
+            "summary": {
+                "type": "string",
+                "description": "One sentence, at most 200 characters, saying what changed. It leads the pull request body, so say what changed rather than that you changed something. No preamble."
+            },
+            "problem": {
+                "type": "string",
+                "description": "Two or three sentences on what was actually wrong and what it cost, as you understand it now that you have read the code. Not a restatement of the issue, which the reviewer can open for themselves: what you found. Empty string for a feature request with no defect behind it, where a sentence on why it is worth having belongs here instead."
+            },
+            "changes": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "One short line per change that alters behaviour, in the order a reader should meet them. Say what the code now does, and name the function or file in backticks. Not a list of touched files: the diff already has that. Empty when the summary covers it, which for a small change it does."
+            },
+            "testing": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "How a reviewer confirms this works, as lines they can act on: the exact command in backticks, or the steps and what to look for. Say what you actually ran, not what could be run. Name the test that covers the fix. Empty only when there is genuinely nothing to run."
+            },
+            "notes": {
+                "type": ["string", "null"],
+                "description": "Null unless there is something the reviewer would otherwise have to ask about: a deliberate omission, a decision worth defending, a risk you are taking knowingly. Not a summary of the above, and not an apology."
+            }
+        },
+        "required": ["not_worth_doing", "reason", "summary", "problem", "changes", "testing", "notes"]
+    })
+}
+
 pub fn response() -> Value {
     json!({
         "type": "object",
@@ -220,6 +267,7 @@ pub fn adjudication() -> Value {
 pub fn all() -> Vec<(&'static str, Value)> {
     vec![
         ("triage", triage()),
+        ("implementation", implementation()),
         ("review", review()),
         ("response", response()),
     ]
@@ -320,6 +368,41 @@ mod tests {
                 asked.contains(field),
                 "a Finding holds `{field}` and the schema never asks for it, so the model will \
                  not fill it and the code reading it will always see nothing"
+            );
+        }
+    }
+
+    /// The same guard for the implementation exchange, where a forgotten field
+    /// means a pull request body with an empty section in it and nobody the
+    /// wiser.
+    #[test]
+    fn the_implementation_schema_asks_for_every_field_it_holds() {
+        use crate::model::Implementation;
+
+        let asked: Vec<String> = implementation()["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .cloned()
+            .collect();
+
+        let populated = Implementation {
+            notes: Some("n".into()),
+            ..Implementation::default()
+        };
+        let held: Vec<String> = serde_json::to_value(&populated)
+            .expect("serialisable")
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect();
+
+        for field in &held {
+            assert!(
+                asked.contains(field),
+                "an Implementation holds `{field}` and the schema never asks for it, so the \
+                 pull request body will always be missing that part"
             );
         }
     }

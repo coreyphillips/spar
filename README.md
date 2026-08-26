@@ -478,6 +478,13 @@ too, and past it whole issues wait for the next run rather than every issue
 losing its tail. A verdict is posted on the issue and can close it, so judging
 one on part of what it says is worse than not having reached it yet.
 
+The issue's URL goes with the body, not instead of it. Comments are not fetched,
+so an agent that can reach the network is told where the discussion is and asked
+to read it when a body leaves something open. It is not a substitute for the
+text: codex runs under `-s workspace-write`, which has no network at all, so a
+link alone would leave it judging the title. Both agents are also told the
+discussion is not included, so neither treats the body as the whole story.
+
 **Two agents that are secretly one.** Config keys are arbitrary, so `alpha` and
 `beta` can both be Claude on the same model. spar compares the resolved binary
 (by inode, so a symlink does not fool it) and the configured model, and warns

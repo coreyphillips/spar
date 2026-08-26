@@ -26,11 +26,15 @@ pub fn triage() -> Value {
                         "issue": {"type": "integer", "description": "The issue number."},
                         "worth_doing": {
                             "type": "boolean",
-                            "description": "False for duplicates, stale requests, things already fixed, vague reports with nothing reproducible, or changes that would make the codebase worse."
+                            "description": "False for duplicates, stale requests, things already fixed, vague reports with nothing reproducible, changes that would make the codebase worse, and tracking issues. Set tracker as well for the last of those."
+                        },
+                        "tracker": {
+                            "type": "boolean",
+                            "description": "True when the issue exists to hold context for work that is filed elsewhere: an umbrella, an epic, a meta issue whose parts are their own issues. Judge it by what the issue is, not by whether you agree with it. Nothing is opened for a tracker, but it is not finished either: its parts are still open, and the shared context and rejected alternatives it records are why somebody wrote it. False for an ordinary issue, whatever you decided about it."
                         },
                         "reason": {
                             "type": "string",
-                            "description": "One sentence. This is posted verbatim on the issue when both agents decline it, so write it for the person who opened it."
+                            "description": "One sentence. This is posted verbatim on the issue when both agents decline it, and the issue may well stay open afterwards, so write it for the person who opened it rather than as a verdict."
                         },
                         "complexity": {"type": "string", "enum": ["s", "m", "l"]},
                         "depends_on": {
@@ -40,7 +44,7 @@ pub fn triage() -> Value {
                         },
                         "risk": {"type": "string", "enum": ["low", "med", "high"]}
                     },
-                    "required": ["issue", "worth_doing", "reason", "complexity", "depends_on", "risk"]
+                    "required": ["issue", "worth_doing", "tracker", "reason", "complexity", "depends_on", "risk"]
                 }
             }
         },

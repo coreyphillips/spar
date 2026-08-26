@@ -103,7 +103,11 @@ keep_worktrees    = false    # keep them after a run, for inspection
 branch_prefix     = ""       # branches are issue-N and pr-N. Set e.g. "spar/"
                              # to namespace them
 close_skipped     = true     # close an issue both agents independently declined,
-                             # after posting the shared reasoning
+                             # after posting the shared reasoning. Never applies
+                             # to a tracking issue: declining to open a PR for
+                             # an umbrella is right, closing it while its parts
+                             # are still open is not, and either agent calling
+                             # it one is enough to hold it open.
 min_number        = 0        # ignore issues and PRs numbered below this when
                              # spar is picking for itself. 0 is no floor. A long
                              # lived repo carries a tail of old issues nobody is

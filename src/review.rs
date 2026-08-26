@@ -1895,6 +1895,7 @@ mod tests {
         let item = SkippedItem {
             issue: 3,
             title: "t".into(),
+            tracker: false,
             reasons: [
                 ("claude".to_string(), "Already fixed in 1.2.".to_string()),
                 ("codex".to_string(), "Duplicate of #2.".to_string()),

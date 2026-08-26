@@ -290,6 +290,9 @@ fn reconcile(issues: &[Issue], verdicts: &[(String, BTreeMap<i64, TriageVerdict>
                     .iter()
                     .map(|(n, v)| ((*n).clone(), v.reason.clone()))
                     .collect(),
+                // Either agent is enough. Closing needs both to agree, so one
+                // saying the issue is not finished is enough to withhold it.
+                tracker: all.iter().any(|(_, v)| v.tracker),
             });
         } else {
             contested.push(ContestedItem {
@@ -562,6 +565,7 @@ mod tests {
         TriageVerdict {
             issue: n,
             worth_doing: worth,
+            tracker: false,
             reason: format!("because {n}"),
             complexity: Complexity::parse_lenient(complexity).unwrap(),
             depends_on: deps.to_vec(),
@@ -668,5 +672,58 @@ mod tests {
             ),
         );
         assert_eq!(vec![2, 3, 4], plan.order[0].depends_on);
+    }
+
+    // -- trackers ---------------------------------------------------------
+
+    /// The failure this exists to stop. Both agents correctly declined an
+    /// umbrella whose three subtasks were filed separately and still open, and
+    /// spar closed it as "not planned". Declining to open a pull request for a
+    /// tracker is right; closing it does not follow from that.
+    #[test]
+    fn an_umbrella_both_agents_declined_is_skipped_but_held_open() {
+        let plan = reconcile(
+            &[issue(1)],
+            &pair(vec![tracker_verdict(1)], vec![tracker_verdict(1)]),
+        );
+        assert!(plan.order.is_empty());
+        assert_eq!(1, plan.skipped.len());
+        assert!(plan.skipped[0].tracker, "a tracker must not be closeable");
+    }
+
+    /// Closing already needs both agents to decline, on the principle that one
+    /// agent's opinion is not enough to close somebody's report. One agent
+    /// saying the issue is not finished is that same principle from the other
+    /// side, so either is enough to withhold the close.
+    #[test]
+    fn one_agent_calling_it_a_tracker_is_enough_to_hold_it_open() {
+        let plan = reconcile(
+            &[issue(1)],
+            &pair(
+                vec![tracker_verdict(1)],
+                vec![verdict(1, false, "s", "low", &[])],
+            ),
+        );
+        assert!(plan.skipped[0].tracker);
+    }
+
+    /// An ordinary decline stays closeable, which is the behaviour worth
+    /// keeping: an issue filed twice is finished.
+    #[test]
+    fn an_ordinary_decline_is_not_held_open() {
+        let plan = reconcile(
+            &[issue(1)],
+            &pair(
+                vec![verdict(1, false, "s", "low", &[])],
+                vec![verdict(1, false, "s", "low", &[])],
+            ),
+        );
+        assert!(!plan.skipped[0].tracker);
+    }
+
+    fn tracker_verdict(n: i64) -> TriageVerdict {
+        let mut v = verdict(n, false, "m", "low", &[]);
+        v.tracker = true;
+        v
     }
 }

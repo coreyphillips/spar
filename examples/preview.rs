@@ -280,6 +280,7 @@ fn main() {
             &SkippedItem {
                 issue: 91,
                 title: "Add a dark mode".into(),
+                tracker: false,
                 reasons: [
                     (
                         "claude".to_string(),

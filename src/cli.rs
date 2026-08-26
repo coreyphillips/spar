@@ -700,7 +700,14 @@ fn make_plan(
         );
     }
     for item in &plan.skipped {
-        log!("  skip #{} (both reviewers: not worth doing)", item.issue);
+        if item.tracker {
+            log!(
+                "  hold #{} (both reviewers: tracks work filed elsewhere)",
+                item.issue
+            );
+        } else {
+            log!("  skip #{} (both reviewers: not worth doing)", item.issue);
+        }
     }
     for item in &plan.contested {
         log!("  ??   #{} contested, parked for you to decide", item.issue);
@@ -710,16 +717,30 @@ fn make_plan(
 
 /// Post the shared reasoning on every issue both agents declined, and close it
 /// when the config says so. Contested issues are never touched.
+///
+/// A tracker is never closed, whatever `close_skipped` says. Declining to open
+/// a pull request for an umbrella is right, and closing it does not follow from
+/// that: its parts are still open, and the shared context and the alternatives
+/// somebody recorded against are the reason the issue exists. spar closed a
+/// real one as "not planned" while all three of its subtasks were open, which
+/// is what this exists to stop.
 fn act_on_plan(cfg: &Config, repo: &Repo, plan: &Plan) {
     for item in &plan.skipped {
         let body = review::skip_comment(item, &repo.style);
-        let outcome = if cfg.loop_cfg.close_skipped {
+        let close = cfg.loop_cfg.close_skipped && !item.tracker;
+        let outcome = if close {
             repo.close_issue(item.issue, &body)
         } else {
             repo.comment_issue(item.issue, &body)
         };
         match outcome {
-            Ok(()) if cfg.loop_cfg.close_skipped => log!("  closed #{}", item.issue),
+            Ok(()) if close => log!("  closed #{}", item.issue),
+            Ok(()) if item.tracker => {
+                log!(
+                    "  left #{} open, it tracks work filed elsewhere",
+                    item.issue
+                )
+            }
             Ok(()) => {}
             Err(e) => logdim!("could not update #{}: {e}", item.issue),
         }

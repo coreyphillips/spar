@@ -181,6 +181,35 @@ impl std::fmt::Display for Followups {
     }
 }
 
+/// Whether a pull request spar opens starts as a draft, and when it stops being
+/// one.
+///
+/// A draft says the work is not for a person yet, which is exactly true while
+/// two agents are still arguing about it. `UntilApproved` makes that state mean
+/// something and clear itself: the loop marks the pull request ready the moment
+/// it has no blocking findings left. `Always` is for somebody who promotes
+/// every pull request by hand and wants spar to keep out of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Drafts {
+    /// Open ordinary pull requests. The default, and what spar has always done.
+    Never,
+    /// Open as a draft, and mark it ready when the review converges.
+    UntilApproved,
+    /// Open as a draft and leave it that way.
+    Always,
+}
+
+impl std::fmt::Display for Drafts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Drafts::Never => "never",
+            Drafts::UntilApproved => "until_approved",
+            Drafts::Always => "always",
+        })
+    }
+}
+
 /// How much of its own working spar narrates into a pull request thread.
 ///
 /// The agents never read the PR: they receive findings through their prompts,
@@ -289,6 +318,8 @@ pub struct LoopCfg {
     /// wave can file follow-ups of its own. Every wave is triaged like any
     /// other issue, so both agents still have to agree it is worth doing.
     pub absorb_new_issues: u32,
+    /// Whether a pull request spar opens starts as a draft.
+    pub drafts: Drafts,
     /// Extra instructions handed to both agents with every request.
     ///
     /// For what a person wants of this repository that the code cannot say and
@@ -339,6 +370,7 @@ impl Default for LoopCfg {
             parallel_triage: true,
             min_number: 0,
             absorb_new_issues: 0,
+            drafts: Drafts::Never,
             instructions: String::new(),
             max_issue_chars: 60_000,
             max_triage_chars: 200_000,
@@ -759,6 +791,17 @@ pub fn parse(text: &str) -> Result<Config> {
     if loop_cfg.max_rounds == 0 {
         bail!("max_rounds must be at least 1");
     }
+    // A draft cannot be merged, so merging one means promoting it first, which
+    // is the one thing `always` asks spar not to do. Refusing is better than
+    // picking a winner: either setting alone is coherent and only somebody who
+    // set both can say which they meant.
+    if loop_cfg.auto_merge && loop_cfg.drafts == Drafts::Always {
+        bail!(
+            "auto_merge cannot be on with drafts = \"always\": merging a draft means marking it \
+             ready, which is what \"always\" asks spar not to do. Use drafts = \"until_approved\" \
+             to have it promoted when the review converges, or turn auto_merge off."
+        );
+    }
 
     let first = match &loop_cfg.first_implementor {
         Some(name) if !name.trim().is_empty() => name.trim().to_string(),
@@ -871,6 +914,49 @@ model = "gpt-5.6-sol"
     #[test]
     fn the_config_layer_does_not_keep_its_own_copy_of_the_budgets() {
         assert_eq!(Style::default(), StyleCfg::default().to_style());
+    }
+
+    // -- drafts ------------------------------------------------------------
+
+    #[test]
+    fn pull_requests_are_not_drafts_unless_asked_for() {
+        assert_eq!(Drafts::Never, parse(TWO_AGENTS).unwrap().loop_cfg.drafts);
+    }
+
+    #[test]
+    fn each_draft_setting_parses() {
+        for (text, want) in [
+            ("never", Drafts::Never),
+            ("until_approved", Drafts::UntilApproved),
+            ("always", Drafts::Always),
+        ] {
+            let cfg = parse(&format!("{TWO_AGENTS}\n[loop]\ndrafts = \"{text}\"\n"))
+                .unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(want, cfg.loop_cfg.drafts, "{text}");
+        }
+    }
+
+    /// Merging a draft means marking it ready, which is the one thing `always`
+    /// asks spar not to do. Either setting alone is coherent, so refusing beats
+    /// picking a winner between them.
+    #[test]
+    fn auto_merge_and_a_permanent_draft_are_refused_together() {
+        let text = format!("{TWO_AGENTS}\n[loop]\nauto_merge = true\ndrafts = \"always\"\n");
+        let err = parse(&text).expect_err("refused");
+        assert!(err.message().contains("auto_merge"), "{err}");
+        assert!(
+            err.message().contains("until_approved"),
+            "says the way out: {err}"
+        );
+    }
+
+    /// The pairing that does make sense: the draft clears when the review
+    /// converges, and then it can merge.
+    #[test]
+    fn auto_merge_is_fine_with_a_draft_that_clears() {
+        let text =
+            format!("{TWO_AGENTS}\n[loop]\nauto_merge = true\ndrafts = \"until_approved\"\n");
+        assert!(parse(&text).is_ok());
     }
 
     #[test]

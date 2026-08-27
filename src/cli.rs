@@ -1096,6 +1096,11 @@ const LOOP_OPTIONS: &[Setting] = &[
     (true, "state_store", "local | pr | both"),
     (
         true,
+        "drafts",
+        "never | until_approved | always. until_approved opens a draft and marks it ready when the review converges, which is what a draft was saying while two agents were still arguing about it.",
+    ),
+    (
+        true,
         "instructions",
         "extra instructions handed to both agents with every request, for what this repository always wants that spar has no setting for. --instructions adds to it for one run.",
     ),

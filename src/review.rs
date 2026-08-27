@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::agent::{self, Agent};
-use crate::config::{Config, Followups, PrComments};
+use crate::config::{Config, Drafts, Followups, PrComments};
 use crate::error::{Result, SparError};
 use crate::jsonx::finding_key;
 use crate::model::{
@@ -531,6 +531,12 @@ fn review_loop(
                 round,
                 &cfg.other(&holder),
             );
+            // Before the merge, not after: a draft cannot be merged, and the
+            // state the draft was signalling, that two agents were still
+            // arguing about it, has just stopped being true.
+            if cfg.loop_cfg.drafts == Drafts::UntilApproved && repo.mark_ready(ctx.pr_number) {
+                log!("{}: out of draft", ctx.label);
+            }
             if cfg.loop_cfg.auto_merge {
                 // Release the worktree first. `gh pr merge --delete-branch`
                 // fails if anything still has the branch checked out, and it

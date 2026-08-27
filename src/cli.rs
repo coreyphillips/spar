@@ -186,6 +186,10 @@ pub struct Common {
     /// itself. A number you name explicitly is always honoured.
     #[arg(long, value_name = "N")]
     pub min_number: Option<i64>,
+    /// Extra instructions for both agents, for this run only. Added to any
+    /// already in the config rather than replacing them.
+    #[arg(long, value_name = "TEXT")]
+    pub instructions: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -556,6 +560,19 @@ fn prepare(common: &Common, overrides: Option<Overrides>) -> Result<(Config, Rep
     }
     if let Some(min) = common.min_number {
         cfg.loop_cfg.min_number = min;
+    }
+    // Added to the config's, not in place of them. One is what this repository
+    // always wants and the other is what today wants, and a flag that silenced
+    // the standing set would be a trap: you would notice it the run after.
+    if let Some(extra) = common.instructions.as_deref().map(str::trim) {
+        if !extra.is_empty() {
+            let standing = cfg.loop_cfg.instructions.trim();
+            cfg.loop_cfg.instructions = if standing.is_empty() {
+                extra.to_string()
+            } else {
+                format!("{standing}\n{extra}")
+            };
+        }
     }
     if let Some(over) = overrides {
         if let Some(v) = over.max_rounds {
@@ -1079,6 +1096,11 @@ const LOOP_OPTIONS: &[Setting] = &[
     (true, "state_store", "local | pr | both"),
     (
         true,
+        "instructions",
+        "extra instructions handed to both agents with every request, for what this repository always wants that spar has no setting for. --instructions adds to it for one run.",
+    ),
+    (
+        true,
         "max_issue_chars",
         "most of one issue body a prompt carries. Sized so nothing a person wrote is cut, and a cut is said out loud when it happens.",
     ),
@@ -1574,6 +1596,28 @@ mod tests {
         match cli.command {
             Command::Run { loop_flags, .. } => assert!(!loop_flags.auto_merge),
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// The flag reaches resume as well as run, which is what makes "stop, edit
+    /// the config, carry on with something extra to say" a thing you can do.
+    #[test]
+    fn every_command_that_reads_a_config_takes_instructions() {
+        for cmd in ["run", "triage", "resume", "review"] {
+            let argv = vec!["spar", cmd, "7", "--instructions", "Do not wait for CI."];
+            let parsed = Cli::parse_from(&argv);
+            let common = match parsed.command {
+                Command::Run { common, .. }
+                | Command::Triage { common, .. }
+                | Command::Resume { common, .. }
+                | Command::Review { common, .. } => common,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(
+                Some("Do not wait for CI."),
+                common.instructions.as_deref(),
+                "{cmd}"
+            );
         }
     }
 

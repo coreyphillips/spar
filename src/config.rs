@@ -289,6 +289,18 @@ pub struct LoopCfg {
     /// wave can file follow-ups of its own. Every wave is triaged like any
     /// other issue, so both agents still have to agree it is worth doing.
     pub absorb_new_issues: u32,
+    /// Extra instructions handed to both agents with every request.
+    ///
+    /// For what a person wants of this repository that the code cannot say and
+    /// spar has no setting for: how far to go, what not to touch, what not to
+    /// wait on. A CLI reads its own conventions file already, CLAUDE.md or
+    /// AGENTS.md, but each reads only its own, and two agents given different
+    /// standing instructions are not the pair this design rests on.
+    ///
+    /// Subordinate to the request and to the schema, which is said in the
+    /// header they arrive under: they change how the work is done, never what
+    /// was asked for or the shape of the answer.
+    pub instructions: String,
     /// The most of one issue body that reaches a prompt.
     ///
     /// Sized so that no issue a person wrote is ever cut. It was 2000 for
@@ -327,6 +339,7 @@ impl Default for LoopCfg {
             parallel_triage: true,
             min_number: 0,
             absorb_new_issues: 0,
+            instructions: String::new(),
             max_issue_chars: 60_000,
             max_triage_chars: 200_000,
             effort_schedule: EffortSchedule::default(),

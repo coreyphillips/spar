@@ -136,6 +136,17 @@ max_followups     = 5        # most one run may record before it stops and says
                              # what it dropped. A backstop, not a target.
 state_store       = "local"  # local | pr | both. local keeps resume state in
                              # .spar/state and off the PR
+instructions      = ""       # extra instructions handed to both agents with
+                             # every request, for what this repository always
+                             # wants that spar has no setting for: how far to
+                             # go, what not to touch, what not to wait on. Each
+                             # CLI reads its own conventions file already,
+                             # CLAUDE.md or AGENTS.md, but only its own, and
+                             # two agents given different standing instructions
+                             # are not the pair this design rests on. Use
+                             # --instructions to add to this for one run; it
+                             # adds rather than replaces, so a flag cannot
+                             # silence the standing set by accident.
 max_issue_chars   = 60000    # most of ONE issue body that reaches a prompt.
                              # Sized so nothing a person wrote is ever cut. It
                              # was 2000 for triage and 6000 for implement, and

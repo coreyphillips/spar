@@ -171,6 +171,30 @@ is detected from `origin/HEAD` rather than assumed to be `main`.
 spar run --repo ~/projects/thing 42     # --repo belongs to the subcommand
 ```
 
+### Telling it something the config has no setting for
+
+Both agents take extra instructions, standing ones from `[loop] instructions`
+and per-run ones from `--instructions`, which adds to them rather than replacing
+them:
+
+```bash
+spar run 42 51 --instructions "Do not wait for CI. If it is red, pick it up on the next pass."
+spar resume 108 --instructions "Prefer the smaller fix; we ship tonight."
+```
+
+They arrive after the request and before the schema, under a header saying where
+they came from, so they change how the work is done and not what was asked for
+or the shape of the answer.
+
+Each CLI already reads its own conventions file, CLAUDE.md or AGENTS.md, and
+will keep doing so. What this adds is one place both agents see, since two
+agents given different standing instructions are not the pair the design rests
+on.
+
+Note that spar itself never waits on CI, and never reads it: an agent that
+waits is doing it on its own initiative, which is why that example is an
+instruction rather than a setting.
+
 ## How a run goes
 
 **Triage.** Both agents independently judge every issue: is it worth doing, how

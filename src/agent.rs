@@ -58,12 +58,24 @@ produced the work.";
 const JSON_INSTRUCTION: &str = "Respond with ONLY a JSON object matching this \
 schema. No prose, no markdown fences, no commentary before or after:";
 
+/// What a run's own instructions arrive under.
+///
+/// Subordinate on purpose. A person adding "do not wait for CI" should not be
+/// able to talk an agent out of the schema it was asked for, and a model told
+/// where an instruction came from weighs it against the request rather than
+/// over it.
+const INSTRUCTIONS_HEADER: &str = "Additional instructions from the person who \
+started this run. They change how you work, not what was asked for above and \
+not the shape of your answer:";
+
 pub struct Agent {
     pub spec: AgentSpec,
     /// Answers in this agent's place when it cannot answer at all. Never
     /// alongside it: the pair is still two, and the fallback only ever holds
     /// the turn the failed agent was already holding.
     fallback: Option<Box<Agent>>,
+    /// Extra instructions for this run, carried onto every request.
+    instructions: Option<String>,
     resolved: OnceLock<PathBuf>,
 }
 
@@ -82,7 +94,37 @@ impl Agent {
         Self {
             spec,
             fallback,
+            instructions: None,
             resolved: OnceLock::new(),
+        }
+    }
+
+    /// Carry this run's instructions, here and on the stand in.
+    ///
+    /// The fallback gets them too. It answers in this agent's place, so a run
+    /// told not to wait on something should not start waiting the moment the
+    /// primary hands over.
+    pub fn with_instructions(mut self, text: &str) -> Self {
+        let text = text.trim();
+        if text.is_empty() {
+            return self;
+        }
+        if let Some(backup) = self.fallback.take() {
+            self.fallback = Some(Box::new(backup.with_instructions(text)));
+        }
+        self.instructions = Some(text.to_string());
+        self
+    }
+
+    /// The request with this run's instructions after it.
+    ///
+    /// After, because the task is what the agent is doing and these modify how.
+    /// Before the schema, which `ask_json` appends afterwards, so the shape of
+    /// the answer stays the last thing read.
+    fn instructed(&self, prompt: &str) -> String {
+        match &self.instructions {
+            Some(extra) => format!("{prompt}\n\n{INSTRUCTIONS_HEADER}\n{extra}"),
+            None => prompt.to_string(),
         }
     }
 
@@ -347,6 +389,7 @@ impl Agent {
     // -- the two operations everything else is built from -------------------
 
     pub fn ask(&self, prompt: &str, cwd: &Path, effort: Option<&str>) -> Result<String> {
+        let prompt = &self.instructed(prompt);
         match self.ask_inner(prompt, cwd, effort, None, None) {
             Ok(text) => Ok(text),
             Err(e) => self.hand_over(e, |backup| backup.ask(prompt, cwd, None)),
@@ -439,6 +482,9 @@ impl Agent {
         cwd: &Path,
         effort: Option<&str>,
     ) -> Result<T> {
+        // Once here, not inside the retry, so the second ask carries the same
+        // instructions as the first alongside the parser's complaint.
+        let prompt = &self.instructed(prompt);
         match self.ask_json_retrying(prompt, schema, cwd, effort) {
             Ok(parsed) => Ok(parsed),
             Err(e) => self.hand_over(e, |backup| {
@@ -771,7 +817,13 @@ pub fn correlation_warning(agents: &[Agent]) -> Option<String> {
 /// Build every configured agent, resolving each binary up front so a missing
 /// CLI fails before any model is billed.
 pub fn build(cfg: &crate::config::Config) -> Result<Vec<Agent>> {
-    let agents: Vec<Agent> = cfg.agents.iter().cloned().map(Agent::new).collect();
+    let agents: Vec<Agent> = cfg
+        .agents
+        .iter()
+        .cloned()
+        .map(Agent::new)
+        .map(|agent| agent.with_instructions(&cfg.loop_cfg.instructions))
+        .collect();
     for agent in &agents {
         agent.resolve_bin()?;
         // A backup that is not installed must not stop a run whose pair is
@@ -1292,6 +1344,55 @@ mod tests {
         let agent = jsonl_agent("codex");
         let err = agent.call_failure(&["codex".to_string()], &failed(&refusal_stream(), ""));
         assert_eq!(ErrorKind::CallFailed, err.kind());
+    }
+
+    // -- this run's own instructions --------------------------------------
+
+    #[test]
+    fn a_request_carries_the_instructions_after_the_task() {
+        let agent = Agent::with_bin(shell("a", "true"), "/bin/sh")
+            .with_instructions("Do not wait for CI. Pick it up next pass.");
+        let asked = agent.instructed("Review the changes on this branch.");
+        assert!(
+            asked.starts_with("Review the changes on this branch."),
+            "{asked}"
+        );
+        assert!(asked.contains("Do not wait for CI"), "{asked}");
+    }
+
+    /// A person adding an instruction should not be able to talk an agent out
+    /// of the schema it was asked for, so where the instruction came from is
+    /// said rather than left to read as part of the request.
+    #[test]
+    fn the_instructions_arrive_subordinate_to_the_request() {
+        let agent = Agent::with_bin(shell("a", "true"), "/bin/sh").with_instructions("Be quick.");
+        let asked = agent.instructed("Do the work.").to_lowercase();
+        assert!(
+            asked.contains("from the person who started this run"),
+            "{asked}"
+        );
+        assert!(asked.contains("not the shape of your answer"), "{asked}");
+    }
+
+    #[test]
+    fn nothing_is_added_when_there_are_none() {
+        let agent = Agent::with_bin(shell("a", "true"), "/bin/sh");
+        assert_eq!("Do the work.", agent.instructed("Do the work."));
+        // Whitespace is not an instruction.
+        let blank = Agent::with_bin(shell("b", "true"), "/bin/sh").with_instructions("   \n  ");
+        assert_eq!("Do the work.", blank.instructed("Do the work."));
+    }
+
+    /// The stand in answers in this agent's place, so a run told not to wait on
+    /// something must not start waiting the moment the primary hands over.
+    #[test]
+    fn the_stand_in_carries_them_too() {
+        let agent = with_fallback(shell("primary", "true"), shell("backup", "true"))
+            .with_instructions("Do not wait for CI.");
+        let backup = agent.fallback().expect("a stand in");
+        assert!(backup
+            .instructed("Do the work.")
+            .contains("Do not wait for CI."));
     }
 
     // -- fallback --------------------------------------------------------

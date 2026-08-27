@@ -888,8 +888,14 @@ fn cmd_init_update(out: &Path) -> Result<i32> {
     for option in &unset {
         if option.section != section {
             section = option.section;
-            block.push_str(&format!("# [{section}]\n"));
+            block.push_str(&format!("\n# [{section}]\n"));
         }
+        // With the same note `spar init` writes. A config that gained a setting
+        // this way used to gain a bare line and nothing saying what it was for,
+        // which is the half of the setting that matters when you are reading it
+        // for the first time.
+        block.push('\n');
+        block.push_str(&wrap_comment(note_for(&option.key)));
         block.push_str(&format!("# {} = {}\n", option.key, option.default));
     }
 
@@ -1030,126 +1036,38 @@ fn report_fallback(agent: &Agent) {
 type Setting = (bool, &'static str, &'static str);
 
 const LOOP_OPTIONS: &[Setting] = &[
-    (
-        false,
-        "max_rounds",
-        "review rounds ONE invocation may spend. Resuming grants a fresh budget, so this is not a lifetime cap on a PR.",
-    ),
-    (
-        false,
-        "auto_merge",
-        "off on purpose: two models agreeing is not the same as being right",
-    ),
-    (false, "first_implementor", ""),
-    (false, "worktrees", "false works in the main checkout"),
-    (
-        false,
-        "close_skipped",
-        "close an issue both reviewers declined",
-    ),
-    (
-        false,
-        "followups",
-        "issues | local | none. local writes .spar/followups.md, not the tracker",
-    ),
-    (
-        true,
-        "file_non_blocking",
-        "a suggestion is not a tracker item",
-    ),
-    (
-        true,
-        "max_followups",
-        "backstop on what one run can spawn",
-    ),
-    (
-        true,
-        "keep_worktrees",
-        "true leaves them behind to inspect",
-    ),
-    (
-        true,
-        "min_number",
-        "ignore anything numbered below this when picking for itself. 0 is no floor.",
-    ),
-    (
-        true,
-        "parallel_triage",
-        "false asks the agents one at a time",
-    ),
-    (
-        true,
-        "absorb_new_issues",
-        "waves of newly filed follow-ups to fold back into this run. Costs more.",
-    ),
-    (true, "file_nits", "true files nits as issues too"),
-    (
-        true,
-        "base_branch",
-        "only a fallback; origin/HEAD wins when it resolves",
-    ),
-    (
-        true,
-        "branch_prefix",
-        "e.g. \"spar/\" to namespace the branches spar creates",
-    ),
-    (true, "state_store", "local | pr | both"),
-    (
-        true,
-        "drafts",
-        "never | until_approved | always. until_approved opens a draft and marks it ready when the review converges, which is what a draft was saying while two agents were still arguing about it.",
-    ),
-    (
-        true,
-        "instructions",
-        "extra instructions handed to both agents with every request, for what this repository always wants that spar has no setting for. --instructions adds to it for one run.",
-    ),
-    (
-        true,
-        "max_issue_chars",
-        "most of one issue body a prompt carries. Sized so nothing a person wrote is cut, and a cut is said out loud when it happens.",
-    ),
-    (
-        true,
-        "max_triage_chars",
-        "most every issue body together may add to one triage prompt. Past it, whole issues wait for the next run rather than all of them losing their tails.",
-    ),
+    (false, "max_rounds", "Review rounds one invocation may spend before escalating. Resuming grants a fresh budget, so this is not a lifetime cap on a pull request."),
+    (false, "auto_merge", "Merge when no blocking findings remain. Off on purpose: two models agreeing is not the same as being right, and neither carries the consequences."),
+    (false, "first_implementor", "Which agent takes the first pass. The other one reviews it."),
+    (false, "worktrees", "Isolate each issue in its own git worktree. Set false to work in the main checkout."),
+    (false, "close_skipped", "Close an issue both reviewers declined, after posting the shared reasoning. A tracking issue is left open whatever this says."),
+    (false, "followups", "Where a follow-up goes. issues files them, local writes .spar/followups.md and leaves the tracker alone, none drops them."),
+    (true, "file_non_blocking", "File a non-blocking finding as a follow-up. Off, because not gating a merge is not the same as deserving somebody's triage queue."),
+    (true, "max_followups", "Most follow-ups one run may record before it stops and says what it dropped. A backstop, not a target."),
+    (true, "keep_worktrees", "Keep worktrees after a run, for inspection."),
+    (true, "min_number", "Ignore issues and pull requests numbered below this when spar picks for itself. 0 is no floor, and a number you name explicitly is always honoured."),
+    (true, "parallel_triage", "Ask both agents to triage at once. They only read during triage, so there is nothing to serialise."),
+    (true, "absorb_new_issues", "Waves of newly filed follow-ups to fold back into this run rather than leaving them for the next one. Multiplies what a run costs."),
+    (true, "file_nits", "File nits as follow-ups too. Off, because a filed nit is somebody else's notification."),
+    (true, "base_branch", "Only a fallback. Whatever origin/HEAD points at wins when it resolves."),
+    (true, "branch_prefix", "Namespace the branches spar creates, for example \"spar/\". Without it they are issue-N and pr-N."),
+    (true, "state_store", "Where resume state is kept. local uses .spar/state and keeps it off the pull request."),
+    (true, "drafts", "Whether a pull request starts as a draft. until_approved opens one and marks it ready when the review converges, which is what the draft was saying while two agents were still arguing about it. always opens one and leaves it, and cannot be combined with auto_merge."),
+    (true, "instructions", "Extra instructions handed to both agents with every request, for what this repository always wants that spar has no setting for. --instructions adds to this for one run."),
+    (true, "max_issue_chars", "Most of one issue body that reaches a prompt. Sized so nothing a person wrote is cut, and a cut is said out loud when it happens."),
+    (true, "max_triage_chars", "Most every issue body together may add to one triage prompt. Past it, whole issues wait for the next run rather than all of them losing their tails."),
 ];
 
 const STYLE_OPTIONS: &[Setting] = &[
-    (false, "ban_em_dash", ""),
-    (false, "ban_ai_attribution", ""),
-    (
-        false,
-        "terse",
-        "hold model prose to a length budget. false removes the valves entirely",
-    ),
-    (
-        true,
-        "pr_comments",
-        "outcome | rounds | none. How much of its own working spar narrates into a PR thread. none never comments at all.",
-    ),
-    (
-        true,
-        "max_title_chars",
-        "a finding, issue, or PR title. Never ellipsised",
-    ),
-    (
-        true,
-        "max_summary_chars",
-        "a one line verdict or refutation",
-    ),
-    (
-        true,
-        "max_detail_chars",
-        "a blocking finding, in the PR thread",
-    ),
-    (true, "max_body_chars", "a PR body"),
-    (
-        true,
-        "max_issue_body_chars",
-        "a filed issue's body. Far larger on purpose: an issue is picked up cold. Fenced code blocks in one are never truncated and never count against this.",
-    ),
+    (false, "ban_em_dash", "Strip em-dashes and en-dashes from everything spar posts, then refuse to post text that still has one."),
+    (false, "ban_ai_attribution", "Strip mentions of the tooling, and Co-Authored-By trailers, from everything spar posts."),
+    (false, "terse", "Hold model prose to a length budget. false removes the valves entirely."),
+    (true, "pr_comments", "How much of its own working spar narrates into a pull request thread. outcome is one comment at the end, rounds is an audit trail, none never comments at all."),
+    (true, "max_title_chars", "A finding, issue, or pull request title. Never ellipsised: a title ending in three dots reads as broken."),
+    (true, "max_summary_chars", "A one line verdict, or a refutation's argument."),
+    (true, "max_detail_chars", "A blocking finding's explanation, as it appears in the pull request thread."),
+    (true, "max_body_chars", "A pull request body."),
+    (true, "max_issue_body_chars", "A filed issue's body. Far larger on purpose: an issue is picked up cold months later. Fenced code blocks are never truncated and never count against it."),
 ];
 
 /// The `[loop]` and `[style]` blocks of a generated config.
@@ -1187,71 +1105,16 @@ fn settings_block(first_implementor: &str) -> String {
 /// onto continuation lines that stay in the column rather than running off the
 /// edge or restarting at the margin.
 fn option_lines(options: &[Setting], value: &dyn Fn(&str) -> String) -> String {
-    let rows: Vec<(String, String)> = options
-        .iter()
-        .map(|(commented, key, note)| {
-            let lead = if *commented { "# " } else { "" };
-            (format!("{lead}{key} = {}", value(key)), note.to_string())
-        })
-        .collect();
-    aligned(&rows)
-}
-
-/// Assignments with their notes lined up in one column, a long note wrapping
-/// onto continuation lines that stay in the column rather than running off the
-/// edge or restarting at the margin.
-///
-/// Shared by the `[loop]` and `[style]` blocks and by an agent's own, which is
-/// how a list of eight effort levels beside a long model name stays inside a
-/// line somebody can read.
-fn aligned(rows: &[(String, String)]) -> String {
-    const WIDTH: usize = 78;
-
-    let column = rows
-        .iter()
-        .map(|(assignment, _)| assignment.chars().count())
-        .max()
-        .unwrap_or(0)
-        + 2;
-
     let mut out = String::new();
-    for (assignment, note) in rows {
-        if note.is_empty() {
-            out.push_str(assignment);
+    for (commented, key, note) in options {
+        if !out.is_empty() {
             out.push('\n');
-            continue;
         }
-        let mut first = true;
-        let mut line = String::new();
-        for word in note.split_whitespace() {
-            let would_be = column + 2 + line.chars().count() + 1 + word.chars().count();
-            if !line.is_empty() && would_be > WIDTH {
-                out.push_str(&noted(assignment, &line, column, &mut first));
-                line.clear();
-            }
-            if !line.is_empty() {
-                line.push(' ');
-            }
-            line.push_str(word);
-        }
-        if !line.is_empty() {
-            out.push_str(&noted(assignment, &line, column, &mut first));
-        }
+        out.push_str(&wrap_comment(note));
+        let lead = if *commented { "# " } else { "" };
+        out.push_str(&format!("{lead}{key} = {}\n", value(key)));
     }
     out
-}
-
-/// One rendered line: the assignment and the start of its note, then the rest
-/// of the note alone, indented to the same column so it reads as one paragraph.
-fn noted(assignment: &str, note: &str, column: usize, first: &mut bool) -> String {
-    let lead = if *first {
-        let pad = column.saturating_sub(assignment.chars().count());
-        format!("{assignment}{}", " ".repeat(pad))
-    } else {
-        " ".repeat(column)
-    };
-    *first = false;
-    format!("{lead}# {note}\n")
 }
 
 /// One prerequisite check: a label and something that either reports a version
@@ -1276,51 +1139,74 @@ fn agent_block(name: &str, spec: &config::AgentSpec) -> String {
     // The first entry of each list is the one written as the suggested value,
     // which is why the presets put the sensible default there rather than in
     // whatever order a CLI's help happens to print.
-    let offered: Vec<(&str, &[String])> = [
-        ("model ", spec.models.as_slice()),
-        ("effort", spec.efforts.as_slice()),
-    ]
-    .into_iter()
-    .filter(|(_, choices)| !choices.is_empty())
-    .collect();
-
-    if !offered.is_empty() {
-        let named: Vec<&str> = offered.iter().map(|(key, _)| key.trim()).collect();
-        out.push_str(&format!(
-            "# Omit {} to use the CLI's own default.\n",
-            named.join(" or ")
-        ));
-
-        // The alternatives sit beside the suggestion, so somebody editing the
-        // file can see what else the CLI takes without going to look it up.
-        // Nothing beside a single choice: there is nothing to choose.
-        let rows: Vec<(String, String)> = offered
-            .iter()
-            .map(|(key, choices)| {
-                let note = if choices.len() > 1 {
-                    choices.join(" | ")
-                } else {
-                    String::new()
-                };
-                (format!("# {key} = \"{}\"", choices[0]), note)
-            })
-            .collect();
-        out.push_str(&aligned(&rows));
+    // Once, above both. The preset's note is about the pair, and repeating it
+    // under each put a sentence about models underneath the effort line.
+    if let Some(extra) = &spec.options_note {
+        if !spec.models.is_empty() || !spec.efforts.is_empty() {
+            out.push('\n');
+            out.push_str(&wrap_comment(extra));
+        }
+    }
+    for (key, choices) in [("model", &spec.models), ("effort", &spec.efforts)] {
+        let Some(suggested) = choices.first() else {
+            continue;
+        };
+        let mut note = format!("Omit {key} to use the CLI's own default.");
+        if choices.len() > 1 {
+            note.push_str(&format!(" One of: {}.", choices.join(" | ")));
+        }
+        out.push('\n');
+        out.push_str(&wrap_comment(&note));
+        out.push_str(&format!("# {key} = \"{suggested}\"\n"));
     }
 
-    if let Some(note) = &spec.options_note {
-        out.push_str(&wrap_comment(note));
-    }
+    // The value from the spec, not a number typed here, for the reason the
+    // [loop] block learned: a second copy of a default is the one that goes
+    // stale.
+    out.push('\n');
+    out.push_str(&wrap_comment(
+        "Seconds one call may take before spar gives up. A timeout costs the whole call and is \
+         never retried, so err long.",
+    ));
+    out.push_str(&format!("# timeout = {}\n", spec.timeout));
+
     // Anything but this agent's own preset: a CLI that has just refused is not
     // a stand in for itself.
     let backup = if name == "cursor" { "gemini" } else { "cursor" };
-    out.push_str("# A stand in for when this CLI refuses, stalls, or runs out of quota.\n");
-    out.push_str("# It answers in place of this agent, never alongside it.\n");
+    out.push('\n');
+    out.push_str(&wrap_comment(
+        "A stand in for when this CLI refuses, stalls, or runs out of quota. It answers in place \
+         of this agent, never alongside it.",
+    ));
     out.push_str(&format!(
         "# [agents.{name}.fallback]\n# preset = \"{backup}\"\n"
     ));
+
+    // The rest of what an agent block takes defines a CLI rather than tunes
+    // one, so it is pointed at rather than offered: a generated file that
+    // invites somebody to edit `command` or `output` on a working preset is
+    // offering them a way to break it.
+    out.push('\n');
+    out.push_str(&wrap_comment(
+        "command, output, search_paths and the rest are in spar.example.toml, for pairing a CLI \
+         that has no preset.",
+    ));
     out.push('\n');
     out
+}
+
+/// What `spar init` says about an option, for `--update` to say too.
+///
+/// Empty for one with nothing written about it, and for the effort schedule,
+/// whose two keys are examples rather than settings and are described by the
+/// stanza they sit in rather than one at a time.
+fn note_for(key: &str) -> &'static str {
+    LOOP_OPTIONS
+        .iter()
+        .chain(STYLE_OPTIONS)
+        .find(|(_, name, _)| *name == key)
+        .map(|(_, _, note)| *note)
+        .unwrap_or("")
 }
 
 /// Wrap a note across comment lines so a long one does not run off the edge.
@@ -1898,22 +1784,46 @@ mod settings_block_tests {
         assert!(settings_block("codex").contains("first_implementor = \"codex\""));
     }
 
-    /// A note long enough to wrap stays in its column rather than restarting at
-    /// the margin, where it would read as a new option.
+    /// Every line starts at the margin, and an option's note sits above the
+    /// option rather than beside it. Beside meant three different columns in
+    /// one file, and a note that wrapped left the reader tracking indentation
+    /// to work out which setting it belonged to.
     #[test]
-    fn a_wrapped_note_stays_in_its_column() {
+    fn a_note_sits_above_the_option_it_describes() {
         let text = settings_block("claude");
-        let column = text
-            .lines()
-            .find(|l| l.starts_with("max_rounds"))
-            .and_then(|l| l.find('#'))
-            .expect("a note on max_rounds");
-        let continuation = text
-            .lines()
-            .find(|l| l.starts_with("    ") && l.trim_start().starts_with('#'))
-            .expect("a wrapped note");
-        assert_eq!(Some(column), continuation.find('#'));
-        assert!(text.lines().all(|l| l.chars().count() <= 80), "{text}");
+        assert!(
+            text.lines().all(|l| l.chars().count() <= 80),
+            "a line runs off the edge:\n{text}"
+        );
+        assert!(
+            text.lines().all(|l| !l.starts_with(' ')),
+            "a line is indented, so the columns are back:\n{text}"
+        );
+
+        // The line before an option carries its note, not another option.
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with("max_rounds"))
+            .expect("max_rounds");
+        assert!(lines[at - 1].starts_with('#'), "{:?}", lines[at - 1]);
+        assert!(
+            lines[at - 1].contains("lifetime cap"),
+            "the note above it is the end of its own note: {:?}",
+            lines[at - 1]
+        );
+    }
+
+    /// A note reads as a sentence now that it leads rather than trails.
+    #[test]
+    fn every_note_starts_as_a_sentence() {
+        for (_, key, note) in LOOP_OPTIONS.iter().chain(STYLE_OPTIONS) {
+            let first = note.chars().next().expect("a note");
+            assert!(
+                first.is_uppercase(),
+                "{key} reads as a margin scribble rather than a sentence: {note}"
+            );
+        }
     }
 }
 
@@ -1939,18 +1849,20 @@ mod agent_block_tests {
         let block = agent_block("cursor", &spec(&["composer-2.5", "auto"], &[]));
         assert!(!block.contains("..."), "{block}");
         assert!(!block.contains("effort"), "{block}");
-        assert!(block.contains("# model  = \"composer-2.5\""), "{block}");
+        assert!(block.contains("# model = \"composer-2.5\""), "{block}");
     }
 
-    /// The header has to name what is actually below it. Saying "model or
-    /// effort" over a block with no effort line sends somebody looking for a
-    /// setting the CLI does not have.
+    /// Each option is introduced by its own line, so a block with no effort
+    /// setting never mentions one.
     #[test]
-    fn the_header_names_only_the_options_that_follow() {
-        assert!(agent_block("cursor", &spec(&["auto"], &[])).contains("Omit model to use"));
-        assert!(
-            agent_block("claude", &spec(&["fable"], &["high"])).contains("Omit model or effort")
-        );
+    fn only_the_options_that_follow_are_introduced() {
+        let model_only = agent_block("cursor", &spec(&["auto"], &[]));
+        assert!(model_only.contains("Omit model to use"), "{model_only}");
+        assert!(!model_only.contains("Omit effort"), "{model_only}");
+
+        let both = agent_block("claude", &spec(&["fable"], &["high"]));
+        assert!(both.contains("Omit model to use"), "{both}");
+        assert!(both.contains("Omit effort to use"), "{both}");
     }
 
     /// A preset with no hints at all still has to produce a loadable block,
@@ -1966,42 +1878,41 @@ mod agent_block_tests {
         );
         // What the block does still carry is unaffected.
         assert!(block.contains("[agents.gemini.fallback]"), "{block}");
+        assert!(block.contains("# timeout = "), "{block}");
     }
 
-    /// Alternatives are listed beside the suggestion, and a single choice is
-    /// not padded out with a column that has nothing in it.
-    /// A long list wraps into its column rather than running off the edge, so
-    /// codex's eight effort levels beside a long model name stay readable.
+    /// The timeout comes from the spec rather than a number typed into the
+    /// generator, for the reason the [loop] block learned the hard way.
     #[test]
-    fn a_long_list_of_choices_wraps_into_its_column() {
-        let block = agent_block(
-            "codex",
-            &spec(
-                &[
-                    "gpt-5.6-sol",
-                    "gpt-5.6-terra",
-                    "gpt-5.6-luna",
-                    "gpt-5.6-pro",
-                ],
-                &[
-                    "ultra", "max", "xhigh", "high", "medium", "low", "minimal", "none",
-                ],
-            ),
-        );
+    fn the_timeout_offered_is_the_one_the_agent_would_use() {
+        let mut spec = spec(&["a"], &[]);
+        spec.timeout = 7200;
         assert!(
-            block.lines().all(|l| l.chars().count() <= 80),
-            "a line runs off the edge:\n{block}"
+            agent_block("custom", &spec).contains("# timeout = 7200"),
+            "the generator kept its own copy"
         );
-        // Every choice survives the wrapping.
-        for choice in ["gpt-5.6-pro", "minimal", "none"] {
-            assert!(block.contains(choice), "{choice} was lost:\n{block}");
-        }
     }
 
+    /// Alternatives are named, and a single choice is not dressed up as one.
     #[test]
     fn alternatives_are_listed_only_when_there_are_any() {
-        assert!(agent_block("a", &spec(&["one", "two"], &[])).contains("# one | two"));
+        assert!(agent_block("a", &spec(&["one", "two"], &[])).contains("One of: one | two."));
         let single = agent_block("b", &spec(&["only"], &[]));
-        assert!(!single.contains('|'), "{single}");
+        assert!(!single.contains("One of:"), "{single}");
+    }
+
+    /// The preset's own note is about the pair, so it appears once above them
+    /// rather than under each, which put a sentence about models beneath the
+    /// effort line.
+    #[test]
+    fn the_presets_note_is_said_once() {
+        let mut spec = spec(&["m1", "m2"], &["e1", "e2"]);
+        spec.options_note = Some("Check the current sets with: mytool --help".into());
+        let block = agent_block("mytool", &spec);
+        assert_eq!(
+            1,
+            block.matches("Check the current sets").count(),
+            "{block}"
+        );
     }
 }

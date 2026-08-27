@@ -171,6 +171,24 @@ is detected from `origin/HEAD` rather than assumed to be `main`.
 spar run --repo ~/projects/thing 42     # --repo belongs to the subcommand
 ```
 
+### Opening pull requests as drafts
+
+```toml
+[loop]
+drafts = "until_approved"   # never | until_approved | always
+```
+
+`until_approved` opens the pull request as a draft and marks it ready the moment
+the review has no blocking findings left. That is what the draft was saying while
+two agents were still arguing about it, so it clears itself rather than becoming
+something you have to remember to promote. A run that ends escalated or out of
+rounds leaves it a draft, which is correct: it is not ready.
+
+`always` opens a draft and leaves it, for somebody who promotes every pull
+request by hand. It cannot be combined with `auto_merge`, and spar refuses the
+pair rather than picking a winner, because merging a draft means promoting it
+first and that is the one thing `always` asks it not to do.
+
 ### Telling it something the config has no setting for
 
 Both agents take extra instructions, standing ones from `[loop] instructions`

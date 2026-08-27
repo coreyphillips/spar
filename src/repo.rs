@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::config::{Config, Followups, StateStore};
+use crate::config::{Config, Drafts, Followups, StateStore};
 use crate::error::Result;
 use crate::model::{Issue, IssueRef, ItemKind, PersistedState, PrRef, PrView};
 use crate::proc::{self, ExecOpts};
@@ -34,6 +34,7 @@ pub struct Repo {
     pub branch_prefix: String,
     pub state_store: StateStore,
     pub followups: Followups,
+    pub drafts: Drafts,
 }
 
 impl Repo {
@@ -56,6 +57,7 @@ impl Repo {
             branch_prefix: cfg.loop_cfg.branch_prefix.clone(),
             state_store: cfg.loop_cfg.state_store,
             followups: cfg.loop_cfg.followups,
+            drafts: cfg.loop_cfg.drafts,
         };
         repo.self_exclude();
         Ok(repo)
@@ -735,14 +737,14 @@ impl Repo {
     ) -> Result<PrRef> {
         let title = self.clean_title(title)?;
         let body = self.clean(body)?;
-        self.gh_at(
-            Some(cwd),
-            &[
-                "pr", "create", "--base", base, "--head", branch, "--title", &title, "--body",
-                &body,
-            ],
-        )
-        .map_err(|e| spar_err!("could not open a PR for {branch}. {}", e.last_line()))?;
+        let mut argv = vec![
+            "pr", "create", "--base", base, "--head", branch, "--title", &title, "--body", &body,
+        ];
+        if self.drafts != Drafts::Never {
+            argv.push("--draft");
+        }
+        self.gh_at(Some(cwd), &argv)
+            .map_err(|e| spar_err!("could not open a PR for {branch}. {}", e.last_line()))?;
         self.pr_for_branch(branch).ok_or_else(|| {
             spar_err!("PR creation reported success but none was found for {branch}")
         })
@@ -902,6 +904,24 @@ impl Repo {
 
     /// Squash merge, tolerating cleanup failures after a successful merge.
     ///
+    /// Take a pull request out of draft, once the review has converged.
+    ///
+    /// Best effort. A draft that stayed a draft is a cosmetic problem, and
+    /// failing the run over it would throw away a review that has already
+    /// finished and been posted.
+    pub fn mark_ready(&self, number: i64) -> bool {
+        match self.gh(&["pr", "ready", &number.to_string()]) {
+            Ok(_) => true,
+            Err(e) => {
+                logdim!(
+                    "PR #{number} is approved but could not be taken out of draft: {}",
+                    e.last_line()
+                );
+                false
+            }
+        }
+    }
+
     /// `gh pr merge --delete-branch` exits non-zero when it cannot delete the
     /// local branch, which happens *after* the merge has already landed.
     /// Treating that as a failure reports work as lost when it is not.
@@ -1450,6 +1470,7 @@ mod tests {
             branch_prefix: String::new(),
             state_store: StateStore::Local,
             followups: crate::config::Followups::Issues,
+            drafts: Drafts::Never,
         }
     }
 

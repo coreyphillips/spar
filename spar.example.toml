@@ -136,6 +136,16 @@ max_followups     = 5        # most one run may record before it stops and says
                              # what it dropped. A backstop, not a target.
 state_store       = "local"  # local | pr | both. local keeps resume state in
                              # .spar/state and off the PR
+drafts            = "never"  # never | until_approved | always. Whether a pull
+                             # request spar opens starts as a draft.
+                             # until_approved opens one and marks it ready the
+                             # moment the review has no blocking findings left,
+                             # which is what the draft was saying while two
+                             # agents were still arguing about it. always opens
+                             # a draft and leaves it, for somebody who promotes
+                             # every pull request by hand. always cannot be
+                             # combined with auto_merge, since merging a draft
+                             # means promoting it first.
 instructions      = ""       # extra instructions handed to both agents with
                              # every request, for what this repository always
                              # wants that spar has no setting for: how far to

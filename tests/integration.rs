@@ -410,6 +410,106 @@ fn a_local_followup_is_written_once_and_only_once() {
     assert!(!notes.contains("From #42."), "{notes}");
 }
 
+/// The writer and the reader live in different modules, and only this crosses
+/// them. A marker or a heading shape that changed on one side and not the other
+/// would file every section of every follow-up as its own issue.
+#[test]
+fn a_followup_file_written_by_spar_is_read_back_by_the_parser() {
+    let fx = repo("followup-roundtrip");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+
+    // Bodies in the shape `issue_report` produces: sections at the same
+    // heading level as the entry title, then the provenance line.
+    let body = |n: i64| {
+        format!(
+            "## Problem\n\nThe guard is inverted.\n\n## Impact\n\nCallers see a stale              value.\n\nFound while working on #{n}."
+        )
+    };
+    for (title, number) in [
+        ("Retry is unbounded", 42),
+        ("Headers are restored only for the initiating instance", 43),
+        ("A stale verdict overwrites a newer one", 44),
+    ] {
+        assert!(repo.append_local_followup(title, &body(number)).is_some());
+    }
+
+    let text = std::fs::read_to_string(repo.followups_path()).unwrap();
+    let entries = spar::followups::parse(&text);
+    assert_eq!(
+        3,
+        entries.len(),
+        "{:?}",
+        entries.iter().map(|e| &e.title).collect::<Vec<_>>()
+    );
+    assert_eq!("Retry is unbounded", entries[0].title);
+    assert!(
+        entries[0].body.contains("## Problem"),
+        "{}",
+        entries[0].body
+    );
+    assert!(entries[2].body.ends_with("Found while working on #44."));
+}
+
+/// The queue is rewritten in place, so what survives a removal has to be
+/// readable by the same parser that produced the spans.
+#[test]
+fn a_rewritten_followup_file_still_reads_back() {
+    let fx = repo("followup-rewrite");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    for title in ["One", "Two", "Three"] {
+        repo.append_local_followup(title, "why it matters\n\nFound while working on #7.");
+    }
+
+    let path = repo.followups_path();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let entries = spar::followups::parse(&text);
+    let left = spar::followups::without(&text, &[entries[1].clone()]);
+    spar::repo::write_text_atomic(&path, &left).unwrap();
+
+    let back = spar::followups::parse(&std::fs::read_to_string(&path).unwrap());
+    assert_eq!(2, back.len());
+    assert_eq!("One", back[0].title);
+    assert_eq!("Three", back[1].title);
+    assert!(
+        !path.with_extension("md.tmp").exists(),
+        "the temp file was left behind"
+    );
+}
+
+/// `spar followup` removes an entry once it has filed it. Without the archive,
+/// the dedup in `append_local_followup` would have nothing left to match and
+/// the next run that rediscovered the same defect would record it again, on top
+/// of the issue that now exists for it.
+#[test]
+fn a_followup_already_dealt_with_is_not_recorded_again() {
+    let fx = repo("followup-archive");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let body = "why it matters\n\nFound while working on #7.";
+
+    assert!(repo
+        .append_local_followup("Retry is unbounded", body)
+        .is_some());
+    let text = std::fs::read_to_string(repo.followups_path()).unwrap();
+    let entries = spar::followups::parse(&text);
+    repo.archive_followup(&entries[0].title, &entries[0].body, "Filed: #512");
+    spar::repo::write_text_atomic(
+        &repo.followups_path(),
+        &spar::followups::without(&text, &entries),
+    )
+    .unwrap();
+
+    assert!(
+        repo.append_local_followup("Retry is unbounded", body)
+            .is_none(),
+        "it was already filed, and recording it again puts it back in the queue forever"
+    );
+    assert_eq!(
+        "",
+        std::fs::read_to_string(repo.followups_path()).unwrap(),
+        "the queue is drained and must stay drained"
+    );
+}
+
 #[test]
 fn state_round_trips_through_the_local_store() {
     use spar::model::{Ledger, LedgerEntry, PersistedState, Status};
@@ -475,6 +575,111 @@ fn spar(args: &[&str], cwd: &Path) -> (bool, String, String) {
     )
 }
 
+/// An empty queue is a local no-op, and it has to say which file it looked in.
+/// Reaching gh to find that out would make the common case cost a round trip.
+#[test]
+fn followup_says_so_when_there_is_nothing_recorded() {
+    let fx = repo("followup-empty");
+    let config = fx.dir.join("spar.toml");
+    std::fs::write(&config, TWO_AGENTS).unwrap();
+
+    let (ok, _, err) = spar(
+        &[
+            "followup",
+            "--config",
+            config.to_str().unwrap(),
+            "--repo",
+            fx.work.to_str().unwrap(),
+        ],
+        &fx.dir,
+    );
+    assert!(ok, "an empty queue is not a failure: {err}");
+    assert!(err.contains("no follow-ups recorded"), "{err}");
+    assert!(err.contains("followups.md"), "{err}");
+}
+
+/// A file that is there and empty is a different thing from one that is not
+/// there, and a file with no headings is a third: the last is a parser problem
+/// and reporting it as an empty queue would hide it.
+#[test]
+fn followup_tells_an_empty_queue_from_one_it_could_not_read() {
+    let fx = repo("followup-shapes");
+    let config = fx.dir.join("spar.toml");
+    std::fs::write(&config, TWO_AGENTS).unwrap();
+    let notes = fx.work.join(".spar");
+    std::fs::create_dir_all(&notes).unwrap();
+    let path = notes.join("followups.md");
+
+    let run = || {
+        spar(
+            &[
+                "followup",
+                "--config",
+                config.to_str().unwrap(),
+                "--repo",
+                fx.work.to_str().unwrap(),
+            ],
+            &fx.dir,
+        )
+    };
+
+    std::fs::write(&path, "\n  \n").unwrap();
+    let (ok, _, err) = run();
+    assert!(ok, "{err}");
+    assert!(err.contains("there and empty"), "{err}");
+
+    std::fs::write(&path, "just some prose nobody put a heading on\n").unwrap();
+    let (ok, _, err) = run();
+    assert!(ok, "{err}");
+    assert!(err.contains("no `## ` headings"), "{err}");
+    assert_eq!(
+        "just some prose nobody put a heading on\n",
+        std::fs::read_to_string(&path).unwrap(),
+        "a file it could not read must not be rewritten"
+    );
+}
+
+/// The watermark is what makes the "leave a thread spar disagreed with open"
+/// decision terminate: without it, an unresolved thread reads as unanswered
+/// forever and spar re-argues every point it lost, once per run.
+#[test]
+fn a_checkin_watermark_round_trips_and_prunes_with_the_rest() {
+    use spar::model::Answered;
+
+    let fx = repo("checkin-state");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+
+    let mut seen = Answered {
+        version: 1,
+        ..Answered::default()
+    };
+    seen.seen
+        .insert("thread:PRRT_kwABC".into(), "PRRC_kw9".into());
+    seen.seen
+        .insert("comment:5455795654".into(), "5455795654".into());
+
+    let path = repo.checkin_state_path(108);
+    spar::repo::write_json_atomic(&path, &seen).unwrap();
+
+    let back: Answered = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        Some(&"PRRC_kw9".to_string()),
+        back.seen.get("thread:PRRT_kwABC")
+    );
+    assert_eq!(2, back.seen.len());
+
+    // It lives beside the resume state so housekeeping reaches it, and it is
+    // named apart so `review::persist` cannot overwrite a map it knows nothing
+    // about.
+    assert_eq!(
+        repo.state_path(108).parent(),
+        path.parent(),
+        "checkin state has to sit where prune_state looks"
+    );
+    assert_ne!(repo.state_path(108), path);
+    assert!(!path.with_extension("json.tmp").exists());
+}
+
 #[test]
 fn version_and_help_work_without_any_configuration() {
     let dir = unique("help");
@@ -485,7 +690,9 @@ fn version_and_help_work_without_any_configuration() {
 
     let (ok, out, _) = spar(&["--help"], &dir);
     assert!(ok);
-    for word in ["run", "triage", "resume", "init", "clean", "doctor"] {
+    for word in [
+        "run", "triage", "resume", "followup", "checkin", "init", "clean", "doctor",
+    ] {
         assert!(out.contains(word), "{word} missing from help:\n{out}");
     }
     let _ = std::fs::remove_dir_all(&dir);

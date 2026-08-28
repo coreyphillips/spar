@@ -7,8 +7,10 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 
 use crate::agent::{self, Agent};
+use crate::checkin;
 use crate::config::{self, Config};
 use crate::error::Result;
+use crate::followups;
 use crate::model::{Issue, IssueRun, ItemKind, Ledger, Plan, Status};
 use crate::proc::{self, ExecOpts};
 use crate::repo::Repo;
@@ -28,7 +30,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
     long_about = "Two coding agents alternate implementing and reviewing GitHub issues until a \
                   pull request converges. Neither agent reviews its own most recent edit.\n\n\
                   Arguments are issue numbers for `run` and `triage`, and pull request numbers \
-                  for `resume`. Omit them and spar takes everything open, up to --limit.",
+                  for `resume`, `review`, and `checkin`. Omit them and spar takes everything \
+                  open, up to --limit. `followup` takes none: it works the queue in \
+                  .spar/followups.md, and an entry there has no number to name.",
     max_term_width = 96
 )]
 pub struct Cli {
@@ -60,6 +64,41 @@ pub enum Command {
         no_worktrees: bool,
     },
 
+    /// Work the follow-ups recorded in .spar/followups.md.
+    ///
+    /// One agent reads every entry against the current checkout and rules on
+    /// it: still there, already fixed, not worth it, or a duplicate. What
+    /// survives is filed as an issue and worked like any other, which means
+    /// both agents still triage it before anything is implemented. An entry
+    /// that was filed or dropped leaves the queue and is kept in
+    /// .spar/followups.done.md.
+    ///
+    /// Takes no numbers: an entry has no number a person could type. --limit
+    /// caps how many are taken, and --min-number does nothing here.
+    Followup {
+        #[command(flatten)]
+        common: Common,
+        #[command(flatten)]
+        loop_flags: LoopFlags,
+        #[command(flatten)]
+        triage_flags: TriageFlags,
+        /// Read this instead of .spar/followups.md.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        /// Print the verdicts and stop. Nothing is filed and no file is touched.
+        #[arg(long)]
+        screen_only: bool,
+        /// File the issues and stop, leaving them for a later `spar run`.
+        #[arg(long, conflicts_with = "screen_only")]
+        file_only: bool,
+        /// Where to write the triage plan.
+        #[arg(long, default_value = "plan.json")]
+        plan_out: PathBuf,
+        /// Work in the main checkout instead of an isolated worktree per issue.
+        #[arg(long)]
+        no_worktrees: bool,
+    },
+
     /// Triage only. Writes the plan and touches nothing else.
     Triage {
         /// Issue numbers. Omit to take every open issue, up to --limit.
@@ -81,6 +120,37 @@ pub enum Command {
         /// Which agent reviews next, overriding the PR's saved state.
         #[arg(long = "next", value_name = "AGENT")]
         next_actor: Option<String>,
+    },
+
+    /// Answer the comments on a pull request, and act on the ones worth acting on.
+    ///
+    /// Reads every comment somebody else left that has not been answered. Both
+    /// agents judge each one. A change they both agree is right and belongs
+    /// here is made, pushed, answered in its own thread, and the thread marked
+    /// resolved. One they both judge wrong gets the reason and the thread is
+    /// left open for you. One they disagree about is parked.
+    Checkin {
+        /// Pull request numbers. An issue number resolves to its open PR.
+        /// Omit to take every open PR, up to --limit.
+        items: Vec<i64>,
+        #[command(flatten)]
+        common: Common,
+        /// Print every reply and every change instead of posting or pushing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Answer in words only. Nothing is committed, pushed, or resolved.
+        #[arg(long)]
+        reply_only: bool,
+        /// Act on a comment from anyone, not only from somebody who can write
+        /// to this repository.
+        #[arg(long)]
+        any_author: bool,
+        /// Answer comments spar already answered, ignoring what it recorded.
+        #[arg(long)]
+        again: bool,
+        /// Leave worktrees in place afterwards, for inspection.
+        #[arg(long)]
+        keep_worktrees: bool,
     },
 
     /// Review pull requests without changing them, including from a fork.
@@ -289,6 +359,79 @@ fn dispatch(cli: Cli) -> Result<i32> {
             Ok(report(&results, &cfg))
         }
 
+        Command::Checkin {
+            items,
+            common,
+            dry_run,
+            reply_only,
+            any_author,
+            again,
+            keep_worktrees,
+        } => {
+            let overrides = Overrides {
+                keep_worktrees: keep_worktrees.then_some(true),
+                ..Overrides::default()
+            };
+            let (cfg, repo, agents) = prepare(&common, Some(overrides))?;
+            let mode = checkin::Mode {
+                dry_run,
+                reply_only,
+                trust: if any_author {
+                    crate::config::Trust::Anyone
+                } else {
+                    cfg.loop_cfg.checkin_trust
+                },
+                again,
+                resolve: cfg.loop_cfg.checkin_resolve,
+                posts: checkin::posts(&cfg),
+            };
+            let numbers = if items.is_empty() {
+                let found = repo.list_open_prs(common.limit, cfg.loop_cfg.min_number)?;
+                if found.is_empty() {
+                    log!("no open PRs");
+                    return Ok(0);
+                }
+                log!(
+                    "no PRs given, checking in on {} open: {}",
+                    found.len(),
+                    found
+                        .iter()
+                        .map(|n| format!("#{n}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                found
+            } else {
+                items
+            };
+            let sorted = classify(&repo, &numbers)?;
+            let mut results = Vec::new();
+            for number in sorted.prs {
+                results.push(checkin::checkin_pr(&agents, &cfg, &repo, number, &mode));
+            }
+            // A change request left on the issue is exactly what this exists to
+            // catch, and when the issue has work open there is a branch to act
+            // on, so route to it rather than refusing.
+            for number in sorted.issues {
+                match repo.open_pr_for_issue(number) {
+                    Some(pr) => {
+                        log!(
+                            "#{number} is an issue; checking in on its open PR {}",
+                            pr.url
+                        );
+                        results.push(checkin::checkin_pr(&agents, &cfg, &repo, pr.number, &mode));
+                    }
+                    None => {
+                        results.push(checkin::checkin_issue(&agents, &cfg, &repo, number, &mode))
+                    }
+                }
+            }
+            if results.is_empty() {
+                return Ok(0);
+            }
+            Ok(report(&results, &cfg))
+        }
+
         Command::Post {
             prs,
             repo: repo_path,
@@ -349,14 +492,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             plan_out,
             no_worktrees,
         } => {
-            let mut overrides = Overrides::from(&loop_flags);
-            overrides.worktrees = if no_worktrees { Some(false) } else { None };
-            overrides.close_skipped =
-                match (triage_flags.close_skipped, triage_flags.no_close_skipped) {
-                    (true, _) => Some(true),
-                    (_, true) => Some(false),
-                    _ => None,
-                };
+            let overrides = Overrides::for_working(&loop_flags, &triage_flags, no_worktrees);
             let (cfg, repo, agents) = prepare(&common, Some(overrides))?;
             let numbers = pick_issues(&repo, issues, common.limit, cfg.loop_cfg.min_number)?;
             if numbers.is_empty() {
@@ -364,80 +500,14 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
             let sorted = classify(&repo, &numbers)?;
             let mut results = Vec::new();
-            let mut ledger = Ledger::new();
-            let mut handled: BTreeSet<i64> = BTreeSet::new();
-            let mut wave = sorted.issues.clone();
-
-            // Wave 0 is what was asked for. Each further wave is the follow-ups
-            // the previous one filed, folded back in rather than left for the
-            // next run. Every wave is triaged like anything else, so both
-            // agents still have to agree each one is worth doing.
-            for round in 0..=cfg.loop_cfg.absorb_new_issues {
-                wave.retain(|n| !handled.contains(n));
-                if wave.is_empty() {
-                    break;
-                }
-                if round > 0 {
-                    log!(
-                        "absorbing {} newly filed issue(s): {}",
-                        wave.len(),
-                        wave.iter()
-                            .map(|n| format!("#{n}"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                }
-                handled.extend(wave.iter().copied());
-
-                let fetched = match repo.fetch_issues(&wave) {
-                    Ok(fetched) => fetched,
-                    Err(e) => {
-                        logdim!("could not read the next wave: {e}");
-                        break;
-                    }
-                };
-                let plan_path = if round == 0 {
-                    plan_out.clone()
-                } else {
-                    plan_out.with_extension(format!("wave{round}.json"))
-                };
-                let plan = make_plan(&agents, &cfg, &repo, &fetched, &plan_path)?;
-                act_on_plan(&cfg, &repo, &plan);
-
-                let before = results.len();
-                for item in &plan.order {
-                    let Some(issue) = fetched.iter().find(|i| i.number == item.issue) else {
-                        continue;
-                    };
-                    results.push(review::run_issue(
-                        &agents,
-                        &cfg,
-                        &repo,
-                        item,
-                        issue,
-                        &mut ledger,
-                    ));
-                }
-
-                // Whatever this wave filed becomes the next one.
-                wave = results[before..]
-                    .iter()
-                    .flat_map(|r| r.filed.iter())
-                    .filter_map(|url| review::filed_issue_number(url))
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-            }
-            if !wave.is_empty() && cfg.loop_cfg.absorb_new_issues > 0 {
-                log!(
-                    "{} issue(s) filed in the last wave were left for a later run: {}",
-                    wave.len(),
-                    wave.iter()
-                        .map(|n| format!("#{n}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
+            work_issues(
+                &agents,
+                &cfg,
+                &repo,
+                sorted.issues.clone(),
+                &plan_out,
+                &mut results,
+            )?;
 
             for number in sorted.prs {
                 results.push(review::resume_pr(&agents, &cfg, &repo, number, None));
@@ -449,6 +519,39 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
             Ok(report(&results, &cfg))
         }
+        Command::Followup {
+            common,
+            loop_flags,
+            triage_flags,
+            file,
+            screen_only,
+            file_only,
+            plan_out,
+            no_worktrees,
+        } => {
+            let overrides = Overrides::for_working(&loop_flags, &triage_flags, no_worktrees);
+            let (cfg, repo, agents) = prepare(&common, Some(overrides))?;
+            let path = file.unwrap_or_else(|| repo.followups_path());
+            let mode = match (screen_only, file_only) {
+                (true, _) => followups::Mode::ScreenOnly,
+                (_, true) => followups::Mode::FileOnly,
+                _ => followups::Mode::Work,
+            };
+            let outcome = followups::run(&agents, &cfg, &repo, &path, common.limit, mode)?;
+
+            let wave = followups::wave(&outcome);
+            if mode != followups::Mode::Work || wave.is_empty() {
+                return Ok(outcome.exit_code());
+            }
+            let mut results = Vec::new();
+            work_issues(&agents, &cfg, &repo, wave, &plan_out, &mut results)?;
+            if results.is_empty() {
+                log!("nothing scheduled");
+                return Ok(outcome.exit_code());
+            }
+            Ok(report(&results, &cfg).max(outcome.exit_code()))
+        }
+
         Command::Resume {
             prs,
             common,
@@ -544,6 +647,115 @@ impl From<&LoopFlags> for Overrides {
             absorb: flags.absorb,
         }
     }
+}
+
+impl Overrides {
+    /// What `run` and `followup` share past the loop flags: both triage, so
+    /// both can decline, and both work issues in a worktree apiece.
+    fn for_working(loop_flags: &LoopFlags, triage: &TriageFlags, no_worktrees: bool) -> Self {
+        let mut over = Overrides::from(loop_flags);
+        over.worktrees = if no_worktrees { Some(false) } else { None };
+        over.close_skipped = match (triage.close_skipped, triage.no_close_skipped) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        };
+        over
+    }
+}
+
+/// Triage a set of issues, work them in dependency order, and fold each wave of
+/// newly filed follow-ups back in as the absorb budget allows.
+///
+/// Shared by `run` and `followup`, which differ only in where the first wave
+/// comes from: `run` takes it from the tracker, `followup` from the issues it
+/// just filed out of the local queue. Everything after that is the same
+/// pipeline, and it has to stay the same. An issue spar filed for itself gets
+/// no easier a ride through triage than one a person opened, which is the whole
+/// reason the screening pass is one agent and this is two.
+fn work_issues(
+    agents: &[Agent],
+    cfg: &Config,
+    repo: &Repo,
+    first_wave: Vec<i64>,
+    plan_out: &Path,
+    results: &mut Vec<IssueRun>,
+) -> Result<()> {
+    let mut ledger = Ledger::new();
+    let mut handled: BTreeSet<i64> = BTreeSet::new();
+    let mut wave = first_wave;
+
+    // Wave 0 is what was asked for. Each further wave is the follow-ups the
+    // previous one filed, folded back in rather than left for the next run.
+    // Every wave is triaged like anything else, so both agents still have to
+    // agree each one is worth doing.
+    for round in 0..=cfg.loop_cfg.absorb_new_issues {
+        wave.retain(|n| !handled.contains(n));
+        if wave.is_empty() {
+            break;
+        }
+        if round > 0 {
+            log!(
+                "absorbing {} newly filed issue(s): {}",
+                wave.len(),
+                wave.iter()
+                    .map(|n| format!("#{n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        handled.extend(wave.iter().copied());
+
+        let fetched = match repo.fetch_issues(&wave) {
+            Ok(fetched) => fetched,
+            Err(e) => {
+                logdim!("could not read the next wave: {e}");
+                break;
+            }
+        };
+        let plan_path = if round == 0 {
+            plan_out.to_path_buf()
+        } else {
+            plan_out.with_extension(format!("wave{round}.json"))
+        };
+        let plan = make_plan(agents, cfg, repo, &fetched, &plan_path)?;
+        act_on_plan(cfg, repo, &plan);
+
+        let before = results.len();
+        for item in &plan.order {
+            let Some(issue) = fetched.iter().find(|i| i.number == item.issue) else {
+                continue;
+            };
+            results.push(review::run_issue(
+                agents,
+                cfg,
+                repo,
+                item,
+                issue,
+                &mut ledger,
+            ));
+        }
+
+        // Whatever this wave filed becomes the next one.
+        wave = results[before..]
+            .iter()
+            .flat_map(|r| r.filed.iter())
+            .filter_map(|url| review::filed_issue_number(url))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+    }
+    if !wave.is_empty() && cfg.loop_cfg.absorb_new_issues > 0 {
+        log!(
+            "{} issue(s) filed in the last wave were left for a later run: {}",
+            wave.len(),
+            wave.iter()
+                .map(|n| format!("#{n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn prepare(common: &Common, overrides: Option<Overrides>) -> Result<(Config, Repo, Vec<Agent>)> {
@@ -1041,9 +1253,9 @@ const LOOP_OPTIONS: &[Setting] = &[
     (false, "first_implementor", "Which agent takes the first pass. The other one reviews it."),
     (false, "worktrees", "Isolate each issue in its own git worktree. Set false to work in the main checkout."),
     (false, "close_skipped", "Close an issue both reviewers declined, after posting the shared reasoning. A tracking issue is left open whatever this says."),
-    (false, "followups", "Where a follow-up goes. issues files them, local writes .spar/followups.md and leaves the tracker alone, none drops them."),
+    (false, "followups", "Where a follow-up goes. issues files them, local writes .spar/followups.md and leaves the tracker alone, none drops them. `spar followup` works that file."),
     (true, "file_non_blocking", "File a non-blocking finding as a follow-up. Off, because not gating a merge is not the same as deserving somebody's triage queue."),
-    (true, "max_followups", "Most follow-ups one run may record before it stops and says what it dropped. A backstop, not a target."),
+    (true, "max_followups", "Most follow-ups one run may record before it stops and says what it dropped. A backstop, not a target. `spar followup` is bounded by --limit instead."),
     (true, "keep_worktrees", "Keep worktrees after a run, for inspection."),
     (true, "min_number", "Ignore issues and pull requests numbered below this when spar picks for itself. 0 is no floor, and a number you name explicitly is always honoured."),
     (true, "parallel_triage", "Ask both agents to triage at once. They only read during triage, so there is nothing to serialise."),
@@ -1055,7 +1267,10 @@ const LOOP_OPTIONS: &[Setting] = &[
     (true, "drafts", "Whether a pull request starts as a draft. until_approved opens one and marks it ready when the review converges, which is what the draft was saying while two agents were still arguing about it. always opens one and leaves it, and cannot be combined with auto_merge."),
     (true, "instructions", "Extra instructions handed to both agents with every request, for what this repository always wants that spar has no setting for. --instructions adds to this for one run."),
     (true, "max_issue_chars", "Most of one issue body that reaches a prompt. Sized so nothing a person wrote is cut, and a cut is said out loud when it happens."),
-    (true, "max_triage_chars", "Most every issue body together may add to one triage prompt. Past it, whole issues wait for the next run rather than all of them losing their tails."),
+    (true, "max_triage_chars", "Most every issue body together may add to one triage prompt, or every recorded follow-up in one screening prompt. Past it, whole items wait for the next run rather than all of them losing their tails."),
+    (true, "checkin_trust", "Whose comments `spar checkin` will act on. write is anybody GitHub says can write to this repository, which is the default because acting on a comment means pushing a commit to somebody's branch. anyone answers everyone, and still only changes code when both agents agree."),
+    (true, "checkin_resolve", "Mark a review thread resolved when spar made the change it asked for. A thread spar disagreed with is left open whatever this says."),
+    (true, "max_checkin_comments", "Most unanswered comments spar will answer on one pull request in a run. A backstop against a long argument being read back to somebody, not a target."),
 ];
 
 const STYLE_OPTIONS: &[Setting] = &[
@@ -1464,6 +1679,8 @@ mod tests {
             vec!["spar", "run", "42"],
             vec!["spar", "triage"],
             vec!["spar", "resume"],
+            vec!["spar", "followup"],
+            vec!["spar", "checkin"],
             vec!["spar", "clean"],
             vec!["spar", "doctor"],
         ] {
@@ -1473,7 +1690,9 @@ mod tests {
             let config = match cli.command {
                 Command::Run { common, .. }
                 | Command::Triage { common, .. }
-                | Command::Resume { common, .. } => common.config,
+                | Command::Resume { common, .. }
+                | Command::Followup { common, .. }
+                | Command::Checkin { common, .. } => common.config,
                 Command::Clean { config, .. } | Command::Doctor { config } => config,
                 other => panic!("{other:?}"),
             };
@@ -1494,20 +1713,54 @@ mod tests {
     /// the config, carry on with something extra to say" a thing you can do.
     #[test]
     fn every_command_that_reads_a_config_takes_instructions() {
-        for cmd in ["run", "triage", "resume", "review"] {
-            let argv = vec!["spar", cmd, "7", "--instructions", "Do not wait for CI."];
+        // `followup` is given no number, because it takes none: its entries
+        // have no identity a person could type.
+        for argv in [
+            vec!["spar", "run", "7", "--instructions", "Do not wait for CI."],
+            vec![
+                "spar",
+                "triage",
+                "7",
+                "--instructions",
+                "Do not wait for CI.",
+            ],
+            vec![
+                "spar",
+                "resume",
+                "7",
+                "--instructions",
+                "Do not wait for CI.",
+            ],
+            vec![
+                "spar",
+                "review",
+                "7",
+                "--instructions",
+                "Do not wait for CI.",
+            ],
+            vec!["spar", "followup", "--instructions", "Do not wait for CI."],
+            vec![
+                "spar",
+                "checkin",
+                "7",
+                "--instructions",
+                "Do not wait for CI.",
+            ],
+        ] {
             let parsed = Cli::parse_from(&argv);
             let common = match parsed.command {
                 Command::Run { common, .. }
                 | Command::Triage { common, .. }
                 | Command::Resume { common, .. }
-                | Command::Review { common, .. } => common,
+                | Command::Review { common, .. }
+                | Command::Followup { common, .. }
+                | Command::Checkin { common, .. } => common,
                 other => panic!("{other:?}"),
             };
             assert_eq!(
                 Some("Do not wait for CI."),
                 common.instructions.as_deref(),
-                "{cmd}"
+                "{argv:?}"
             );
         }
     }
@@ -1525,9 +1778,28 @@ mod tests {
     fn close_skipped_is_offered_only_where_it_means_something() {
         assert!(Cli::try_parse_from(["spar", "run", "--close-skipped"]).is_ok());
         assert!(Cli::try_parse_from(["spar", "run", "--no-close-skipped"]).is_ok());
+        // `followup` triages what it files, so it can decline it too.
+        assert!(Cli::try_parse_from(["spar", "followup", "--close-skipped"]).is_ok());
         assert!(Cli::try_parse_from(["spar", "resume", "--close-skipped"]).is_err());
         assert!(Cli::try_parse_from(["spar", "review", "--close-skipped"]).is_err());
         assert!(Cli::try_parse_from(["spar", "triage", "--close-skipped"]).is_err());
+    }
+
+    /// An entry in the follow-up queue has no number and its title is prose, so
+    /// a number on the command line could only be silently ignored.
+    #[test]
+    fn followup_takes_no_numbers() {
+        assert!(Cli::try_parse_from(["spar", "followup"]).is_ok());
+        assert!(Cli::try_parse_from(["spar", "followup", "42"]).is_err());
+    }
+
+    /// `--screen-only` stops before `--file-only` does, so asking for both says
+    /// nothing about where to stop.
+    #[test]
+    fn the_two_stopping_points_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from(["spar", "followup", "--screen-only"]).is_ok());
+        assert!(Cli::try_parse_from(["spar", "followup", "--file-only"]).is_ok());
+        assert!(Cli::try_parse_from(["spar", "followup", "--screen-only", "--file-only"]).is_err());
     }
 
     #[test]
@@ -1606,6 +1878,42 @@ mod tests {
     }
 
     #[test]
+    fn checkin_takes_pr_numbers_and_a_dry_run() {
+        match Cli::parse_from(["spar", "checkin", "108", "112", "--dry-run"]).command {
+            Command::Checkin { items, dry_run, .. } => {
+                assert_eq!(vec![108, 112], items);
+                assert!(dry_run);
+            }
+            other => panic!("{other:?}"),
+        }
+        match Cli::parse_from(["spar", "checkin"]).command {
+            Command::Checkin { items, dry_run, .. } => {
+                assert!(items.is_empty());
+                assert!(!dry_run);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `--auto-merge` must not exist on the one command whose input is written
+    /// by somebody else, and `--max-rounds` would be worse than useless: the
+    /// judgement is two passes by construction, so `--max-rounds 1` could only
+    /// mean "let one agent decide alone", which removes the one thing standing
+    /// between a stranger's comment and a push.
+    #[test]
+    fn checkin_offers_no_flag_that_would_weaken_the_pair() {
+        assert!(Cli::try_parse_from(["spar", "checkin", "--auto-merge"]).is_err());
+        assert!(Cli::try_parse_from(["spar", "checkin", "--max-rounds", "1"]).is_err());
+        assert!(Cli::try_parse_from(["spar", "checkin", "--absorb", "1"]).is_err());
+        assert!(Cli::try_parse_from(["spar", "checkin", "--close-skipped"]).is_err());
+        // What it does offer.
+        assert!(Cli::try_parse_from(["spar", "checkin", "--reply-only"]).is_ok());
+        assert!(Cli::try_parse_from(["spar", "checkin", "--any-author"]).is_ok());
+        assert!(Cli::try_parse_from(["spar", "checkin", "--again"]).is_ok());
+        assert!(Cli::try_parse_from(["spar", "checkin", "--keep-worktrees"]).is_ok());
+    }
+
+    #[test]
     fn resume_takes_a_next_override() {
         let cli = Cli::parse_from(["spar", "resume", "108", "--next", "codex"]);
         match cli.command {
@@ -1657,7 +1965,9 @@ mod min_number_tests {
             Command::Run { common, .. }
             | Command::Triage { common, .. }
             | Command::Resume { common, .. }
-            | Command::Review { common, .. } => common.min_number,
+            | Command::Review { common, .. }
+            | Command::Followup { common, .. }
+            | Command::Checkin { common, .. } => common.min_number,
             other => panic!("{other:?}"),
         }
     }
@@ -1669,7 +1979,7 @@ mod min_number_tests {
 
     #[test]
     fn every_command_that_picks_for_itself_accepts_a_floor() {
-        for cmd in ["run", "triage", "resume", "review"] {
+        for cmd in ["run", "triage", "resume", "review", "checkin"] {
             assert_eq!(
                 Some(480),
                 read(&["spar", cmd, "--min-number", "480"]),

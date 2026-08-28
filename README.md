@@ -77,12 +77,15 @@ run on a repository you care about:
 ```bash
 spar triage 42              # judges the issue, writes plan.json, touches nothing
 spar review 108 --dry-run   # full two agent review, printed, nothing posted
+spar checkin 108 --dry-run  # every reply and every change, posted nowhere
+spar followup --screen-only # judges the queue, writes nothing, files nothing
 spar run 42 --no-close-skipped   # will not close an issue it declines
 ```
 
-`--dry-run` is on `review` only, because `review` is the command whose whole
-output is a comment. There is no `--dry-run` on `run`, since `run` writes code:
-`triage` is its read-only half.
+`--dry-run` is on `review` and `checkin`, because those are the commands whose
+whole output is a comment. There is no `--dry-run` on `run`, since `run` writes
+code: `triage` is its read-only half, and `followup --screen-only` is
+`followup`'s.
 
 For something persistent rather than per invocation, these live in `spar.toml`:
 
@@ -130,6 +133,15 @@ spar run 42 --plan-out /tmp/plan.json      # where the triage plan is written
 spar run 42 --no-close-skipped   # comment on a declined issue but leave it open
 spar run 42 --close-skipped      # close it (the default, so rarely needed)
 spar run 42 --absorb 1      # work the follow-ups this run files, in this run
+
+spar followup               # work the follow-ups recorded in .spar/followups.md
+spar followup --screen-only # print the verdicts, write nothing
+spar followup --file-only   # file the issues, leave them for a later run
+
+spar checkin 108            # answer the unanswered comments on a PR
+spar checkin                # every open PR
+spar checkin 108 --dry-run  # every reply and every change, posted nowhere
+spar checkin 108 --reply-only    # answer in words, never touch the code
 
 spar review 108             # review a PR without touching it, fork or not
 spar review 108 --dry-run   # print the review instead of posting it
@@ -253,6 +265,9 @@ back into the current one instead, a wave at a time, each wave triaged like any
 other issue so both agents still have to agree it is worth doing. It is off by
 default because it multiplies what a run costs.
 
+With the default `followups = "local"` they go to `.spar/followups.md` instead
+of the tracker, and `spar followup` is what works that file. See below.
+
 **Convergence.** Only `blocking` findings gate the merge. Everything else is
 filed as a follow-up issue and the PR proceeds. This matters: a competent
 reviewer can always find something, so "no objections remaining" is not a
@@ -350,6 +365,127 @@ comment (`state_store = "pr"`) if a run might be picked up from another machine.
 
 A PR with no spar state starts fresh, with the agent that did not implement
 taking the first review.
+
+## Working the follow-up queue
+
+`followups = "local"` is the default, so a review that finds something real but
+out of scope writes it to `.spar/followups.md` and leaves your tracker alone.
+That file used to be where follow-ups went to die: nothing read it back.
+
+```bash
+spar followup                 # screen, file, and work them
+spar followup --screen-only   # print the verdicts and write nothing
+spar followup --file-only     # file the issues, leave them for a later run
+spar followup --limit 3       # take three entries rather than twenty
+```
+
+One agent reads every entry against the checkout as it is now and rules on it:
+still there, already fixed, not worth it, or a duplicate. Time passes and code
+moves, so a note written three weeks ago is often about a defect somebody has
+since fixed, and filing it would put a closed question on somebody's queue. What
+survives becomes an issue and then goes through ordinary triage, which means
+both agents still have to agree before anything is implemented. The screen is
+one agent because it is a filter, not a verdict: it is told to say
+still_relevant when unsure, because what survives can still be declined and what
+it drops is dropped.
+
+An entry that was filed or ruled out leaves the queue, so the file shrinks as it
+is worked, and its text is kept in `.spar/followups.done.md` with the verdict
+under it. That archive is not sentiment. It is what stops the next run
+rediscovering the same defect and recording it again on top of the issue that
+now exists for it, and it means a wrong "already fixed" costs you a re-read
+rather than the only copy of a real finding.
+
+The queue is ordinary markdown and editing it by hand is expected. An entry is a
+`## Title` line and the text under it. spar writes an invisible marker above each
+one it appends, so the boundaries are exact for anything it wrote; a file you
+keep yourself works without it. Editing an entry before running `spar followup`
+changes what gets filed, which is the point.
+
+An entry is only removed after its issue exists, so a run that dies halfway
+files one thing twice rather than losing one. The duplicate is caught by the
+same search that catches every other one.
+
+## Answering the comments on a pull request
+
+The loop's only input is what the two agents produce. Somebody who leaves a
+review comment is talking to nobody. `spar checkin` reads what other people
+said, judges it, and acts on it.
+
+```bash
+spar checkin 108            # one pull request
+spar checkin                # every open PR, up to --limit
+spar checkin 108 --dry-run  # every reply and every change, posted nowhere
+spar checkin 108 --reply-only    # answer in words, never touch the code
+spar checkin 108 --any-author    # act on a comment from outside the repo too
+spar checkin 108 --again         # re-read what spar already answered
+```
+
+Unanswered means three things: an inline review thread GitHub has not marked
+resolved, a review summary, and a top level comment, in each case written by
+somebody other than you and not already answered. Comments you wrote are
+excluded, and so is spar's own hidden state block.
+
+Both agents then judge each one. The first rules on it with the code checked
+out; the second reads the same comments and those rulings, goes to the code, and
+agrees or does not. Four outcomes:
+
+- **A change they both agree is right and belongs here** is made, committed,
+  pushed to the pull request branch, answered in that comment's own thread, and
+  the thread marked resolved. Not a reply saying it should be fixed. The fix, on
+  the branch, with the thread closed off.
+- **Right, but really its own piece of work** is filed as an issue, and the
+  reply says where it went.
+- **Wrong, or not worth doing** gets the argument as a reply, and **the thread
+  is left open**. It is not spar's thread to close: the person who raised it has
+  not had their say yet. It also shows up under "disputed" in the terminal
+  summary.
+- **The two disagree** and nothing is changed. It is answered, left open, and
+  handed to you.
+
+Replies to inline threads go into those threads. A review summary and a top
+level comment have no thread to reply into, so they are answered together in one
+comment on the pull request rather than five comments in a row.
+
+### What stops a comment from getting arbitrary code pushed
+
+This is the only command whose input is written by a third party and whose
+output is a `git push`, so it is worth saying exactly what the layers are.
+
+- `checkin_trust = "write"` by default. Everybody is answered in words; only
+  somebody GitHub says can write to this repository can cause a commit. On a
+  repository you do not own, the author of a pull request is a `CONTRIBUTOR` on
+  their own PR, so set `checkin_trust = "anyone"` or pass `--any-author` if you
+  are answering your own contributors. Every comment the gate holds back is
+  named in the log, so the setting is never silent.
+- **Both agents have to agree.** A second opinion that never arrived is not
+  agreement: if the checking agent and its fallback both fail, nothing is
+  implemented that run. Disagreement always resolves toward saying something
+  rather than doing something, because getting a decline wrong costs one person
+  one read of a thread that stays open, and getting a change wrong costs them a
+  commit they did not ask for.
+- **Ambiguity is a stop, not a guess.** Either agent saying the comment could be
+  read two ways turns it into a reply asking what was meant.
+- **A third refusal, with the code open**, and a mechanical check that `HEAD`
+  actually moved. A reply never claims a fix that is not in the diff.
+- Comment bodies reach the agents inside a marked block, as data rather than
+  instruction, with the marker stripped out of the body so it cannot close its
+  own fence. A comment that tries to redirect the agent is itself grounds to
+  decline.
+- The push is `--force-with-lease` onto a worktree built from the pull request's
+  own head, so the worst case is a commit you revert, never rewritten history.
+  Nothing merges: there is no `--auto-merge` on this command, deliberately.
+
+A pull request from a fork cannot be pushed to, so `checkin` answers it and
+files what it finds and changes nothing, and says so. `spar checkin <issue>`
+routes to that issue's open pull request when there is one, and otherwise
+answers the comments on the issue itself without touching code.
+
+Running it twice does not answer the same thing twice. Threads carry GitHub's
+own resolved flag, and what spar answered is recorded in `.spar/state`, which is
+what makes leaving a disputed thread open terminate rather than re-arguing it
+once a run forever. A fresh clone has no record, so it will answer a previously
+declined point once more.
 
 ## Keeping it readable
 
@@ -705,6 +841,8 @@ by accident produces a baffling failure.
 ## Housekeeping
 
 ```bash
+spar followup       # work the follow-ups a run recorded locally
+spar checkin        # answer the comments nobody replied to
 spar clean          # drop worktrees, branches, and state whose PR is finished
 spar clean --all    # drop every worktree and branch spar created, review ones too
 spar clean --pr-state   # also delete state comments left on finished PRs
@@ -744,6 +882,11 @@ subscriptions.
 Rough shape per issue: two calls for triage, one to implement, then two per
 review round. `spar review` is cheaper, four to six calls for a whole pull
 request, because nothing is being rewritten between passes.
+
+`spar followup` is one call for the whole queue, however many entries it holds,
+and then the ordinary pipeline for each one it files. `spar checkin` is two
+calls per pull request, one to judge and one to check, and a third only when
+there is something to implement.
 
 ## Caveats
 

@@ -7,6 +7,9 @@
 //! The model output below is deliberately as verbose as a real model gets. What
 //! prints is what a reviewer would actually read.
 
+use spar::checkin::{checkin_comment, thread_reply, Settled};
+use spar::comments::{CommentKind, Pending};
+use spar::model::Ask;
 use spar::model::{
     Dispute, Finding, Implementation, IssueRun, Judged, NextAction, ResponseDoc, Review, Severity,
     SkippedItem, Standing, Verdict,
@@ -300,5 +303,113 @@ fn main() {
             &style
         )
     );
+    rule("Answering a comment in its own thread");
+    for item in [
+        settled(
+            Ask::Implement,
+            "alice",
+            "src/retry.rs:91",
+            "Added the guard on the retry path and a test that reproduces the original failure.",
+            "",
+            true,
+        ),
+        settled(
+            Ask::Decline,
+            "bob",
+            "src/pool.rs:14",
+            "",
+            "Every caller of this function already holds the pool lock, so the check on line 14 \
+             cannot be reached with a null connection. I ran the suite with an assertion in its \
+             place and nothing tripped it.",
+            false,
+        ),
+        settled(
+            Ask::Defer,
+            "carol",
+            "src/electrum.rs:203",
+            "",
+            "This is real and it predates the branch: the reconnect monitor puts a stopped wallet \
+             back into the header router. It is not caused by anything here, so fixing it in this \
+             pull request would put an unrelated change in front of whoever reviews it.",
+            false,
+        ),
+    ] {
+        println!("{}\n", thread_reply(&item, &style));
+    }
+
+    rule("What a check-in leaves on the pull request");
+    let mut fixed = settled(
+        Ask::Implement,
+        "alice",
+        "the pull request",
+        "Retried the 429 with the backoff the issue asked for.",
+        "",
+        true,
+    );
+    fixed.pending.file = None;
+    let mut parked = settled(
+        Ask::Decline,
+        "dave",
+        "the pull request",
+        "",
+        "The two reviewers read the same code and did not agree about whether the guard is \
+         reachable.",
+        false,
+    );
+    parked.pending.file = None;
+    parked.parked = true;
+    println!(
+        "{}",
+        checkin_comment(&[fixed, parked], &style)
+            .unwrap_or_else(|| "(nothing to say, so no comment is posted)".into())
+    );
+    println!("\n  (and a check-in with nothing outstanding posts no comment at all)");
+
     println!();
+}
+
+/// One settled comment, for the preview. Deliberately verbose model output, so
+/// what prints is what somebody would actually read.
+fn settled(
+    ask: Ask,
+    author: &str,
+    at: &str,
+    summary: &str,
+    reasoning: &str,
+    pushed: bool,
+) -> Settled {
+    let (file, line) = match at.split_once(':') {
+        Some((f, l)) => (Some(f.to_string()), l.parse().ok()),
+        None => (Some(at.to_string()), None),
+    };
+    Settled {
+        pending: Pending {
+            ref_id: "c1".into(),
+            kind: CommentKind::Thread {
+                thread_id: "PRRT_kwABC".into(),
+                reply_to: 1,
+                can_resolve: true,
+            },
+            key: "thread:PRRT_kwABC".into(),
+            newest: "PRRC_kw1".into(),
+            author: author.into(),
+            association: "COLLABORATOR".into(),
+            body: String::new(),
+            file,
+            line,
+            hunk: String::new(),
+            url: String::new(),
+            at: "2026-01-02T03:04:05Z".into(),
+        },
+        ask,
+        request: "add a guard on the retry path".into(),
+        reasoning: reasoning.into(),
+        summary: summary.into(),
+        changed: pushed,
+        pushed,
+        blocked: None,
+        filed: (ask == Ask::Defer).then(|| "https://github.com/owner/repo/issues/512".to_string()),
+        parked: false,
+        counterpoint: None,
+    }
 }

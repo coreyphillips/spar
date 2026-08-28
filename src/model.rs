@@ -138,6 +138,41 @@ string_enum! {
 }
 
 string_enum! {
+    /// What spar should do about one comment somebody left.
+    ///
+    /// Every value maps to exactly one action, which is the point: a verdict
+    /// that needs a second field to decide what it means is one that gets
+    /// decided differently in two places.
+    pub enum Ask {
+        /// A change is asked for, it is right, and it belongs on this branch.
+        /// Make it, push it, say so, and resolve the thread.
+        Implement = "implement" | "do" | "accept" | "fix",
+        /// Right, but really its own piece of work. File it, say where it went.
+        Defer = "defer" | "file_issue" | "filed_issue" | "out_of_scope" | "followup",
+        /// Should not be made. Reply with the reason, leave the thread open.
+        Decline = "decline" | "refute" | "reject" | "disagree" | "wontfix",
+        /// A question rather than a request. Answer it in words.
+        Answer = "answer" | "question" | "reply" | "clarify",
+        /// Nothing is being asked. Praise, or a thread they settled themselves.
+        Nothing = "nothing" | "none" | "no_request" | "noop" | "skip",
+    }
+}
+
+string_enum! {
+    /// What one screening pass decided about one recorded follow-up.
+    ///
+    /// Only `StillRelevant` files anything. The other three all take the entry
+    /// out of the queue, which is why the prompt asks for a reason and the log
+    /// prints it: they are the verdicts nobody sees the working for.
+    pub enum Screened {
+        StillRelevant = "still_relevant" | "still-relevant" | "relevant" | "keep" | "file",
+        AlreadyFixed = "already_fixed" | "already-fixed" | "fixed" | "done" | "resolved",
+        NotWorthIt = "not_worth_it" | "not-worth-it" | "not_worth_doing" | "skip" | "drop" | "wontfix",
+        Duplicate = "duplicate" | "dupe" | "dup",
+    }
+}
+
+string_enum! {
     /// Terminal state of one issue or one resumed PR.
     pub enum Status {
         Pending = "pending",
@@ -150,6 +185,8 @@ string_enum! {
         Reviewed = "reviewed",
         /// Review only: both reviewers found nothing that blocks a merge.
         Clean = "clean",
+        /// Check-in: comments were read and answered.
+        Answered = "answered",
     }
 }
 
@@ -271,6 +308,19 @@ pub fn de_bool<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
     d.deserialize_any(V)
 }
 
+/// An optional number that may arrive as 412, "412", "#412", null, or "none".
+///
+/// Anything unparseable yields None rather than failing. A duplicate pointer is
+/// decoration on a verdict that stands without it, and taking a whole batch down
+/// over one stray string costs a second full repo pass to learn nothing.
+pub fn de_opt_i64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+    Ok(match Option::<serde_json::Value>::deserialize(d)? {
+        Some(serde_json::Value::Number(n)) => n.as_i64(),
+        Some(serde_json::Value::String(s)) => s.trim().trim_start_matches('#').parse().ok(),
+        _ => None,
+    })
+}
+
 fn de_bool_default_true<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
     #[derive(Deserialize)]
     struct Wrap(#[serde(deserialize_with = "de_bool")] bool);
@@ -309,6 +359,127 @@ pub struct TriageVerdict {
 pub struct TriageResponse {
     #[serde(default)]
     pub issues: Vec<TriageVerdict>,
+}
+
+/// One agent's ruling on one entry in the local follow-up queue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenVerdict {
+    /// The entry's position in the list it was given, from 1.
+    ///
+    /// Matched back by index rather than by title, because the entries are
+    /// spar's own data and so can carry a handle a model cannot paraphrase.
+    #[serde(deserialize_with = "de_i64")]
+    pub entry: i64,
+    pub verdict: Screened,
+    #[serde(default, deserialize_with = "de_string")]
+    pub title: String,
+    #[serde(default, deserialize_with = "de_string")]
+    pub reason: String,
+    /// The issue or sibling entry a duplicate points at.
+    #[serde(default, deserialize_with = "de_opt_i64")]
+    pub duplicate_of: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenResponse {
+    #[serde(default)]
+    pub entries: Vec<ScreenVerdict>,
+}
+
+/// One agent's judgement of one comment somebody left on a pull request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommentVerdict {
+    /// The handle spar printed beside the comment, copied back so the answer
+    /// can be matched to it. Not a title: a finding's title is the only handle
+    /// there is because findings are model authored, but a comment is spar's
+    /// own data, so it gets one that cannot be paraphrased or collided.
+    #[serde(default, deserialize_with = "de_string")]
+    pub ref_id: String,
+    pub ask: Ask,
+    /// What is being asked for, in one sentence, in the agent's own words.
+    /// How spar checks the comment was understood before acting on it.
+    #[serde(default, deserialize_with = "de_string")]
+    pub request: String,
+    /// The whole argument. For a decline this is posted in the thread, so it is
+    /// written for the person who raised the point.
+    #[serde(default, deserialize_with = "de_string")]
+    pub reasoning: String,
+    /// False when the comment could be read more than one way. spar answers an
+    /// ambiguous comment in words and never guesses at a commit.
+    #[serde(deserialize_with = "de_bool")]
+    pub unambiguous: bool,
+    #[serde(default)]
+    pub new_issue_title: Option<String>,
+    #[serde(default)]
+    pub new_issue_body: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckinDoc {
+    #[serde(default)]
+    pub verdicts: Vec<CommentVerdict>,
+}
+
+/// The second agent's ruling on the first one's call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommentCheck {
+    #[serde(default, deserialize_with = "de_string")]
+    pub ref_id: String,
+    #[serde(deserialize_with = "de_bool")]
+    pub agrees: bool,
+    /// What this agent would do instead. Read only when `agrees` is false.
+    pub ask: Ask,
+    #[serde(deserialize_with = "de_bool")]
+    pub unambiguous: bool,
+    #[serde(default, deserialize_with = "de_string")]
+    pub reasoning: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckDoc {
+    #[serde(default)]
+    pub checks: Vec<CommentCheck>,
+}
+
+/// What the fix pass did about one comment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FixOutcome {
+    #[serde(default, deserialize_with = "de_string")]
+    pub ref_id: String,
+    /// False when the change turned out to be wrong once the code was open.
+    /// Declining here is a better answer than making a change you now believe
+    /// is a mistake.
+    #[serde(deserialize_with = "de_bool")]
+    pub changed: bool,
+    /// One sentence naming what changed, or why it was left alone. Posted in
+    /// the thread, so it is written for the person who asked.
+    #[serde(default, deserialize_with = "de_string")]
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FixReport {
+    #[serde(default)]
+    pub done: Vec<FixOutcome>,
+}
+
+/// What spar has already answered on one pull request or issue.
+///
+/// Keyed by thread or comment, valued by the newest message in it that spar did
+/// not write. A thread that has moved since spar answered carries a different
+/// value and is read again, which is what makes "they replied to my reply"
+/// work. GitHub's own resolved flag covers the threads spar fixed; this covers
+/// the ones it argued with, which stay open on purpose and would otherwise be
+/// re-argued once per run, forever.
+///
+/// Written only after a reply has posted. A run that could not post is a run
+/// that has not answered, and recording it as answered would lose the comment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Answered {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub seen: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -654,6 +825,7 @@ impl IssueRun {
                 | Status::Abandoned
                 | Status::Reviewed
                 | Status::Clean
+                | Status::Answered
         )
     }
 }

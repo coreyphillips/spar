@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -24,6 +25,15 @@ pub const FETCH_CEILING: usize = 500;
 /// terminated with `-->`, so GitHub renders the whole block as nothing.
 pub const STATE_MARKER: &str = "<!-- spar:state";
 
+/// An entry boundary in the local follow-up note, on the same principle as
+/// `STATE_MARKER` and rendered as nothing for the same reason.
+///
+/// A follow-up's own sections are written as `## Problem` and friends, at the
+/// same heading level as the entry's title, so the file's shape does not say
+/// which of two `## ` lines starts an entry. This does. Files written before it
+/// existed are still read, by the heuristic in `followups::parse`.
+pub const FOLLOWUP_MARKER: &str = "<!-- spar:followup -->";
+
 const WORKTREE_DIR: &str = ".spar-worktrees";
 const STATE_DIR: &str = ".spar";
 
@@ -35,6 +45,12 @@ pub struct Repo {
     pub state_store: StateStore,
     pub followups: Followups,
     pub drafts: Drafts,
+    /// The login `gh` is authenticated as, asked at most once.
+    ///
+    /// `OnceLock` rather than `OnceCell` because `&Repo` crosses a
+    /// `std::thread::scope` whenever both agents are asked at the same time,
+    /// and only `OnceLock` is `Sync`.
+    viewer: OnceLock<String>,
 }
 
 impl Repo {
@@ -58,6 +74,7 @@ impl Repo {
             state_store: cfg.loop_cfg.state_store,
             followups: cfg.loop_cfg.followups,
             drafts: cfg.loop_cfg.drafts,
+            viewer: OnceLock::new(),
         };
         repo.self_exclude();
         Ok(repo)
@@ -550,6 +567,50 @@ impl Repo {
         .unwrap_or_default()
     }
 
+    /// The login `gh` is authenticated as.
+    ///
+    /// A hard error, never a degradation. Everything spar wrote has to be
+    /// excluded from what it answers, and custody cannot be read from git
+    /// authorship, so this is the only thing that tells spar's own comments
+    /// from somebody else's. Without it the failure is not "answers a bit too
+    /// much", it is a thread where spar answers itself until somebody notices.
+    ///
+    /// Not cached on disk: `gh auth switch` between runs would make a stored
+    /// answer wrong in exactly the way that produces that thread.
+    pub fn viewer_login(&self) -> Result<&str> {
+        if let Some(login) = self.viewer.get() {
+            return Ok(login);
+        }
+        let rest = self.gh_try(&["api", "user", "--jq", ".login"]);
+        let login = if !rest.trim().is_empty() {
+            rest.trim().to_string()
+        } else {
+            // A token that cannot read /user can still answer for itself in
+            // GraphQL, which is the case on some Enterprise installs.
+            self.gh(&[
+                "api",
+                "graphql",
+                "-f",
+                "query={ viewer { login } }",
+                "--jq",
+                ".data.viewer.login",
+            ])
+            .map_err(|e| {
+                spar_err!(
+                    "could not find out who `gh` is authenticated as, so spar cannot tell its \
+                     own comments from anybody else's. {}\nRun `gh auth status`.",
+                    e.last_line()
+                )
+            })?
+            .trim()
+            .to_string()
+        };
+        if login.is_empty() {
+            bail!("`gh` reported an empty login. Run `gh auth status`.");
+        }
+        Ok(self.viewer.get_or_init(|| login))
+    }
+
     pub fn fetch_issues(&self, numbers: &[i64]) -> Result<Vec<Issue>> {
         let mut issues = Vec::new();
         for number in numbers {
@@ -945,18 +1006,50 @@ impl Repo {
 
     // -- follow-ups -------------------------------------------------------
 
+    /// The queue of follow-ups recorded locally rather than filed, which
+    /// `spar followup` works.
+    pub fn followups_path(&self) -> PathBuf {
+        self.root.join(STATE_DIR).join("followups.md")
+    }
+
+    /// What `spar followup` already dealt with, kept beside the queue.
+    ///
+    /// Two jobs. It is what stops `append_local_followup` re-recording a
+    /// follow-up whose entry has since left the queue, which would otherwise
+    /// turn the file into a ring buffer of things already filed. And it keeps
+    /// the text of an entry a screening pass ruled stale, so a wrong verdict
+    /// costs a re-read rather than the only copy of a real defect.
+    pub fn worked_followups_path(&self) -> PathBuf {
+        self.root.join(STATE_DIR).join("followups.done.md")
+    }
+
+    /// What `spar checkin` has already answered on one pull request or issue.
+    pub fn checkin_state_path(&self, number: i64) -> PathBuf {
+        self.root
+            .join(STATE_DIR)
+            .join("state")
+            .join(format!("checkin-{number}.json"))
+    }
+
     /// Append a follow-up to a local note instead of the tracker.
     ///
     /// Deduplicated on the title, matching the issue path. Returns a display
     /// string, or None when it was already recorded. The body arrives with its
     /// provenance already stamped by the caller, so nothing is added here.
+    ///
+    /// Both files are checked, because `spar followup` removes an entry from
+    /// the queue once it has filed it. Checking only the queue would let the
+    /// next run that rediscovers the same defect append it again, on top of the
+    /// issue that now exists for it.
     pub fn append_local_followup(&self, title: &str, body: &str) -> Option<String> {
-        let path = self.root.join(STATE_DIR).join("followups.md");
+        let path = self.followups_path();
         let heading = format!("## {}", title.trim());
-        if let Ok(existing) = std::fs::read_to_string(&path) {
-            if existing.contains(&heading) {
-                logdim!("follow-up already noted: {title}");
-                return None;
+        for seen in [&path, &self.worked_followups_path()] {
+            if let Ok(existing) = std::fs::read_to_string(seen) {
+                if existing.contains(&heading) {
+                    logdim!("follow-up already noted: {title}");
+                    return None;
+                }
             }
         }
         if let Some(parent) = path.parent() {
@@ -965,7 +1058,11 @@ impl Repo {
         use std::io::Write;
         // The caller already stamped the provenance into the body. Adding
         // "From #N." here as well printed it twice, in two different wordings.
-        let entry = format!("{heading}\n\n{}\n\n", body.trim());
+        //
+        // The marker above the heading is what makes the entry boundary
+        // unambiguous to the parser, since the body's own sections are written
+        // at the same heading level as the title.
+        let entry = format!("{FOLLOWUP_MARKER}\n{heading}\n\n{}\n\n", body.trim());
         match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -979,6 +1076,30 @@ impl Repo {
                 logdim!("could not write {}: {e}", path.display());
                 None
             }
+        }
+    }
+
+    /// Record what `spar followup` did with an entry, and why.
+    ///
+    /// Best effort: an archive that could not be written is not a reason to
+    /// stop, since the entry has already been filed or ruled on.
+    pub fn archive_followup(&self, title: &str, body: &str, verdict: &str) {
+        let path = self.worked_followups_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        use std::io::Write;
+        let entry = format!(
+            "{FOLLOWUP_MARKER}\n## {}\n\n{verdict}\n\n{}\n\n",
+            title.trim(),
+            body.trim()
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = file.write_all(entry.as_bytes());
         }
     }
 
@@ -1083,13 +1204,15 @@ impl Repo {
             .map(|_| ())
     }
 
-    fn comments_json(&self, number: i64) -> Vec<Value> {
+    /// Top level comments. Works for issues and pull requests alike, because
+    /// GitHub serves both from the issues endpoint.
+    pub fn issue_comments(&self, number: i64) -> Vec<Value> {
         let path = format!("repos/{{owner}}/{{repo}}/issues/{number}/comments");
         parse_comment_pages(&self.gh_try(&["api", "--paginate", &path]))
     }
 
     fn state_comments(&self, number: i64) -> Vec<(i64, String)> {
-        self.comments_json(number)
+        self.issue_comments(number)
             .into_iter()
             .filter_map(|c| {
                 let body = c.get("body").and_then(Value::as_str)?.to_string();
@@ -1324,22 +1447,33 @@ pub fn is_finished(state: &str) -> bool {
     matches!(state.trim().to_uppercase().as_str(), "MERGED" | "CLOSED")
 }
 
-/// Write JSON through a temporary file and rename, so a kill cannot leave a
-/// truncated state file behind.
-pub fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
+/// Write text through a temporary file and rename, so a kill cannot leave a
+/// truncated file behind.
+///
+/// The follow-up queue is the one file spar rewrites in place rather than
+/// appends to, and a truncated queue is lost work: what it held was never
+/// written anywhere else.
+pub fn write_text_atomic(path: &Path, text: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| spar_err!("could not create {}: {e}", parent.display()))?;
     }
+    // The extension defaults to `json` so `clear_state`, which removes a
+    // leftover `pr-N.json.tmp` by name, keeps finding the one this wrote.
     let tmp = path.with_extension(format!(
         "{}.tmp",
         path.extension().and_then(|e| e.to_str()).unwrap_or("json")
     ));
-    std::fs::write(&tmp, serde_json::to_vec_pretty(value)?)
-        .map_err(|e| spar_err!("could not write {}: {e}", tmp.display()))?;
+    std::fs::write(&tmp, text).map_err(|e| spar_err!("could not write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path)
         .map_err(|e| spar_err!("could not replace {}: {e}", path.display()))?;
     Ok(())
+}
+
+/// Write JSON through a temporary file and rename, so a kill cannot leave a
+/// truncated state file behind.
+pub fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_text_atomic(path, &serde_json::to_string_pretty(value)?)
 }
 
 /// Among the open pull requests gh listed, the first that would close `issue`.
@@ -1471,6 +1605,7 @@ mod tests {
             state_store: StateStore::Local,
             followups: crate::config::Followups::Issues,
             drafts: Drafts::Never,
+            viewer: OnceLock::new(),
         }
     }
 

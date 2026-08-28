@@ -6,9 +6,12 @@
 //! and the disagreements are the useful part.
 
 pub mod agent;
+pub mod checkin;
 pub mod cli;
+pub mod comments;
 pub mod config;
 pub mod error;
+pub mod followups;
 pub mod jsonx;
 pub mod logging;
 pub mod model;

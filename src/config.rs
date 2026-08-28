@@ -258,6 +258,45 @@ impl StateStore {
     }
 }
 
+/// Whose comments `spar checkin` will act on.
+///
+/// The default is not timidity. Acting on a comment means a commit pushed to a
+/// branch because somebody typed a sentence, and `authorAssociation` is one
+/// field GitHub already returns on every comment endpoint that says whether
+/// they can write to this repository at all. Everybody is still answered in
+/// words either way; this governs only whether a comment can produce a commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Trust {
+    /// Anybody GitHub says can write here: OWNER, MEMBER, COLLABORATOR.
+    Write,
+    /// Anybody at all. Both agents still have to agree before anything changes.
+    Anyone,
+}
+
+impl std::fmt::Display for Trust {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Trust::Write => "write",
+            Trust::Anyone => "anyone",
+        })
+    }
+}
+
+impl Trust {
+    /// Whether a comment from somebody with this association may produce a
+    /// commit.
+    pub fn may_act_on(self, association: &str) -> bool {
+        match self {
+            Trust::Anyone => true,
+            Trust::Write => matches!(
+                association.trim().to_uppercase().as_str(),
+                "OWNER" | "MEMBER" | "COLLABORATOR"
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffortSchedule {
@@ -348,6 +387,18 @@ pub struct LoopCfg {
     /// can close it, so judging one on part of its body is worse than not
     /// reaching it yet.
     pub max_triage_chars: usize,
+    /// Whose comments `spar checkin` will act on.
+    pub checkin_trust: Trust,
+    /// Mark a review thread resolved when spar made the change it asked for.
+    ///
+    /// A thread spar disagreed with is left open whatever this says: the person
+    /// who raised it has not had their say yet, and it is their thread.
+    pub checkin_resolve: bool,
+    /// Most unanswered comments spar answers on one pull request in a run.
+    ///
+    /// A backstop against a long argument being read back to somebody, not a
+    /// target. What it held back is said out loud.
+    pub max_checkin_comments: usize,
     pub effort_schedule: EffortSchedule,
 }
 
@@ -374,6 +425,9 @@ impl Default for LoopCfg {
             instructions: String::new(),
             max_issue_chars: 60_000,
             max_triage_chars: 200_000,
+            checkin_trust: Trust::Write,
+            checkin_resolve: true,
+            max_checkin_comments: 20,
             effort_schedule: EffortSchedule::default(),
         }
     }

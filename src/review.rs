@@ -849,36 +849,98 @@ fn file_followup(
         return repo.append_local_followup(&title, &body);
     }
 
-    // An issue that already covers this, however it was worded. Filing a second
-    // one is the complaint; silently dropping the new wording is not much
-    // better, because a later run often carries evidence the first did not.
-    if let Some(existing) = repo.find_similar_issue(&title, &body) {
-        let known = format!("{} {}", existing.title, existing.body);
-        if !existing.open {
-            logdim!(
-                "#{} already covers '{title}' and is closed, leaving it alone",
-                existing.number
-            );
-            return None;
-        }
-        if crate::textsim::adds_information(&body, &known) {
-            match repo.comment_issue(existing.number, &body) {
-                Ok(()) => log!("added to #{}: {title}", existing.number),
-                Err(e) => logdim!("could not add to #{}: {e}", existing.number),
-            }
-        } else {
-            logdim!("#{} already says this, nothing added", existing.number);
-        }
-        return Some(existing.url);
-    }
-
-    match repo.create_issue(&title, &body) {
-        Ok(url) => Some(url),
+    match file_as_issue(repo, &title, &body) {
+        Ok(filed) => filed.url().map(str::to_string),
         Err(e) => {
             logdim!("could not file a follow-up for '{title}': {e}");
             None
         }
     }
+}
+
+/// What happened to one finding on the way to the tracker.
+#[derive(Debug, Clone)]
+pub enum Filed {
+    /// A new issue.
+    Opened(i64, String),
+    /// An open issue already covered it, and this pass had something to add.
+    AddedTo(i64, String),
+    /// An open issue already covered it, and this pass added nothing.
+    Covered(i64, String),
+    /// A closed issue already covered it. Nothing was written.
+    AlreadyClosed(i64, String),
+}
+
+impl Filed {
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            Filed::Opened(_, url) | Filed::AddedTo(_, url) | Filed::Covered(_, url) => Some(url),
+            // The work is done and closed. Reporting it as filed would put it
+            // back into a wave to be implemented again.
+            Filed::AlreadyClosed(_, _) => None,
+        }
+    }
+
+    /// The issue to work, when there is one to work.
+    pub fn number(&self) -> Option<i64> {
+        match self {
+            Filed::Opened(n, _) | Filed::AddedTo(n, _) | Filed::Covered(n, _) => Some(*n),
+            Filed::AlreadyClosed(_, _) => None,
+        }
+    }
+
+    /// One clause saying where it went, for a log line or an archive entry.
+    pub fn note(&self) -> String {
+        match self {
+            Filed::Opened(n, _) => format!("#{n}"),
+            Filed::AddedTo(n, _) => format!("added to #{n}"),
+            Filed::Covered(n, _) => format!("#{n} already says this"),
+            Filed::AlreadyClosed(n, _) => format!("#{n} covers it and is closed"),
+        }
+    }
+
+    pub fn describe(&self, title: &str) -> String {
+        let title = style::clip(title.trim(), 80);
+        match self {
+            Filed::Opened(n, _) => format!("filed #{n}: {title}"),
+            Filed::AddedTo(n, _) => format!("added to #{n}: {title}"),
+            Filed::Covered(n, _) => format!("#{n} already says this: {title}"),
+            Filed::AlreadyClosed(n, _) => format!("#{n} covers it and is closed: {title}"),
+        }
+    }
+}
+
+/// File an issue, or add to the one that already covers it.
+///
+/// Exact title matching let duplicates through: two agents, or two runs a week
+/// apart, never word one defect identically, and a real run filed two that had
+/// to be closed by hand. Filing a second copy is the complaint; silently
+/// dropping the new wording is not much better, because a later pass often
+/// carries evidence the first did not.
+///
+/// The title arrives cleaned by the caller, and it has to: searching for
+/// anything but the exact string that will land on GitHub means the duplicate
+/// check can never hit.
+pub fn file_as_issue(repo: &Repo, title: &str, body: &str) -> Result<Filed> {
+    let title = repo.clean_title(title)?;
+    if title.trim().is_empty() {
+        return Err(spar_err!("nothing left of the title after cleaning it"));
+    }
+    if let Some(existing) = repo.find_similar_issue(&title, body) {
+        let known = format!("{} {}", existing.title, existing.body);
+        if !existing.open {
+            return Ok(Filed::AlreadyClosed(existing.number, existing.url));
+        }
+        if crate::textsim::adds_information(body, &known) {
+            repo.comment_issue(existing.number, body)?;
+            return Ok(Filed::AddedTo(existing.number, existing.url));
+        }
+        return Ok(Filed::Covered(existing.number, existing.url));
+    }
+    let url = repo.create_issue(&title, body)?;
+    let number = filed_issue_number(&url)
+        .ok_or_else(|| spar_err!("filed an issue but could not read its number from {url}"))?;
+    Ok(Filed::Opened(number, url))
 }
 
 fn file_out_of_scope(

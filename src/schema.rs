@@ -268,12 +268,194 @@ pub fn adjudication() -> Value {
     })
 }
 
+/// One agent ruling on recorded follow-ups, before any becomes an issue.
+///
+/// Deliberately not the triage schema. Triage asks whether an issue is worth a
+/// pull request; this asks whether a note written weeks ago is still true of the
+/// code, which is a different question with a different expensive mistake:
+/// dropping something real, rather than scheduling something small.
+pub fn screen() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "entries": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "entry": {
+                            "type": "integer",
+                            "description": "The number this entry was given in the list above. Copy it exactly, so the verdict can be matched back to the entry it is about."
+                        },
+                        "verdict": {
+                            "type": "string",
+                            "enum": ["still_relevant", "already_fixed", "not_worth_it", "duplicate"],
+                            "description": "still_relevant files it as an issue. The other three take it out of the queue and file nothing, so say still_relevant when you are unsure: what survives is triaged by both agents afterwards and can be declined there, while what is dropped here is dropped."
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "The entry's title, which becomes the issue title. Copy it across unchanged unless it is wrong or says nothing, in which case write one that states the defect."
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "One sentence. For already_fixed, name the function or the change that fixed it, so somebody can check you. For anything but still_relevant this is the only record of why the entry was dropped, so give the reason rather than the verdict again."
+                        },
+                        "duplicate_of": {
+                            "type": ["integer", "null"],
+                            "description": "Only when the verdict is duplicate, null otherwise. An open issue number, or the number of an earlier entry in this same list."
+                        }
+                    },
+                    "required": ["entry", "verdict", "title", "reason", "duplicate_of"]
+                }
+            }
+        },
+        "required": ["entries"]
+    })
+}
+
+/// One agent judging the comments other people left on a pull request.
+///
+/// The descriptions carry the asymmetry the whole command rests on, because
+/// they travel with the request rather than sitting a thousand tokens back in
+/// the prompt: getting a decline wrong costs a person one read of a thread that
+/// stays open for them, and getting an implement wrong costs them a commit they
+/// did not ask for on a branch they own.
+pub fn checkin() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "verdicts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "ref_id": {
+                            "type": "string",
+                            "description": "The handle printed beside the comment, copied across exactly, so your answer can be matched back to it."
+                        },
+                        "ask": {
+                            "type": "string",
+                            "enum": ["implement", "defer", "decline", "answer", "nothing"],
+                            "description": "implement: the change is right and belongs on this branch. defer: the change is right and is really its own piece of work, so supply new_issue_title and new_issue_body. decline: the change should not be made. answer: a question rather than a request. nothing: nothing is being asked for."
+                        },
+                        "request": {
+                            "type": "string",
+                            "description": "What is being asked for, in one sentence, in your own words. This is how the harness checks the comment was understood before acting on it, so restate the request rather than the comment."
+                        },
+                        "reasoning": {
+                            "type": "string",
+                            "description": "One or two sentences. For decline this is the whole argument and it is posted in the thread, so give the reason and write it for the person who raised the point, not for this harness."
+                        },
+                        "unambiguous": {
+                            "type": "boolean",
+                            "description": "False if the comment could be read more than one way, or if you are guessing at what it wants. False costs a reply asking what was meant; a wrong true costs somebody a commit on their branch that they did not ask for."
+                        },
+                        "new_issue_title": {
+                            "type": ["string", "null"],
+                            "description": "Only when ask is defer, null otherwise. States the defect, not the fix."
+                        },
+                        "new_issue_body": {
+                            "type": ["string", "null"],
+                            "description": "Only when ask is defer, null otherwise. Written for somebody picking it up cold months later, not for whoever is reading this thread today."
+                        }
+                    },
+                    "required": ["ref_id", "ask", "request", "reasoning", "unambiguous", "new_issue_title", "new_issue_body"]
+                }
+            }
+        },
+        "required": ["verdicts"]
+    })
+}
+
+/// The second agent ruling on the first one's calls.
+pub fn checkin_check() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "checks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "ref_id": {
+                            "type": "string",
+                            "description": "The handle printed beside the comment, copied across exactly."
+                        },
+                        "agrees": {
+                            "type": "boolean",
+                            "description": "True only if you went to the code and confirmed the call. Do not defer to the other agent and do not agree to be agreeable: a decision you cannot confirm is one that is about to put a commit on somebody's branch in their name."
+                        },
+                        "ask": {
+                            "type": "string",
+                            "enum": ["implement", "defer", "decline", "answer", "nothing"],
+                            "description": "What you would do instead. Read only when agrees is false."
+                        },
+                        "unambiguous": {
+                            "type": "boolean",
+                            "description": "False if the comment could be read more than one way, whatever the other agent said about it."
+                        },
+                        "reasoning": {
+                            "type": "string",
+                            "description": "One or two sentences saying what you checked and what it showed. Required when you disagree, and useful when you agree."
+                        }
+                    },
+                    "required": ["ref_id", "agrees", "ask", "unambiguous", "reasoning"]
+                }
+            }
+        },
+        "required": ["checks"]
+    })
+}
+
+/// What the fix pass reports back about each change it was asked to make.
+pub fn checkin_fix() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "done": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "ref_id": {
+                            "type": "string",
+                            "description": "The handle printed beside the comment, copied across exactly."
+                        },
+                        "changed": {
+                            "type": "boolean",
+                            "description": "False if the change turned out to be wrong once you were in the code. You are not obliged to make a change you now believe is a mistake, and saying so is a better answer than making it."
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "One sentence naming what changed, or why it was left alone. This is posted in the thread the comment sits in, so write it for the person who asked rather than for this harness."
+                        }
+                    },
+                    "required": ["ref_id", "changed", "summary"]
+                }
+            }
+        },
+        "required": ["done"]
+    })
+}
+
 pub fn all() -> Vec<(&'static str, Value)> {
     vec![
         ("triage", triage()),
         ("implementation", implementation()),
         ("review", review()),
         ("response", response()),
+        ("screen", screen()),
+        ("checkin", checkin()),
+        ("checkin_check", checkin_check()),
+        ("checkin_fix", checkin_fix()),
     ]
 }
 
@@ -373,6 +555,67 @@ mod tests {
                 "a Finding holds `{field}` and the schema never asks for it, so the model will \
                  not fill it and the code reading it will always see nothing"
             );
+        }
+    }
+
+    /// The same guard for the check-in exchange. A field added to the struct
+    /// and forgotten in the schema is one the model is never asked for, so the
+    /// code reading it always sees nothing: an `unambiguous` that is never
+    /// filled would default false and answer every comment in words.
+    #[test]
+    fn the_checkin_schema_asks_for_every_field_a_verdict_holds() {
+        use crate::model::{Ask, CommentVerdict};
+
+        let asked: Vec<String> = checkin()["properties"]["verdicts"]["items"]["properties"]
+            .as_object()
+            .expect("verdict properties")
+            .keys()
+            .cloned()
+            .collect();
+
+        let populated = CommentVerdict {
+            ref_id: "c1".into(),
+            ask: Ask::Decline,
+            request: "r".into(),
+            reasoning: "w".into(),
+            unambiguous: true,
+            new_issue_title: Some("t".into()),
+            new_issue_body: Some("b".into()),
+        };
+        let held: Vec<String> = serde_json::to_value(&populated)
+            .expect("serialisable")
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect();
+
+        for field in &held {
+            assert!(
+                asked.contains(field),
+                "a CommentVerdict holds `{field}` and the schema never asks for it, so the model \
+                 will not fill it and the code reading it will always see nothing"
+            );
+        }
+    }
+
+    /// Every value the schema offers has to be one the parser accepts, or an
+    /// answer that matched the schema exactly is thrown away.
+    #[test]
+    fn the_checkin_ask_enum_matches_the_parser() {
+        use crate::model::Ask;
+
+        for schema in [
+            checkin()["properties"]["verdicts"]["items"]["properties"]["ask"].clone(),
+            checkin_check()["properties"]["checks"]["items"]["properties"]["ask"].clone(),
+        ] {
+            for value in schema["enum"].as_array().expect("an enum") {
+                let text = value.as_str().expect("a string");
+                assert!(
+                    Ask::parse_lenient(text).is_some(),
+                    "the schema offers `{text}` and the parser refuses it"
+                );
+            }
         }
     }
 

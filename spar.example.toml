@@ -125,7 +125,10 @@ followups         = "local"  # issues | local | none. Where a follow-up goes.
                              # local writes .spar/followups.md and leaves the
                              # tracker alone, which is the default because a
                              # thorough reviewer always finds something and a
-                             # tracker is somebody's queue.
+                             # tracker is somebody's queue. `spar followup`
+                             # works that file: it screens each note against
+                             # the code as it is now, files the ones that still
+                             # hold, and takes them out of the queue.
 file_non_blocking = false    # file a non-blocking finding as a follow-up. Off,
                              # and this is the setting that stops a run breeding:
                              # with it on, one issue produced ten follow-ups,
@@ -165,6 +168,25 @@ max_issue_chars   = 60000    # most of ONE issue body that reaches a prompt.
                              # rest existed. A cut is now said out loud, in the
                              # log and in the prompt, and never lands mid line
                              # or inside a code fence.
+checkin_trust     = "write"  # write | anyone. Whose comments `spar checkin`
+                             # will act on. Answering is for everybody; making
+                             # a change means a commit pushed to somebody's
+                             # branch because a stranger typed a sentence, so
+                             # by default only somebody GitHub says can write
+                             # here can cause one. Note that on a repository
+                             # you do not own, the author of a pull request is
+                             # a CONTRIBUTOR on their own PR, so "anyone" is
+                             # what you want if you are answering your own
+                             # contributors. Both agents still have to agree
+                             # either way.
+checkin_resolve   = true     # mark a review thread resolved when spar made the
+                             # change it asked for. A thread spar disagreed
+                             # with is left open whatever this says: the person
+                             # who raised it has not had their say yet.
+max_checkin_comments = 20    # most unanswered comments spar answers on one
+                             # pull request in a run. A backstop against a long
+                             # argument being read back to somebody, not a
+                             # target.
 max_triage_chars  = 200000   # most every issue body TOGETHER may add to one
                              # triage prompt. Triage reads the whole queue at
                              # once, so the queue is the only unbounded thing

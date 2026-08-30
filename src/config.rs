@@ -302,8 +302,9 @@ impl Trust {
 pub struct EffortSchedule {
     /// The deep first review.
     pub round_1: Option<String>,
-    /// Every round after the first, and the closing pass. Both are asked a
-    /// narrower question than the first review, so neither buys its depth again.
+    /// Every round after the first, and the closing pass on any run that spent
+    /// more than one. Both are asked a narrower question than the first review,
+    /// so neither buys its depth again.
     pub rest: Option<String>,
 }
 

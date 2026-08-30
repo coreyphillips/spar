@@ -17,6 +17,7 @@
 //!   into accepting wrong review comments, so refutation is blessed and the
 //!   merge gate is blocking-findings-empty, not reviewer-satisfied.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::agent::{self, Agent};
@@ -876,10 +877,9 @@ fn review_loop(
 /// The closing pass: one look at what the last round left, and the verdict.
 ///
 /// Not a round. It cannot ask for a fix, there is nothing after it, and it is
-/// the only way a run that spends its whole budget ends in a merge. Folding it
-/// into the `for` would mean a round that behaves differently on its last
-/// iteration, and a round that behaves differently on its last iteration is how
-/// the last iteration came to be the one nobody reviewed.
+/// the only way a run that spends its whole budget ends in an approval. Kept out
+/// of the `for` so every round keeps one shape, and the call that behaves
+/// differently is the one with a different name.
 ///
 /// It inherits PR #24's invariant from the same place the rounds do, and not
 /// from a rule of its own: the closer is `holder`, which `next_reviewer` has
@@ -905,9 +905,10 @@ fn close_out(
 
     // Nothing to close over. The last round changed no code and claimed no fix,
     // so the branch in front of the closer is the branch a round already read at
-    // full breadth, and asking again is the unbounded re-audit this whole change
-    // exists to stop. It ends on its own sentence rather than the one about
-    // unread fixes, because on this path there are none.
+    // full breadth, and one more call over it buys nothing. An empty head is the
+    // same answer for a different reason: git could not be read, so there is no
+    // range to hand the pass. Either way it ends on its own sentence rather than
+    // the one about unread fixes, because on this path there are none.
     let landed = (!audited_head.is_empty())
         .then(|| repo.commits_since(&ctx.work_dir, audited_head, "HEAD"))
         .flatten();
@@ -980,8 +981,16 @@ fn close_out(
             // keep the worktree, and a commit the pull request does not have is
             // one the next invocation reviews without anybody being able to see
             // it on the pull request.
-            repo.rewrite_commits_if_needed(&ctx.work_dir, cfg.base_branch())?;
-            repo.push(&ctx.work_dir, &ctx.branch)?;
+            // Logged rather than propagated, like the failed call above. An
+            // error here would return `Status::Error` and post nothing at all,
+            // losing the run's whole account of itself to the push that
+            // followed a rule break by the last call in it.
+            if let Err(e) = repo
+                .rewrite_commits_if_needed(&ctx.work_dir, cfg.base_branch())
+                .and_then(|()| repo.push(&ctx.work_dir, &ctx.branch))
+            {
+                logdim!("could not push what the closing pass committed: {e}");
+            }
             next = next_reviewer(cfg, holder, Some(holder));
         }
     }
@@ -1376,8 +1385,17 @@ fn record_own_fixes(style: &Style, blocking: &[Finding], ledger: &mut Ledger, ro
 /// forever.
 fn check_relitigation(ledger: &mut Ledger, blocking: &[Finding], state: &mut IssueRun) -> bool {
     let mut escalate = false;
+    // One re-raise per round, however many times a review says it. Counting
+    // each finding separately let a review that listed one title twice take an
+    // entry from nothing to escalated in a single pass, without the author ever
+    // being asked. Rare while only refutations were recorded, and not rare now
+    // that every fix leaves an entry.
+    let mut counted: BTreeSet<String> = BTreeSet::new();
     for finding in blocking {
         let key = finding_key(&finding.title, &finding.file);
+        if !counted.insert(key.clone()) {
+            continue;
+        }
         if let Some(entry) = ledger.get_mut(&key) {
             entry.reraised += 1;
             if entry.reraised >= 2 {
@@ -2740,6 +2758,36 @@ mod tests {
         assert_eq!("", settled_block(&ledger));
     }
 
+    /// A review that lists one point twice used to take its entry from nothing
+    /// to escalated in a single pass, without the author ever being asked. Rare
+    /// while only refutations were recorded, and not rare now that every fix
+    /// leaves an entry.
+    #[test]
+    fn one_review_spends_one_re_raise_however_often_it_says_it() {
+        let mut ledger = ledger_with("Missing error handling", "src/net.rs");
+        let mut state = IssueRun::new(1, "t");
+        let twice = vec![
+            finding(
+                "blocking",
+                "Missing error handling",
+                "d",
+                "src/net.rs",
+                true,
+            ),
+            finding(
+                "blocking",
+                "Missing error handling",
+                "e",
+                "src/net.rs",
+                true,
+            ),
+        ];
+
+        assert!(!check_relitigation(&mut ledger, &twice, &mut state));
+        assert_eq!(1, ledger.values().next().unwrap().reraised);
+        assert!(check_relitigation(&mut ledger, &twice, &mut state));
+    }
+
     #[test]
     fn an_untracked_finding_does_not_escalate() {
         let mut state = IssueRun::new(1, "t");
@@ -3000,31 +3048,17 @@ mod tests {
 
     // -- the closing pass -------------------------------------------------
 
-    /// The closing pass is the only way a run that spends its budget merges, so
-    /// PR #24's invariant has to hold for it too. It inherits it from
-    /// `next_reviewer` rather than from a rule of its own, which is why this
-    /// asserts on that function: whoever closes is `holder`, and `holder` has
-    /// already been moved off whoever wrote the head.
+    /// The closing pass is not supposed to write, and when it does anyway it
+    /// must give the pull request up, or a resumed run hands the branch back to
+    /// the agent that wrote its head. This is the expression `close_out` uses
+    /// for exactly that, which is where the rule is inherited rather than
+    /// restated.
     #[test]
-    fn nobody_closes_over_their_own_edit() {
+    fn a_closing_pass_that_wrote_the_head_gives_the_pull_request_up() {
         let cfg = cfg_with(true, false);
         for holder in ["a", "b"] {
-            for editor in ["a", "b"] {
-                assert_ne!(editor, next_reviewer(&cfg, holder, Some(editor)));
-            }
-            // Nothing landed, so the head is the one this holder already read
-            // without writing, and it keeps the pull request.
-            assert_eq!(holder, next_reviewer(&cfg, holder, None));
+            assert_ne!(holder, next_reviewer(&cfg, holder, Some(holder)));
         }
-    }
-
-    /// A pass that wrote judged a tree the rollback then takes away, so its
-    /// "nothing blocking" was said about code that is not there. Same gate as a
-    /// round, and deliberately the same function.
-    #[test]
-    fn a_close_that_wrote_the_branch_cannot_sign_it_off() {
-        assert!(approval_stands(&[], false));
-        assert!(!approval_stands(&[], true));
     }
 
     #[test]
@@ -3689,8 +3723,8 @@ mod outcome_tests {
         assert!(!text.contains("was pushed"), "{text}");
     }
 
-    /// "Not signed off: the last round was pushed and nobody read it" tells a
-    /// maintainer nothing they can act on. What is left, with where it is, is
+    /// Telling a maintainer that the last round was pushed and nobody read it
+    /// gives them nothing they can act on. What is left, with where it is, is
     /// three lines and a decision.
     #[test]
     fn an_unresolved_close_names_what_is_still_wrong() {

@@ -255,9 +255,11 @@ the PR history stay coherent.
 **The close.** A round is review and then fix, so the fix comes last and the
 budget used to run out on a commit nobody had read. After the last round, one
 closing pass by the agent that did not write the head reads what landed and the
-points the author says it fixed, and the run ends in a merge or in named points
-for a person. That is one review call more than `max_rounds` on a run that spends
-its whole budget, and none on a run that converges before it.
+points the author says it fixed, and the run ends approved or with the remaining
+points named for a person. That is at most one review call more than
+`max_rounds`, on a run that spends its whole budget and has something new to
+read. A run that converges before the budget, or whose last round changed
+nothing, buys none.
 
 **Follow-ups.** A review that finds something real but out of scope files it as
 its own issue. Before filing, spar looks for an issue that already describes the
@@ -275,16 +277,18 @@ With the default `followups = "local"` they go to `.spar/followups.md` instead
 of the tracker, and `spar followup` is what works that file. See below.
 
 **Convergence.** Only `blocking` findings gate the merge. Everything else is
-filed as a follow-up issue, listed on the PR, and the PR proceeds. This matters:
-a competent reviewer can always find something, so "no objections remaining" is
-not a stopping condition, but "no blocking objections" is. A real defect too
-small to be worth another round is `non-blocking`, and every one of those a
-reviewer chose not to gate on is listed under "Noted, not blocking", so
+either filed as a follow-up issue or listed on the PR, and the PR proceeds. This
+matters: a competent reviewer can always find something, so "no objections
+remaining" is not a stopping condition, but "no blocking objections" is. A real
+defect too small to be worth another round is `non-blocking`, and every in-scope
+one a reviewer chose not to gate on is listed under "Noted, not blocking", so
 downgrading a point is visible rather than a way to delete it.
 
-A run ends in one of four ways, three of which say something about the branch:
-approved, unresolved with the remaining points named, deadlocked with the
-argument attached, or unread when the closing pass itself could not run.
+A run that reaches an ending says which one on the pull request: approved,
+unresolved with the remaining points named, deadlocked with the argument
+attached, unchanged when the last round wrote nothing, or unread when the
+closing pass itself could not run. A run that fails on a call ends in an error
+with the reason, and comments nothing.
 
 ## Resuming work someone else started
 
@@ -645,11 +649,11 @@ smaller than another round" rather than "a genuine improvement".
 
 **No endgame.** A round is review and then fix, so the last thing a long run did
 was push a commit nobody had read, and running out of rounds was the only ending
-it could reach. Two pull requests spent three rounds each, added around 800 lines
-apiece answering reviews, and both ended by telling the maintainer the newest
-code was unreviewed. The budget now bounds the asking. After it, one closing pass
-by the agent that did not write the head is handed what landed and the fixes the
-author claimed, and asked the one question a merge turns on.
+it could reach. Two pull requests on this repository spent three rounds each and
+both ended by telling the maintainer the newest code was unreviewed. The budget
+now bounds the asking. After it, one closing pass by the agent that did not write
+the head is handed what landed and the fixes the author claimed, and asked the
+one question a merge turns on.
 
 **Re-litigation.** If A refutes a point and B raises it again next round, the
 loop never ends. Refuted points are hashed into a ledger carried across rounds

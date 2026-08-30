@@ -390,6 +390,14 @@ mod tests {
     }
 
     #[test]
+    fn stdin_reaches_the_child_byte_for_byte() {
+        let body = "line one  \n\nline three\n";
+        let out = run_str(&["/bin/sh", "-c", "cat"], &ExecOpts::new().stdin(body))
+            .expect("the child reads stdin");
+        assert_eq!(body, out);
+    }
+
+    #[test]
     fn stdout_used_when_stderr_is_empty() {
         let msg = failure_message(&argv(&["claude"]), &proc("You've hit your limit.", "", 1));
         assert!(msg.contains("hit your limit"), "{msg}");

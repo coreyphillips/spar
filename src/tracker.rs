@@ -19,7 +19,7 @@
 //! body is re-read immediately before each one, and `spar triage` prints the
 //! whole thing without writing any of it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -978,6 +978,12 @@ fn apply(repo: &Repo, tracker: i64, steps: &[Step]) -> Vec<i64> {
             }
         }
     }
+    unique_children(children)
+}
+
+fn unique_children(mut children: Vec<i64>) -> Vec<i64> {
+    let mut seen = BTreeSet::new();
+    children.retain(|number| seen.insert(*number));
     children
 }
 
@@ -1551,6 +1557,11 @@ Write the parts like this:
             assert!(matches!(reference.origin, Origin::Url(_)));
             assert_eq!(None, reference.local(HOME));
         }
+    }
+
+    #[test]
+    fn one_child_referenced_by_several_items_is_worked_once() {
+        assert_eq!(vec![8, 9], unique_children(vec![8, 8, 9, 8]));
     }
 
     // -- the line surgery -------------------------------------------------

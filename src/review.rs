@@ -444,6 +444,9 @@ fn review_loop(
     ledger: &mut Ledger,
 ) -> Result<()> {
     let base = cfg.base_branch().to_string();
+    // Never the agent that made the last commit, on entry and after every
+    // round. An approval or a deadlock ends the round with nothing edited, so
+    // those paths persist it unchanged.
     let mut holder = ctx.holder.clone();
 
     // `max_rounds` is a budget for this invocation, not a lifetime cap on the
@@ -509,28 +512,14 @@ fn review_loop(
                 ledger,
                 Ending::Deadlocked(&blocking),
             );
-            persist(
-                repo,
-                ctx.pr_number,
-                state,
-                ledger,
-                round,
-                &cfg.other(&holder),
-            );
+            persist(repo, ctx.pr_number, state, ledger, round, &holder);
             return Ok(());
         }
 
         if blocking.is_empty() {
             state.status = Status::Approved;
             post_outcome(repo, ctx.pr_number, state, ledger, Ending::Approved);
-            persist(
-                repo,
-                ctx.pr_number,
-                state,
-                ledger,
-                round,
-                &cfg.other(&holder),
-            );
+            persist(repo, ctx.pr_number, state, ledger, round, &holder);
             // Before the merge, not after: a draft cannot be merged, and the
             // state the draft was signalling, that two agents were still
             // arguing about it, has just stopped being true.
@@ -590,7 +579,7 @@ fn review_loop(
 
         repo.rewrite_commits_if_needed(&ctx.work_dir, &base)?;
         repo.push(&ctx.work_dir, &ctx.branch)?;
-        holder = cfg.other(&holder);
+        holder = next_reviewer(cfg, &holder, review.next_action);
         persist(repo, ctx.pr_number, state, ledger, round, &holder);
     }
 
@@ -601,6 +590,24 @@ fn review_loop(
     post_outcome(repo, ctx.pr_number, state, ledger, Ending::OutOfRounds);
     persist(repo, ctx.pr_number, state, ledger, last_round, &holder);
     Ok(())
+}
+
+/// Who reviews the next round: never the agent that made the last commit.
+///
+/// `fix_myself` leaves the reviewer holding its own edit, so the PR changes
+/// hands. `hand_back` leaves the author holding it, so the reviewer keeps the PR
+/// and reads the fix it asked for. Handing it to the author instead puts an
+/// agent in front of its own fix, and an agent that reviews its own fix approves
+/// it, which ends the loop.
+///
+/// `merge` cannot arrive here with blocking findings outstanding, but a reviewer
+/// that raises them and asks to merge anyway takes the hand back path, so it is
+/// grouped with it.
+fn next_reviewer(cfg: &Config, reviewer: &str, action: NextAction) -> String {
+    match action {
+        NextAction::FixMyself => cfg.other(reviewer),
+        NextAction::HandBack | NextAction::Merge => reviewer.to_string(),
+    }
 }
 
 /// The inclusive range of round numbers this invocation will work through.
@@ -1500,6 +1507,39 @@ mod tests {
     #[test]
     fn nothing_is_released_when_worktrees_are_off() {
         assert!(!should_release(&cfg_with(false, false), Status::Approved));
+    }
+
+    // -- custody ---------------------------------------------------------
+
+    /// The reviewer fixed the findings itself, so it wrote the head and the
+    /// other agent takes round 2.
+    #[test]
+    fn fixing_your_own_findings_hands_the_pr_over() {
+        let cfg = cfg_with(true, false);
+        assert_eq!("a", next_reviewer(&cfg, "b", NextAction::FixMyself));
+        assert_eq!("b", next_reviewer(&cfg, "a", NextAction::FixMyself));
+    }
+
+    /// The author wrote the head, so the reviewer keeps the PR. Flipping here
+    /// gave the author its own fix to review in round 2, and an approval of it
+    /// ended the loop.
+    #[test]
+    fn handing_back_keeps_the_reviewer_for_the_next_round() {
+        let cfg = cfg_with(true, false);
+        assert_eq!("b", next_reviewer(&cfg, "b", NextAction::HandBack));
+        assert_eq!("a", next_reviewer(&cfg, "a", NextAction::HandBack));
+    }
+
+    /// Whoever holds round 2 did not write what it is reading, on either path.
+    /// `a` implements, so `b` reviews round 1.
+    #[test]
+    fn nobody_reviews_their_own_edit() {
+        let cfg = cfg_with(true, false);
+        let round_1 = cfg.other(&cfg.first_implementor);
+        assert_eq!("b", round_1);
+        for (action, editor) in [(NextAction::FixMyself, "b"), (NextAction::HandBack, "a")] {
+            assert_ne!(editor, next_reviewer(&cfg, &round_1, action), "{action}");
+        }
     }
 
     // -- round budget ----------------------------------------------------

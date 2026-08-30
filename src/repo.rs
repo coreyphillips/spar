@@ -287,7 +287,7 @@ impl Repo {
         self.git_try(&["fetch", "origin", &branch]);
         let remote_branch = format!("origin/{branch}");
         if self.rev_exists(&self.root, &remote_branch) {
-            let ahead = self.commit_subjects(&self.root, &remote_branch, base).len();
+            let ahead = self.commit_count(&self.root, &remote_branch, base);
             if ahead > 0 {
                 bail!(
                     "origin/{branch} already has {ahead} commit(s) that are not on {base}, and no \
@@ -308,20 +308,21 @@ impl Repo {
         // reachable from the reflog alone, which nothing would tell anyone to
         // look at.
         if self.rev_exists(&self.root, &branch) {
-            let subjects = self.commit_subjects(&self.root, &branch, base);
-            if !subjects.is_empty() && self.any_pr_for_branch(&branch).is_none() {
-                let listed = subjects
+            let ahead = self.commit_count(&self.root, &branch, base);
+            if ahead > 0 && !self.pull_request_holds(&branch, base) {
+                let listed = self
+                    .commit_lines(&self.root, &branch, base)
                     .iter()
-                    .map(|s| format!("  {s}"))
+                    .map(|line| format!("  {line}"))
                     .collect::<Vec<_>>()
                     .join("\n");
                 bail!(
-                    "the local branch {branch} has {} commit(s) that are not on {base}, and \
-                     nothing accounts for them: no branch on origin and no pull request. \
-                     Rebuilding it would delete the only copy.\n{listed}\nPush it and run `spar \
+                    "the local branch {branch} has {ahead} commit(s) that are not on {base}, and \
+                     nothing accounts for them: no branch on origin and no pull request that \
+                     holds them. Rebuilding it would delete the only copy.\n{listed}\nPush it \
+                     and run `spar \
                      resume <pr>` on the pull request to continue it, or delete it with `git \
-                     branch -D {branch}` if it is stale.",
-                    subjects.len()
+                     branch -D {branch}` if it is stale."
                 );
             }
         }
@@ -351,6 +352,41 @@ impl Repo {
         })?;
         self.record_branch(&branch, "issue", issue);
         Ok((path, branch))
+    }
+
+    /// Whether a pull request already holds every commit `branch` has beyond
+    /// `base`.
+    ///
+    /// GitHub serves `refs/pull/N/head` for as long as the repository lives, so
+    /// commits that reached a pull request outlive the branch they were pushed
+    /// from. A matching branch name does not establish that on its own: an
+    /// issue worked twice reuses the name, and the merged pull request from the
+    /// first round says nothing about where the second round's commits are.
+    fn pull_request_holds(&self, branch: &str, base: &str) -> bool {
+        self.prs_for_branch(branch)
+            .iter()
+            .any(|pr| self.pr_head_holds(pr.number, branch, base))
+    }
+
+    fn pr_head_holds(&self, number: i64, branch: &str, base: &str) -> bool {
+        let head = format!("refs/spar/pr-head/{number}");
+        let refspec = format!("+refs/pull/{number}/head:{head}");
+        if self.git(&["fetch", "origin", &refspec]).is_err() {
+            return false;
+        }
+        let held = self.commits_held_by(branch, base, &head);
+        self.git_try(&["update-ref", "-d", &head]);
+        held
+    }
+
+    /// Whether `other` already contains every commit `branch` has beyond
+    /// `base`. False when either ref fails to resolve, so a ref that is not
+    /// there cannot vouch for anything.
+    pub fn commits_held_by(&self, branch: &str, base: &str, other: &str) -> bool {
+        let range = format!("{}..{branch}", self.base_ref(&self.root, base));
+        self.git_try(&["rev-list", "--count", &range, "--not", other])
+            .trim()
+            == "0"
     }
 
     pub fn worktree_remove(&self, issue: i64) {
@@ -475,6 +511,31 @@ impl Repo {
             .git_try_at(Some(cwd), &["log", &range, "--oneline"])
             .trim()
             .is_empty()
+    }
+
+    /// How many commits `refname` carries that the base does not.
+    ///
+    /// Counted from the commits themselves rather than from `commit_subjects`,
+    /// which drops a commit whose message is empty. The guards in
+    /// `worktree_add` decide whether to delete a branch on this number, and an
+    /// empty message must not read as an empty branch.
+    pub fn commit_count(&self, cwd: &Path, refname: &str, base: &str) -> usize {
+        let range = format!("{}..{refname}", self.base_ref(cwd, base));
+        self.git_try_at(Some(cwd), &["rev-list", "--count", &range])
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    /// One `hash subject` line per commit `refname` carries that the base does
+    /// not, oldest first. For showing a person what is on a branch, so the
+    /// hash keeps a commit with no message from listing as nothing.
+    pub fn commit_lines(&self, cwd: &Path, refname: &str, base: &str) -> Vec<String> {
+        let range = format!("{}..{refname}", self.base_ref(cwd, base));
+        self.git_try_at(Some(cwd), &["log", &range, "--reverse", "--format=%h %s"])
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     /// The subjects of the commits `refname` carries that the base does not,
@@ -731,20 +792,17 @@ impl Repo {
     }
 
     pub fn pr_for_branch(&self, branch: &str) -> Option<PrRef> {
-        self.branch_pr(branch, "open")
+        self.branch_prs(branch, "open").into_iter().next()
     }
 
-    /// A pull request for this branch whatever became of it, merged or closed
-    /// included.
-    ///
-    /// "Is there one open" is the right question when deciding what to
-    /// continue, and the wrong one when deciding whether commits on a branch
-    /// exist anywhere but here: a merged pull request is not work at risk.
-    pub fn any_pr_for_branch(&self, branch: &str) -> Option<PrRef> {
-        self.branch_pr(branch, "all")
+    /// Every pull request opened from this branch, merged and closed ones
+    /// included, because a commit is preserved by whichever one carries it and
+    /// that is rarely the newest.
+    fn prs_for_branch(&self, branch: &str) -> Vec<PrRef> {
+        self.branch_prs(branch, "all")
     }
 
-    fn branch_pr(&self, branch: &str, state: &str) -> Option<PrRef> {
+    fn branch_prs(&self, branch: &str, state: &str) -> Vec<PrRef> {
         let text = self.gh_try(&[
             "pr",
             "list",
@@ -755,15 +813,7 @@ impl Repo {
             "--json",
             "number,url,title",
         ]);
-        serde_json::from_str::<Vec<PrRef>>(text.trim())
-            .ok()
-            .and_then(|mut v| {
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(v.remove(0))
-                }
-            })
+        serde_json::from_str::<Vec<PrRef>>(text.trim()).unwrap_or_default()
     }
 
     /// Whether a number names an issue or a pull request.

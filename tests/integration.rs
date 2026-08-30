@@ -1093,6 +1093,103 @@ fn a_local_branch_that_matches_the_base_is_not_treated_as_work() {
     repo.worktree_remove(46);
 }
 
+/// `git commit --allow-empty-message` is legal and leaves a commit with no
+/// subject line, which is exactly what a listing of subjects drops. The guards
+/// count commits instead, or a branch whose work happens to be unnamed reads as
+/// an empty branch and gets rebuilt over.
+#[test]
+fn a_commit_with_no_message_is_still_work() {
+    let fx = repo("noclobber-blank");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+
+    git(&fx.work, &["checkout", "-q", "-b", "issue-47"]);
+    std::fs::write(fx.work.join("feature.txt"), "round one\n").unwrap();
+    git(&fx.work, &["add", "."]);
+    git(
+        &fx.work,
+        &["commit", "-q", "--allow-empty-message", "-m", ""],
+    );
+    let before = git(&fx.work, &["rev-parse", "issue-47"]);
+    git(&fx.work, &["checkout", "-q", "main"]);
+
+    let err = repo.worktree_add(47, "main").unwrap_err().to_string();
+
+    assert!(err.contains("1 commit(s)"), "{err}");
+    assert_eq!(
+        before,
+        git(&fx.work, &["rev-parse", "issue-47"]),
+        "the unpushed work must still be reachable"
+    );
+}
+
+#[test]
+fn a_pushed_commit_with_no_message_is_still_work() {
+    let fx = repo("noclobber-blank-remote");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+
+    git(&fx.work, &["checkout", "-q", "-b", "issue-48"]);
+    std::fs::write(fx.work.join("feature.txt"), "round one\n").unwrap();
+    git(&fx.work, &["add", "."]);
+    git(
+        &fx.work,
+        &["commit", "-q", "--allow-empty-message", "-m", ""],
+    );
+    git(&fx.work, &["push", "-q", "-u", "origin", "issue-48"]);
+    git(&fx.work, &["checkout", "-q", "main"]);
+    let before = git(&fx.work, &["rev-parse", "origin/issue-48"]);
+
+    let err = repo.worktree_add(48, "main").unwrap_err().to_string();
+
+    assert!(err.contains("force push"), "{err}");
+    assert_eq!(
+        before,
+        git(&fx.work, &["rev-parse", "origin/issue-48"]),
+        "the previous work must still be on origin"
+    );
+}
+
+/// What lets the local guard rebuild a branch: a pull request already holds its
+/// commits. Reusing a branch name for a second round puts new commits under the
+/// old number, and the head that pull request preserved holds the round it was
+/// opened from and nothing after it.
+#[test]
+fn a_pull_request_head_holds_only_what_it_was_opened_from() {
+    let fx = repo("pr-head-holds");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let pr_head = "refs/spar/test-pr-head";
+
+    git(&fx.work, &["checkout", "-q", "-b", "issue-49"]);
+    commit(
+        &fx.work,
+        "feature.txt",
+        "round one\n",
+        "First round, merged",
+    );
+    // What GitHub still serves at refs/pull/N/head after the branch is gone.
+    git(&fx.work, &["update-ref", pr_head, "issue-49"]);
+
+    assert!(
+        repo.commits_held_by("issue-49", "main", pr_head),
+        "the pull request holds the commits it was opened from"
+    );
+
+    commit(
+        &fx.work,
+        "feature.txt",
+        "round two\n",
+        "Second round, unpushed",
+    );
+
+    assert!(
+        !repo.commits_held_by("issue-49", "main", pr_head),
+        "a commit made after the pull request is not on its head"
+    );
+    assert!(
+        !repo.commits_held_by("issue-49", "main", "refs/spar/does-not-exist"),
+        "a ref that does not resolve cannot vouch for anything"
+    );
+}
+
 #[test]
 fn a_fresh_issue_is_unaffected_by_the_guard() {
     let fx = repo("noclobber-fresh");

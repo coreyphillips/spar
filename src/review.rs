@@ -515,7 +515,8 @@ fn resume_inner(
 
     match &saved {
         Some(_) => log!(
-            "PR #{pr_number}: resuming at round {start_round}, {} settled point(s), next up {holder}",
+            "PR #{pr_number}: resuming at round {start_round}, {} point(s) on record, next up \
+             {holder}",
             ledger.len()
         ),
         None => log!("PR #{pr_number}: no prior spar state, starting fresh with {holder}"),
@@ -922,20 +923,28 @@ fn settled_block(ledger: &Ledger) -> String {
     if ledger.is_empty() {
         return String::new();
     }
+    // A fixed point has no line here. The code changed for it, which is the
+    // opposite of what this block says, and it goes in the answers block
+    // instead, where it reads as a claim to check rather than an argument
+    // already won.
     let lines: Vec<String> = ledger
         .values()
-        .map(|e| match e.outcome {
-            Settled::Refuted => format!("- {}: refuted because {}", e.title, e.reasoning),
-            Settled::Filed => format!(
+        .filter_map(|e| match e.outcome {
+            Settled::Refuted => Some(format!("- {}: refuted because {}", e.title, e.reasoning)),
+            Settled::Filed => Some(format!(
                 "- {}: out of scope here, and filed. {}",
                 e.title, e.reasoning
-            ),
-            Settled::Dropped => format!(
+            )),
+            Settled::Dropped => Some(format!(
                 "- {}: out of scope here, and not filed. {}",
                 e.title, e.reasoning
-            ),
+            )),
+            Settled::Fixed => None,
         })
         .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
     format!(
         "\nThe following points were already raised and settled, by a refutation or by a \
          follow-up issue. Treat them as settled. Do not raise them again unless you have new \
@@ -963,14 +972,28 @@ fn check_relitigation(ledger: &mut Ledger, blocking: &[Finding], state: &mut Iss
             entry.reraised += 1;
             if entry.reraised >= 2 {
                 state.notes.push(format!(
-                    "'{}' was settled and re-raised twice; escalating.",
-                    finding.title
+                    "'{}' {}",
+                    finding.title,
+                    why_escalated(entry.outcome)
                 ));
                 escalate = true;
             }
         }
     }
     escalate
+}
+
+/// What a person is told about a point that ran out of tries.
+///
+/// A fix that missed twice is not an argument nobody would give up, and calling
+/// it one sends a maintainer to the wrong side of it. The code changed twice for
+/// this point and the reviewer still says it is wrong, which is a different
+/// thing to look at and a more likely one to be right about.
+fn why_escalated(outcome: Settled) -> &'static str {
+    match outcome {
+        Settled::Fixed => "was fixed twice and raised again; escalating.",
+        _ => "was settled and re-raised twice; escalating.",
+    }
 }
 
 fn normalise(text: &str) -> String {
@@ -1094,7 +1117,29 @@ fn apply_dispositions(
                     },
                 );
             }
-            Action::Fixed => fixed.push(title),
+            Action::Fixed => {
+                // Recorded like every other disposition, on the reviewer's own
+                // wording, so a re-raise next round hashes to this entry.
+                //
+                // Fixing is what most dispositions are, and it was the one that
+                // left nothing behind. The next round met the fix as ordinary
+                // code with no sign anybody had asked for it, and the guard that
+                // ends an argument had only refutations to match, so across six
+                // fix rounds on two pull requests it never fired once.
+                settle(
+                    ledger,
+                    finding_key(canonical, &file),
+                    LedgerEntry {
+                        title: title.clone(),
+                        file: file.clone(),
+                        reasoning: style::summary(&d.reasoning, &repo.style),
+                        round,
+                        reraised: 0,
+                        outcome: Settled::Fixed,
+                    },
+                );
+                fixed.push(title);
+            }
         }
     }
 
@@ -1411,8 +1456,8 @@ pub enum Ending<'a> {
     /// The round budget ran out. The last round's fixes were pushed but never
     /// reviewed, which is the part a maintainer has to know.
     OutOfRounds,
-    /// A point was refuted and raised again anyway. Nobody is going to break
-    /// the tie but a person.
+    /// A point that ran out of tries: refuted and raised again anyway, or fixed
+    /// twice and raised again. Nobody is going to break the tie but a person.
     Deadlocked(&'a [Finding]),
 }
 
@@ -1533,6 +1578,15 @@ pub fn outcome_comment(
                         // comment you are reading.
                         Some((Settled::Dropped, reason)) => format!(
                             "{title}{where_at}. Out of scope here, and not filed: {}",
+                            style::summary(&reason, style)
+                        ),
+                        // Not a refutation, so it must not read as one. Nobody
+                        // argued this point down: it was fixed, raised again,
+                        // fixed again, and raised again, and what a person has
+                        // to weigh is a fix that keeps missing rather than an
+                        // argument neither agent would give up.
+                        Some((Settled::Fixed, reason)) => format!(
+                            "{title}{where_at}. Fixed and raised again. The author said: {}",
                             style::summary(&reason, style)
                         ),
                         None => format!("{title}{where_at}"),
@@ -2054,6 +2108,60 @@ mod tests {
         let blocking = vec![finding("blocking", "nit about naming", "d", "a.rs", true)];
         assert!(!check_relitigation(&mut ledger, &blocking, &mut state));
         assert!(check_relitigation(&mut ledger, &blocking, &mut state));
+    }
+
+    /// Fixing is what most dispositions are, and it recorded nothing, so the
+    /// guard had only refutations to match and never fired on a real run. Three
+    /// tries at one point is a person's problem, not another round's.
+    #[test]
+    fn a_point_fixed_twice_and_raised_again_escalates() {
+        let mut ledger = ledger_with("Unbounded loop", "src/x.rs");
+        for entry in ledger.values_mut() {
+            entry.outcome = Settled::Fixed;
+        }
+        let mut state = IssueRun::new(1, "t");
+        let blocking = vec![finding("blocking", "Unbounded loop", "d", "src/x.rs", true)];
+
+        assert!(!check_relitigation(&mut ledger, &blocking, &mut state));
+        assert!(check_relitigation(&mut ledger, &blocking, &mut state));
+    }
+
+    /// A maintainer reading "settled and re-raised" about a fix that genuinely
+    /// did not work sides with the author, and is wrong.
+    #[test]
+    fn a_fix_that_missed_twice_is_not_reported_as_a_refutation() {
+        assert!(why_escalated(Settled::Fixed).contains("fixed twice"));
+        for outcome in [Settled::Refuted, Settled::Filed, Settled::Dropped] {
+            assert!(why_escalated(outcome).contains("settled"), "{outcome}");
+        }
+    }
+
+    /// The settled block tells a reviewer the code will not change for a point.
+    /// That is the opposite of what happened to a fix, and a fixed point printed
+    /// there reads as an argument already won.
+    #[test]
+    fn a_fixed_point_is_not_in_the_settled_block() {
+        let mut ledger = ledger_with("refuted point", "a.rs");
+        ledger.extend(ledger_with("fixed point", "b.rs"));
+        for entry in ledger.values_mut() {
+            if entry.title == "fixed point" {
+                entry.outcome = Settled::Fixed;
+            }
+        }
+        let block = settled_block(&ledger);
+        assert!(block.contains("refuted point"));
+        assert!(!block.contains("fixed point"));
+    }
+
+    /// And a ledger holding nothing but fixes has no settled block at all,
+    /// rather than a heading with no points under it.
+    #[test]
+    fn a_ledger_of_only_fixes_says_nothing_is_settled() {
+        let mut ledger = ledger_with("fixed point", "b.rs");
+        for entry in ledger.values_mut() {
+            entry.outcome = Settled::Fixed;
+        }
+        assert_eq!("", settled_block(&ledger));
     }
 
     #[test]

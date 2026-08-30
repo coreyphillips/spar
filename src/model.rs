@@ -761,15 +761,24 @@ pub struct Plan {
 }
 
 string_enum! {
-    /// How a point stopped being open. Every ending means the same thing to the
-    /// next round: the code will not change for it here, so raising it again
-    /// only spends a round. They do not mean the same thing to a person, which
-    /// is why `Dropped` is not folded into `Filed`: only `Filed` promises that
-    /// somewhere holds the point.
+    /// How a point stands, one round to the next.
+    ///
+    /// Three of these are endings: the code will not change for the point here,
+    /// so raising it again only spends a round. They do not mean the same thing
+    /// to a person, which is why `Dropped` is not folded into `Filed`: only
+    /// `Filed` promises that somewhere holds the point.
+    ///
+    /// `Fixed` is not an ending. The code changed, the change is the author's
+    /// claim about the point, and nothing has checked it. It is here because the
+    /// ledger is the only thing a later round reads, and recording nothing for a
+    /// fix left it holding only the points the reviewer lost. Six fix rounds
+    /// across two pull requests produced no entry at all, and the guard that
+    /// ends an argument had nothing to match.
     pub enum Settled {
         Refuted = "refuted" | "refute" | "rejected",
         Filed = "filed" | "filed_issue" | "filed-issue" | "out_of_scope",
         Dropped = "dropped" | "not_filed" | "not-filed" | "unfiled",
+        Fixed = "fixed" | "fix" | "changed",
     }
 }
 

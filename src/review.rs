@@ -23,7 +23,7 @@ use crate::error::{Result, SparError};
 use crate::jsonx::finding_key;
 use crate::model::{
     Action, Dispute, Finding, Implementation, Issue, IssueRun, Ledger, LedgerEntry, NextAction,
-    PersistedState, PlanItem, PrView, ResponseDoc, Review, Severity, SkippedItem, Status,
+    PersistedState, PlanItem, PrView, ResponseDoc, Review, Settled, Severity, SkippedItem, Status,
     STATE_VERSION,
 };
 use crate::repo::Repo;
@@ -444,6 +444,9 @@ fn review_loop(
     ledger: &mut Ledger,
 ) -> Result<()> {
     let base = cfg.base_branch().to_string();
+    // Never the agent that made the last commit, on entry and after every
+    // round. An approval or a deadlock ends the round with nothing edited, so
+    // those paths persist it unchanged.
     let mut holder = ctx.holder.clone();
 
     // `max_rounds` is a budget for this invocation, not a lifetime cap on the
@@ -509,28 +512,14 @@ fn review_loop(
                 ledger,
                 Ending::Deadlocked(&blocking),
             );
-            persist(
-                repo,
-                ctx.pr_number,
-                state,
-                ledger,
-                round,
-                &cfg.other(&holder),
-            );
+            persist(repo, ctx.pr_number, state, ledger, round, &holder);
             return Ok(());
         }
 
         if blocking.is_empty() {
             state.status = Status::Approved;
             post_outcome(repo, ctx.pr_number, state, ledger, Ending::Approved);
-            persist(
-                repo,
-                ctx.pr_number,
-                state,
-                ledger,
-                round,
-                &cfg.other(&holder),
-            );
+            persist(repo, ctx.pr_number, state, ledger, round, &holder);
             // Before the merge, not after: a draft cannot be merged, and the
             // state the draft was signalling, that two agents were still
             // arguing about it, has just stopped being true.
@@ -590,7 +579,7 @@ fn review_loop(
 
         repo.rewrite_commits_if_needed(&ctx.work_dir, &base)?;
         repo.push(&ctx.work_dir, &ctx.branch)?;
-        holder = cfg.other(&holder);
+        holder = next_reviewer(cfg, &holder, review.next_action);
         persist(repo, ctx.pr_number, state, ledger, round, &holder);
     }
 
@@ -601,6 +590,24 @@ fn review_loop(
     post_outcome(repo, ctx.pr_number, state, ledger, Ending::OutOfRounds);
     persist(repo, ctx.pr_number, state, ledger, last_round, &holder);
     Ok(())
+}
+
+/// Who reviews the next round: never the agent that made the last commit.
+///
+/// `fix_myself` leaves the reviewer holding its own edit, so the PR changes
+/// hands. `hand_back` leaves the author holding it, so the reviewer keeps the PR
+/// and reads the fix it asked for. Handing it to the author instead puts an
+/// agent in front of its own fix, and an agent that reviews its own fix approves
+/// it, which ends the loop.
+///
+/// `merge` cannot arrive here with blocking findings outstanding, but a reviewer
+/// that raises them and asks to merge anyway takes the hand back path, so it is
+/// grouped with it.
+fn next_reviewer(cfg: &Config, reviewer: &str, action: NextAction) -> String {
+    match action {
+        NextAction::FixMyself => cfg.other(reviewer),
+        NextAction::HandBack | NextAction::Merge => reviewer.to_string(),
+    }
 }
 
 /// The inclusive range of round numbers this invocation will work through.
@@ -659,17 +666,33 @@ fn settled_block(ledger: &Ledger) -> String {
     }
     let lines: Vec<String> = ledger
         .values()
-        .map(|e| format!("- {}: refuted because {}", e.title, e.reasoning))
+        .map(|e| match e.outcome {
+            Settled::Refuted => format!("- {}: refuted because {}", e.title, e.reasoning),
+            Settled::Filed => format!(
+                "- {}: out of scope here, and filed. {}",
+                e.title, e.reasoning
+            ),
+        })
         .collect();
     format!(
-        "\nThe following points were already raised and refuted. Treat them as settled. Do not \
-         raise them again unless you have new evidence:\n{}",
+        "\nThe following points were already raised and settled, by a refutation or by a \
+         follow-up issue. Treat them as settled. Do not raise them again unless you have new \
+         evidence:\n{}",
         lines.join("\n")
     )
 }
 
-/// A point refuted and then raised twice more goes to a person rather than
-/// looping forever.
+/// Record a point as settled, keeping any re-raise count it already carries.
+/// Answering the same point a second time does not reset the argument, and
+/// zeroing the count here would put the escalation guard out of reach: the
+/// count is spent every round and rebuilt from nothing every round.
+fn settle(ledger: &mut Ledger, key: String, entry: LedgerEntry) {
+    let reraised = ledger.get(&key).map(|e| e.reraised).unwrap_or(0);
+    ledger.insert(key, LedgerEntry { reraised, ..entry });
+}
+
+/// A settled point raised twice more goes to a person rather than looping
+/// forever.
 fn check_relitigation(ledger: &mut Ledger, blocking: &[Finding], state: &mut IssueRun) -> bool {
     let mut escalate = false;
     for finding in blocking {
@@ -678,7 +701,7 @@ fn check_relitigation(ledger: &mut Ledger, blocking: &[Finding], state: &mut Iss
             entry.reraised += 1;
             if entry.reraised >= 2 {
                 state.notes.push(format!(
-                    "'{}' was refuted and re-raised twice; escalating.",
+                    "'{}' was settled and re-raised twice; escalating.",
                     finding.title
                 ));
                 escalate = true;
@@ -746,7 +769,8 @@ fn apply_dispositions(
         match d.action {
             Action::Refuted => {
                 let reasoning = style::summary(&d.reasoning, &repo.style);
-                ledger.insert(
+                settle(
+                    ledger,
                     finding_key(canonical, &file),
                     LedgerEntry {
                         title: title.clone(),
@@ -754,6 +778,7 @@ fn apply_dispositions(
                         reasoning: reasoning.clone(),
                         round,
                         reraised: 0,
+                        outcome: Settled::Refuted,
                     },
                 );
                 state.disputes.push(Dispute {
@@ -774,10 +799,29 @@ fn apply_dispositions(
                     .filter(|b| !b.trim().is_empty())
                     .unwrap_or_else(|| d.reasoning.clone());
                 let recorded = file_followup(repo, &new_title, &new_body, subject, cfg, state);
+                let mut reasoning = style::summary(&d.reasoning, &repo.style);
                 if let Some(url) = recorded {
+                    reasoning = format!("{reasoning} Tracked in {}.", as_reference(&url));
                     state.filed.push(url.clone());
                     filed.push(url);
                 }
+                // Settled like a refutation, because it ends the same way: the
+                // code will not change for this point on this branch. Without
+                // the entry the reviewer keeping the PR raises it again next
+                // round, the author files a duplicate, and the round budget
+                // goes on one point nobody disagrees about.
+                settle(
+                    ledger,
+                    finding_key(canonical, &file),
+                    LedgerEntry {
+                        title: title.clone(),
+                        file: file.clone(),
+                        reasoning,
+                        round,
+                        reraised: 0,
+                        outcome: Settled::Filed,
+                    },
+                );
             }
             Action::Fixed => fixed.push(title),
         }
@@ -1080,22 +1124,22 @@ pub fn post_outcome(
     }
 }
 
-/// Why a point was refuted: this run's disputes first, then the ledger, which
-/// is what survives across a resume.
-fn refutation_of(finding: &Finding, state: &IssueRun, ledger: &Ledger) -> Option<String> {
+/// How a point was settled and why: this run's disputes first, then the ledger,
+/// which is what survives across a resume.
+fn settled_as(finding: &Finding, state: &IssueRun, ledger: &Ledger) -> Option<(Settled, String)> {
     if let Some(d) = state
         .disputes
         .iter()
         .find(|d| same_point(&d.title, &finding.title))
     {
         if !d.reasoning.trim().is_empty() {
-            return Some(d.reasoning.clone());
+            return Some((Settled::Refuted, d.reasoning.clone()));
         }
     }
     ledger
         .get(&finding_key(&finding.title, &finding.file))
-        .map(|entry| entry.reasoning.clone())
-        .filter(|r| !r.trim().is_empty())
+        .filter(|entry| !entry.reasoning.trim().is_empty())
+        .map(|entry| (entry.outcome, entry.reasoning.clone()))
 }
 
 /// `#123` from a filed issue URL, falling back to the URL when it does not look
@@ -1142,7 +1186,7 @@ pub fn outcome_comment(
         ),
         Ending::Deadlocked(points) => {
             // Rendered once, with the argument attached. A deadlocked point is
-            // by definition one that was refuted earlier, so the reasoning is
+            // by definition one that was settled earlier, so the reasoning is
             // the whole reason a person is being asked to look. On a resumed
             // run `state.disputes` is empty (only `filed` is restored), so the
             // ledger is the only place that argument survives.
@@ -1155,9 +1199,13 @@ pub fn outcome_comment(
                     };
                     let title = style::title(&f.title, style);
                     already.push(title.clone());
-                    match refutation_of(f, state, ledger) {
-                        Some(reason) => format!(
+                    match settled_as(f, state, ledger) {
+                        Some((Settled::Refuted, reason)) => format!(
                             "{title}{where_at}. Refuted as: {}",
+                            style::summary(&reason, style)
+                        ),
+                        Some((Settled::Filed, reason)) => format!(
+                            "{title}{where_at}. Filed as out of scope: {}",
                             style::summary(&reason, style)
                         ),
                         None => format!("{title}{where_at}"),
@@ -1502,6 +1550,39 @@ mod tests {
         assert!(!should_release(&cfg_with(false, false), Status::Approved));
     }
 
+    // -- custody ---------------------------------------------------------
+
+    /// The reviewer fixed the findings itself, so it wrote the head and the
+    /// other agent takes round 2.
+    #[test]
+    fn fixing_your_own_findings_hands_the_pr_over() {
+        let cfg = cfg_with(true, false);
+        assert_eq!("a", next_reviewer(&cfg, "b", NextAction::FixMyself));
+        assert_eq!("b", next_reviewer(&cfg, "a", NextAction::FixMyself));
+    }
+
+    /// The author wrote the head, so the reviewer keeps the PR. Flipping here
+    /// gave the author its own fix to review in round 2, and an approval of it
+    /// ended the loop.
+    #[test]
+    fn handing_back_keeps_the_reviewer_for_the_next_round() {
+        let cfg = cfg_with(true, false);
+        assert_eq!("b", next_reviewer(&cfg, "b", NextAction::HandBack));
+        assert_eq!("a", next_reviewer(&cfg, "a", NextAction::HandBack));
+    }
+
+    /// Whoever holds round 2 did not write what it is reading, on either path.
+    /// `a` implements, so `b` reviews round 1.
+    #[test]
+    fn nobody_reviews_their_own_edit() {
+        let cfg = cfg_with(true, false);
+        let round_1 = cfg.other(&cfg.first_implementor);
+        assert_eq!("b", round_1);
+        for (action, editor) in [(NextAction::FixMyself, "b"), (NextAction::HandBack, "a")] {
+            assert_ne!(editor, next_reviewer(&cfg, &round_1, action), "{action}");
+        }
+    }
+
     // -- round budget ----------------------------------------------------
 
     /// A fresh PR gets rounds 1 through max_rounds.
@@ -1550,6 +1631,7 @@ mod tests {
                 reasoning: "no".into(),
                 round: 1,
                 reraised: 0,
+                outcome: Settled::Refuted,
             },
         );
         ledger
@@ -1638,6 +1720,36 @@ mod tests {
         let block = settled_block(&ledger_with("a point", "x.rs"));
         assert!(block.contains("a point"));
         assert!(block.contains("settled"));
+    }
+
+    /// A point the author moved to its own issue is done with on this branch.
+    /// Leaving it out of the block let the reviewer that keeps the PR raise it
+    /// again every round until the budget ran out.
+    #[test]
+    fn a_filed_point_is_settled_too() {
+        let mut ledger = ledger_with("out of scope", "x.rs");
+        for entry in ledger.values_mut() {
+            entry.outcome = Settled::Filed;
+            entry.reasoning = "Tracked in #9.".into();
+        }
+        let block = settled_block(&ledger);
+        assert!(block.contains("out of scope"));
+        assert!(block.contains("#9"));
+    }
+
+    /// The author answers the point again every round it is re-raised, so
+    /// recording the answer must not wipe the count that ends the argument.
+    #[test]
+    fn answering_a_point_again_keeps_its_re_raise_count() {
+        let mut ledger = ledger_with("a point", "x.rs");
+        let entry = ledger.values().next().unwrap().clone();
+        let key = finding_key("a point", "x.rs");
+        let mut state = IssueRun::new(1, "t");
+        let blocking = vec![finding("blocking", "a point", "d", "x.rs", true)];
+
+        assert!(!check_relitigation(&mut ledger, &blocking, &mut state));
+        settle(&mut ledger, key, entry);
+        assert!(check_relitigation(&mut ledger, &blocking, &mut state));
     }
 
     // -- brevity ---------------------------------------------------------

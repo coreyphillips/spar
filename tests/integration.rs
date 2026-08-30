@@ -526,6 +526,7 @@ fn state_round_trips_through_the_local_store() {
             reasoning: "the caller already bounds it".into(),
             round: 1,
             reraised: 0,
+            outcome: Default::default(),
         },
     );
     let state = PersistedState {

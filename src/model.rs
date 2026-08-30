@@ -760,6 +760,23 @@ pub struct Plan {
     pub contested: Vec<ContestedItem>,
 }
 
+string_enum! {
+    /// How a point stopped being open. Both endings mean the same thing to the
+    /// next round: the code will not change for it here, so raising it again
+    /// only spends a round.
+    pub enum Settled {
+        Refuted = "refuted" | "refute" | "rejected",
+        Filed = "filed" | "filed_issue" | "filed-issue" | "out_of_scope",
+    }
+}
+
+impl Default for Settled {
+    /// State written before the ledger held anything but refutations.
+    fn default() -> Self {
+        Settled::Refuted
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LedgerEntry {
     pub title: String,
@@ -768,9 +785,11 @@ pub struct LedgerEntry {
     pub round: u32,
     #[serde(default)]
     pub reraised: u32,
+    #[serde(default)]
+    pub outcome: Settled,
 }
 
-/// Refuted points, keyed by `finding_key`. Ordered so the settled block in a
+/// Settled points, keyed by `finding_key`. Ordered so the settled block in a
 /// prompt is stable between rounds, which keeps prompt caches warm and diffs
 /// readable.
 pub type Ledger = BTreeMap<String, LedgerEntry>;

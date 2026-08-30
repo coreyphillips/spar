@@ -743,7 +743,7 @@ fn the_followup_cap_drops_rather_than_fails() {
 
 #[test]
 fn state_round_trips_through_the_local_store() {
-    use spar::model::{Ledger, LedgerEntry, PersistedState, Status};
+    use spar::model::{Dispute, Finding, Ledger, LedgerEntry, PersistedState, Severity, Status};
 
     let fx = repo("state");
     let repo = Repo::open(&fx.work, &cfg()).unwrap();
@@ -762,11 +762,31 @@ fn state_round_trips_through_the_local_store() {
     );
     let state = PersistedState {
         version: 1,
+        checkpoint: 0,
         round: 2,
         next_actor: "b".into(),
         status: Status::Pending,
+        pr_head: "abc123".into(),
         ledger,
         filed: vec!["https://example.invalid/1".into()],
+        open_findings: vec![Finding {
+            severity: Severity::Blocking,
+            title: "Unchecked error".into(),
+            detail: "the failure is discarded".into(),
+            file: "src/a.rs:12".into(),
+            ..Finding::default()
+        }],
+        disputes: vec![Dispute {
+            title: "Retry limit".into(),
+            file: "src/net.rs".into(),
+            reasoning: "the caller already bounds it".into(),
+        }],
+        noted: vec![Finding {
+            severity: Severity::NonBlocking,
+            title: "Timeout is fixed".into(),
+            file: "src/config.rs".into(),
+            ..Finding::default()
+        }],
     };
     repo.write_state(7, &state).unwrap();
 
@@ -774,14 +794,44 @@ fn state_round_trips_through_the_local_store() {
     let back: PersistedState = serde_json::from_str(&text).unwrap();
     assert_eq!(2, back.round);
     assert_eq!("b", back.next_actor);
+    assert_eq!("abc123", back.pr_head);
     assert!(back.ledger.contains_key("abc123"));
     assert_eq!(
         "the caller already bounds it",
         back.ledger["abc123"].reasoning
     );
+    assert_eq!("Unchecked error", back.open_findings[0].title);
+    assert_eq!("src/net.rs", back.disputes[0].file);
+    assert_eq!("Timeout is fixed", back.noted[0].title);
 
     repo.clear_state(7);
     assert!(!repo.state_path(7).exists());
+}
+
+#[test]
+fn a_state_checkpoint_failure_is_reported() {
+    use spar::model::{Ledger, PersistedState, Status};
+
+    let fx = repo("state-write-fails");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let state_dir = fx.work.join(".spar");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(state_dir.join("state"), "not a directory").unwrap();
+    let state = PersistedState {
+        version: 1,
+        checkpoint: 0,
+        round: 0,
+        next_actor: "a".into(),
+        status: Status::Pending,
+        pr_head: "abc123".into(),
+        ledger: Ledger::new(),
+        filed: vec![],
+        open_findings: vec![],
+        disputes: vec![],
+        noted: vec![],
+    };
+
+    assert!(repo.write_state(7, &state).is_err());
 }
 
 #[test]

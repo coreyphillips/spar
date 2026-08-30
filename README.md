@@ -123,7 +123,7 @@ spar triage                 # triage only, write plan.json, touch nothing
 spar run --limit 50         # raise the cap on how many open issues to take
 spar run --min-number 480   # ignore anything numbered below #480
 spar run 42 --auto-merge    # merge when no blocking findings remain
-spar run 42 --max-rounds 5  # allow more review rounds before escalating
+spar run 42 --max-rounds 5  # allow five rounds that can ask for changes
 spar run 42                 # if 42 already has an open PR, continues that
 spar run 101                # 101 is a PR? it reviews it, no triage
 spar run 42 101             # mixed is fine
@@ -256,10 +256,10 @@ the PR history stay coherent.
 budget used to run out on a commit nobody had read. After the last round, one
 closing pass by the agent that did not write the head reads what landed and the
 points the author says it fixed, and the run ends approved or with the remaining
-points named for a person. That is at most one review call more than
-`max_rounds`, on a run that spends its whole budget and has something new to
-read. A run that converges before the budget, or whose last round changed
-nothing, buys none.
+points named for a person. That is at most one additional review call beyond
+the calls used by the rounds, on a run that spends its whole budget and has
+something new to read. A run that converges before the budget, or whose last
+round changed nothing, buys none.
 
 **Follow-ups.** A review that finds something real but out of scope files it as
 its own issue. Before filing, spar looks for an issue that already describes the
@@ -284,11 +284,12 @@ defect too small to be worth another round is `non-blocking`, and every in-scope
 one a reviewer chose not to gate on is listed under "Noted, not blocking", so
 downgrading a point is visible rather than a way to delete it.
 
-A run that reaches an ending says which one on the pull request: approved,
-unresolved with the remaining points named, deadlocked with the argument
-attached, unchanged when the last round wrote nothing, or unread when the
-closing pass itself could not run. A run that fails on a call ends in an error
-with the reason, and comments nothing.
+A run that reaches an ending reports unresolved points, deadlocks, unchanged
+branches, and unread closing work on the pull request when comments are
+enabled. A clean approval stays silent, and `pr_comments = "none"` suppresses
+all pull request comments. A failure before the closing pass ends in an error
+with the reason and posts no final outcome comment. A closing-pass failure
+keeps the review record and reports that the last changes remain unread.
 
 ## Resuming work someone else started
 
@@ -379,6 +380,13 @@ and authorship reveals nothing about who acted last. So spar keeps its own
 state: round number, whose turn is next, and the full disputed ledger. That
 lives in `.spar/state/` by default, and can also travel on the PR as a hidden
 comment (`state_store = "pr"`) if a run might be picked up from another machine.
+
+Each checkpoint is bound to the exact published PR head. If the branch moves
+without a matching checkpoint, `resume` refuses to guess who may safely review
+it. Choose the reviewer explicitly with `--next <agent>`; spar then keeps filed
+follow-ups but clears branch-dependent findings and ledger entries before the
+new review. State written by an older release has no head binding, so its first
+resume also requires that explicit choice.
 
 A PR with no spar state starts fresh, with the agent that did not implement
 taking the first review.
@@ -740,7 +748,7 @@ model  = "gpt-5.6-sol"
 effort = "ultra"
 
 [loop]
-max_rounds        = 3       # then escalate rather than loop
+max_rounds        = 3       # custody rounds, or review-only phases
 auto_merge        = false
 first_implementor = "claude"
 close_skipped     = true
@@ -748,7 +756,7 @@ worktrees         = true
 
 [loop.effort_schedule]
 round_1 = "ultra"           # the deep pass
-rest    = "high"            # later rounds only see a small delta
+rest    = "high"            # later rounds and the closing pass
 
 [style]
 ban_em_dash        = true
@@ -924,9 +932,11 @@ review of a three-line round-3 delta is money on fire, which is what
 `effort_schedule` exists to prevent. Both agents bill against their respective
 subscriptions.
 
-Rough shape per issue: two calls for triage, one to implement, then two per
-review round. `spar review` is cheaper, four to six calls for a whole pull
-request, because nothing is being rewritten between passes.
+Rough shape per issue: two calls for triage, one to implement, up to two per
+review round, plus at most one closing review call when the run spends its
+budget and leaves something new to read. `spar review` is cheaper, four to six
+calls for a whole pull request, because nothing is being rewritten between
+passes.
 
 `spar followup` is one call for the whole queue, however many entries it holds,
 and then the ordinary pipeline for each one it files. `spar checkin` is two

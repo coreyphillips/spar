@@ -27,7 +27,7 @@ use std::path::Path;
 use crate::agent::Agent;
 use crate::config::Config;
 use crate::error::Result;
-use crate::jsonx::finding_key;
+use crate::jsonx::exact_finding_key as finding_key;
 use crate::model::{
     AdjudicationDoc, Finding, IssueRun, Judged, PrView, Review, Severity, Standing, Status,
 };
@@ -248,12 +248,16 @@ fn corroborate(by_agent: &[(String, Vec<Finding>)]) -> Vec<Judged> {
     let mut judged: Vec<Judged> = Vec::new();
 
     for (name, findings) in by_agent {
-        for finding in findings {
-            let key = finding_key(&finding.title, &finding.file);
-            match judged
-                .iter_mut()
-                .find(|j| finding_key(&j.finding.title, &j.finding.file) == key)
-            {
+        for finding in dedupe_exact_findings(findings) {
+            let exact = finding_key(&finding.title, &finding.file);
+            let mut exact_matches = judged.iter().enumerate().filter(|(_, existing)| {
+                existing.standing == Standing::Unverified
+                    && existing.raised_by != *name
+                    && finding_key(&existing.finding.title, &existing.finding.file) == exact
+            });
+            let exact_match = exact_matches.next().map(|(index, _)| index);
+            let exact_match = exact_match.filter(|_| exact_matches.next().is_none());
+            match exact_match.map(|index| &mut judged[index]) {
                 Some(existing) => {
                     // Both reached it independently. Keep the graver severity:
                     // one reviewer calling it blocking is a reason to look.
@@ -262,7 +266,7 @@ fn corroborate(by_agent: &[(String, Vec<Finding>)]) -> Vec<Judged> {
                     existing.raised_by = format!("{} and {name}", existing.raised_by);
                 }
                 None => judged.push(Judged {
-                    finding: finding.clone(),
+                    finding,
                     raised_by: name.clone(),
                     standing: Standing::Unverified,
                     counterpoint: None,
@@ -272,6 +276,28 @@ fn corroborate(by_agent: &[(String, Vec<Finding>)]) -> Vec<Judged> {
         }
     }
     judged
+}
+
+/// Collapse repeated output from one reviewer before looking for independent
+/// corroboration. Repeating a point is not a second opinion, and leaving both
+/// copies in the pool can prevent the other reviewer's matching point from
+/// corroborating either one.
+fn dedupe_exact_findings(findings: &[Finding]) -> Vec<Finding> {
+    let mut unique: Vec<Finding> = Vec::new();
+    for finding in findings {
+        let key = finding_key(&finding.title, &finding.file);
+        if let Some(existing) = unique
+            .iter_mut()
+            .find(|existing| finding_key(&existing.title, &existing.file) == key)
+        {
+            let severity = existing.severity.graver(finding.severity);
+            *existing = finding.clone();
+            existing.severity = severity;
+        } else {
+            unique.push(finding.clone());
+        }
+    }
+    unique
 }
 
 fn adjudicate(
@@ -331,7 +357,12 @@ fn adjudicate(
             let Some(target) = judged.iter_mut().find(|j| {
                 j.raised_by != name
                     && (finding_key(&j.finding.title, &j.finding.file) == key
-                        || crate::review::same_point(&j.finding.title, &verdict.title))
+                        || crate::review::same_finding_parts(
+                            &j.finding.title,
+                            &j.finding.file,
+                            &verdict.title,
+                            &verdict.file,
+                        ))
             }) else {
                 continue;
             };
@@ -419,7 +450,12 @@ fn rebut(
                 j.raised_by == name
                     && j.standing == Standing::Disputed
                     && (finding_key(&j.finding.title, &j.finding.file) == key
-                        || crate::review::same_point(&j.finding.title, &verdict.title))
+                        || crate::review::same_finding_parts(
+                            &j.finding.title,
+                            &j.finding.file,
+                            &verdict.title,
+                            &verdict.file,
+                        ))
             }) else {
                 continue;
             };
@@ -455,6 +491,7 @@ fn finish(
     for j in judged.iter().filter(|j| j.standing == Standing::Disputed) {
         state.disputes.push(crate::model::Dispute {
             title: style::title(&j.finding.title, &repo.style),
+            file: j.finding.file.clone(),
             reasoning: j.counterpoint.clone().unwrap_or_default(),
         });
     }
@@ -733,12 +770,81 @@ mod tests {
     }
 
     #[test]
+    fn repeating_a_finding_is_not_an_independent_opinion() {
+        let repeated = finding("non-blocking", "Unchecked error", "src/net.rs:10");
+        let mut graver = repeated.clone();
+        graver.severity = Severity::Blocking;
+        graver.detail = "confirmed by the failing path".into();
+
+        let judged = corroborate(&[
+            from("first", vec![repeated, graver]),
+            from("second", vec![]),
+        ]);
+
+        assert_eq!(1, judged.len());
+        assert_eq!(Standing::Unverified, judged[0].standing);
+        assert_eq!(Severity::Blocking, judged[0].finding.severity);
+        assert_eq!("confirmed by the failing path", judged[0].finding.detail);
+    }
+
+    #[test]
+    fn one_repeated_finding_and_one_independent_match_corroborate_once() {
+        let repeated = finding("blocking", "Unchecked error", "src/net.rs:10");
+        let judged = corroborate(&[
+            from("first", vec![repeated.clone(), repeated]),
+            from(
+                "second",
+                vec![finding("blocking", "unchecked error!", "src/net.rs:10")],
+            ),
+        ]);
+
+        assert_eq!(1, judged.len());
+        assert_eq!(Standing::Corroborated, judged[0].standing);
+    }
+
+    #[test]
     fn the_same_title_in_a_different_file_is_two_findings() {
         let judged = corroborate(&[
             from("claude", vec![finding("nit", "Naming", "a.rs")]),
             from("codex", vec![finding("nit", "Naming", "b.rs")]),
         ]);
         assert_eq!(2, judged.len());
+    }
+
+    #[test]
+    fn one_reviewer_cannot_corroborate_itself_at_two_sites() {
+        let judged = corroborate(&[
+            from(
+                "first",
+                vec![
+                    finding("blocking", "Unchecked error", "src/net.rs:10"),
+                    finding("blocking", "Unchecked error", "src/net.rs:200"),
+                ],
+            ),
+            from("second", vec![]),
+        ]);
+        assert_eq!(2, judged.len());
+        assert!(judged
+            .iter()
+            .all(|finding| finding.standing == Standing::Unverified));
+    }
+
+    #[test]
+    fn different_sites_are_not_corroborated() {
+        let judged = corroborate(&[
+            from(
+                "first",
+                vec![finding("blocking", "Unchecked error", "src/net.rs:10")],
+            ),
+            from(
+                "second",
+                vec![finding("blocking", "Unchecked error", "src/net.rs:12")],
+            ),
+        ]);
+        assert_eq!(2, judged.len());
+        assert!(judged
+            .iter()
+            .all(|finding| finding.standing == Standing::Unverified));
     }
 
     /// Resolved upward on purpose. Nothing here gates a merge, so advice that

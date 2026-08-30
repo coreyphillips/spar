@@ -837,7 +837,7 @@ pub struct LedgerEntry {
     pub outcome: Settled,
 }
 
-/// Settled points, keyed by `finding_key`. Ordered so the settled block in a
+/// Settled points, keyed by the review loop's finding identity. Ordered so the settled block in a
 /// prompt is stable between rounds, which keeps prompt caches warm and diffs
 /// readable.
 pub type Ledger = BTreeMap<String, LedgerEntry>;
@@ -845,6 +845,8 @@ pub type Ledger = BTreeMap<String, LedgerEntry>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dispute {
     pub title: String,
+    #[serde(default, deserialize_with = "de_string")]
+    pub file: String,
     pub reasoning: String,
 }
 
@@ -912,16 +914,28 @@ impl IssueRun {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedState {
     pub version: u32,
+    /// Monotonic checkpoint order for writes within this repository.
+    #[serde(default)]
+    pub checkpoint: u64,
     pub round: u32,
     pub next_actor: String,
     pub status: Status,
+    /// Published pull request head to which this checkpoint applies.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pr_head: String,
     #[serde(default)]
     pub ledger: Ledger,
     #[serde(default)]
     pub filed: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_findings: Vec<Finding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disputes: Vec<Dispute>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub noted: Vec<Finding>,
 }
 
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // What gh returns

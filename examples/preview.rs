@@ -197,6 +197,7 @@ fn main() {
     let mut ended = IssueRun::new(482, "t");
     ended.disputes = vec![Dispute {
         title: "Config loader swallows a parse error".into(),
+        file: "src/config.rs".into(),
         reasoning: "the caller validates against the schema before load_config is reached".into(),
     }];
     ended.filed = vec![

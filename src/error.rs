@@ -19,6 +19,9 @@ pub enum ErrorKind {
     /// corrects readily when told what was wrong. Nothing about a refusal, a
     /// quota, or a crash is corrected by being asked the same thing again.
     CallFailed,
+    /// A write failed locally, but the destination could not be reread to tell
+    /// whether it landed. Repeating it blindly could duplicate the write.
+    UncertainWrite,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,13 +53,20 @@ impl SparError {
         }
     }
 
+    pub fn uncertain_write(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: ErrorKind::UncertainWrite,
+        }
+    }
+
     pub fn kind(&self) -> ErrorKind {
         self.kind
     }
 
     /// Whether asking the same thing again could plausibly go better.
     pub fn worth_retrying(&self) -> bool {
-        self.kind != ErrorKind::TimedOut
+        !matches!(self.kind, ErrorKind::TimedOut | ErrorKind::UncertainWrite)
     }
 
     pub fn message(&self) -> &str {

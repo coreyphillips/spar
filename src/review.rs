@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use crate::agent::{self, Agent};
 use crate::config::{Config, Drafts, Followups, PrComments};
-use crate::error::{Result, SparError};
+use crate::error::{ErrorKind, Result, SparError};
 use crate::jsonx::{exact_finding_key as finding_key, finding_file, stable_finding_key};
 use crate::model::{
     Action, Disposition, Dispute, Finding, Followup, Implementation, Issue, IssueRun, Ledger,
@@ -2253,6 +2253,31 @@ fn filed_entry(recorded: &Followup, reasoning: &str) -> Option<(Settled, String)
 // Follow-ups
 // ---------------------------------------------------------------------------
 
+// One uncertain external write stops the rest for this process. A later run
+// performs exact and similarity prechecks before it writes again.
+fn external_followup_write_paused(destination: Followups, state: &IssueRun) -> bool {
+    destination == Followups::Issues && state.followup_writes_uncertain
+}
+
+fn failed_followup(state: &mut IssueRun, error: &SparError) -> Followup {
+    if error.kind() == ErrorKind::UncertainWrite {
+        state.followup_writes_uncertain = true;
+        if !state
+            .notes
+            .iter()
+            .any(|note| note.contains("external follow-up writes were paused"))
+        {
+            state.notes.push(
+                "An external follow-up write could not be verified, so further external \
+                 follow-up writes were paused for this run. Inspect recent issues and comments \
+                 before trying them again."
+                    .to_string(),
+            );
+        }
+    }
+    Followup::Failed
+}
+
 /// Record a finding that is real but out of scope for this PR.
 ///
 /// On your own repository an issue is the right home. On a large repository
@@ -2269,10 +2294,17 @@ pub fn file_followup(
     body: &str,
     source: i64,
     cfg: &Config,
-    state: &IssueRun,
+    state: &mut IssueRun,
 ) -> Followup {
     if repo.followups == Followups::None {
         return Followup::Dropped("follow-ups are off for this repository");
+    }
+    if external_followup_write_paused(repo.followups, state) {
+        logdim!(
+            "not attempting another external follow-up write after an earlier result could not \
+             be verified"
+        );
+        return Followup::Failed;
     }
     // A backstop against a run that will not stop finding things. Silent
     // truncation is not on offer: what was dropped is said out loud.
@@ -2317,7 +2349,7 @@ pub fn file_followup(
         Ok(filed) => filed.into(),
         Err(e) => {
             logdim!("could not file a follow-up for '{title}': {e}");
-            Followup::Failed
+            failed_followup(state, &e)
         }
     }
 }
@@ -2429,18 +2461,28 @@ pub fn file_as_issue_apart_from(
     if title.trim().is_empty() {
         return Err(spar_err!("nothing left of the title after cleaning it"));
     }
-    if let Some(existing) = repo.find_similar_issue_apart_from(&title, body, apart_from) {
+    let issue_body = repo.clean_issue_body(body)?;
+    if let Some(existing) = repo.try_exact_issue_apart_from(&title, &issue_body, apart_from)? {
+        return Ok(if existing.open {
+            Filed::Covered(existing.number, existing.url)
+        } else {
+            Filed::AlreadyClosed(existing.number, existing.url)
+        });
+    }
+    if let Some(existing) =
+        repo.try_find_similar_issue_apart_from(&title, &issue_body, apart_from)?
+    {
         let known = format!("{} {}", existing.title, existing.body);
         if !existing.open {
             return Ok(Filed::AlreadyClosed(existing.number, existing.url));
         }
-        if crate::textsim::adds_information(body, &known) {
-            repo.comment_issue(existing.number, body)?;
+        if crate::textsim::adds_information(&issue_body, &known) {
+            repo.comment_issue(existing.number, &issue_body)?;
             return Ok(Filed::AddedTo(existing.number, existing.url));
         }
         return Ok(Filed::Covered(existing.number, existing.url));
     }
-    let url = repo.create_issue(&title, body)?;
+    let url = repo.create_issue_apart_from(&title, &issue_body, apart_from)?;
     let number = filed_issue_number(&url)
         .ok_or_else(|| spar_err!("filed an issue but could not read its number from {url}"))?;
     Ok(Filed::Opened(number, url))
@@ -5408,6 +5450,27 @@ mod followup_outcome_tests {
     #[test]
     fn a_failed_followup_settles_nothing() {
         assert_eq!(None, entry(Followup::Failed));
+    }
+
+    #[test]
+    fn an_uncertain_external_write_blocks_later_issue_followups_for_this_run() {
+        let mut state = IssueRun::new(1, "review");
+        let uncertain = SparError::uncertain_write("the result could not be verified");
+        assert_eq!(Followup::Failed, failed_followup(&mut state, &uncertain));
+        assert!(external_followup_write_paused(Followups::Issues, &state));
+        assert!(!external_followup_write_paused(Followups::Local, &state));
+        assert_eq!(1, state.notes.len());
+
+        assert_eq!(Followup::Failed, failed_followup(&mut state, &uncertain));
+        assert_eq!(1, state.notes.len(), "the recovery note was duplicated");
+
+        let mut ordinary = IssueRun::new(2, "review");
+        let error = SparError::new("permission denied");
+        assert_eq!(Followup::Failed, failed_followup(&mut ordinary, &error));
+        assert!(!external_followup_write_paused(
+            Followups::Issues,
+            &ordinary
+        ));
     }
 
     #[test]

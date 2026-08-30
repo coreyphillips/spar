@@ -16,6 +16,7 @@ use crate::proc::{self, ExecOpts};
 use crate::repo::Repo;
 use crate::review;
 use crate::review_only;
+use crate::split;
 use crate::style;
 use crate::tracker;
 use crate::triage;
@@ -31,8 +32,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
     long_about = "Two coding agents alternate implementing and reviewing GitHub issues until a \
                   pull request converges. Neither agent reviews its own most recent edit.\n\n\
                   Arguments are issue numbers for `run` and `triage`, and pull request numbers \
-                  for `resume`, `review`, and `checkin`. Omit them and spar takes everything \
-                  open, up to --limit. `followup` takes none: it works the queue in \
+                  for `resume`, `review`, and `checkin`. `split` takes either. Omit them and \
+                  spar takes everything open, up to --limit. `split` applies that limit once to \
+                  issues and once to pull requests. `followup` takes none: it works the queue in \
                   .spar/followups.md, and an entry there has no number to name.",
     max_term_width = 96
 )]
@@ -173,6 +175,37 @@ pub enum Command {
         max_rounds: Option<u32>,
     },
 
+    /// Break an issue or a pull request into smaller ones.
+    ///
+    /// One agent proposes the parts with the code open, the other rules on the
+    /// proposal: accept, reject, or accept with named parts struck.
+    /// Disagreement resolves toward not splitting.
+    ///
+    /// An issue's parts are filed as issues and the parent is rewritten into a
+    /// checklist that points at them. A pull request's parts each get their own
+    /// branch and their own pull request, and the original is left open and
+    /// otherwise untouched: split branches use create-only pushes, and the
+    /// parent is never closed or rebased. A pull request from a fork is proposed
+    /// in a comment rather than split.
+    ///
+    /// It decomposes and stops. Nothing is triaged, implemented, or merged. Run
+    /// the reported child numbers next, or enable `decompose_trackers` and run
+    /// the issue parent.
+    Split {
+        /// Issue or pull request numbers. Omit to go through every open issue
+        /// and every open pull request, and split what is worth splitting.
+        items: Vec<i64>,
+        #[command(flatten)]
+        common: Common,
+        /// Print the proposal and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Start a separate split even when one is recorded or retained. Does
+        /// not resume retained branches.
+        #[arg(long)]
+        again: bool,
+    },
+
     /// Post a review a dry run produced, without running the agents again.
     ///
     /// `spar review <pr> --dry-run` saves what it produced. Read it, edit the
@@ -215,7 +248,8 @@ pub enum Command {
         repo: PathBuf,
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Remove every worktree and branch spar created, even for open PRs.
+        /// Remove every local worktree and local branch spar recorded, even for
+        /// open PRs.
         #[arg(long)]
         all: bool,
         /// Also delete state comments left on finished PRs.
@@ -250,7 +284,8 @@ pub struct Common {
     /// Which agent implements first. A key from the `[agents]` table.
     #[arg(long)]
     pub first: Option<String>,
-    /// Cap on how many open items to take when none are named.
+    /// Cap on open items of each kind when none are named. Bare `split` may take
+    /// this many issues and this many pull requests.
     #[arg(long, default_value_t = 20)]
     pub limit: usize,
     /// Ignore issues and pull requests numbered below this when picking for
@@ -426,6 +461,59 @@ fn dispatch(cli: Cli) -> Result<i32> {
                         results.push(checkin::checkin_issue(&agents, &cfg, &repo, number, &mode))
                     }
                 }
+            }
+            if results.is_empty() {
+                return Ok(0);
+            }
+            Ok(report(&results, &cfg))
+        }
+
+        Command::Split {
+            items,
+            common,
+            dry_run,
+            again,
+        } => {
+            let (cfg, repo, agents) = prepare(&common, None)?;
+            let mode = split::Mode { dry_run, again };
+            let picked = if items.is_empty() {
+                pick_for_split(&agents, &cfg, &repo, common.limit, &mode)?
+            } else {
+                let sorted = classify(&repo, &items)?;
+                let mut out: Vec<(i64, ItemKind)> = sorted
+                    .issues
+                    .iter()
+                    .map(|n| (*n, ItemKind::Issue))
+                    .collect();
+                out.extend(sorted.prs.iter().map(|n| (*n, ItemKind::Pr)));
+                out
+            };
+
+            let mut results = Vec::new();
+            let mut seen: BTreeSet<i64> = BTreeSet::new();
+            for (number, kind) in picked {
+                // An issue whose work is half done produces children describing
+                // work that already exists on a branch, so it routes to the
+                // branch instead, the way `checkin` and `review` already do.
+                let target = match kind {
+                    ItemKind::Pr => Some(number),
+                    ItemKind::Issue => repo.open_pr_for_issue(number).map(|pr| {
+                        log!("#{number} is an issue; splitting its open PR {}", pr.url);
+                        pr.number
+                    }),
+                };
+                // An issue and the pull request it routes to can both be named,
+                // and the queue can hold both. Splitting one pull request twice
+                // makes two sets of branches and pull requests out of it, which
+                // `--again` would not stop.
+                if !seen.insert(target.unwrap_or(number)) {
+                    logdim!("#{number} was already covered by this run, skipping it");
+                    continue;
+                }
+                results.push(match target {
+                    Some(pr) => split::split_pr(&agents, &cfg, &repo, pr, &mode),
+                    None => split::split_issue(&agents, &cfg, &repo, number, &mode),
+                });
             }
             if results.is_empty() {
                 return Ok(0);
@@ -951,6 +1039,94 @@ fn pick_issues(repo: &Repo, given: Vec<i64>, limit: usize, min_number: i64) -> R
     Ok(found)
 }
 
+/// The bare `spar split`: every open issue and every open pull request, then
+/// one screening call over both.
+///
+/// The first command that means both kinds when given nothing, so it says so
+/// out loud. `--limit` applies to each list rather than to the two together: a
+/// single budget shared across both would fill up on issues and starve the pull
+/// requests. `min_number` applies because this is picked work rather than named
+/// work.
+///
+/// One agent rules on the whole list in one call rather than two calls per
+/// item, because two agent calls per item across a whole queue is the wrong
+/// price for a question whose answer is usually no.
+fn pick_for_split(
+    agents: &[Agent],
+    cfg: &Config,
+    repo: &Repo,
+    limit: usize,
+    mode: &split::Mode,
+) -> Result<Vec<(i64, ItemKind)>> {
+    let issues = repo.list_open_issues(limit, cfg.loop_cfg.min_number)?;
+    let prs = repo.list_open_prs(limit, cfg.loop_cfg.min_number)?;
+    log!(
+        "no numbers given, considering {} open issue(s) and {} open pull request(s)",
+        issues.len(),
+        prs.len()
+    );
+    if issues.is_empty() && prs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let issue_rows = repo.open_issue_rows();
+    let pr_rows = repo.open_pr_rows();
+    let mut candidates: Vec<split::Candidate> = Vec::new();
+    let mut already = 0usize;
+
+    for number in &issues {
+        let Some(row) = issue_rows.iter().find(|i| i.number == *number) else {
+            logdim!("could not read #{number}, leaving it alone");
+            continue;
+        };
+        // Free here, because the body is already in hand. A pull request that
+        // has been split is caught by `split_pr`, which reads its comments.
+        if split::already_split(row.body_text()) && !mode.again {
+            already += 1;
+            continue;
+        }
+        candidates.push(split::Candidate::from_issue(row));
+    }
+    for number in &prs {
+        match pr_rows.iter().find(|p| p.number == *number) {
+            Some(row) => candidates.push(split::Candidate::from_pr(row)),
+            None => logdim!("could not read PR #{number}, leaving it alone"),
+        }
+    }
+    if already > 0 {
+        log!("{already} issue(s) already split, skipped. --again reopens them.");
+    }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let agent = agent::find(agents, &cfg.first_implementor)?;
+    log!(
+        "screening {} item(s) with {}",
+        candidates.len(),
+        agent.name()
+    );
+    let verdicts = split::screen(agent, cfg, repo, &candidates)?;
+
+    let mut picked = Vec::new();
+    for candidate in &candidates {
+        match verdicts.iter().find(|v| v.item == candidate.number) {
+            Some(v) if v.split => {
+                log!("  split #{}: {}", candidate.number, v.reason.trim());
+                picked.push((candidate.number, candidate.kind));
+            }
+            // Not a warning: no is the expected answer, and one line per item
+            // saying so is the whole screen printed twice.
+            Some(v) => logdim!("  leave #{} whole: {}", candidate.number, v.reason.trim()),
+            None => logdim!("  no verdict for #{}, leaving it whole", candidate.number),
+        }
+    }
+    if picked.is_empty() {
+        log!("nothing worth splitting");
+    }
+    Ok(picked)
+}
+
 /// Numbers split by what they actually name.
 ///
 /// Issues and pull requests share one number sequence per repository, so a
@@ -1330,6 +1506,7 @@ const LOOP_OPTIONS: &[Setting] = &[
     (false, "followups", "Where a follow-up goes. issues files them, local writes .spar/followups.md and leaves the tracker alone, none drops them. `spar followup` works that file."),
     (true, "file_non_blocking", "File a non-blocking finding as a follow-up. Off, because not gating a merge is not the same as deserving somebody's triage queue."),
     (true, "max_followups", "Most follow-ups one run may record before it stops and says what it dropped. A backstop, not a target. `spar followup` is bounded by --limit instead."),
+    (true, "max_split_parts", "Most parts `spar split` will make out of one issue or pull request. A backstop against a queue nobody asked for, not a target, and what it holds back is said out loud. A part is never itself split, so if one is still too big, `spar split <part>` is one command away."),
     (true, "keep_worktrees", "Keep worktrees after a run, for inspection."),
     (true, "min_number", "Ignore issues and pull requests numbered below this when spar picks for itself. 0 is no floor, and a number you name explicitly is always honoured."),
     (true, "parallel_triage", "Ask both agents to triage at once. They only read during triage, so there is nothing to serialise."),
@@ -1338,7 +1515,7 @@ const LOOP_OPTIONS: &[Setting] = &[
     (true, "max_tracker_children", "Most unchecked items from one tracker's checklist that one run will act on. A cap, not a target, and what it left is named out loud."),
     (true, "file_nits", "File nits as follow-ups too. Off, because a filed nit is somebody else's notification."),
     (true, "base_branch", "Only a fallback. Whatever origin/HEAD points at wins when it resolves."),
-    (true, "branch_prefix", "Namespace the branches spar creates, for example \"spar/\". Without it they are issue-N and pr-N."),
+    (true, "branch_prefix", "Namespace the branches spar creates, for example \"spar/\". Without it they are issue-N, pr-N, and split-N-I with a suffix on repeated split names."),
     (true, "state_store", "Where resume state is kept. local uses .spar/state and keeps it off the pull request."),
     (true, "drafts", "Whether a pull request starts as a draft. until_approved opens one and marks it ready when the review converges, which is what the draft was saying while two agents were still arguing about it. always opens one and leaves it, and cannot be combined with auto_merge."),
     (true, "instructions", "Extra instructions handed to both agents with every request, for what this repository always wants that spar has no setting for. --instructions adds to this for one run."),
@@ -1782,6 +1959,7 @@ mod tests {
             vec!["spar", "resume"],
             vec!["spar", "followup"],
             vec!["spar", "checkin"],
+            vec!["spar", "split"],
             vec!["spar", "clean"],
             vec!["spar", "doctor"],
         ] {
@@ -1793,6 +1971,7 @@ mod tests {
                 | Command::Triage { common, .. }
                 | Command::Resume { common, .. }
                 | Command::Followup { common, .. }
+                | Command::Split { common, .. }
                 | Command::Checkin { common, .. } => common.config,
                 Command::Clean { config, .. } | Command::Doctor { config } => config,
                 other => panic!("{other:?}"),
@@ -1847,6 +2026,13 @@ mod tests {
                 "--instructions",
                 "Do not wait for CI.",
             ],
+            vec![
+                "spar",
+                "split",
+                "7",
+                "--instructions",
+                "Do not wait for CI.",
+            ],
         ] {
             let parsed = Cli::parse_from(&argv);
             let common = match parsed.command {
@@ -1855,6 +2041,7 @@ mod tests {
                 | Command::Resume { common, .. }
                 | Command::Review { common, .. }
                 | Command::Followup { common, .. }
+                | Command::Split { common, .. }
                 | Command::Checkin { common, .. } => common,
                 other => panic!("{other:?}"),
             };
@@ -2054,6 +2241,104 @@ mod absorb_tests {
         assert!(Cli::try_parse_from(["spar", "run", "--absorb", "1"]).is_ok());
         assert!(Cli::try_parse_from(["spar", "resume", "--absorb", "1"]).is_ok());
         assert!(Cli::try_parse_from(["spar", "review", "--absorb", "1"]).is_err());
+        // `split` decomposes and stops, so there is nothing for a wave of newly
+        // filed issues to be absorbed into.
+        assert!(Cli::try_parse_from(["spar", "split", "--absorb", "1"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    #[test]
+    fn split_takes_numbers_of_either_kind() {
+        match Cli::parse_from(["spar", "split", "10", "12"]).command {
+            Command::Split { items, .. } => assert_eq!(vec![10, 12], items),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The bare form means both kinds, which no other command does, so it has
+    /// to be allowed to take nothing.
+    #[test]
+    fn split_with_no_numbers_is_allowed() {
+        match Cli::parse_from(["spar", "split"]).command {
+            Command::Split {
+                items,
+                dry_run,
+                again,
+                ..
+            } => {
+                assert!(items.is_empty());
+                assert!(!dry_run);
+                assert!(!again);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A wrong split is N issues to close, a checklist to strip out of
+    /// somebody's body, and branches and pull requests to delete, so the read
+    /// only half is not optional.
+    #[test]
+    fn split_can_be_told_to_write_nothing() {
+        match Cli::parse_from(["spar", "split", "10", "--dry-run"]).command {
+            Command::Split { dry_run, .. } => assert!(dry_run),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The flag `checkin` established for exactly this: do it again on
+    /// something spar already dealt with.
+    #[test]
+    fn split_can_be_told_to_split_something_it_already_split() {
+        match Cli::parse_from(["spar", "split", "10", "--again"]).command {
+            Command::Split { again, .. } => assert!(again),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// It picks for itself when given nothing, so it takes both of the flags
+    /// that govern picking, and its config like everything else.
+    #[test]
+    fn split_takes_the_flags_that_govern_picking() {
+        match Cli::parse_from([
+            "spar",
+            "split",
+            "--limit",
+            "5",
+            "--min-number",
+            "480",
+            "--config",
+            "other.toml",
+        ])
+        .command
+        {
+            Command::Split { common, .. } => {
+                assert_eq!(5, common.limit);
+                assert_eq!(Some(480), common.min_number);
+                assert_eq!(Some(PathBuf::from("other.toml")), common.config);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `split` decomposes and stops. A flag that implied it works, reviews, or
+    /// merges anything would be a flag that does nothing.
+    #[test]
+    fn split_offers_no_flag_that_would_make_it_a_second_run() {
+        for flag in [
+            vec!["--auto-merge"],
+            vec!["--max-rounds", "2"],
+            vec!["--close-skipped"],
+            vec!["--no-close-skipped"],
+            vec!["--keep-worktrees"],
+        ] {
+            let mut argv = vec!["spar", "split", "10"];
+            argv.extend(flag.iter().copied());
+            assert!(Cli::try_parse_from(&argv).is_err(), "{argv:?}");
+        }
     }
 }
 
@@ -2068,6 +2353,7 @@ mod min_number_tests {
             | Command::Resume { common, .. }
             | Command::Review { common, .. }
             | Command::Followup { common, .. }
+            | Command::Split { common, .. }
             | Command::Checkin { common, .. } => common.min_number,
             other => panic!("{other:?}"),
         }
@@ -2080,7 +2366,7 @@ mod min_number_tests {
 
     #[test]
     fn every_command_that_picks_for_itself_accepts_a_floor() {
-        for cmd in ["run", "triage", "resume", "review", "checkin"] {
+        for cmd in ["run", "triage", "resume", "review", "checkin", "split"] {
             assert_eq!(
                 Some(480),
                 read(&["spar", cmd, "--min-number", "480"]),

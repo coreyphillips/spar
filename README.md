@@ -81,13 +81,15 @@ spar triage 42              # judges the issue, writes plan.json, touches nothin
 spar review 108 --dry-run   # full two agent review, printed, nothing posted
 spar checkin 108 --dry-run  # every reply and every change, posted nowhere
 spar followup --screen-only # judges the queue, writes nothing, files nothing
+spar split 10 --dry-run     # the parts it would make, filed and branched nowhere
 spar run 42 --no-close-skipped   # will not close an issue it declines
 ```
 
-`--dry-run` is on `review` and `checkin`, because those are the commands whose
-whole output is a comment. There is no `--dry-run` on `run`, since `run` writes
-code: `triage` is its read-only half, and `followup --screen-only` is
-`followup`'s.
+`--dry-run` is on `review`, `checkin` and `split`. The first two are the commands
+whose whole output is a comment; `split` writes more kinds of thing than any
+other command, which is why its read-only half exists. There is no `--dry-run` on
+`run`, since `run` writes code: `triage` is its read-only half, and
+`followup --screen-only` is `followup`'s.
 
 For something persistent rather than per invocation, these live in `spar.toml`:
 
@@ -144,6 +146,11 @@ spar checkin 108            # answer the unanswered comments on a PR
 spar checkin                # every open PR
 spar checkin 108 --dry-run  # every reply and every change, posted nowhere
 spar checkin 108 --reply-only    # answer in words, never touch the code
+
+spar split 42               # break an issue into smaller issues, and stop
+spar split 108              # break a PR into smaller PRs, leaving it untouched
+spar split                  # go through every open issue and PR
+spar split 42 --dry-run     # print the proposal, write nothing
 
 spar review 108             # review a PR without touching it, fork or not
 spar review 108 --dry-run   # print the review instead of posting it
@@ -574,6 +581,111 @@ what makes leaving a disputed thread open terminate rather than re-arguing it
 once a run forever. A fresh clone has no record, so it will answer a previously
 declined point once more.
 
+## Splitting something too big to work in one piece
+
+The unit of work used to be fixed. One issue became one branch and one pull
+request whatever its size, and the only way to change that was to file the
+smaller issues by hand. `spar split` is that judgement made executable.
+
+```bash
+spar split 10 12        # split these
+spar split              # every open issue and PR, split what is worth splitting
+spar split 10 --dry-run # print the proposal, write nothing
+spar split 10 --again   # split something spar already split
+```
+
+It decomposes and stops. Nothing is triaged, implemented, or merged: it produces
+smaller units and hands them to the commands that already exist.
+
+```bash
+spar split 42
+spar run 101 102             # use the child numbers reported by split
+```
+
+Or set `decompose_trackers = true` and run `spar run 42`. The checklist added
+to the parent is then read as a tracker, and its open child issues become the
+next wave in that run.
+
+Two agents, asymmetrically. One proposes the parts with the code open, the other
+rules on the proposal: accept, reject, or accept with named parts struck. Not two
+independent proposals, because two decompositions of one thing cannot be
+reconciled mechanically and reconciling them is a third judgement nobody asked
+for. Disagreement resolves toward not splitting, and striking enough parts that
+one is left means nothing is split, because a split into one part is not a split.
+
+**An issue.** Each surviving part is filed through the same path a follow-up
+takes, so it inherits the similarity check that stops duplicates. The parent is
+then rewritten into a tracker: your text untouched, with a checklist appended
+where each line carries its `#N`. It is never closed. Its body is now the plan,
+which makes it a tracker, and spar already refuses to close one of those.
+
+**A pull request.** Additive, always. An independent slice gets its own branch
+off the base; a stacked slice starts from its predecessor. The slice is applied,
+an agent is asked to make it stand on its own, and it gets its own pull request.
+The original gets one comment naming the parts and whatever is left over, and is
+left open and otherwise untouched. **spar never rewrites the branch behind
+somebody's pull request:** split branches use create-only pushes that refuse an
+existing remote ref unless it already names the same commit, and they never
+move it. Nothing is closed, and nothing is rebased under anybody.
+These are code-level guards, not requests left to a prompt.
+
+A slice that will not stand alone is not a slice. If the agent cannot make a part
+build and pass on its own branch it says so, and the part is dropped rather than
+pushed broken. So is a part whose fixes were left uncommitted, since what is not
+committed is not what gets pushed. The whole value of splitting is that each part
+can be reviewed and merged on its own, and a part that does not build has none of
+it. If dropping parts leaves only one, nothing was decomposed: the one that was
+made is still named on the original, and the run reports the pull request as left
+whole.
+
+Whether the parts are independent or stacked is a property of the change rather
+than of the repository, so it rides on the proposal instead of `spar.toml`.
+Independent parts each sit on the base branch and merge in any order. Stacked
+parts are created in order, each branched off its predecessor.
+
+The parent head is checked throughout the build and once more before the final
+comment. If it moves, spar stops rather than publishing more work from the old
+snapshot. A branch already pushed before a later failure is kept with its
+worktree and blocks an ordinary rerun. Compare every retained branch with the
+current parent, then open a missing child pull request only when the branch is
+still valid and post the parts summary by hand. To start over, remove every
+retained local worktree and branch, child pull request, and remote split branch.
+`--again` starts a new split; it does not resume retained branches.
+
+Once every child pull request exists, successful part worktrees and local
+branches are released together unless `[loop] keep_worktrees = true`. A failure
+after a push keeps them so the partial result can be inspected and recovered.
+
+A pull request from a fork is proposed, not split: spar cannot push to the fork,
+and carving somebody's contribution into pull requests of your own without asking
+is not something to do automatically. The proposal goes up as a comment and
+nothing else happens, which is how `review` already treats a fork.
+
+Given no numbers, `split` is the one command that means both kinds: every open
+issue and every open pull request, each list capped by `--limit` on its own so a
+shared budget cannot fill up on issues and starve the pull requests. One agent
+then rules on the whole list in one call, because two agent calls per item across
+a queue is the wrong price for a question whose answer is usually no. Anything
+already split is skipped, and `--again` reopens it. An issue that already has a
+pull request open routes to that pull request, since splitting an issue whose
+work is half done produces children describing work that already exists on a
+branch.
+
+A wrong split is expensive to undo: N issues to close, a checklist to strip out
+of somebody's body, and branches and pull requests to delete. So there is a hard
+cap, no recursion, and `--dry-run`.
+
+```toml
+[loop]
+max_split_parts = 4     # most parts one issue or PR becomes. A backstop, not a
+                        # target, and what it holds back is said out loud.
+```
+
+A part is never itself split in the same invocation, however large the proposal
+says it is. If a part is still too big, `spar split <part>` is one command away,
+typed by somebody who looked at it. There is no setting to turn splitting off,
+because it is a command nobody has to run.
+
 ## Keeping it readable
 
 The reader of a PR is a person with other work. Model prose defaults to three
@@ -958,8 +1070,8 @@ by accident produces a baffling failure.
 ```bash
 spar followup       # work the follow-ups a run recorded locally
 spar checkin        # answer the comments nobody replied to
-spar clean          # drop worktrees, branches, and state whose PR is finished
-spar clean --all    # drop every worktree and branch spar created, review ones too
+spar clean          # drop local worktrees, branches, and state for finished PRs
+spar clean --all    # drop every local worktree and branch spar recorded
 spar clean --pr-state   # also delete state comments left on finished PRs
 spar doctor         # check prerequisites and resolve each configured agent
 spar doctor --config other.toml   # check a config before adopting it
@@ -975,17 +1087,22 @@ the only command that triages and so the only one that can decline an issue.
 Each issue gets its own git worktree so a failed run cannot poison the next
 one's base. A worktree is released as soon as its run reaches a terminal
 outcome, and kept only on `escalated` or `error`, where you may want to inspect
-local state. Pass `--keep-worktrees` to hold on to them regardless, or
-`--no-worktrees` to work directly in the main checkout.
+local state. Commands that expose the run flags accept `--keep-worktrees` to
+hold on to them regardless, or `--no-worktrees` to work directly in the main
+checkout. `split` takes neither lifecycle flag; set `[loop] keep_worktrees =
+true` when its successful part worktrees should remain.
 
 Releasing matters for more than tidiness: a stranded worktree holds its branch
 checked out, which makes a later `gh pr merge --delete-branch` fail to clean up.
 Runs also sweep any finished worktrees on start.
 
-Cleanup only ever touches branches spar recorded creating. Branch names default
-to `issue-N`, which is exactly what a person would call a branch by hand, so the
-name alone can never establish ownership: `spar clean --all` will not delete
-your `issue-9`.
+Cleanup only ever touches local branches spar recorded creating. Branch names
+default to `issue-N`, `pr-N`, and `split-N-I`, with a numeric suffix when a split
+name is repeated. The first is exactly what a person would call a branch by
+hand. The name alone can never establish ownership: `spar clean --all` will not
+delete your `issue-9`. It also does not delete a remote branch. Remove a retained
+remote split branch only after its child pull request has been handled or
+abandoned.
 
 ## Cost
 

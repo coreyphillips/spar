@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::config::{Config, Drafts, Followups, StateStore};
 use crate::error::Result;
-use crate::model::{Followup, Issue, IssueRef, ItemKind, PersistedState, PrRef, PrView};
+use crate::model::{Followup, Issue, IssueRef, ItemKind, PersistedState, PrRef, PrRow, PrView};
 use crate::proc::{self, ExecOpts};
 use crate::style::{self, Style};
 use crate::textsim;
@@ -226,6 +226,15 @@ impl Repo {
 
     pub fn branch_for_pr(&self, number: i64) -> String {
         format!("{}pr-{number}", self.branch_prefix)
+    }
+
+    /// One part of a split, numbered from 1 within its parent.
+    ///
+    /// Its own namespace rather than `issue-N`, because the parts of a split
+    /// pull request have no issue of their own and would otherwise collide with
+    /// the branch of the issue that happens to share the parent's number.
+    pub fn branch_for_split(&self, parent: i64, index: usize) -> String {
+        format!("{}split-{parent}-{index}", self.branch_prefix)
     }
 
     fn ledger_path(&self) -> PathBuf {
@@ -461,6 +470,52 @@ impl Repo {
         Ok(path)
     }
 
+    /// A worktree for one part of a split, on a new branch off `start`.
+    ///
+    /// `start` is the base branch for independent parts and the previous part's
+    /// branch for stacked ones, which is the only difference between the two
+    /// shapes at this level.
+    pub fn worktree_for_split(
+        &self,
+        parent: i64,
+        index: usize,
+        start: &str,
+    ) -> Result<(PathBuf, String)> {
+        let branch = self.branch_for_split(parent, index);
+        let path = self.worktree_path(&format!("split-{parent}-{index}"));
+
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| spar_err!("could not create {}: {e}", dir.display()))?;
+        }
+        self.remove_worktree_at(&path);
+        self.git_try(&["branch", "-D", &branch]);
+
+        let path_str = path.display().to_string();
+        self.git(&["worktree", "add", "-b", &branch, &path_str, start])
+            .map_err(|e| {
+                spar_err!(
+                    "could not create a worktree for part {index} of #{parent}. {}",
+                    e.last_line()
+                )
+            })?;
+        // Recorded before anything else can fail. An unrecorded branch is one
+        // `prune_branches` will never remove.
+        self.record_branch(&branch, "split", parent);
+        Ok((path, branch))
+    }
+
+    /// Throw one part away: its worktree, its branch, and its record.
+    ///
+    /// For a part that would not stand on its own. Nothing has been pushed at
+    /// that point, so this leaves no trace anywhere but the log.
+    pub fn release_split_worktree(&self, parent: i64, index: usize) {
+        self.remove_worktree_at(&self.worktree_path(&format!("split-{parent}-{index}")));
+        let branch = self.branch_for_split(parent, index);
+        self.git_try(&["branch", "-D", &branch]);
+        self.forget_branch(&branch);
+    }
+
     pub fn release_review_worktree(&self, number: i64) {
         self.remove_worktree_at(&self.worktree_path(&format!("review-{number}")));
         self.git_try(&["update-ref", "-d", &review_ref(number)]);
@@ -548,6 +603,32 @@ impl Repo {
             .filter(|line| !line.is_empty())
             .map(str::to_string)
             .collect()
+    }
+
+    /// The paths this checkout changes relative to the base, sorted.
+    ///
+    /// A three dot range, matching `diff_stat`: what the branch did, not what
+    /// the base has done since.
+    pub fn changed_files(&self, cwd: &Path, base: &str) -> Vec<String> {
+        let range = format!("{}...HEAD", self.base_ref(cwd, base));
+        self.git_try_at(Some(cwd), &["diff", "--name-only", &range])
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Whether `path` exists at `refname`, so a slice can tell a file the change
+    /// added or edited from one it deleted.
+    pub fn path_exists_at(&self, cwd: &Path, refname: &str, path: &str) -> bool {
+        // `git cat-file -e` says so in its exit status and prints nothing, so
+        // the usual `git_try` shape, which reads stdout, cannot see the answer.
+        let spec = format!("{refname}:{path}");
+        let argv = ["git".to_string(), "cat-file".into(), "-e".into(), spec];
+        proc::exec(&argv, &self.git_opts(Some(cwd), false).timeout_secs(60))
+            .map(|out| out.ok())
+            .unwrap_or(false)
     }
 
     pub fn diff_stat(&self, cwd: &Path, base: &str) -> String {
@@ -941,6 +1022,76 @@ impl Repo {
                 e.last_line()
             )
         })
+    }
+
+    /// Replace an issue body, refusing unless it is still byte for byte what
+    /// the caller read.
+    ///
+    /// The only place spar rewrites text somebody else wrote, so the check is
+    /// the whole point: an edit computed from a body that has since moved would
+    /// silently delete whatever moved it. A refusal costs one rerun.
+    ///
+    /// Deliberately not through `clean_issue_body`. The body is mostly a
+    /// person's own prose, and the scrub would rewrite their punctuation while
+    /// the length budget could truncate the end of a long report. Callers pass
+    /// the original text back verbatim and clean only what they add to it.
+    pub fn edit_issue_body(&self, number: i64, expected: &str, body: &str) -> Result<()> {
+        let current = self.issue_body(number)?;
+        if current != expected {
+            bail!(
+                "the body of #{number} changed since it was read, so it was left alone rather \
+                 than written over. Run this again to work from the body as it is now."
+            );
+        }
+        self.gh(&["issue", "edit", &number.to_string(), "--body", body])
+            .map(|_| ())
+            .map_err(|e| spar_err!("could not rewrite the body of #{number}. {}", e.last_line()))
+    }
+
+    /// One issue's body, exactly as GitHub holds it.
+    pub fn issue_body(&self, number: i64) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Row {
+            #[serde(default)]
+            body: Option<String>,
+        }
+        let text = self.gh(&["issue", "view", &number.to_string(), "--json", "body"])?;
+        let row: Row = serde_json::from_str(text.trim())
+            .map_err(|e| spar_err!("unexpected shape for issue #{number}: {e}"))?;
+        Ok(row.body.unwrap_or_default())
+    }
+
+    /// Every open issue with its title and body, in one call.
+    ///
+    /// For a screen that has to say something about each of twenty items before
+    /// anything expensive happens. One call rather than one per issue.
+    pub fn open_issue_rows(&self) -> Vec<Issue> {
+        let text = self.gh_try(&[
+            "issue",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            &FETCH_CEILING.to_string(),
+            "--json",
+            "number,title,body,labels,state,url",
+        ]);
+        serde_json::from_str::<Vec<Issue>>(text.trim()).unwrap_or_default()
+    }
+
+    /// Every open pull request with its size, in one call.
+    pub fn open_pr_rows(&self) -> Vec<PrRow> {
+        let text = self.gh_try(&[
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            &FETCH_CEILING.to_string(),
+            "--json",
+            "number,title,changedFiles,additions,deletions",
+        ]);
+        serde_json::from_str::<Vec<PrRow>>(text.trim()).unwrap_or_default()
     }
 
     pub fn create_issue(&self, title: &str, body: &str) -> Result<String> {
@@ -1521,7 +1672,10 @@ impl Repo {
         if let Some(rest) = entry.strip_prefix("pr-") {
             return is_finished(&self.pr_state(rest.parse().unwrap_or(-1)));
         }
-        if entry.starts_with("issue-") {
+        // A split part is the same shape as an issue branch: one branch, whose
+        // pull requests say whether it is finished. Without it here, a part
+        // branch is one nothing but `clean --all` would ever remove.
+        if entry.starts_with("issue-") || entry.starts_with("split-") {
             let text = self.gh_try(&[
                 "pr", "list", "--head", branch, "--state", "all", "--json", "state",
             ]);

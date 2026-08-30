@@ -231,12 +231,33 @@ fn implement_and_review(
         );
     }
     let prompt = implement_prompt(number, &item.title, &issue.url, &body);
-    let mut work: Implementation = implementor.ask_json(
+    let answer: Result<Implementation> = implementor.ask_json(
         &prompt,
         &schema::implementation(),
         work_dir,
         cfg.effort_for_round(&implementor.spec, 1).as_deref(),
-    )?;
+    );
+
+    // A call that fails with commits on the branch is not the same as one that
+    // fails with nothing to show. The agent commits as it goes and reports at
+    // the end, so the usual failure here is the report, not the work, and
+    // returning the error would leave the commits unpushed on a local branch
+    // that the next `spar run` deletes. The review loop is what the round is
+    // for and it needs the diff, not the summary.
+    let mut work = match answer {
+        Ok(work) => work,
+        Err(e) if repo.has_changes(work_dir, &base) => {
+            logwarn!(
+                "#{number}: {holder} failed after committing: {e}\nContinuing from the commits, \
+                 with a pull request body written from their messages."
+            );
+            state
+                .notes
+                .push(format!("{holder} failed after committing: {e}"));
+            from_commits(repo, work_dir, &base)
+        }
+        Err(e) => return Err(e),
+    };
 
     if work.not_worth_doing || !repo.has_changes(work_dir, &base) {
         state.status = Status::Abandoned;
@@ -1306,6 +1327,25 @@ fn section(heading: &str, lines: &[String], style: &Style) -> Option<String> {
         return None;
     }
     Some(format!("## {heading}\n\n{}", bullets(&items)))
+}
+
+/// A pull request body for work whose author never got to describe it.
+///
+/// The implement call failed after the commits were made, so what those commits
+/// say about themselves is the only account of them there is. It is a poor one,
+/// and better than an empty body over work nobody would otherwise know was
+/// there; the note says as much, so a reviewer does not read the list as the
+/// author's own summary.
+pub fn from_commits(repo: &Repo, work_dir: &Path, base: &str) -> Implementation {
+    Implementation {
+        changes: repo.commit_subjects(work_dir, "HEAD", base),
+        notes: Some(
+            "The implement call failed after these commits were made, so this body is assembled \
+             from their messages rather than written by their author. Read the diff."
+                .to_string(),
+        ),
+        ..Implementation::default()
+    }
 }
 
 /// What gets posted on an issue that produced no pull request.

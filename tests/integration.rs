@@ -1589,3 +1589,48 @@ fn post_refuses_a_file_for_several_pull_requests() {
     assert!(!ok);
     assert!(err.contains("one pull request"), "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// Work whose author never got to describe it
+// ---------------------------------------------------------------------------
+
+/// An implement call that fails on its structured answer leaves commits and no
+/// description of them. The commit messages are the only account there is, so
+/// the pull request body is written from those rather than the branch being
+/// left with nothing pointing at it.
+#[test]
+fn a_pr_body_is_assembled_from_the_commits_when_the_report_never_came() {
+    let fx = repo("frombranch");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    commit(&fx.work, "parser.rs", "one\n", "Add the parser");
+    commit(&fx.work, "empty.rs", "two\n", "Cover the empty input case");
+
+    let work = spar::review::from_commits(&repo, &fx.work, "main");
+    assert!(
+        !work.not_worth_doing,
+        "there is work, so it was not declined"
+    );
+    assert_eq!(
+        vec!["Add the parser", "Cover the empty input case"],
+        work.changes,
+        "oldest first, as the branch reads"
+    );
+
+    let body = spar::review::pr_body(42, &work, &repo.style);
+    assert!(body.contains("Closes #42"), "{body}");
+    assert!(body.contains("- Add the parser"), "{body}");
+    assert!(body.contains("- Cover the empty input case"), "{body}");
+    assert!(
+        body.contains("failed after these commits were made"),
+        "a reviewer has to know this body is not the author's own: {body}"
+    );
+}
+
+#[test]
+fn a_branch_with_no_commits_of_its_own_lists_nothing() {
+    let fx = repo("frombranch-empty");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    assert!(spar::review::from_commits(&repo, &fx.work, "main")
+        .changes
+        .is_empty());
+}

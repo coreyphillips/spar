@@ -2359,6 +2359,17 @@ impl Filed {
         }
     }
 
+    /// The issue this went to, whatever state it is in. `number` answers the
+    /// narrower question of what there is to work.
+    pub fn issue(&self) -> i64 {
+        match self {
+            Filed::Opened(n, _)
+            | Filed::AddedTo(n, _)
+            | Filed::Covered(n, _)
+            | Filed::AlreadyClosed(n, _) => *n,
+        }
+    }
+
     /// The issue to work, when there is one to work.
     pub fn number(&self) -> Option<i64> {
         match self {
@@ -2400,11 +2411,25 @@ impl Filed {
 /// anything but the exact string that will land on GitHub means the duplicate
 /// check can never hit.
 pub fn file_as_issue(repo: &Repo, title: &str, body: &str) -> Result<Filed> {
+    file_as_issue_apart_from(repo, title, body, None)
+}
+
+/// The same, with one issue this cannot be a duplicate of.
+///
+/// A checklist item is quoted in the tracker it was read from, so the tracker
+/// is the closest match for every item in it. Without this the run would
+/// comment an item onto its own tracker and call it covered.
+pub fn file_as_issue_apart_from(
+    repo: &Repo,
+    title: &str,
+    body: &str,
+    apart_from: Option<i64>,
+) -> Result<Filed> {
     let title = repo.clean_title(title)?;
     if title.trim().is_empty() {
         return Err(spar_err!("nothing left of the title after cleaning it"));
     }
-    if let Some(existing) = repo.find_similar_issue(&title, body) {
+    if let Some(existing) = repo.find_similar_issue_apart_from(&title, body, apart_from) {
         let known = format!("{} {}", existing.title, existing.body);
         if !existing.open {
             return Ok(Filed::AlreadyClosed(existing.number, existing.url));

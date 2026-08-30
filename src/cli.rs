@@ -1,6 +1,6 @@
 //! The command line.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -17,6 +17,7 @@ use crate::repo::Repo;
 use crate::review;
 use crate::review_only;
 use crate::style;
+use crate::tracker;
 use crate::triage;
 use crate::{bail, log, logdim, logging, logwarn, spar_err};
 
@@ -481,7 +482,15 @@ fn dispatch(cli: Cli) -> Result<i32> {
             // Deliberately no act_on_plan here. `triage` is the command you
             // reach for to look before leaping, and a preview that comments on
             // and closes issues is a trap.
-            make_plan(&agents, &cfg, &repo, &issues, &plan_out)?;
+            let plan = make_plan(&agents, &cfg, &repo, &issues, &plan_out)?;
+            // A preview that files issues and rewrites somebody's issue body is
+            // that same trap, so this prints the decomposition and writes none
+            // of it. It is where the first few real trackers should be checked.
+            if cfg.loop_cfg.decompose_trackers {
+                for item in plan.skipped.iter().filter(|i| i.tracker) {
+                    tracker::preview(&cfg, &repo, item.issue);
+                }
+            }
             Ok(0)
         }
         Command::Run {
@@ -682,43 +691,65 @@ fn work_issues(
     results: &mut Vec<IssueRun>,
 ) -> Result<()> {
     let mut handled: BTreeSet<i64> = BTreeSet::new();
-    let mut wave = first_wave;
+    let mut leftover: BTreeSet<i64> = BTreeSet::new();
+    let mut queue: VecDeque<Wave> = VecDeque::from([Wave::first(first_wave)]);
+    let mut plans_written = 0usize;
 
-    // Wave 0 is what was asked for. Each further wave is the follow-ups the
-    // previous one filed, folded back in rather than left for the next run.
-    // Every wave is triaged like anything else, so both agents still have to
-    // agree each one is worth doing.
-    for round in 0..=cfg.loop_cfg.absorb_new_issues {
-        wave.retain(|n| !handled.contains(n));
-        if wave.is_empty() {
-            break;
+    // The first wave is what was asked for. A wave of follow-ups the previous
+    // one filed is folded back in as the absorb budget allows, and a wave of
+    // children extracted from a tracker's checklist joins the same run because
+    // it is named work rather than picked work. Every wave is triaged like
+    // anything else, so both agents still have to agree each one is worth
+    // doing.
+    while let Some(mut wave) = queue.pop_front() {
+        wave.numbers.retain(|n| !handled.contains(n));
+        if wave.numbers.is_empty() {
+            continue;
         }
-        if round > 0 {
-            log!(
+        match wave.parent {
+            Some(tracker) => log!(
+                "working {} item(s) from the checklist in #{tracker}: {}",
+                wave.numbers.len(),
+                numbers(&wave.numbers)
+            ),
+            None if wave.absorbed > 0 => log!(
                 "absorbing {} newly filed issue(s): {}",
-                wave.len(),
-                wave.iter()
-                    .map(|n| format!("#{n}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+                wave.numbers.len(),
+                numbers(&wave.numbers)
+            ),
+            None => {}
         }
-        handled.extend(wave.iter().copied());
+        handled.extend(wave.numbers.iter().copied());
 
-        let fetched = match repo.fetch_issues(&wave) {
+        let fetched = match repo.fetch_issues(&wave.numbers) {
             Ok(fetched) => fetched,
             Err(e) => {
                 logdim!("could not read the next wave: {e}");
-                break;
+                continue;
             }
         };
-        let plan_path = if round == 0 {
+        // Named for the order the plans were written in, so the first is
+        // plan.json exactly as before and no two waves overwrite each other.
+        let plan_path = if plans_written == 0 {
             plan_out.to_path_buf()
         } else {
-            plan_out.with_extension(format!("wave{round}.json"))
+            plan_out.with_extension(format!("wave{plans_written}.json"))
         };
+        plans_written += 1;
         let plan = make_plan(agents, cfg, repo, &fetched, &plan_path)?;
         act_on_plan(cfg, repo, &plan);
+
+        // No recursion: a child that triage calls a tracker in its turn is
+        // commented on and held like any other. `file_non_blocking` records
+        // what happened the last time this codebase let something multiply.
+        if cfg.loop_cfg.decompose_trackers && wave.parent.is_none() {
+            for item in plan.skipped.iter().filter(|i| i.tracker) {
+                let children = tracker::decompose(cfg, repo, item.issue);
+                if !children.is_empty() {
+                    queue.push_back(wave.child(item.issue, children));
+                }
+            }
+        }
 
         let before = results.len();
         for item in &plan.order {
@@ -728,26 +759,77 @@ fn work_issues(
             results.push(review::run_issue(agents, cfg, repo, item, issue));
         }
 
-        // Whatever this wave filed becomes the next one.
-        wave = results[before..]
+        // Whatever this wave filed becomes the next one, budget allowing.
+        let filed: Vec<i64> = results[before..]
             .iter()
             .flat_map(|r| r.filed.iter())
             .filter_map(|url| review::filed_issue_number(url))
+            .filter(|n| !handled.contains(n))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        if filed.is_empty() {
+            continue;
+        }
+        match wave.absorbed < cfg.loop_cfg.absorb_new_issues {
+            true => queue.push_back(wave.absorb(filed)),
+            false => leftover.extend(filed),
+        }
     }
-    if !wave.is_empty() && cfg.loop_cfg.absorb_new_issues > 0 {
+    if !leftover.is_empty() && cfg.loop_cfg.absorb_new_issues > 0 {
         log!(
             "{} issue(s) filed in the last wave were left for a later run: {}",
-            wave.len(),
-            wave.iter()
-                .map(|n| format!("#{n}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+            leftover.len(),
+            numbers(&leftover.iter().copied().collect::<Vec<_>>())
         );
     }
     Ok(())
+}
+
+/// One pass of the pipeline, and where it came from.
+struct Wave {
+    numbers: Vec<i64>,
+    /// Absorb rounds spent to reach it. A tracker's children inherit their
+    /// parent's, because extracting named work is not absorbing a follow-up:
+    /// `absorb_new_issues` is off by default, and spending it here would make
+    /// `decompose_trackers` silently do nothing.
+    absorbed: u32,
+    /// The tracker whose checklist this wave came out of.
+    parent: Option<i64>,
+}
+
+impl Wave {
+    fn first(numbers: Vec<i64>) -> Self {
+        Self {
+            numbers,
+            absorbed: 0,
+            parent: None,
+        }
+    }
+
+    fn child(&self, tracker: i64, numbers: Vec<i64>) -> Self {
+        Self {
+            numbers,
+            absorbed: self.absorbed,
+            parent: Some(tracker),
+        }
+    }
+
+    fn absorb(&self, numbers: Vec<i64>) -> Self {
+        Self {
+            numbers,
+            absorbed: self.absorbed + 1,
+            parent: None,
+        }
+    }
+}
+
+fn numbers(items: &[i64]) -> String {
+    items
+        .iter()
+        .map(|n| format!("#{n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn prepare(common: &Common, overrides: Option<Overrides>) -> Result<(Config, Repo, Vec<Agent>)> {
@@ -1252,6 +1334,8 @@ const LOOP_OPTIONS: &[Setting] = &[
     (true, "min_number", "Ignore issues and pull requests numbered below this when spar picks for itself. 0 is no floor, and a number you name explicitly is always honoured."),
     (true, "parallel_triage", "Ask both agents to triage at once. They only read during triage, so there is nothing to serialise."),
     (true, "absorb_new_issues", "Waves of newly filed follow-ups to fold back into this run rather than leaving them for the next one. Multiplies what a run costs."),
+    (true, "decompose_trackers", "Turn the checklist in a tracking issue into issues, link each item to the one covering it, tick an item off when its issue closes, and work the children in this run. Only ever acts on markdown task list items, so it is opt in per issue as well. `spar triage` prints what it would do without writing any of it."),
+    (true, "max_tracker_children", "Most unchecked items from one tracker's checklist that one run will act on. A cap, not a target, and what it left is named out loud."),
     (true, "file_nits", "File nits as follow-ups too. Off, because a filed nit is somebody else's notification."),
     (true, "base_branch", "Only a fallback. Whatever origin/HEAD points at wins when it resolves."),
     (true, "branch_prefix", "Namespace the branches spar creates, for example \"spar/\". Without it they are issue-N and pr-N."),

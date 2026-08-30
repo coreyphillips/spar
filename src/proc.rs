@@ -80,6 +80,11 @@ impl ExecOpts {
         self.env.push((key.into(), value.into()));
         self
     }
+
+    pub fn stdin(mut self, text: impl Into<String>) -> Self {
+        self.stdin = Some(text.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -382,6 +387,14 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn stdin_reaches_the_child_byte_for_byte() {
+        let body = "line one  \n\nline three\n";
+        let out = run_str(&["/bin/sh", "-c", "cat"], &ExecOpts::new().stdin(body))
+            .expect("the child reads stdin");
+        assert_eq!(body, out);
     }
 
     #[test]

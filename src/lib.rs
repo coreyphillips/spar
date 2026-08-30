@@ -22,6 +22,7 @@ pub mod review_only;
 pub mod schema;
 pub mod style;
 pub mod textsim;
+pub mod tracker;
 pub mod triage;
 
 pub use error::{Result, SparError};

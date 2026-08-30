@@ -70,8 +70,13 @@ only read the diff.
 
 Label every finding by severity, and be honest about which is which:
 - blocking: the PR should not merge as is. Real defects only.
-- non-blocking: a genuine improvement that need not gate this PR.
+- non-blocking: real, and smaller than another round. A minor defect belongs
+  here as much as an improvement does.
 - nit: style or taste.
+
+Blocking is the only severity that costs a round, and a round is another commit
+somebody has to read before this can merge. Being right that something is wrong
+is not enough to block. It has to be wrong in a way that would cost somebody.
 
 Confirm anything you label blocking before you label it. Run the code,
 reproduce the failure, or point at the exact line that breaks, and say in the
@@ -88,7 +93,7 @@ that is worth somebody stopping to fix. Each one becomes a tracked item a
 maintainer has to read and triage, so the bar is a defect and not an observation.
 A thorough reviewer can always find something adjacent to what it is reading;
 that is not a reason to file it. If you are not sure it is worth a maintainer's
-time, leave in_scope true and say your piece in the finding.
+time, say your piece in the finding and label it non-blocking.
 
 Reviewing one issue should not manufacture ten more. If you find yourself with
 several out of scope findings, keep the ones that would bite somebody and drop
@@ -98,7 +103,7 @@ Then choose next_action:
 - merge: no blocking findings, the PR is good.
 - fix_myself: there are blocking findings and you will fix them directly.
 - hand_back: there are blocking findings the author should address.
-{settled}";
+{answers}{settled}{round}";
 
 const FIX_PROMPT: &str = "\
 You reviewed this branch and chose to fix the blocking findings yourself.
@@ -106,6 +111,13 @@ Implement those fixes now and commit them.
 
 Your findings:
 {findings}
+
+Fix what the point says and nothing else. The smallest change that answers it is
+the right one: no refactor alongside it, no capability nobody asked for, no
+handling for cases nobody raised. Every line you add is what the next pass
+reviews, so a fix that grows the branch buys another round of findings about the
+fix. If a point cannot be answered without a change bigger than the point, say so
+rather than making the change.
 
 Commit your changes. Do not push, do not merge.";
 
@@ -116,14 +128,21 @@ Here is a review of your PR for issue #{number}.
 
 For each point, choose exactly one disposition:
 - fixed: the point is valid and in scope. Fix it and commit.
-- refuted: the point is wrong, or not worth acting on. Explain why. Refuting is
-  a legitimate outcome; do not accept a review comment you believe is incorrect
-  just to get the PR approved.
+- refuted: the point is wrong, or the change it asks for is bigger than the
+  problem it names. Explain why. Refuting is a legitimate outcome; do not accept
+  a review comment you believe is incorrect just to get the PR approved.
 - filed_issue: the point is valid but unrelated to this PR. Supply
   new_issue_title and new_issue_body; the harness files it and skips duplicates.
 
 Copy each finding's title and file across exactly as given, so your answer can
 be matched back to the review.
+
+Fix what the point says and nothing else. The smallest change that answers it is
+the right one: no refactor alongside it, no capability nobody asked for, no
+handling for cases nobody raised. Every line you add is what the next pass
+reviews, so a fix that grows the branch buys another round of findings about the
+fix. If a point cannot be answered without a change bigger than the point, say so
+rather than making the change.
 
 Commit any fixes. Do not push, do not merge.";
 
@@ -617,11 +636,7 @@ fn review_loop(
             effort.as_deref().unwrap_or("default effort")
         );
 
-        let prompt = REVIEW_PROMPT
-            .replace("{base}", &base)
-            .replace("{number}", &ctx.subject.to_string())
-            .replace("{title}", &ctx.title)
-            .replace("{settled}", &settled_block(ledger));
+        let prompt = review_prompt(&base, ctx.subject, &ctx.title, ledger, round, last_allowed);
         let before_review = snapshot(repo, &ctx.work_dir);
         let review: Review = reviewer.review(
             &base,
@@ -671,6 +686,7 @@ fn review_loop(
         // deduplicates by title, so repeats across rounds are free.
         file_out_of_scope(repo, &review.findings, ctx.subject, state, cfg);
         file_nonblocking(repo, &review.findings, ctx.subject, state, cfg);
+        note_downgraded(&review.findings, state);
 
         if check_relitigation(ledger, &blocking, state) {
             state.status = Status::Escalated;
@@ -953,6 +969,53 @@ fn settled_block(ledger: &Ledger) -> String {
     )
 }
 
+/// What a later round is told about the fixes it asked for.
+///
+/// The ledger used to hold only the points the reviewer lost, so a round that
+/// fixed nine findings left nothing behind and the next round met the fix as
+/// ordinary code. Rendered apart from the settled block on purpose: a settled
+/// point is an argument to weigh, a fixed point is a claim to check, and printed
+/// under one heading a claim to check reads as an argument already won.
+fn answers_block(ledger: &Ledger) -> String {
+    let lines: Vec<String> = ledger
+        .values()
+        .filter(|e| e.outcome == Settled::Fixed)
+        .map(|e| match e.file.trim() {
+            "" => format!("- {}. The author said: {}", e.title, e.reasoning),
+            file => format!("- {} ({file}). The author said: {}", e.title, e.reasoning),
+        })
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\nThese points were raised on this pull request in earlier rounds and the author says \
+         it fixed them. The code is on the branch and the claim is the author's:\n{}\n\nCheck the \
+         answer rather than taking it. If one of them is still not fixed, raise it again under \
+         the same title, so the run can tell a point that was not answered from a new one.\n",
+        lines.join("\n")
+    )
+}
+
+/// What the reviewer is told about where in the run it is.
+///
+/// Empty until the last round that can ask for anything, where it says one thing
+/// the prompt could not say before: when the asking stops. The deadline holds
+/// whether or not the reviewer is told, so saying it out loud only lets the
+/// reviewer spend the round it has. It says nothing about severity, because a
+/// reviewer that lowers its bar to finish is the failure this loop was built
+/// against.
+fn round_note(round: u32, last: u32) -> String {
+    if round < last {
+        return String::new();
+    }
+    "\nThis is the last round in this run that can ask the author for anything. After it, one \
+     pass reads what landed and the pull request either merges or goes to a person with what is \
+     left. Raise everything you mean to raise now. A point held back for a later round does not \
+     get one.\n"
+        .to_string()
+}
+
 /// Record a point as settled, keeping any re-raise count it already carries.
 /// Answering the same point a second time does not reset the argument, and
 /// zeroing the count here would put the escalation guard out of reach: the
@@ -960,6 +1023,35 @@ fn settled_block(ledger: &Ledger) -> String {
 fn settle(ledger: &mut Ledger, key: String, entry: LedgerEntry) {
     let reraised = ledger.get(&key).map(|e| e.reraised).unwrap_or(0);
     ledger.insert(key, LedgerEntry { reraised, ..entry });
+}
+
+/// Keep the real points a reviewer chose not to gate on.
+///
+/// The severity ladder is the whole defence against the nitpick spiral, and it
+/// only works if a reviewer can put a real defect somewhere other than blocking.
+/// Somewhere has to be a place, though: under the defaults a non-blocking
+/// finding is filed nowhere and commented nowhere, so downgrading one deleted
+/// it. Now downgrading costs the reviewer a line on the pull request in its own
+/// words, and a run that merges with fourteen of them says so where a person
+/// will see it.
+///
+/// Nits are not kept. They are taste, and a list of them is the noise the
+/// outcome comment exists to avoid.
+fn note_downgraded(findings: &[Finding], state: &mut IssueRun) {
+    for finding in findings {
+        if finding.severity != Severity::NonBlocking || !finding.in_scope {
+            continue;
+        }
+        // Raised again in a later round is the same point, not a second one.
+        if state
+            .noted
+            .iter()
+            .any(|kept| same_point(&kept.title, &finding.title))
+        {
+            continue;
+        }
+        state.noted.push(finding.clone());
+    }
 }
 
 /// A settled point raised twice more goes to a person rather than looping
@@ -1540,9 +1632,12 @@ pub fn outcome_comment(
 
     match ending {
         Ending::Approved => {
-            if state.disputes.is_empty() && state.filed.is_empty() {
+            if state.disputes.is_empty() && state.filed.is_empty() && state.noted.is_empty() {
                 // A clean approval with nothing outstanding needs no comment.
-                // The absence of objections is the message.
+                // The absence of objections is the message. `noted` is in that
+                // condition because the message has to be true: a reviewer that
+                // found six real problems and gated on none of them did not find
+                // nothing, and silence would say it did.
                 return None;
             }
             out.push("Reviewed, nothing blocking a merge.".into());
@@ -1619,12 +1714,48 @@ pub fn outcome_comment(
         out.push(format!("Raised and refuted:\n{}", bullets(&lines)));
     }
 
+    if !state.noted.is_empty() {
+        // The only place a downgraded point survives. The diff shows what was
+        // fixed and the refutation list shows what was argued down; a finding
+        // the reviewer judged real and chose not to gate on had nothing.
+        let lines: Vec<String> = state
+            .noted
+            .iter()
+            .filter(|f| !already.iter().any(|t| same_point(t, &f.title)))
+            .map(|f| located(f, style))
+            .collect();
+        if !lines.is_empty() {
+            out.push(format!("Noted, not blocking:\n{}", bullets(&lines)));
+        }
+    }
+
     if !state.filed.is_empty() {
         let refs: Vec<String> = state.filed.iter().map(|u| as_reference(u)).collect();
         out.push(format!("Filed separately: {}", refs.join(", ")));
     }
 
     Some(out.join("\n\n"))
+}
+
+/// What the reviewer is asked, with what it already answered behind it.
+///
+/// Built here rather than inline in the loop, because a prompt built inline is a
+/// prompt with no test.
+fn review_prompt(
+    base: &str,
+    number: i64,
+    title: &str,
+    ledger: &Ledger,
+    round: u32,
+    last: u32,
+) -> String {
+    REVIEW_PROMPT
+        .replace("{base}", base)
+        .replace("{number}", &number.to_string())
+        .replace("{title}", title)
+        .replace("{answers}", &answers_block(ledger))
+        .replace("{settled}", &settled_block(ledger))
+        .replace("{round}", &round_note(round, last))
 }
 
 /// What the implementor is asked, with the issue in front of it.
@@ -2422,6 +2553,127 @@ mod tests {
         assert!(disposition_comment("claude", &response, &[], &[], &[], &style()).is_none());
     }
 
+    // -- the review prompt ----------------------------------------------
+
+    /// A round that fixed nine findings left nothing behind, so the next round
+    /// met the fix as ordinary code with no sign anybody had asked for it.
+    #[test]
+    fn the_answers_block_asks_the_reviewer_to_check_rather_than_to_trust() {
+        let mut ledger = ledger_with("Unbounded loop", "src/x.rs");
+        for entry in ledger.values_mut() {
+            entry.outcome = Settled::Fixed;
+            entry.reasoning = "bounded it on max_attempts".into();
+        }
+        let block = answers_block(&ledger);
+        assert!(block.contains("Unbounded loop"), "{block}");
+        assert!(block.contains("src/x.rs"), "{block}");
+        assert!(block.contains("bounded it on max_attempts"), "{block}");
+        assert!(block.contains("Check the answer"), "{block}");
+        assert!(!block.contains("settled"), "{block}");
+    }
+
+    /// A refutation is an argument to weigh and a fix is a claim to check, and
+    /// the two blocks say opposite things. Neither may carry the other's points.
+    #[test]
+    fn a_fix_and_a_refutation_do_not_share_a_heading() {
+        let mut ledger = ledger_with("refuted point", "a.rs");
+        ledger.extend(ledger_with("fixed point", "b.rs"));
+        for entry in ledger.values_mut() {
+            if entry.title == "fixed point" {
+                entry.outcome = Settled::Fixed;
+            }
+        }
+        let answers = answers_block(&ledger);
+        let settled = settled_block(&ledger);
+        assert!(answers.contains("fixed point") && !answers.contains("refuted point"));
+        assert!(settled.contains("refuted point") && !settled.contains("fixed point"));
+    }
+
+    #[test]
+    fn an_empty_ledger_adds_no_answers_block() {
+        assert_eq!("", answers_block(&Ledger::new()));
+    }
+
+    /// A point held back for a later round does not get one, so the reviewer is
+    /// told which round is the last that can ask for anything.
+    #[test]
+    fn the_last_round_that_can_ask_for_anything_says_so() {
+        assert_eq!("", round_note(1, 3));
+        assert_eq!("", round_note(2, 3));
+        assert!(round_note(3, 3).contains("last round"));
+        // Round numbers keep counting up across a resume, so the last round of
+        // an invocation is not round `max_rounds`.
+        assert!(round_note(6, 6).contains("last round"));
+    }
+
+    /// Telling a reviewer when the asking stops must never tell it to want less.
+    /// A reviewer that lowers its bar to finish is the failure this loop was
+    /// built against, so the note carries no severity vocabulary at all. That
+    /// the pull request may merge afterwards is a fact about the harness, and
+    /// saying it is not the same as asking for an approval.
+    #[test]
+    fn saying_when_the_asking_stops_says_nothing_about_severity() {
+        let note = round_note(3, 3);
+        for word in ["approve", "blocking", "severity", "nit"] {
+            assert!(!note.contains(word), "{word} in: {note}");
+        }
+    }
+
+    #[test]
+    fn the_review_prompt_leaves_nothing_unsubstituted() {
+        let empty = review_prompt("main", 42, "Retry a 429", &Ledger::new(), 1, 3);
+        assert!(!empty.contains('{'), "{empty}");
+        assert!(empty.contains("main") && empty.contains("#42") && empty.contains("Retry a 429"));
+
+        let mut ledger = ledger_with("refuted point", "a.rs");
+        ledger.extend(ledger_with("fixed point", "b.rs"));
+        for entry in ledger.values_mut() {
+            if entry.title == "fixed point" {
+                entry.outcome = Settled::Fixed;
+            }
+        }
+        let full = review_prompt("main", 42, "Retry a 429", &ledger, 3, 3);
+        assert!(!full.contains('{'), "{full}");
+        assert!(full.contains("fixed point") && full.contains("refuted point"));
+        assert!(full.contains("last round"), "{full}");
+    }
+
+    /// A confirmed defect that is minor had no label but blocking: non-blocking
+    /// was defined as an improvement, and nit as taste. Severity gating is the
+    /// whole defence against the nitpick spiral, and it had a hole in it.
+    #[test]
+    fn a_minor_defect_has_a_severity_that_is_not_blocking() {
+        assert!(
+            REVIEW_PROMPT.contains("A minor defect belongs\n  here as much as an improvement does")
+        );
+        assert!(schema::review()
+            .to_string()
+            .contains("A minor defect belongs here"));
+    }
+
+    /// Doubt used to resolve onto `in_scope = true`, which is half of what gates
+    /// a merge. It resolves onto the severity instead, which is not.
+    #[test]
+    fn doubt_resolves_away_from_the_field_that_gates() {
+        for text in [REVIEW_PROMPT.to_string(), schema::review().to_string()] {
+            assert!(text.contains("say your piece in the finding and label it non-blocking"));
+            assert!(!text.contains("leave in_scope true"));
+        }
+    }
+
+    /// Every line a fix adds is what the next pass reviews, so a fix that grows
+    /// the branch buys another round of findings about the fix.
+    #[test]
+    fn both_edit_prompts_ask_for_the_smallest_change_that_answers_the_point() {
+        for prompt in [FIX_PROMPT, RESPOND_PROMPT] {
+            assert!(
+                prompt.contains("The smallest change that answers it is"),
+                "{prompt}"
+            );
+        }
+        assert!(RESPOND_PROMPT.contains("bigger than the\n  problem it names"));
+    }
+
     /// Both, not either. The link is how an agent that can reach the network
     /// reads the discussion spar does not fetch, and the body is what the one
     /// that cannot works from: codex runs with no network, so a link alone
@@ -2661,12 +2913,100 @@ mod outcome_tests {
         }
     }
 
+    fn graded(severity: Severity, title: &str, file: &str, in_scope: bool) -> Finding {
+        Finding {
+            severity,
+            in_scope,
+            ..finding(title, file)
+        }
+    }
+
     /// The absence of objections is the message. A PR that reviewed cleanly and
     /// filed nothing should leave no trace in the thread at all.
     #[test]
     fn a_clean_approval_says_nothing() {
         let state = state_with(vec![], vec![]);
         assert!(outcome_comment(&state, &Ledger::new(), &Ending::Approved, &style()).is_none());
+    }
+
+    /// Widening the ladder makes downgrading the easy answer, and under the
+    /// defaults a non-blocking finding is filed nowhere and commented nowhere.
+    /// Without this, a reviewer could make a real defect disappear by relabelling
+    /// it, and the pull request would look exactly like a clean one.
+    #[test]
+    fn a_downgraded_finding_still_reaches_the_pull_request() {
+        let mut state = state_with(vec![], vec![]);
+        note_downgraded(
+            &[
+                graded(
+                    Severity::NonBlocking,
+                    "Timeout is not configurable",
+                    "n.rs",
+                    true,
+                ),
+                graded(Severity::Nit, "Log wording", "n.rs", true),
+                graded(Severity::NonBlocking, "Adjacent leak", "o.rs", false),
+                graded(Severity::Blocking, "Unbounded loop", "x.rs", true),
+            ],
+            &mut state,
+        );
+
+        // A nit is taste, and an out of scope point is filed rather than noted.
+        // Neither belongs in a list a person reads for what was let through.
+        assert_eq!(1, state.noted.len());
+
+        let text = outcome_comment(&state, &Ledger::new(), &Ending::Approved, &style()).unwrap();
+        assert!(text.contains("Noted, not blocking"), "{text}");
+        assert!(
+            text.contains("Timeout is not configurable (n.rs)"),
+            "{text}"
+        );
+    }
+
+    /// The same point raised again in a later round is one point, not three.
+    #[test]
+    fn a_point_noted_twice_is_listed_once() {
+        let mut state = state_with(vec![], vec![]);
+        let raised = graded(
+            Severity::NonBlocking,
+            "Timeout is not configurable",
+            "n.rs",
+            true,
+        );
+        let reworded = graded(
+            Severity::NonBlocking,
+            "timeout is not configurable!",
+            "n.rs",
+            true,
+        );
+        note_downgraded(&[raised], &mut state);
+        note_downgraded(&[reworded], &mut state);
+        assert_eq!(1, state.noted.len());
+    }
+
+    /// A point already printed with its argument attached is not printed again
+    /// under a second heading.
+    #[test]
+    fn a_deadlocked_point_is_not_also_noted() {
+        let mut state = state_with(vec![], vec![]);
+        note_downgraded(
+            &[graded(
+                Severity::NonBlocking,
+                "Unbounded loop",
+                "x.rs",
+                true,
+            )],
+            &mut state,
+        );
+        let points = vec![finding("Unbounded loop", "x.rs")];
+        let text = outcome_comment(
+            &state,
+            &Ledger::new(),
+            &Ending::Deadlocked(&points),
+            &style(),
+        )
+        .unwrap();
+        assert!(!text.contains("Noted, not blocking"), "{text}");
     }
 
     #[test]

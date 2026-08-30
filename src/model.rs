@@ -862,6 +862,16 @@ pub struct IssueRun {
     pub disputes: Vec<Dispute>,
     #[serde(default)]
     pub filed: Vec<String>,
+    /// Real points a reviewer judged smaller than another round.
+    ///
+    /// Nothing else carries them. The round comment is off under the default
+    /// `pr_comments = "outcome"` and a non-blocking finding is not filed under
+    /// the default `file_non_blocking = false`, so without this the severity
+    /// ladder is a way to make a finding disappear rather than a way to stop it
+    /// costing a round. Silence on a pull request should mean nothing was
+    /// found, not that nothing was gated.
+    #[serde(default)]
+    pub noted: Vec<Finding>,
     #[serde(default)]
     pub notes: Vec<String>,
 }
@@ -876,6 +886,7 @@ impl IssueRun {
             rounds: 0,
             disputes: Vec::new(),
             filed: Vec::new(),
+            noted: Vec::new(),
             notes: Vec::new(),
         }
     }

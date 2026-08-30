@@ -112,17 +112,20 @@ The branch has been read round by round already, and this call is not another
 audit of it. It answers one question: is there anything in what those rounds
 produced that must not merge.
 {landed}{answers}{settled}
-A finding here is one of two things: a point above that the code does not
-actually answer, or a defect in what landed since the last round. Go and look
-before you raise either. Run the test that covers it, or read the lines the fix
-touched and follow them to the caller, and say in the detail what you did.
+Something blocks here if it is one of two things: a point above that the code
+does not actually answer, or a defect in what landed since the last round. Go
+and look before you raise either. Run the test that covers it, or read the lines
+the fix touched and follow them to the caller, and say in the detail what you
+did.
 
-Something you could have raised in an earlier round and did not does not block
-now. You read that code and passed it, and holding the branch for it spends
-somebody's week on a pull request two agents have already been over. If it is
-real and worth somebody's time it is a follow-up: set in_scope=false and the
-harness files it, which keeps the point without stopping this. That is not free
-either, so keep the ones that would bite somebody and drop the rest.
+Everything else you see is real or it is nothing, and if it is real it still has
+somewhere to go. A defect you could have raised in an earlier round does not
+block now: you read that code and passed it, and holding the branch for it
+spends somebody's week on a pull request two agents have already been over.
+Label it non-blocking and it is written on the pull request where a person will
+see it. Keep in_scope=false for what it has always meant, a real defect this
+pull request did not cause, which the harness files as its own issue. That is
+not free either, so keep the ones that would bite somebody and drop the rest.
 
 Nothing you raise here will be fixed, because there is no round after this. A
 finding means the pull request stays open with that finding on it for a person
@@ -727,7 +730,7 @@ fn review_loop(
         // deduplicates by title, so repeats across rounds are free.
         file_out_of_scope(repo, &review.findings, ctx.subject, state, cfg);
         file_nonblocking(repo, &review.findings, ctx.subject, state, cfg);
-        note_downgraded(&review.findings, state);
+        note_downgraded(cfg, &review.findings, state);
 
         if check_relitigation(ledger, &blocking, state) {
             state.status = Status::Escalated;
@@ -766,7 +769,17 @@ fn review_loop(
             let before_fix = snapshot(repo, &ctx.work_dir);
             reviewer.ask(&prompt, &ctx.work_dir, effort.as_deref())?;
             match editor_after(repo, &ctx.work_dir, &before_fix, &ctx.label, &holder) {
-                Some(who) => editor = Some(who),
+                Some(who) => {
+                    // Recorded like an author's fix, and for the same reason.
+                    // These points were answered in code too, and leaving them
+                    // out left this path with the hole the other one had: the
+                    // next pass reads a fix with nothing saying it was asked
+                    // for, and the guard that ends an argument cannot count it.
+                    // The reviewer wrote both the finding and the fix, so its
+                    // own detail is the claim.
+                    record_own_fixes(&repo.style, &blocking, ledger, round);
+                    editor = Some(who);
+                }
                 None => {
                     // Handing over here is what the bug was: the head is still
                     // the author's, so the author would be reading its own work.
@@ -829,6 +842,7 @@ fn review_loop(
                 ctx.subject,
                 ctx.pr_number,
                 &author_name,
+                editor.is_some(),
             );
         }
 
@@ -882,28 +896,29 @@ fn close_out(
     round: u32,
     audited_head: &str,
 ) -> Result<()> {
-    let out_of_rounds = |state: &mut IssueRun, ledger: &Ledger| {
+    let stop = |state: &mut IssueRun, ledger: &Ledger, ending: Ending<'_>| {
         state.status = Status::Escalated;
         state.notes.push(exhausted_note(ctx.start_round, round));
-        post_outcome(repo, ctx.pr_number, state, ledger, Ending::OutOfRounds);
+        post_outcome(repo, ctx.pr_number, state, ledger, ending);
         persist(repo, ctx.pr_number, state, ledger, round, holder);
     };
 
     // Nothing to close over. The last round changed no code and claimed no fix,
     // so the branch in front of the closer is the branch a round already read at
     // full breadth, and asking again is the unbounded re-audit this whole change
-    // exists to stop.
+    // exists to stop. It ends on its own sentence rather than the one about
+    // unread fixes, because on this path there are none.
     let landed = (!audited_head.is_empty())
         .then(|| repo.commits_since(&ctx.work_dir, audited_head, "HEAD"))
         .flatten();
     if audited_head.is_empty()
-        || (landed.as_ref().is_some_and(|l| l.is_empty()) && !any_fixes(ledger))
+        || (landed.as_ref().is_some_and(|l| l.is_empty()) && !any_fixes(ledger, round))
     {
         logdim!(
             "{}: nothing landed after the last review, so there is nothing to close over",
             ctx.label
         );
-        out_of_rounds(state, ledger);
+        stop(state, ledger, Ending::Unchanged);
         return Ok(());
     }
 
@@ -916,11 +931,13 @@ fn close_out(
     );
 
     let prompt = close_prompt(
+        cfg.base_branch(),
         ctx.subject,
         &ctx.title,
         audited_head,
         landed.as_deref(),
         ledger,
+        round,
     );
     let before = snapshot(repo, &ctx.work_dir);
     // `ask_json` rather than `Agent::review`, whose appended paragraph pins the
@@ -936,14 +953,19 @@ fn close_out(
                 // losing all of it to an unreachable model on the last call is worse
                 // than ending where it would have ended before this existed.
                 logwarn!("{}: the closing pass failed: {e}", ctx.label);
-                out_of_rounds(state, ledger);
+                stop(state, ledger, Ending::OutOfRounds);
                 return Ok(());
             }
         };
 
     // Held to the same rule as a review, for the same reason: a pass that judged
     // a tree the rollback then takes away judged code that is not there.
-    let mut close_wrote = snapshot(repo, &ctx.work_dir) != before;
+    let close_wrote = snapshot(repo, &ctx.work_dir) != before;
+    // Whoever holds the pull request after this. The closing pass is not
+    // supposed to write, and when it does anyway the same rule applies to it as
+    // to a round: a resumed run must not hand this branch back to the agent that
+    // wrote its head.
+    let mut next = holder.to_string();
     if close_wrote {
         logwarn!(
             "{}: {holder} changed the branch while closing, which the prompt forbids. Rolling it \
@@ -960,13 +982,13 @@ fn close_out(
             // it on the pull request.
             repo.rewrite_commits_if_needed(&ctx.work_dir, cfg.base_branch())?;
             repo.push(&ctx.work_dir, &ctx.branch)?;
+            next = next_reviewer(cfg, holder, Some(holder));
         }
-        close_wrote = true;
     }
 
     file_out_of_scope(repo, &pass.findings, ctx.subject, state, cfg);
     file_nonblocking(repo, &pass.findings, ctx.subject, state, cfg);
-    note_downgraded(&pass.findings, state);
+    note_downgraded(cfg, &pass.findings, state);
 
     let blocking: Vec<Finding> = pass
         .findings
@@ -984,12 +1006,27 @@ fn close_out(
             ledger,
             Ending::Deadlocked(&blocking),
         );
-        persist(repo, ctx.pr_number, state, ledger, round, holder);
+        persist(repo, ctx.pr_number, state, ledger, round, &next);
         return Ok(());
     }
 
     if approval_stands(&blocking, close_wrote) {
-        return approve(cfg, repo, ctx, state, ledger, round, holder);
+        return approve(cfg, repo, ctx, state, ledger, round, &next);
+    }
+
+    if blocking.is_empty() {
+        // Nothing blocking, and the only way past `approval_stands` with an
+        // empty list is a pass that wrote. Its answer was about a tree the
+        // rollback has taken away, so there is nothing to name and nothing has
+        // read the branch as it stands. Rendering `Unresolved` here put a
+        // heading over an empty list and a note counting zero points.
+        state.status = Status::Escalated;
+        state.notes.push(format!(
+            "{holder} edited the branch during the closing pass, so its answer did not stand"
+        ));
+        post_outcome(repo, ctx.pr_number, state, ledger, Ending::OutOfRounds);
+        persist(repo, ctx.pr_number, state, ledger, round, &next);
+        return Ok(());
     }
 
     state.status = Status::Escalated;
@@ -1001,13 +1038,19 @@ fn close_out(
         ledger,
         Ending::Unresolved(&blocking),
     );
-    persist(repo, ctx.pr_number, state, ledger, round, holder);
+    persist(repo, ctx.pr_number, state, ledger, round, &next);
     Ok(())
 }
 
-/// Whether the author claimed a fix that a closing pass could ask about.
-fn any_fixes(ledger: &Ledger) -> bool {
-    ledger.values().any(|e| e.outcome == Settled::Fixed)
+/// Whether the last round left a claimed fix for the closing pass to ask about.
+///
+/// Scoped to the round rather than to the pull request. Asked over the whole
+/// ledger, a resumed run with an old fix in it would never take the skip, and
+/// the pass would be handed a branch nothing had changed.
+fn any_fixes(ledger: &Ledger, round: u32) -> bool {
+    ledger
+        .values()
+        .any(|e| e.outcome == Settled::Fixed && e.round >= round)
 }
 
 /// What the run says about itself when the closing pass did not sign off.
@@ -1202,10 +1245,17 @@ fn settled_block(ledger: &Ledger) -> String {
 ///
 /// One formatter for the two blocks that print them, because two copies of a
 /// list are two copies to drift.
-fn fixed_lines(ledger: &Ledger) -> Vec<String> {
+///
+/// `since` is what keeps the list from growing without end. A fix is a claim for
+/// whoever reads the branch next, and once that pass has read it and not raised
+/// it again, it has been checked. Carrying every fix a pull request ever saw
+/// would put a resumed run's tenth round in front of nine rounds of answered
+/// points, which is the same unbounded surface this whole change exists to
+/// bound.
+fn fixed_lines(ledger: &Ledger, since: u32) -> Vec<String> {
     ledger
         .values()
-        .filter(|e| e.outcome == Settled::Fixed)
+        .filter(|e| e.outcome == Settled::Fixed && e.round >= since)
         .map(|e| match e.file.trim() {
             "" => format!("- {}. The author said: {}", e.title, e.reasoning),
             file => format!("- {} ({file}). The author said: {}", e.title, e.reasoning),
@@ -1220,8 +1270,10 @@ fn fixed_lines(ledger: &Ledger) -> Vec<String> {
 /// ordinary code. Rendered apart from the settled block on purpose: a settled
 /// point is an argument to weigh, a fixed point is a claim to check, and printed
 /// under one heading a claim to check reads as an argument already won.
-fn answers_block(ledger: &Ledger) -> String {
-    let lines = fixed_lines(ledger);
+fn answers_block(ledger: &Ledger, round: u32) -> String {
+    // The round before this one: what the pass this reviewer is following up on
+    // asked for, and got.
+    let lines = fixed_lines(ledger, round.saturating_sub(1));
     if lines.is_empty() {
         return String::new();
     }
@@ -1274,7 +1326,13 @@ fn settle(ledger: &mut Ledger, key: String, entry: LedgerEntry) {
 ///
 /// Nits are not kept. They are taste, and a list of them is the noise the
 /// outcome comment exists to avoid.
-fn note_downgraded(findings: &[Finding], state: &mut IssueRun) {
+fn note_downgraded(cfg: &Config, findings: &[Finding], state: &mut IssueRun) {
+    // With `file_non_blocking` on, every one of these is already an issue and
+    // already named under "Filed separately". Listing it twice under two
+    // headings reads as two points.
+    if cfg.loop_cfg.file_non_blocking {
+        return;
+    }
     for finding in findings {
         if finding.severity != Severity::NonBlocking || !finding.in_scope {
             continue;
@@ -1288,6 +1346,29 @@ fn note_downgraded(findings: &[Finding], state: &mut IssueRun) {
             continue;
         }
         state.noted.push(finding.clone());
+    }
+}
+
+/// Put the findings a reviewer fixed itself in the ledger.
+///
+/// The other path has an author's disposition to record, naming which points it
+/// answered. Here the reviewer both raised and fixed them, so there is no
+/// disposition and the findings themselves are the record. Only reached when a
+/// commit landed, which the caller has just observed.
+fn record_own_fixes(style: &Style, blocking: &[Finding], ledger: &mut Ledger, round: u32) {
+    for finding in blocking {
+        settle(
+            ledger,
+            finding_key(&finding.title, &finding.file),
+            LedgerEntry {
+                title: style::title(&finding.title, style),
+                file: finding.file.clone(),
+                reasoning: style::summary(&finding.detail, style),
+                round,
+                reraised: 0,
+                outcome: Settled::Fixed,
+            },
+        );
     }
 }
 
@@ -1360,6 +1441,7 @@ fn apply_dispositions(
     subject: i64,
     pr_number: i64,
     author: &str,
+    committed: bool,
 ) {
     let mut fixed = Vec::new();
     let mut refuted = Vec::new();
@@ -1455,18 +1537,26 @@ fn apply_dispositions(
                 // code with no sign anybody had asked for it, and the guard that
                 // ends an argument had only refutations to match, so across six
                 // fix rounds on two pull requests it never fired once.
-                settle(
-                    ledger,
-                    finding_key(canonical, &file),
-                    LedgerEntry {
-                        title: title.clone(),
-                        file: file.clone(),
-                        reasoning: style::summary(&d.reasoning, &repo.style),
-                        round,
-                        reraised: 0,
-                        outcome: Settled::Fixed,
-                    },
-                );
+                //
+                // Only when something was actually committed, on the same rule
+                // `filed_entry` keeps for a follow-up that failed: an entry says
+                // the point was dealt with and it outlives the run, so writing
+                // one for a fix that does not exist tells every later pass to
+                // check code nobody wrote.
+                if committed {
+                    settle(
+                        ledger,
+                        finding_key(canonical, &file),
+                        LedgerEntry {
+                            title: title.clone(),
+                            file: file.clone(),
+                            reasoning: style::summary(&d.reasoning, &repo.style),
+                            round,
+                            reraised: 0,
+                            outcome: Settled::Fixed,
+                        },
+                    );
+                }
                 fixed.push(title);
             }
         }
@@ -1785,6 +1875,9 @@ pub enum Ending<'a> {
     /// The closing pass could not run, so the last round's fixes were pushed and
     /// nothing has read them, which is the part a maintainer has to know.
     OutOfRounds,
+    /// The budget ran out on a branch the last round did not change. Nothing is
+    /// unread, and nothing cleared the points that were raised either.
+    Unchanged,
     /// The closing pass read what the last round left and did not sign it off.
     /// Nothing more will be fixed here, so what is left is a person's to weigh.
     Unresolved(&'a [Finding]),
@@ -1884,6 +1977,14 @@ pub fn outcome_comment(
         }
         Ending::OutOfRounds => out.push(
             "Not signed off: the last round of fixes was pushed but has not been reviewed.".into(),
+        ),
+        // Deliberately not the sentence above. Nothing was pushed on this path,
+        // and telling a maintainer to go and read a commit that does not exist
+        // is worse than saying nothing.
+        Ending::Unchanged => out.push(
+            "Not signed off: the last round changed nothing, so the branch is the one that was \
+             already reviewed."
+                .into(),
         ),
         Ending::Unresolved(points) => {
             let lines: Vec<String> = points
@@ -2001,11 +2102,13 @@ pub fn outcome_comment(
 /// is `git log` reporting the whole branch as unread and this pass quietly
 /// becoming the full audit it exists to replace.
 fn close_prompt(
+    base: &str,
     number: i64,
     title: &str,
     from: &str,
     landed: Option<&[String]>,
     ledger: &Ledger,
+    round: u32,
 ) -> String {
     let landed = match landed {
         Some([]) => "\nNothing landed after the last round of review. What it asked for was \
@@ -2021,15 +2124,16 @@ fn close_prompt(
                 .collect::<Vec<_>>()
                 .join("\n")
         ),
-        None => "\nThe commits on this branch were rewritten after the last round of review, so \
-                 the harness cannot say which of them are new. Read the branch against its base.\n"
-            .to_string(),
+        None => format!(
+            "\nThe commits on this branch were rewritten after the last round of review, so the \
+             harness cannot say which of them are new. Read it against `{base}`.\n"
+        ),
     };
     CLOSE_PROMPT
         .replace("{number}", &number.to_string())
         .replace("{title}", title)
         .replace("{landed}", &landed)
-        .replace("{answers}", &closing_answers(ledger))
+        .replace("{answers}", &closing_answers(ledger, round))
         .replace("{settled}", &settled_block(ledger))
 }
 
@@ -2037,8 +2141,8 @@ fn close_prompt(
 ///
 /// The same points `answers_block` gives a round, asked as the thing this pass
 /// is for rather than as context for a wider read.
-fn closing_answers(ledger: &Ledger) -> String {
-    let lines = fixed_lines(ledger);
+fn closing_answers(ledger: &Ledger, round: u32) -> String {
+    let lines = fixed_lines(ledger, round);
     if lines.is_empty() {
         return String::new();
     }
@@ -2065,7 +2169,7 @@ fn review_prompt(
         .replace("{base}", base)
         .replace("{number}", &number.to_string())
         .replace("{title}", title)
-        .replace("{answers}", &answers_block(ledger))
+        .replace("{answers}", &answers_block(ledger, round))
         .replace("{settled}", &settled_block(ledger))
         .replace("{round}", &round_note(round, last))
 }
@@ -2579,6 +2683,35 @@ mod tests {
         }
     }
 
+    /// A reviewer that fixes its own findings answers them in code too. Leaving
+    /// them out left that path with the hole the other one had: the next pass
+    /// reads a fix with nothing saying it was asked for, and the guard cannot
+    /// count it.
+    #[test]
+    fn a_reviewer_that_fixes_its_own_findings_records_them_too() {
+        let mut ledger = Ledger::new();
+        let blocking = vec![finding(
+            "blocking",
+            "Unbounded loop",
+            "spins",
+            "src/x.rs",
+            true,
+        )];
+
+        record_own_fixes(&style(), &blocking, &mut ledger, 1);
+
+        let entry = ledger
+            .get(&finding_key("Unbounded loop", "src/x.rs"))
+            .expect("keyed where the next round will look");
+        assert_eq!(Settled::Fixed, entry.outcome);
+        assert_eq!("spins", entry.reasoning);
+
+        // And the guard can now count it, which it could not before.
+        let mut state = IssueRun::new(1, "t");
+        assert!(!check_relitigation(&mut ledger, &blocking, &mut state));
+        assert!(check_relitigation(&mut ledger, &blocking, &mut state));
+    }
+
     /// The settled block tells a reviewer the code will not change for a point.
     /// That is the opposite of what happened to a fix, and a fixed point printed
     /// there reads as an argument already won.
@@ -2896,12 +3029,12 @@ mod tests {
 
     #[test]
     fn a_ledger_with_no_claimed_fix_has_nothing_to_close_over() {
-        assert!(!any_fixes(&ledger_with("refuted point", "a.rs")));
+        assert!(!any_fixes(&ledger_with("refuted point", "a.rs"), 1));
         let mut fixed = ledger_with("fixed point", "b.rs");
         for entry in fixed.values_mut() {
             entry.outcome = Settled::Fixed;
         }
-        assert!(any_fixes(&fixed));
+        assert!(any_fixes(&fixed, 1));
     }
 
     /// A count of rounds is a fact about spar, and what is left is a fact about
@@ -2925,7 +3058,15 @@ mod tests {
     #[test]
     fn the_closing_prompt_names_every_fix_it_has_to_check() {
         let landed = vec!["abc1234 Bound the retry loop".to_string()];
-        let prompt = close_prompt(42, "Retry a 429", "9f8e7d6", Some(&landed), &fixed_ledger());
+        let prompt = close_prompt(
+            "main",
+            42,
+            "Retry a 429",
+            "9f8e7d6",
+            Some(&landed),
+            &fixed_ledger(),
+            1,
+        );
         assert!(prompt.contains("Unbounded loop"), "{prompt}");
         assert!(prompt.contains("bounded it on max_attempts"), "{prompt}");
         assert!(prompt.contains("abc1234 Bound the retry loop"), "{prompt}");
@@ -2937,7 +3078,15 @@ mod tests {
     /// cannot tell", and neither may leave a heading with nothing under it.
     #[test]
     fn a_close_with_nothing_landed_says_so_rather_than_leaving_a_hole() {
-        let prompt = close_prompt(42, "Retry a 429", "9f8e7d6", Some(&[]), &Ledger::new());
+        let prompt = close_prompt(
+            "main",
+            42,
+            "Retry a 429",
+            "9f8e7d6",
+            Some(&[]),
+            &Ledger::new(),
+            1,
+        );
         assert!(
             prompt.contains("Nothing landed after the last round"),
             "{prompt}"
@@ -2951,7 +3100,15 @@ mod tests {
     /// of it as unread would turn this pass back into the full audit it replaces.
     #[test]
     fn a_rewritten_branch_admits_it_cannot_say_what_landed() {
-        let prompt = close_prompt(42, "Retry a 429", "9f8e7d6", None, &fixed_ledger());
+        let prompt = close_prompt(
+            "main",
+            42,
+            "Retry a 429",
+            "9f8e7d6",
+            None,
+            &fixed_ledger(),
+            1,
+        );
         assert!(prompt.contains("were rewritten"), "{prompt}");
         assert!(!prompt.contains("nobody has read it"), "{prompt}");
         assert!(!prompt.contains('{'), "{prompt}");
@@ -2961,7 +3118,7 @@ mod tests {
     /// forbids it, so the prompt has to actually forbid it.
     #[test]
     fn the_closing_prompt_forbids_the_writing_the_loop_rolls_back() {
-        let prompt = close_prompt(42, "t", "9f8e7d6", Some(&[]), &Ledger::new());
+        let prompt = close_prompt("main", 42, "t", "9f8e7d6", Some(&[]), &Ledger::new(), 1);
         assert!(prompt.contains("do not commit"), "{prompt}");
     }
 
@@ -2969,12 +3126,53 @@ mod tests {
     /// kept these runs going, and this is the one call with no round after it.
     #[test]
     fn the_closing_prompt_does_not_reopen_what_a_round_already_passed() {
-        let prompt = close_prompt(42, "t", "9f8e7d6", Some(&[]), &Ledger::new());
+        let prompt = close_prompt("main", 42, "t", "9f8e7d6", Some(&[]), &Ledger::new(), 1);
         assert!(
-            prompt.contains("does not block\nnow. You read that code and passed it"),
+            prompt.contains("does not\nblock now: you read that code and passed it"),
             "{prompt}"
         );
         assert!(prompt.contains("Only one\nof them ships"), "{prompt}");
+    }
+
+    /// The closing pass had two routes for a real point, block or in_scope=false,
+    /// and `blocks()` is `severity == Blocking && in_scope`, so the second one
+    /// silently opens the merge gate. A closer taking it filed an issue saying
+    /// the branch must not merge and merged the branch.
+    #[test]
+    fn the_closing_pass_is_offered_a_severity_rather_than_the_field_that_gates() {
+        let prompt = close_prompt("main", 42, "t", "9f8e7d6", Some(&[]), &Ledger::new(), 1);
+        assert!(prompt.contains("Label it non-blocking"), "{prompt}");
+        assert!(
+            prompt.contains("a real defect this\npull request did not cause"),
+            "{prompt}"
+        );
+    }
+
+    /// A point that only ever reached `in_scope = false` never reaches
+    /// `blocking`, whatever severity it carries, so the run merges.
+    #[test]
+    fn an_out_of_scope_point_cannot_gate_the_close() {
+        let out_of_scope = finding("blocking", "Adjacent leak", "d", "o.rs", false);
+        assert!(!out_of_scope.blocks());
+        assert!(approval_stands(&[], false));
+    }
+
+    /// The closing pass reads what the last round left. Carrying every fix a
+    /// pull request ever saw would hand a resumed run's close nine rounds of
+    /// answered points, which is the unbounded surface this replaces.
+    #[test]
+    fn a_fix_is_shown_to_the_pass_that_has_to_check_it_and_not_after() {
+        let mut ledger = ledger_with("Unbounded loop", "src/x.rs");
+        for entry in ledger.values_mut() {
+            entry.outcome = Settled::Fixed;
+            entry.round = 2;
+        }
+        // Round 3 follows the round that claimed it.
+        assert!(answers_block(&ledger, 3).contains("Unbounded loop"));
+        // Round 4 does not: round 3 read it and did not raise it again.
+        assert_eq!("", answers_block(&ledger, 4));
+        assert!(any_fixes(&ledger, 2));
+        assert!(!any_fixes(&ledger, 3));
     }
 
     // -- the review prompt ----------------------------------------------
@@ -2988,7 +3186,7 @@ mod tests {
             entry.outcome = Settled::Fixed;
             entry.reasoning = "bounded it on max_attempts".into();
         }
-        let block = answers_block(&ledger);
+        let block = answers_block(&ledger, 2);
         assert!(block.contains("Unbounded loop"), "{block}");
         assert!(block.contains("src/x.rs"), "{block}");
         assert!(block.contains("bounded it on max_attempts"), "{block}");
@@ -3007,7 +3205,7 @@ mod tests {
                 entry.outcome = Settled::Fixed;
             }
         }
-        let answers = answers_block(&ledger);
+        let answers = answers_block(&ledger, 2);
         let settled = settled_block(&ledger);
         assert!(answers.contains("fixed point") && !answers.contains("refuted point"));
         assert!(settled.contains("refuted point") && !settled.contains("fixed point"));
@@ -3015,7 +3213,7 @@ mod tests {
 
     #[test]
     fn an_empty_ledger_adds_no_answers_block() {
-        assert_eq!("", answers_block(&Ledger::new()));
+        assert_eq!("", answers_block(&Ledger::new(), 2));
     }
 
     /// A point held back for a later round does not get one, so the reviewer is
@@ -3054,6 +3252,7 @@ mod tests {
         for entry in ledger.values_mut() {
             if entry.title == "fixed point" {
                 entry.outcome = Settled::Fixed;
+                entry.round = 2;
             }
         }
         let full = review_prompt("main", 42, "Retry a 429", &ledger, 3, 3);
@@ -3070,9 +3269,17 @@ mod tests {
         assert!(
             REVIEW_PROMPT.contains("A minor defect belongs\n  here as much as an improvement does")
         );
-        assert!(schema::review()
-            .to_string()
-            .contains("A minor defect belongs here"));
+        // The schema is shared with `spar review`, which has no rounds, so it
+        // and that prompt carry the same ladder without the round neither can
+        // spend. Two definitions of one enum value in one request is how a
+        // reviewer ends up applying a cost model that does not exist.
+        for text in [
+            schema::review().to_string(),
+            crate::review_only::review_only_prompt().to_string(),
+        ] {
+            assert!(text.contains("as much as an improvement does"), "{text}");
+            assert!(!text.contains("a genuine improvement"), "{text}");
+        }
     }
 
     /// Doubt used to resolve onto `in_scope = true`, which is half of what gates
@@ -3337,6 +3544,13 @@ mod outcome_tests {
         }
     }
 
+    /// Follow-ups off, which is the default, so a downgraded point has nowhere
+    /// to go but the noted list.
+    fn cfg_with(_worktrees: bool, _keep: bool) -> Config {
+        let text = "[agents.a]\ncommand = [\"x\"]\n[agents.b]\ncommand = [\"y\"]\n";
+        crate::config::parse(text).unwrap()
+    }
+
     fn graded(severity: Severity, title: &str, file: &str, in_scope: bool) -> Finding {
         Finding {
             severity,
@@ -3361,6 +3575,7 @@ mod outcome_tests {
     fn a_downgraded_finding_still_reaches_the_pull_request() {
         let mut state = state_with(vec![], vec![]);
         note_downgraded(
+            &cfg_with(true, false),
             &[
                 graded(
                     Severity::NonBlocking,
@@ -3387,6 +3602,21 @@ mod outcome_tests {
         );
     }
 
+    /// With follow-ups on, every one of these is already an issue and already
+    /// named under "Filed separately". Two headings for one point reads as two.
+    #[test]
+    fn a_point_that_was_filed_is_not_also_noted() {
+        let mut cfg = cfg_with(true, false);
+        cfg.loop_cfg.file_non_blocking = true;
+        let mut state = state_with(vec![], vec![]);
+        note_downgraded(
+            &cfg,
+            &[graded(Severity::NonBlocking, "Timeout", "n.rs", true)],
+            &mut state,
+        );
+        assert!(state.noted.is_empty());
+    }
+
     /// The same point raised again in a later round is one point, not three.
     #[test]
     fn a_point_noted_twice_is_listed_once() {
@@ -3403,8 +3633,9 @@ mod outcome_tests {
             "n.rs",
             true,
         );
-        note_downgraded(&[raised], &mut state);
-        note_downgraded(&[reworded], &mut state);
+        let cfg = cfg_with(true, false);
+        note_downgraded(&cfg, &[raised], &mut state);
+        note_downgraded(&cfg, &[reworded], &mut state);
         assert_eq!(1, state.noted.len());
     }
 
@@ -3414,6 +3645,7 @@ mod outcome_tests {
     fn a_deadlocked_point_is_not_also_noted() {
         let mut state = state_with(vec![], vec![]);
         note_downgraded(
+            &cfg_with(true, false),
             &[graded(
                 Severity::NonBlocking,
                 "Unbounded loop",
@@ -3444,6 +3676,17 @@ mod outcome_tests {
         );
         let text = outcome_comment(&state, &Ledger::new(), &Ending::Approved, &style()).unwrap();
         assert!(text.contains("Filed separately: #485, #486"), "{text}");
+    }
+
+    /// The skip path is taken when nothing landed, so the sentence about fixes
+    /// that were pushed and not read is false there. Sending a maintainer to
+    /// read a commit that does not exist is worse than saying nothing.
+    #[test]
+    fn a_run_that_changed_nothing_does_not_claim_there_is_something_to_read() {
+        let state = state_with(vec![], vec![]);
+        let text = outcome_comment(&state, &Ledger::new(), &Ending::Unchanged, &style()).unwrap();
+        assert!(text.contains("changed nothing"), "{text}");
+        assert!(!text.contains("was pushed"), "{text}");
     }
 
     /// "Not signed off: the last round was pushed and nobody read it" tells a

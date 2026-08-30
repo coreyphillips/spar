@@ -35,6 +35,13 @@ use crate::repo::Repo;
 use crate::style::{self, Style};
 use crate::{log, logdim, schema, spar_err};
 
+/// The independent review prompt, for the test that holds it and
+/// `schema::review()` to one definition of each severity.
+#[cfg(test)]
+pub(crate) fn review_only_prompt() -> &'static str {
+    REVIEW_ONLY_PROMPT
+}
+
 const REVIEW_ONLY_PROMPT: &str = "\
 Review pull request #{number} against `{base}`: {title}
 
@@ -47,7 +54,8 @@ not only read the diff.
 
 Label every finding by severity, and be honest about which is which:
 - blocking: this should not merge as is. Real defects only.
-- non-blocking: a genuine improvement that need not gate the merge.
+- non-blocking: real, and smaller than holding the merge for. A minor defect
+  belongs here as much as an improvement does.
 - nit: style or taste.
 
 Confirm anything you label blocking before you label it. Run the code, reproduce

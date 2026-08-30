@@ -72,7 +72,7 @@ pub fn review() -> Value {
                         "severity": {
                             "type": "string",
                             "enum": ["blocking", "non-blocking", "nit"],
-                            "description": "blocking: the PR should not merge as is, real defects only, and the only severity that costs a round. non-blocking: real, and smaller than another round. A minor defect belongs here as much as an improvement does. nit: style or taste."
+                            "description": "blocking: this should not merge as is, real defects only. non-blocking: real, and smaller than holding the merge for. A minor defect belongs here as much as an improvement does. nit: style or taste."
                         },
                         "title": {
                             "type": "string",

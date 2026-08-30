@@ -637,6 +637,14 @@ accepting wrong review comments. Refutation is explicitly blessed in the prompt,
 disputes are surfaced in the summary, and the merge gate is
 blocking-findings-empty rather than reviewer-satisfied.
 
+**A reviewer reading its own commit.** "Neither agent reviews its own most
+recent edit" was enforced from what the reviewer said it would do next rather
+than from what landed. A `fix_myself` call that returned without committing
+handed the author back its own commit, and a reviewer that committed during the
+review kept a pull request whose head it had written. Custody follows `HEAD`,
+which is recorded either side of every call: a review that writes is rolled
+back, and the next reviewer is chosen from whoever actually moved it.
+
 **Merge authority.** Two models agreeing is not the same as being right, and
 neither carries the consequences. `--auto-merge` is off by default; the terminal
 state is "approved, ready for a human to merge". Branch protection on the target

@@ -596,6 +596,12 @@ impl Agent {
     /// of `--output-schema`, so it cannot yield a machine checkable verdict.
     /// Running inside the worktree is what makes an agent repo aware, not a
     /// subcommand.
+    ///
+    /// The call has write access, so the paragraph saying not to write is not
+    /// decoration: an agent that commits while reviewing ends up holding the
+    /// head it is about to be handed back, which is the one thing the
+    /// alternating loop exists to prevent. `review::review_loop` rolls back
+    /// what this asks for anyway, because a prompt is not a permission.
     pub fn review<T: serde::de::DeserializeOwned>(
         &self,
         base: &str,
@@ -607,7 +613,11 @@ impl Agent {
         let scoped = format!(
             "{prompt}\n\nThe changes under review are the diff between `{base}` and HEAD in your \
              working directory. Inspect them with git, then read the surrounding code before \
-             judging. Do not review only the diff."
+             judging. Do not review only the diff.\n\nThis call is a review and nothing else. Do \
+             not edit the code under review, do not commit, and do not push: somebody else acts \
+             on what you find, and a reviewer that writes ends up reviewing its own work. Writing \
+             a scratch file to check a claim is fine, and anything else you leave behind is rolled \
+             back."
         );
         self.ask_json(&scoped, schema, cwd, effort)
     }

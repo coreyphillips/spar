@@ -315,6 +315,125 @@ pub fn screen() -> Value {
     })
 }
 
+/// One agent ruling on a whole queue at once: is this worth splitting.
+///
+/// One call rather than N, for the reason `screen` is one call: a repository
+/// aware pass is the dominant cost, and "is this too big to work in one piece"
+/// is partly a judgement across the queue rather than about each item alone.
+pub fn split_screen() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "item": {
+                            "type": "integer",
+                            "description": "The issue or pull request number from the list above, copied exactly, so the verdict can be matched back to what it is about."
+                        },
+                        "split": {
+                            "type": "boolean",
+                            "description": "True only for something that is plainly several separate pieces of work and would be reviewed better as several. Say false when you are unsure: no is the common answer, and a split proposed on a whim is a proposal somebody now has to read. Size alone is not the test, since a forty file rename is one piece of work and a three file mess can be three."
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "One sentence. For true, name the pieces you can see, so somebody can check you before two more agent calls are spent on it."
+                        }
+                    },
+                    "required": ["item", "split", "reason"]
+                }
+            }
+        },
+        "required": ["items"]
+    })
+}
+
+/// One agent decomposing one issue or one pull request.
+///
+/// The descriptions carry the two rules the command rests on: a part that
+/// cannot stand on its own is not a part, and the whole value of splitting is
+/// that each piece can be reviewed and merged by itself.
+pub fn split_proposal() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "should_split": {
+                "type": "boolean",
+                "description": "False when this is one piece of work, however large. A rename across forty files is one change; three unrelated fixes in one file are three. False is a fine answer and costs one person one read of something that stays as it was."
+            },
+            "reason": {
+                "type": "string",
+                "description": "One or two sentences on why it should or should not be split. For false this is the whole argument, so give the reason rather than the verdict again."
+            },
+            "stacked": {
+                "type": "boolean",
+                "description": "True only when the parts are genuinely sequential, so each needs its predecessor to make sense. Stacked parts are created in order, each branched off the one before. False means each part stands on the base branch and can be reviewed and merged in any order, which is what makes the review loop cheaper, so prefer it wherever the change allows."
+            },
+            "parts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Under 80 characters. States the piece of work, not the fact that it was split out."
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "For an issue, the body of the issue this part becomes, written for somebody picking it up cold with no sight of the parent: what is wrong, how to see it, what it should do instead. For a pull request slice, what this slice is and why it stands on its own. Either way, no preamble and no restating the title."
+                        },
+                        "files": {
+                            "type": ["array", "null"],
+                            "items": {"type": "string"},
+                            "description": "Only when splitting a pull request, null when splitting an issue. The paths from the change that this slice carries, copied exactly from the list you were given. Every path belongs to at most one part, and a part whose files cannot build and pass on their own is not a part: fold it into another or leave it out."
+                        }
+                    },
+                    "required": ["title", "body", "files"]
+                }
+            }
+        },
+        "required": ["should_split", "reason", "stacked", "parts"]
+    })
+}
+
+/// The second agent ruling on the first one's decomposition.
+///
+/// Not a second proposal. Two decompositions of one thing cannot be reconciled
+/// mechanically, so this agent rules on the one in front of it: accept, reject,
+/// or accept with named parts struck.
+pub fn split_check() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "accept": {
+                "type": "boolean",
+                "description": "True only if you read the code and this decomposition is right. Do not defer to the other agent and do not agree to be agreeable. Getting a rejection wrong costs one person one read of something that stays as it was; getting an acceptance wrong costs them issues to close, a checklist to strip out of somebody's body, and branches and pull requests to delete."
+            },
+            "stacked": {
+                "type": "boolean",
+                "description": "Your own view of whether the parts are sequential, whatever the other agent said. True means each part is branched off the one before it."
+            },
+            "strike": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "The numbers of any parts, from 1, that should not be split out: a part that cannot stand on its own, one that is really the same work as another, one that is too small to be worth its own review. Empty to accept the parts as proposed. Striking so many that fewer than two remain means nothing is split, which is the right answer when that is what you think."
+            },
+            "reasoning": {
+                "type": "string",
+                "description": "One or two sentences saying what you checked and what it showed. Required when you reject or strike anything, and useful when you accept."
+            }
+        },
+        "required": ["accept", "stacked", "strike", "reasoning"]
+    })
+}
+
 /// One agent judging the comments other people left on a pull request.
 ///
 /// The descriptions carry the asymmetry the whole command rests on, because
@@ -456,6 +575,9 @@ pub fn all() -> Vec<(&'static str, Value)> {
         ("checkin", checkin()),
         ("checkin_check", checkin_check()),
         ("checkin_fix", checkin_fix()),
+        ("split_screen", split_screen()),
+        ("split_proposal", split_proposal()),
+        ("split_check", split_check()),
     ]
 }
 
@@ -597,6 +719,56 @@ mod tests {
                  will not fill it and the code reading it will always see nothing"
             );
         }
+    }
+
+    /// The same guard for the split exchange. A part field added to the struct
+    /// and forgotten here is one the model is never asked for, so a slice would
+    /// arrive with no files and carry nothing.
+    #[test]
+    fn the_split_schemas_ask_for_every_field_they_hold() {
+        use crate::model::{SplitCheck, SplitPart, SplitProposal};
+
+        let cases: Vec<(&str, Value, serde_json::Value)> = vec![
+            (
+                "SplitProposal",
+                split_proposal()["properties"].clone(),
+                serde_json::to_value(SplitProposal::default()).expect("serialisable"),
+            ),
+            (
+                "SplitPart",
+                split_proposal()["properties"]["parts"]["items"]["properties"].clone(),
+                serde_json::to_value(SplitPart::default()).expect("serialisable"),
+            ),
+            (
+                "SplitCheck",
+                split_check()["properties"].clone(),
+                serde_json::to_value(SplitCheck::default()).expect("serialisable"),
+            ),
+        ];
+        for (what, asked, held) in cases {
+            let asked: Vec<String> = asked
+                .as_object()
+                .expect("properties")
+                .keys()
+                .cloned()
+                .collect();
+            for field in held.as_object().expect("object").keys() {
+                assert!(
+                    asked.contains(field),
+                    "a {what} holds `{field}` and the schema never asks for it, so the code \
+                     reading it will always see nothing"
+                );
+            }
+        }
+    }
+
+    /// A slice with no files carries nothing, so the one field that decides
+    /// what a part is has to be spelled as nullable rather than left out.
+    #[test]
+    fn a_split_part_may_carry_no_files_without_omitting_the_field() {
+        let types = split_proposal()["properties"]["parts"]["items"]["properties"]["files"]["type"]
+            .to_string();
+        assert!(types.contains("null"), "files must accept null: {types}");
     }
 
     /// Every value the schema offers has to be one the parser accepts, or an

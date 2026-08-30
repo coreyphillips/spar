@@ -332,6 +332,14 @@ pub struct LoopCfg {
     /// Most follow-ups one run may record before it stops and says what it
     /// dropped. A backstop, not a target.
     pub max_followups: usize,
+    /// Most parts `spar split` will make out of one issue or pull request.
+    ///
+    /// A backstop, not a target, in the shape of `max_followups`. There is no
+    /// setting to turn splitting off: it is a command somebody types, and a
+    /// setting to disable a command nobody has to run only ever confuses. There
+    /// is no mechanical threshold either, because a floor on files changed
+    /// would split a forty file rename and hold back a three file mess.
+    pub max_split_parts: usize,
     /// Nits stay in the PR thread by default. A filed nit is somebody else's
     /// notification: a run on a production codebase once opened an issue titled
     /// "Log wording".
@@ -416,6 +424,7 @@ impl Default for LoopCfg {
             followups: Followups::Local,
             file_non_blocking: false,
             max_followups: 5,
+            max_split_parts: 4,
             file_nits: false,
             close_skipped: true,
             parallel_triage: true,

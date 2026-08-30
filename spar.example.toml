@@ -137,6 +137,12 @@ file_non_blocking = false    # file a non-blocking finding as a follow-up. Off,
 file_nits         = false    # nits stay in the PR thread, never a follow-up
 max_followups     = 5        # most one run may record before it stops and says
                              # what it dropped. A backstop, not a target.
+max_split_parts   = 4        # most parts `spar split` makes out of one issue or
+                             # pull request. A backstop against a queue nobody
+                             # asked for, and what it holds back is said out
+                             # loud. A part is never itself split, so if one is
+                             # still too big, `spar split <part>` is one command
+                             # away.
 state_store       = "local"  # local | pr | both. local keeps resume state in
                              # .spar/state and off the PR
 drafts            = "never"  # never | until_approved | always. Whether a pull

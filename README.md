@@ -643,7 +643,16 @@ than from what landed. A `fix_myself` call that returned without committing
 handed the author back its own commit, and a reviewer that committed during the
 review kept a pull request whose head it had written. Custody follows `HEAD`,
 which is recorded either side of every call: a review that writes is rolled
-back, and the next reviewer is chosen from whoever actually moved it.
+back, and the next reviewer is chosen from whoever actually moved it. A review
+that wrote cannot approve either, because the branch it passed is the one the
+rollback has just taken away.
+
+Only commits reach the pull request, so tracked files a call leaves uncommitted
+are discarded rather than shown to the next reviewer as if they were the diff.
+Nothing is discarded silently: it is parked with `git stash create` first, and
+the log prints the `git stash apply` that puts it back. That matters most with
+`--no-worktrees`, where the checkout is yours and an edit you make while a call
+is running is indistinguishable from one an agent left behind.
 
 **Merge authority.** Two models agreeing is not the same as being right, and
 neither carries the consequences. `--auto-merge` is off by default; the terminal

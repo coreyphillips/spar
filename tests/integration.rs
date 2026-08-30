@@ -11,7 +11,7 @@ use std::process::Command;
 use spar::config::{self, Config, Followups};
 use spar::model::{Followup, IssueRun};
 use spar::repo::Repo;
-use spar::review::{file_followup, snapshot, undo_edits};
+use spar::review::{drop_uncommitted, file_followup, park, snapshot, undo_edits};
 
 const SPAR_BIN: &str = env!("CARGO_BIN_EXE_spar");
 
@@ -347,6 +347,57 @@ fn an_uncommitted_edit_made_while_reviewing_is_rolled_back() {
     assert!(!during.landed_over(&before));
 
     assert_eq!(before, undo_edits(&repo, &fx.work, &before));
+}
+
+/// A fix left in the working tree is code the next review reads and the pull
+/// request does not have, so it goes. What the call did commit stays.
+#[test]
+fn a_fix_left_uncommitted_does_not_reach_the_next_round() {
+    let fx = repo("dirtyfix");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    commit(&fx.work, "a.txt", "one\n", "Fix the finding");
+    let committed = snapshot(&repo, &fx.work);
+
+    std::fs::write(fx.work.join("a.txt"), "two\n").unwrap();
+    std::fs::write(fx.work.join("check.sh"), "echo hi\n").unwrap();
+
+    assert_eq!(committed, drop_uncommitted(&repo, &fx.work));
+    assert_eq!(
+        "one\n",
+        std::fs::read_to_string(fx.work.join("a.txt")).unwrap()
+    );
+    assert!(
+        fx.work.join("check.sh").exists(),
+        "scratch files are not ours"
+    );
+}
+
+/// A shared checkout is the user's own, and nothing here can tell an agent's
+/// leftovers from an edit somebody made while a call was running, so what the
+/// rollback throws away is recoverable. The stash stack is left alone: it
+/// belongs to whoever is working in the repository.
+#[test]
+fn what_the_rollback_throws_away_is_saved_first() {
+    let fx = repo("parked");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let before = snapshot(&repo, &fx.work);
+    std::fs::write(fx.work.join("README.md"), "somebody was editing this\n").unwrap();
+
+    // The rollback parks the same way; doing it here is how the test gets hold
+    // of the handle the log prints.
+    let parked = park(&repo, &fx.work).expect("a dirty tree has something to save");
+    assert_eq!(before, undo_edits(&repo, &fx.work, &before));
+    assert_eq!(
+        "seed\n",
+        std::fs::read_to_string(fx.work.join("README.md")).unwrap()
+    );
+    assert!(git(&fx.work, &["stash", "list"]).trim().is_empty());
+
+    git(&fx.work, &["stash", "apply", &parked]);
+    assert_eq!(
+        "somebody was editing this\n",
+        std::fs::read_to_string(fx.work.join("README.md")).unwrap()
+    );
 }
 
 /// The `fix_myself` bug, at the level the loop reads. A call that returns

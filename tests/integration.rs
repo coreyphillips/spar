@@ -1043,6 +1043,56 @@ fn a_branch_that_matches_the_base_is_not_treated_as_work() {
     repo.worktree_remove(43);
 }
 
+/// The other half of the same case. An implement call that fails after the
+/// agent has committed leaves the work unpushed, so there is no remote branch
+/// for the guard above to find and nothing but the reflog if this one deletes
+/// the local branch.
+#[test]
+fn a_local_branch_with_unpushed_work_is_not_rebuilt() {
+    let fx = repo("noclobber-local");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+
+    git(&fx.work, &["checkout", "-q", "-b", "issue-45"]);
+    commit(
+        &fx.work,
+        "feature.txt",
+        "round one\n",
+        "Implement the feature",
+    );
+    let before = git(&fx.work, &["rev-parse", "issue-45"]);
+    git(&fx.work, &["checkout", "-q", "main"]);
+
+    let err = repo.worktree_add(45, "main").unwrap_err().to_string();
+
+    assert!(
+        err.contains("Implement the feature"),
+        "the message has to say what is sitting there: {err}"
+    );
+    assert!(
+        err.contains("git branch -D issue-45"),
+        "the remedy has to be in the message: {err}"
+    );
+    assert_eq!(
+        before,
+        git(&fx.work, &["rev-parse", "issue-45"]),
+        "the unpushed work must still be reachable"
+    );
+}
+
+#[test]
+fn a_local_branch_that_matches_the_base_is_not_treated_as_work() {
+    let fx = repo("noclobber-local-equal");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    git(&fx.work, &["branch", "issue-46", "main"]);
+
+    let (path, branch) = repo
+        .worktree_add(46, "main")
+        .expect("an empty branch carries no work to lose");
+    assert_eq!("issue-46", branch);
+    assert!(path.is_dir());
+    repo.worktree_remove(46);
+}
+
 #[test]
 fn a_fresh_issue_is_unaffected_by_the_guard() {
     let fx = repo("noclobber-fresh");

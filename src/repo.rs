@@ -287,12 +287,7 @@ impl Repo {
         self.git_try(&["fetch", "origin", &branch]);
         let remote_branch = format!("origin/{branch}");
         if self.rev_exists(&self.root, &remote_branch) {
-            let range = format!("origin/{base}..{remote_branch}");
-            let ahead: u32 = self
-                .git_try(&["rev-list", "--count", &range])
-                .trim()
-                .parse()
-                .unwrap_or(0);
+            let ahead = self.commit_subjects(&self.root, &remote_branch, base).len();
             if ahead > 0 {
                 bail!(
                     "origin/{branch} already has {ahead} commit(s) that are not on {base}, and no \
@@ -300,6 +295,33 @@ impl Repo {
                      that work.\nOpen a pull request for the branch and run `spar resume <pr>` to \
                      continue it, or delete it with `git push origin --delete {branch}` if it is \
                      stale."
+                );
+            }
+        }
+
+        // The same guard, for commits that never reached the remote at all.
+        //
+        // An agent commits as it goes, so a run that dies after the commits and
+        // before the push leaves the local branch holding the only copy. With
+        // nothing on origin there is no remote branch to guard and no pull
+        // request to find the work by, and `git branch -D` below would leave it
+        // reachable from the reflog alone, which nothing would tell anyone to
+        // look at.
+        if self.rev_exists(&self.root, &branch) {
+            let subjects = self.commit_subjects(&self.root, &branch, base);
+            if !subjects.is_empty() && self.any_pr_for_branch(&branch).is_none() {
+                let listed = subjects
+                    .iter()
+                    .map(|s| format!("  {s}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                bail!(
+                    "the local branch {branch} has {} commit(s) that are not on {base}, and \
+                     nothing accounts for them: no branch on origin and no pull request. \
+                     Rebuilding it would delete the only copy.\n{listed}\nPush it and run `spar \
+                     resume <pr>` on the pull request to continue it, or delete it with `git \
+                     branch -D {branch}` if it is stale.",
+                    subjects.len()
                 );
             }
         }
@@ -453,6 +475,18 @@ impl Repo {
             .git_try_at(Some(cwd), &["log", &range, "--oneline"])
             .trim()
             .is_empty()
+    }
+
+    /// The subjects of the commits `refname` carries that the base does not,
+    /// oldest first.
+    pub fn commit_subjects(&self, cwd: &Path, refname: &str, base: &str) -> Vec<String> {
+        let range = format!("{}..{refname}", self.base_ref(cwd, base));
+        self.git_try_at(Some(cwd), &["log", &range, "--reverse", "--format=%s"])
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
     }
 
     pub fn diff_stat(&self, cwd: &Path, base: &str) -> String {
@@ -697,13 +731,27 @@ impl Repo {
     }
 
     pub fn pr_for_branch(&self, branch: &str) -> Option<PrRef> {
+        self.branch_pr(branch, "open")
+    }
+
+    /// A pull request for this branch whatever became of it, merged or closed
+    /// included.
+    ///
+    /// "Is there one open" is the right question when deciding what to
+    /// continue, and the wrong one when deciding whether commits on a branch
+    /// exist anywhere but here: a merged pull request is not work at risk.
+    pub fn any_pr_for_branch(&self, branch: &str) -> Option<PrRef> {
+        self.branch_pr(branch, "all")
+    }
+
+    fn branch_pr(&self, branch: &str, state: &str) -> Option<PrRef> {
         let text = self.gh_try(&[
             "pr",
             "list",
             "--head",
             branch,
             "--state",
-            "open",
+            state,
             "--json",
             "number,url,title",
         ]);

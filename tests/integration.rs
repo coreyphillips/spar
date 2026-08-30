@@ -506,6 +506,189 @@ fn a_recorded_branch_already_deleted_by_hand_is_forgotten() {
 }
 
 // ---------------------------------------------------------------------------
+// Splitting
+// ---------------------------------------------------------------------------
+
+/// A part branch has to go through `record_branch`, or `prune_branches` can
+/// never clean it up: ownership comes from the ledger, never from the name.
+#[test]
+fn a_split_part_gets_its_own_branch_off_the_base_and_is_recorded() {
+    let fx = repo("split-part");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    commit(&fx.work, "a.rs", "one\n", "on main");
+    git(&fx.work, &["push", "origin", "main"]);
+
+    let (path, branch) = repo.worktree_for_split(12, 1, "origin/main").unwrap();
+
+    assert_eq!("split-12-1", branch);
+    assert!(path.is_dir(), "{}", path.display());
+    assert!(path.join("a.rs").is_file(), "it starts from the base");
+    assert!(repo.known_branches().contains_key("split-12-1"));
+
+    // Its own namespace, so it cannot collide with the branch of the issue that
+    // happens to share the parent's number.
+    assert_ne!(repo.branch_for_issue(12), branch);
+    assert_ne!(repo.branch_for_pr(12), branch);
+}
+
+#[test]
+fn a_branch_prefix_namespaces_a_part_branch_too() {
+    let fx = repo("split-prefix");
+    let mut c = cfg();
+    c.loop_cfg.branch_prefix = "spar/".into();
+    let repo = Repo::open(&fx.work, &c).unwrap();
+    assert_eq!("spar/split-12-2", repo.branch_for_split(12, 2));
+
+    let (_, branch) = repo.worktree_for_split(12, 2, "main").unwrap();
+    assert_eq!("spar/split-12-2", branch);
+    repo.release_split_worktree(12, 2);
+}
+
+/// A part that will not stand on its own is dropped, and nothing was pushed at
+/// that point, so it has to leave no trace anywhere but the log.
+#[test]
+fn a_dropped_part_takes_its_branch_and_its_record_with_it() {
+    let fx = repo("split-drop");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, branch) = repo.worktree_for_split(12, 1, "main").unwrap();
+
+    repo.release_split_worktree(12, 1);
+
+    assert!(!path.is_dir(), "the worktree survived");
+    let branches = git(
+        &fx.work,
+        &["for-each-ref", "refs/heads/", "--format=%(refname:short)"],
+    );
+    assert!(!branches.contains(&branch), "{branches}");
+    assert!(!repo.known_branches().contains_key(&branch));
+}
+
+#[test]
+fn a_part_branch_is_swept_by_clean_all_like_any_other() {
+    let fx = repo("split-clean");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, branch) = repo.worktree_for_split(12, 1, "main").unwrap();
+
+    let removed = repo.prune_worktrees(true);
+
+    assert!(!removed.is_empty(), "nothing was cleaned");
+    assert!(!path.is_dir());
+    assert!(!repo.known_branches().contains_key(&branch));
+}
+
+/// The mechanical heart of a pull request split, and the case it gets wrong:
+/// a file the change deleted is not there to check out, so it has to be removed
+/// rather than fetched. Everything the slice does not name stays as the base
+/// had it.
+#[test]
+fn a_slice_carries_only_its_own_files_deletions_included() {
+    let fx = repo("split-slice");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    for (name, body) in [("a.rs", "one\n"), ("b.rs", "two\n"), ("c.rs", "three\n")] {
+        std::fs::write(fx.work.join(name), body).unwrap();
+    }
+    git(&fx.work, &["add", "-A"]);
+    git(&fx.work, &["commit", "-m", "base"]);
+    git(&fx.work, &["push", "origin", "main"]);
+
+    // What the pull request did: edited a.rs and b.rs, added new.rs, deleted c.rs.
+    git(&fx.work, &["checkout", "-b", "theirs"]);
+    std::fs::write(fx.work.join("a.rs"), "one, changed\n").unwrap();
+    std::fs::write(fx.work.join("b.rs"), "two, changed\n").unwrap();
+    std::fs::write(fx.work.join("new.rs"), "added\n").unwrap();
+    std::fs::remove_file(fx.work.join("c.rs")).unwrap();
+    git(&fx.work, &["add", "-A"]);
+    git(&fx.work, &["commit", "-m", "theirs"]);
+
+    // What the proposing agent is shown, read the way the split reads it: from
+    // the checked out head, against the base.
+    assert_eq!(
+        vec!["a.rs", "b.rs", "c.rs", "new.rs"],
+        repo.changed_files(&fx.work, "main")
+    );
+    assert!(repo.path_exists_at(&fx.work, "theirs", "a.rs"));
+    assert!(
+        !repo.path_exists_at(&fx.work, "theirs", "c.rs"),
+        "a file the change deleted is not at its head"
+    );
+    git(&fx.work, &["checkout", "main"]);
+
+    let (dir, _) = repo.worktree_for_split(12, 1, "main").unwrap();
+    let slice: Vec<String> = ["a.rs", "c.rs"].iter().map(|s| s.to_string()).collect();
+    assert!(spar::split::apply_slice(&repo, &dir, "theirs", &slice).unwrap());
+    git(&dir, &["commit", "-m", "part one"]);
+
+    assert_eq!(
+        "one, changed\n",
+        std::fs::read_to_string(dir.join("a.rs")).unwrap()
+    );
+    assert!(
+        !dir.join("c.rs").exists(),
+        "the deletion did not carry over"
+    );
+    assert_eq!(
+        "two\n",
+        std::fs::read_to_string(dir.join("b.rs")).unwrap(),
+        "a file no part named was changed anyway"
+    );
+    assert!(
+        !dir.join("new.rs").exists(),
+        "a file no part named was added"
+    );
+}
+
+/// A slice that changes nothing is a part with no content, and committing it
+/// would fail on an empty tree.
+#[test]
+fn a_slice_that_changes_nothing_says_so_rather_than_committing() {
+    let fx = repo("split-empty");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    git(&fx.work, &["branch", "theirs"]);
+
+    let (dir, _) = repo.worktree_for_split(12, 1, "main").unwrap();
+    let slice = vec!["README.md".to_string()];
+    assert!(!spar::split::apply_slice(&repo, &dir, "theirs", &slice).unwrap());
+}
+
+/// **spar never rewrites the branch behind somebody's pull request.** Splitting
+/// a pull request touches code somebody else wrote, and the only thing that
+/// makes it safe is that it is purely additive. This is that invariant against
+/// a real repository: the base, the pull request's own branch, and an unrelated
+/// branch all stay exactly where they were.
+#[test]
+fn splitting_never_moves_the_branch_behind_the_pull_request() {
+    let fx = repo("split-additive");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+
+    // The pull request's branch, with work on it that is not on main.
+    git(&fx.work, &["checkout", "-b", "their-feature"]);
+    commit(&fx.work, "theirs.rs", "their work\n", "their commit");
+    git(&fx.work, &["push", "-u", "origin", "their-feature"]);
+    git(&fx.work, &["checkout", "main"]);
+    let before = git(&fx.work, &["rev-parse", "their-feature"]);
+    let main_before = git(&fx.work, &["rev-parse", "main"]);
+
+    // A part is built and committed on its own branch off the base.
+    let (dir, branch) = repo.worktree_for_split(12, 1, "main").unwrap();
+    std::fs::write(dir.join("part.rs"), "the slice\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-m", "part one"]);
+
+    assert_eq!(before, git(&fx.work, &["rev-parse", "their-feature"]));
+    assert_eq!(main_before, git(&fx.work, &["rev-parse", "main"]));
+    assert_ne!(before, git(&fx.work, &["rev-parse", &branch]));
+
+    // And the push path refuses any name but the one it created.
+    assert!(spar::split::additive(&branch, "their-feature", "").is_ok());
+    for other in ["their-feature", "main", "pr-12", "issue-12"] {
+        assert!(
+            spar::split::additive(other, "their-feature", "").is_err(),
+            "{other} was allowed"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Local state and follow-ups
 // ---------------------------------------------------------------------------
 

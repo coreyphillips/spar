@@ -178,10 +178,11 @@ pub fn already_split(text: &str) -> bool {
 pub fn tracker_body(original: &str, parts: &[(String, i64)]) -> String {
     let mut out = original.trim_end().to_string();
     if !out.is_empty() {
-        if unclosed_fence(&out) {
+        if let Some(fence) = unclosed_fence(&out) {
             // A fence somebody left open swallows everything after it, so the
             // checklist would render as code rather than as a checklist.
-            out.push_str("\n```");
+            out.push('\n');
+            out.push_str(&fence);
         }
         out.push_str("\n\n");
     }
@@ -193,30 +194,37 @@ pub fn tracker_body(original: &str, parts: &[(String, i64)]) -> String {
     out
 }
 
-/// Whether the text ends inside a fenced code block.
+/// The fence that closes this text, when it ends inside a fenced code block.
 ///
-/// Tracked rather than counted, because a fence of one character inside a block
-/// opened with the other is content and not a fence at all. Counting them would
-/// close a block that was never open, which puts the checklist inside a fence
-/// this wrote.
-fn unclosed_fence(text: &str) -> bool {
-    let mut open: Option<char> = None;
+/// The opener is carried rather than counted, because only a fence of the same
+/// character and at least the same length closes it: three backticks inside a
+/// block opened with four are content, and no number of backticks closes a
+/// block opened with tildes. Anything else would answer with a fence that does
+/// not close the block, and the checklist stays inside it either way.
+fn unclosed_fence(text: &str) -> Option<String> {
+    let mut open: Option<(char, usize)> = None;
     for line in text.lines() {
         let start = line.trim_start();
         let Some(ch @ ('`' | '~')) = start.chars().next() else {
             continue;
         };
-        if start.chars().take_while(|c| *c == ch).count() < 3 {
+        let run = start.chars().take_while(|c| *c == ch).count();
+        if run < 3 {
             continue;
         }
         match open {
-            None => open = Some(ch),
-            // A closing fence is the same character and carries no info string.
-            Some(c) if c == ch && start.trim_end().chars().all(|c| c == ch) => open = None,
+            None => open = Some((ch, run)),
+            // A closing fence is the same character, no shorter than the one
+            // that opened the block, and carries no info string.
+            Some((open_ch, len))
+                if open_ch == ch && run >= len && start.trim_end().chars().all(|c| c == ch) =>
+            {
+                open = None;
+            }
             Some(_) => {}
         }
     }
-    open.is_some()
+    open.map(|(ch, len)| ch.to_string().repeat(len))
 }
 
 // ---------------------------------------------------------------------------
@@ -848,6 +856,13 @@ fn proposed_leftover(changed: &[String], decision: &Decision) -> Vec<String> {
     leftover(changed, decision.parts.iter().map(|p| p.files.as_slice()))
 }
 
+/// One part as it was actually built: its pull request, and the files its
+/// branch really changed.
+struct Built {
+    pr: crate::model::PrRef,
+    files: Vec<String>,
+}
+
 /// One part that exists: its number, its title, its pull request, and the files
 /// it took with it.
 struct Made {
@@ -911,14 +926,32 @@ fn build_parts(
             &against,
         );
         match outcome {
-            Ok(Some(pr)) => {
-                log!("  part {index}: {}", pr.url);
-                state.filed.push(pr.url.clone());
+            Ok(Some(built)) => {
+                log!("  part {index}: {}", built.pr.url);
+                state.filed.push(built.pr.url.clone());
+                // The proposal's list only as a fallback. The branch was pushed
+                // with a commit on it, so an empty answer means the diff could
+                // not be read, and taking it would report every file the part
+                // carries as still being only on the original.
+                let files = if built.files.is_empty() {
+                    part.files.clone()
+                } else {
+                    built.files
+                };
+                for path in overlapping(&made, &files, decision.stacked) {
+                    // Not an error: the part is pushed and its pull request is
+                    // open. But two parts carrying one path is the thing a
+                    // split exists to avoid, so it cannot pass unsaid.
+                    logwarn!("  part {index} also changed `{path}`, which an earlier part carries");
+                    state.notes.push(format!(
+                        "part {index} and an earlier part both carry {path}"
+                    ));
+                }
                 made.push(Made {
                     index,
                     title: part.title.clone(),
-                    url: pr.url,
-                    files: part.files.clone(),
+                    url: built.pr.url,
+                    files,
                 });
                 if decision.stacked {
                     start = branch.clone();
@@ -938,6 +971,31 @@ fn build_parts(
     Ok(made)
 }
 
+/// The paths this part changed that a part already made carries too.
+///
+/// `confine` keeps the proposal's parts disjoint, but the stand-alone pass
+/// commits whatever the part needed to build and nothing tells it what the
+/// other parts own, so this is only answerable once a part exists.
+///
+/// Nothing for a stacked split, where each part is diffed against the one
+/// before it: changing a file an earlier part changed is what a stack is, and
+/// the parts land in that order.
+fn overlapping(made: &[Made], files: &[String], stacked: bool) -> Vec<String> {
+    if stacked {
+        return Vec::new();
+    }
+    let taken: BTreeSet<&str> = made
+        .iter()
+        .flat_map(|m| m.files.iter())
+        .map(String::as_str)
+        .collect();
+    files
+        .iter()
+        .filter(|path| taken.contains(path.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Build one part on its own branch, or say it will not stand.
 ///
 /// Returns None for a part the agent declined, which is dropped rather than
@@ -954,7 +1012,7 @@ fn build_one(
     dir: &Path,
     branch: &str,
     against: &str,
-) -> Result<Option<crate::model::PrRef>> {
+) -> Result<Option<Built>> {
     let number = parent.number;
     log!(
         "PR #{number}: building part {index} of {total} on {branch} ({} file(s))",
@@ -998,7 +1056,7 @@ fn build_one(
     // stand-alone pass left in the tree missing from it. That is the one shape
     // of failure this cannot see afterwards: the part arrives without exactly
     // the fixes that were supposed to make it stand on its own.
-    if crate::review::snapshot(repo, dir).dirty {
+    if uncommitted(repo, dir) {
         bail!("it left its stand-alone fixes uncommitted");
     }
 
@@ -1009,8 +1067,27 @@ fn build_one(
 
     let title = format!("{} (part {index} of #{number})", part.title.trim());
     let body = part_body(number, index, total, part, &work, &repo.style);
+    // The branch, not the proposal. The stand-alone pass commits whatever the
+    // part needed to build, so what it carries is only knowable here, and this
+    // list is what the comment on the original reports as taken.
+    let files = repo.changed_files(dir, against);
     repo.create_pr(dir, branch, against, &title, &body)
-        .map(Some)
+        .map(|pr| Some(Built { pr, files }))
+}
+
+/// Whether anything in this tree is missing from the commit, untracked files
+/// included.
+///
+/// `review::snapshot` asks only about tracked files, and the shape that matters
+/// here is a file the stand-alone pass wrote and never added: a new module a
+/// part needs to build is exactly that, and it would be pushed missing.
+///
+/// Public so that it can be tested against a real repository.
+pub fn uncommitted(repo: &Repo, dir: &Path) -> bool {
+    !repo
+        .git_try_at(Some(dir), &["status", "--porcelain"])
+        .trim()
+        .is_empty()
 }
 
 /// Put one slice of the parent's change on this branch.
@@ -1537,6 +1614,27 @@ mod tests {
         assert!(already_split(&out), "{out}");
     }
 
+    /// The closer has to match the opener, or the checklist stays inside the
+    /// block while `already_split` reports the parent as a tracker: it looks
+    /// untouched and no later run comes back to it.
+    #[test]
+    fn an_open_fence_is_closed_by_one_that_actually_closes_it() {
+        for original in [
+            // Backticks close nothing here.
+            "Here:\n\n~~~\nfn unfinished() {}",
+            // Three backticks are content inside a block opened with four.
+            "Here:\n\n````\n```\nfn unfinished() {}",
+        ] {
+            let out = tracker_body(original, &[("a".into(), 1)]);
+            let marker = out.split(SPLIT_MARKER).next().unwrap();
+            assert!(
+                unclosed_fence(marker).is_none(),
+                "the checklist is inside a code block: {out}"
+            );
+            assert!(already_split(&out), "{out}");
+        }
+    }
+
     /// The other half of that: a body whose fences are balanced must not have
     /// one opened for it, which would put the checklist inside a code block
     /// this wrote.
@@ -1547,6 +1645,8 @@ mod tests {
             // A fence of the other character inside a block is content, not a
             // fence, so counting them would find three and close one.
             "Here:\n\n```\n~~~\n```",
+            // Same for a shorter run of the same character.
+            "Here:\n\n````\n```\n````",
             "no fences at all",
         ] {
             let out = tracker_body(original, &[("a".into(), 1)]);
@@ -1640,6 +1740,27 @@ mod tests {
         confine(&mut parts, &changed);
         assert_eq!(vec!["a.rs".to_string(), "b.rs".to_string()], parts[0].files);
         assert!(parts[1].files.is_empty(), "{:?}", parts[1].files);
+    }
+
+    /// What a part carries is read off its branch, so the stand-alone pass can
+    /// put it on top of a file another part already took. `confine` cannot see
+    /// that: it runs before either part exists.
+    #[test]
+    fn a_path_two_parts_ended_up_carrying_is_reported() {
+        let made = vec![Made {
+            index: 1,
+            title: "one".into(),
+            url: "https://example.invalid/pull/1".into(),
+            files: vec!["a.rs".to_string(), "lib.rs".into()],
+        }];
+        let second = vec!["b.rs".to_string(), "lib.rs".into()];
+        assert_eq!(
+            vec!["lib.rs".to_string()],
+            overlapping(&made, &second, false)
+        );
+        // A stacked part is diffed against the one before it, so a shared path
+        // is the stack working, not two parts fighting over a file.
+        assert!(overlapping(&made, &second, true).is_empty());
     }
 
     /// Both comments a pull request split can leave have to be recognisable

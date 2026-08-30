@@ -669,14 +669,22 @@ impl Repo {
     /// the source out of the list, and a part carrying only the destination
     /// would be a copy. As a deletion and an addition it is two paths, which a
     /// part can carry together or leave to the leftover report.
+    ///
+    /// `-z` because without it git writes paths for display: anything
+    /// non-ASCII comes back escaped and wrapped in quotes, and that string is
+    /// not a path. A part built from one carries a pathspec matching no file,
+    /// so the file never reaches the slice while every list still says the part
+    /// took it. It also keeps a path with a space at either end intact.
     pub fn changed_files(&self, cwd: &Path, base: &str) -> Vec<String> {
         let range = format!("{}...HEAD", self.base_ref(cwd, base));
-        self.git_try_at(Some(cwd), &["diff", "--name-only", "--no-renames", &range])
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect()
+        self.git_try_at(
+            Some(cwd),
+            &["diff", "--name-only", "--no-renames", "-z", &range],
+        )
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect()
     }
 
     /// Where `refname` left the base: the commit its own change is measured

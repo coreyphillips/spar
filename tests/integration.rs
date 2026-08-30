@@ -784,6 +784,73 @@ fn a_rename_reads_as_both_of_its_paths() {
     assert!(!dir.join("old.rs").exists(), "the rename became a copy");
 }
 
+/// A path git renders for display is not a path. Anything non-ASCII comes back
+/// escaped and quoted unless it is asked for raw, and a part carrying that
+/// string matches no file: the file never reaches the slice while the record
+/// still says the part took it.
+#[test]
+fn a_slice_carries_a_path_that_is_not_ascii() {
+    let fx = repo("split-unicode");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    for name in ["ascii.rs", "файл.rs"] {
+        std::fs::write(fx.work.join(name), "one\n").unwrap();
+    }
+    git(&fx.work, &["add", "-A"]);
+    git(&fx.work, &["commit", "-m", "base"]);
+    git(&fx.work, &["push", "origin", "main"]);
+
+    git(&fx.work, &["checkout", "-b", "theirs"]);
+    for name in ["ascii.rs", "файл.rs"] {
+        std::fs::write(fx.work.join(name), "two\n").unwrap();
+    }
+    git(&fx.work, &["add", "-A"]);
+    git(&fx.work, &["commit", "-m", "theirs"]);
+
+    assert_eq!(
+        vec!["ascii.rs", "файл.rs"],
+        repo.changed_files(&fx.work, "main")
+    );
+    git(&fx.work, &["checkout", "main"]);
+
+    let (dir, _) = repo.worktree_for_split(12, 1, "origin/main").unwrap();
+    let slice = vec!["файл.rs".to_string()];
+    assert!(spar::split::apply_slice(&repo, &dir, "main", "theirs", &slice).unwrap());
+
+    assert_eq!(
+        "two\n",
+        std::fs::read_to_string(dir.join("файл.rs")).unwrap(),
+        "the part was built without the file it carries"
+    );
+    assert_eq!(
+        "one\n",
+        std::fs::read_to_string(dir.join("ascii.rs")).unwrap(),
+        "a file no part named came with it"
+    );
+}
+
+/// The slice is committed before the stand-alone pass runs, so a push would
+/// succeed with whatever that pass left behind missing from the branch. A file
+/// it wrote and never added is the shape that matters: a new module the part
+/// needs to build, invisible to a check that asks only about tracked files.
+#[test]
+fn a_stand_alone_fix_left_untracked_counts_as_uncommitted() {
+    let fx = repo("split-untracked");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (dir, _) = repo.worktree_for_split(12, 1, "main").unwrap();
+    commit(&dir, "part.rs", "the slice\n", "part one");
+    assert!(!spar::split::uncommitted(&repo, &dir));
+
+    std::fs::write(dir.join("required.rs"), "what it needs to build\n").unwrap();
+    assert!(
+        spar::split::uncommitted(&repo, &dir),
+        "a file the part needs would have been pushed missing"
+    );
+
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-m", "stand alone"]);
+    assert!(!spar::split::uncommitted(&repo, &dir));
+}
+
 /// **spar never rewrites the branch behind somebody's pull request.** Splitting
 /// a pull request touches code somebody else wrote, and the only thing that
 /// makes it safe is that it is purely additive. This is that invariant against

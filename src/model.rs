@@ -761,12 +761,15 @@ pub struct Plan {
 }
 
 string_enum! {
-    /// How a point stopped being open. Both endings mean the same thing to the
+    /// How a point stopped being open. Every ending means the same thing to the
     /// next round: the code will not change for it here, so raising it again
-    /// only spends a round.
+    /// only spends a round. They do not mean the same thing to a person, which
+    /// is why `Dropped` is not folded into `Filed`: only `Filed` promises that
+    /// somewhere holds the point.
     pub enum Settled {
         Refuted = "refuted" | "refute" | "rejected",
         Filed = "filed" | "filed_issue" | "filed-issue" | "out_of_scope",
+        Dropped = "dropped" | "not_filed" | "not-filed" | "unfiled",
     }
 }
 
@@ -774,6 +777,42 @@ impl Default for Settled {
     /// State written before the ledger held anything but refutations.
     fn default() -> Self {
         Settled::Refuted
+    }
+}
+
+/// What one attempt to record a follow-up actually did.
+///
+/// The distinction the ledger needs. A point written down somewhere is settled
+/// and tracked; a point deliberately not written down is settled and untracked;
+/// a point that failed to be written down is not settled at all, and saying it
+/// was loses it. A single `Option<String>` collapsed all three into "no URL".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Followup {
+    /// A tracker issue or a local note now carries it. The string is what a
+    /// reader is shown: an issue URL, or a note line.
+    Recorded(String),
+    /// Something already covers it and nothing was written: a closed issue, or
+    /// a note the local queue still holds. There is a reference to point at,
+    /// but no new work to hand anyone.
+    Covered(String),
+    /// Deliberately not recorded, with the reason. Follow-ups are off, or the
+    /// run has spent its cap.
+    Dropped(&'static str),
+    /// Nothing was written and nothing covers it. The point is still open, so
+    /// the next round is free to try again.
+    Failed,
+}
+
+impl Followup {
+    /// The reference to add to the run's filed list, when there is a live one.
+    ///
+    /// `Covered` is deliberately excluded: a closed issue reported as filed
+    /// goes back into a wave to be implemented again.
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            Followup::Recorded(url) => Some(url),
+            _ => None,
+        }
     }
 }
 

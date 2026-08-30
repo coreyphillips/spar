@@ -22,9 +22,9 @@ use crate::config::{Config, Drafts, Followups, PrComments};
 use crate::error::{Result, SparError};
 use crate::jsonx::finding_key;
 use crate::model::{
-    Action, Dispute, Finding, Implementation, Issue, IssueRun, Ledger, LedgerEntry, NextAction,
-    PersistedState, PlanItem, PrView, ResponseDoc, Review, Settled, Severity, SkippedItem, Status,
-    STATE_VERSION,
+    Action, Dispute, Finding, Followup, Implementation, Issue, IssueRun, Ledger, LedgerEntry,
+    NextAction, PersistedState, PlanItem, PrView, ResponseDoc, Review, Settled, Severity,
+    SkippedItem, Status, STATE_VERSION,
 };
 use crate::repo::Repo;
 use crate::style::{self, Style};
@@ -693,6 +693,10 @@ fn settled_block(ledger: &Ledger) -> String {
                 "- {}: out of scope here, and filed. {}",
                 e.title, e.reasoning
             ),
+            Settled::Dropped => format!(
+                "- {}: out of scope here, and not filed. {}",
+                e.title, e.reasoning
+            ),
         })
         .collect();
     format!(
@@ -820,17 +824,26 @@ fn apply_dispositions(
                     .filter(|b| !b.trim().is_empty())
                     .unwrap_or_else(|| d.reasoning.clone());
                 let recorded = file_followup(repo, &new_title, &new_body, subject, cfg, state);
-                let mut reasoning = style::summary(&d.reasoning, &repo.style);
-                if let Some(url) = recorded {
-                    reasoning = format!("{reasoning} Tracked in {}.", as_reference(&url));
-                    state.filed.push(url.clone());
-                    filed.push(url);
+                if let Some(url) = recorded.url() {
+                    state.filed.push(url.to_string());
+                    filed.push(url.to_string());
                 }
                 // Settled like a refutation, because it ends the same way: the
                 // code will not change for this point on this branch. Without
                 // the entry the reviewer keeping the PR raises it again next
                 // round, the author files a duplicate, and the round budget
                 // goes on one point nobody disagrees about.
+                //
+                // Unless nothing holds the point, in which case there is no
+                // entry to write: see `filed_entry`.
+                let Some((outcome, reasoning)) =
+                    filed_entry(&recorded, &style::summary(&d.reasoning, &repo.style))
+                else {
+                    logwarn!(
+                        "'{title}' was not recorded anywhere, so it stays open for the next round"
+                    );
+                    continue;
+                };
                 settle(
                     ledger,
                     finding_key(canonical, &file),
@@ -840,7 +853,7 @@ fn apply_dispositions(
                         reasoning,
                         round,
                         reraised: 0,
-                        outcome: Settled::Filed,
+                        outcome,
                     },
                 );
             }
@@ -858,6 +871,33 @@ fn apply_dispositions(
     }
 }
 
+/// What the ledger should say about a point the author moved out of this pull
+/// request, and whether it should say anything at all.
+///
+/// Nothing, for a follow-up that failed. An entry tells every later round the
+/// point was dealt with, and it outlives the run: recording one for a write
+/// that never happened suppresses a real defect for good, on the strength of a
+/// transient error.
+fn filed_entry(recorded: &Followup, reasoning: &str) -> Option<(Settled, String)> {
+    let (outcome, tail) = match recorded {
+        Followup::Recorded(reference) => (
+            Settled::Filed,
+            format!("Tracked in {}.", as_reference(reference)),
+        ),
+        Followup::Covered(reference) => (
+            Settled::Filed,
+            format!("Already covered by {}.", as_reference(reference)),
+        ),
+        Followup::Dropped(why) => (Settled::Dropped, format!("Not filed anywhere: {why}.")),
+        Followup::Failed => return None,
+    };
+    let reasoning = match reasoning.trim() {
+        "" => tail,
+        said => format!("{said} {tail}"),
+    };
+    Some((outcome, reasoning))
+}
+
 // ---------------------------------------------------------------------------
 // Follow-ups
 // ---------------------------------------------------------------------------
@@ -868,16 +908,20 @@ fn apply_dispositions(
 /// that is not yours it is somebody else's notification and somebody else's
 /// triage queue, so `local` keeps the same information in `.spar/followups.md`
 /// and `none` drops it.
-fn file_followup(
+///
+/// The answer says which of those happened, because the caller settles the
+/// point on it. A failure and a deliberate drop look identical from the outside
+/// and mean opposite things to the next round.
+pub fn file_followup(
     repo: &Repo,
     title: &str,
     body: &str,
     source: i64,
     cfg: &Config,
     state: &IssueRun,
-) -> Option<String> {
+) -> Followup {
     if repo.followups == Followups::None {
-        return None;
+        return Followup::Dropped("follow-ups are off for this repository");
     }
     // A backstop against a run that will not stop finding things. Silent
     // truncation is not on offer: what was dropped is said out loud.
@@ -888,20 +932,24 @@ fn file_followup(
             state.filed.len(),
             style::title(title, &repo.style)
         );
-        return None;
+        return Followup::Dropped("this run had already recorded as many follow-ups as it may");
     }
     // The exact string that will land on GitHub. Searching for anything else
     // means the duplicate check can never hit, and every round files another
     // copy of the same follow-up.
+    //
+    // A title the style gate cannot clean is a failure rather than a drop: the
+    // next round words the point differently, and that wording may pass.
     let title = match repo.clean_title(title) {
         Ok(title) => title,
         Err(e) => {
             logdim!("could not clean a follow-up title: {e}");
-            return None;
+            return Followup::Failed;
         }
     };
     if title.trim().is_empty() {
-        return None;
+        logdim!("nothing left of a follow-up title after cleaning it");
+        return Followup::Failed;
     }
     // Not style::body: that is the budget for a pull request comment, read with
     // the diff in front of you. This is a work item somebody picks up cold.
@@ -915,10 +963,10 @@ fn file_followup(
     }
 
     match file_as_issue(repo, &title, &body) {
-        Ok(filed) => filed.url().map(str::to_string),
+        Ok(filed) => filed.into(),
         Err(e) => {
             logdim!("could not file a follow-up for '{title}': {e}");
-            None
+            Followup::Failed
         }
     }
 }
@@ -934,6 +982,20 @@ pub enum Filed {
     Covered(i64, String),
     /// A closed issue already covered it. Nothing was written.
     AlreadyClosed(i64, String),
+}
+
+impl From<Filed> for Followup {
+    fn from(filed: Filed) -> Self {
+        match filed {
+            Filed::Opened(_, url) | Filed::AddedTo(_, url) | Filed::Covered(_, url) => {
+                Followup::Recorded(url)
+            }
+            // Covered rather than recorded: the point is genuinely tracked, so
+            // raising it again is waste, but the issue holding it is closed and
+            // must not be handed out as work.
+            Filed::AlreadyClosed(_, url) => Followup::Covered(url),
+        }
+    }
 }
 
 impl Filed {
@@ -1017,8 +1079,9 @@ fn file_out_of_scope(
 ) {
     for finding in findings.iter().filter(|f| !f.in_scope) {
         let body = issue_report(finding);
-        if let Some(url) = file_followup(repo, &finding.title, &body, subject, cfg, state) {
-            state.filed.push(url);
+        let recorded = file_followup(repo, &finding.title, &body, subject, cfg, state);
+        if let Some(url) = recorded.url() {
+            state.filed.push(url.to_string());
         }
     }
 }
@@ -1072,9 +1135,9 @@ fn file_nonblocking(
         if !keep || !finding.in_scope {
             continue;
         }
-        if let Some(url) = file_followup(repo, &finding.title, &finding.detail, subject, cfg, state)
-        {
-            state.filed.push(url);
+        let recorded = file_followup(repo, &finding.title, &finding.detail, subject, cfg, state);
+        if let Some(url) = recorded.url() {
+            state.filed.push(url.to_string());
         }
     }
 }
@@ -1227,6 +1290,12 @@ pub fn outcome_comment(
                         ),
                         Some((Settled::Filed, reason)) => format!(
                             "{title}{where_at}. Filed as out of scope: {}",
+                            style::summary(&reason, style)
+                        ),
+                        // Never "filed": nothing holds this point but the
+                        // comment you are reading.
+                        Some((Settled::Dropped, reason)) => format!(
+                            "{title}{where_at}. Out of scope here, and not filed: {}",
                             style::summary(&reason, style)
                         ),
                         None => format!("{title}{where_at}"),
@@ -2436,6 +2505,135 @@ mod followup_restraint_tests {
             cfg.loop_cfg.max_followups <= 5,
             "a run that can file ten follow-ups is a branching process"
         );
+    }
+}
+
+/// What the ledger is told about a point the author moved out of the pull
+/// request. Every case here used to record "filed", including the ones where
+/// nothing was written anywhere.
+#[cfg(test)]
+mod followup_outcome_tests {
+    use super::*;
+
+    const URL: &str = "https://github.com/you/thing/issues/485";
+
+    fn entry(recorded: Followup) -> Option<(Settled, String)> {
+        filed_entry(&recorded, "It predates this branch.")
+    }
+
+    /// The bug. A tracker request or a local write that failed left no
+    /// follow-up, and the ledger said it had been filed, which is a claim that
+    /// survives every later round and every resume.
+    #[test]
+    fn a_failed_followup_settles_nothing() {
+        assert_eq!(None, entry(Followup::Failed));
+    }
+
+    #[test]
+    fn a_recorded_followup_is_filed_and_says_where() {
+        let (outcome, reasoning) = entry(Followup::Recorded(URL.into())).unwrap();
+        assert_eq!(Settled::Filed, outcome);
+        assert!(
+            reasoning.contains("It predates this branch."),
+            "{reasoning}"
+        );
+        assert!(reasoning.contains("#485"), "{reasoning}");
+    }
+
+    /// A closed issue already carries the point, so raising it again is waste.
+    /// It is still not something to hand anybody as work.
+    #[test]
+    fn a_closed_issue_covering_the_point_settles_it_without_offering_work() {
+        let recorded = Followup::from(Filed::AlreadyClosed(9, URL.into()));
+        assert_eq!(Followup::Covered(URL.into()), recorded);
+        assert_eq!(
+            None,
+            recorded.url(),
+            "a closed issue is not work to pick up"
+        );
+
+        let (outcome, reasoning) = entry(recorded).unwrap();
+        assert_eq!(Settled::Filed, outcome);
+        assert!(reasoning.contains("#485"), "{reasoning}");
+    }
+
+    /// An open issue that already covers the point is worth linking from the
+    /// pull request, and worth counting against the cap.
+    #[test]
+    fn an_open_issue_that_already_covers_the_point_is_still_a_reference() {
+        for filed in [
+            Filed::Opened(9, URL.into()),
+            Filed::AddedTo(9, URL.into()),
+            Filed::Covered(9, URL.into()),
+        ] {
+            assert_eq!(Some(URL), Followup::from(filed).url());
+        }
+    }
+
+    /// Configuration, not failure: retrying it every round would spend the
+    /// budget on a write that is never going to happen. The entry has to be
+    /// honest about it, because nothing else holds the point.
+    #[test]
+    fn a_dropped_followup_is_settled_but_never_reported_as_filed() {
+        let (outcome, reasoning) = entry(Followup::Dropped("follow-ups are off")).unwrap();
+        assert_eq!(Settled::Dropped, outcome);
+        assert!(reasoning.contains("follow-ups are off"), "{reasoning}");
+        assert!(reasoning.contains("Not filed"), "{reasoning}");
+    }
+
+    fn ledger_of(outcome: Settled, reasoning: &str) -> Ledger {
+        let mut ledger = Ledger::new();
+        ledger.insert(
+            finding_key("A pre-existing leak", "src/x.rs"),
+            LedgerEntry {
+                title: "A pre-existing leak".into(),
+                file: "src/x.rs".into(),
+                reasoning: reasoning.into(),
+                round: 1,
+                reraised: 0,
+                outcome,
+            },
+        );
+        ledger
+    }
+
+    /// The next reviewer is told to leave settled points alone either way, so
+    /// the wording is all that separates them. Saying "filed" of a point
+    /// nothing holds is the lie that loses it.
+    #[test]
+    fn the_settled_block_tells_a_filed_point_from_a_dropped_one() {
+        let filed = settled_block(&ledger_of(Settled::Filed, "Tracked in #9."));
+        assert!(filed.contains("out of scope here, and filed"), "{filed}");
+
+        let dropped = settled_block(&ledger_of(Settled::Dropped, "Not filed anywhere: off."));
+        assert!(
+            dropped.contains("out of scope here, and not filed"),
+            "{dropped}"
+        );
+        assert!(dropped.contains("A pre-existing leak"), "{dropped}");
+    }
+
+    /// A deadlock goes to a person, and the first thing they do is look for the
+    /// issue the comment says exists.
+    #[test]
+    fn a_deadlocked_point_that_was_never_filed_does_not_claim_to_be() {
+        let points = [Finding {
+            severity: Severity::Blocking,
+            title: "A pre-existing leak".into(),
+            detail: "d".into(),
+            file: "src/x.rs".into(),
+            in_scope: false,
+            ..Default::default()
+        }];
+        let text = outcome_comment(
+            &IssueRun::new(1, "t"),
+            &ledger_of(Settled::Dropped, "Not filed anywhere: follow-ups are off."),
+            &Ending::Deadlocked(&points),
+            &Style::default(),
+        )
+        .unwrap();
+        assert!(text.contains("not filed"), "{text}");
+        assert!(!text.contains("Filed as out of scope"), "{text}");
     }
 }
 

@@ -1042,7 +1042,7 @@ fn write(repo: &Repo, tracker: i64, raw: &str, change: &Change) -> bool {
             return false;
         }
     };
-    match repo.edit_issue_body(tracker, &updated, change.inserted()) {
+    match repo.edit_issue_body(tracker, &body, &updated, change.inserted()) {
         Ok(()) => true,
         Err(e) => {
             logdim!("  could not edit #{tracker}: {}", e.first_line());

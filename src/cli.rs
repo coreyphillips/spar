@@ -33,9 +33,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
                   pull request converges. Neither agent reviews its own most recent edit.\n\n\
                   Arguments are issue numbers for `run` and `triage`, and pull request numbers \
                   for `resume`, `review`, and `checkin`. `split` takes either. Omit them and \
-                  spar takes everything open, up to --limit, which for `split` means every open \
-                  issue and every open pull request. `followup` takes none: it works the queue \
-                  in .spar/followups.md, and an entry there has no number to name.",
+                  spar takes everything open, up to --limit. `split` applies that limit once to \
+                  issues and once to pull requests. `followup` takes none: it works the queue in \
+                  .spar/followups.md, and an entry there has no number to name.",
     max_term_width = 96
 )]
 pub struct Cli {
@@ -184,11 +184,13 @@ pub enum Command {
     /// An issue's parts are filed as issues and the parent is rewritten into a
     /// checklist that points at them. A pull request's parts each get their own
     /// branch and their own pull request, and the original is left open and
-    /// otherwise untouched: nothing is force pushed, closed, or rebased. A pull
-    /// request from a fork is proposed in a comment rather than split.
+    /// otherwise untouched: split branches use create-only pushes, and the
+    /// parent is never closed or rebased. A pull request from a fork is proposed
+    /// in a comment rather than split.
     ///
-    /// It decomposes and stops. Nothing is triaged, implemented, or merged, so
-    /// `spar split 42` and then `spar run` are the two halves.
+    /// It decomposes and stops. Nothing is triaged, implemented, or merged. Run
+    /// the reported child numbers next, or enable `decompose_trackers` and run
+    /// the issue parent.
     Split {
         /// Issue or pull request numbers. Omit to go through every open issue
         /// and every open pull request, and split what is worth splitting.
@@ -198,7 +200,8 @@ pub enum Command {
         /// Print the proposal and write nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Split something that already carries a split spar made.
+        /// Start a separate split even when one is recorded or retained. Does
+        /// not resume retained branches.
         #[arg(long)]
         again: bool,
     },
@@ -245,7 +248,8 @@ pub enum Command {
         repo: PathBuf,
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Remove every worktree and branch spar created, even for open PRs.
+        /// Remove every local worktree and local branch spar recorded, even for
+        /// open PRs.
         #[arg(long)]
         all: bool,
         /// Also delete state comments left on finished PRs.
@@ -280,7 +284,8 @@ pub struct Common {
     /// Which agent implements first. A key from the `[agents]` table.
     #[arg(long)]
     pub first: Option<String>,
-    /// Cap on how many open items to take when none are named.
+    /// Cap on open items of each kind when none are named. Bare `split` may take
+    /// this many issues and this many pull requests.
     #[arg(long, default_value_t = 20)]
     pub limit: usize,
     /// Ignore issues and pull requests numbered below this when picking for
@@ -1510,7 +1515,7 @@ const LOOP_OPTIONS: &[Setting] = &[
     (true, "max_tracker_children", "Most unchecked items from one tracker's checklist that one run will act on. A cap, not a target, and what it left is named out loud."),
     (true, "file_nits", "File nits as follow-ups too. Off, because a filed nit is somebody else's notification."),
     (true, "base_branch", "Only a fallback. Whatever origin/HEAD points at wins when it resolves."),
-    (true, "branch_prefix", "Namespace the branches spar creates, for example \"spar/\". Without it they are issue-N and pr-N."),
+    (true, "branch_prefix", "Namespace the branches spar creates, for example \"spar/\". Without it they are issue-N, pr-N, and split-N-I with a suffix on repeated split names."),
     (true, "state_store", "Where resume state is kept. local uses .spar/state and keeps it off the pull request."),
     (true, "drafts", "Whether a pull request starts as a draft. until_approved opens one and marks it ready when the review converges, which is what the draft was saying while two agents were still arguing about it. always opens one and leaves it, and cannot be combined with auto_merge."),
     (true, "instructions", "Extra instructions handed to both agents with every request, for what this repository always wants that spar has no setting for. --instructions adds to this for one run."),

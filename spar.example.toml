@@ -102,8 +102,8 @@ first_implementor = "claude"
 base_branch       = "main"   # only a fallback; origin/HEAD wins when it exists
 worktrees         = true     # isolate each issue in its own git worktree
 keep_worktrees    = false    # keep them after a run, for inspection
-branch_prefix     = ""       # branches are issue-N and pr-N. Set e.g. "spar/"
-                             # to namespace them
+branch_prefix     = ""       # branches are issue-N, pr-N, and split-N-I, with
+                             # a suffix on repeats. Set e.g. "spar/" to namespace.
 close_skipped     = true     # close an issue both agents independently declined,
                              # after posting the shared reasoning. Never applies
                              # to a tracking issue: declining to open a PR for

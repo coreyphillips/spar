@@ -508,6 +508,7 @@ impl Agent {
     fn worth_asking_again(&self, e: &SparError) -> bool {
         match e.kind() {
             ErrorKind::TimedOut => false,
+            ErrorKind::UncertainWrite => false,
             ErrorKind::CallFailed => self.fallback().is_none(),
             ErrorKind::Other => true,
         }

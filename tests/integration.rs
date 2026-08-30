@@ -545,9 +545,8 @@ fn a_branch_prefix_namespaces_a_part_branch_too() {
 }
 
 /// Splitting the same pull request again must not land on the names the first
-/// run used. `push` is `--force-with-lease` against a tracking ref that still
-/// matches, so reusing a name rewrites the branch behind a part's pull request
-/// rather than adding one.
+/// run used. A part's remote branch belongs to its pull request after the first
+/// run, even when its local worktree and branch are gone.
 #[test]
 fn a_second_split_never_reuses_the_first_run_s_branches() {
     let fx = repo("split-again");
@@ -587,6 +586,48 @@ fn a_second_split_never_reuses_the_first_run_s_branches() {
     assert!(repo.known_branches().contains_key(&second));
 }
 
+/// A free name can be taken after allocation and before push. Split branches
+/// use a create-only lease so that race rejects the push instead of moving the
+/// ref another pull request may already own, even when it could fast-forward.
+#[test]
+fn a_split_push_never_rewrites_a_branch_that_appeared_after_allocation() {
+    let fx = repo("split-push-race");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    commit(&fx.work, "base.rs", "base\n", "on main");
+    git(&fx.work, &["push", "origin", "main"]);
+
+    let (dir, branch) = repo.worktree_for_split(12, 1, "origin/main").unwrap();
+    commit(&dir, "part.rs", "the slice\n", "part one");
+
+    let theirs = git(&fx.work, &["rev-parse", "HEAD"]);
+    git(&fx.work, &["push", "origin", &format!("HEAD:{branch}")]);
+
+    let error = repo.push_split_branch(&dir, &branch).unwrap_err();
+    assert!(
+        error.to_string().contains("Nothing was overwritten"),
+        "{error}"
+    );
+    git(&fx.work, &["fetch", "origin", &branch]);
+    assert_eq!(
+        theirs,
+        git(&fx.work, &["rev-parse", &format!("origin/{branch}")])
+    );
+}
+
+/// A pushed branch is a durable retry guard when the parent comment or pull
+/// request creation failed after the push.
+#[test]
+fn a_remote_split_branch_marks_the_parent_as_started() {
+    let fx = repo("split-started");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (dir, branch) = repo.worktree_for_split(12, 1, "origin/main").unwrap();
+    commit(&dir, "part.rs", "the slice\n", "part one");
+    repo.push_split_branch(&dir, &branch).unwrap();
+
+    assert!(repo.has_remote_split_branch(12).unwrap());
+    assert!(!repo.has_remote_split_branch(13).unwrap());
+}
+
 /// A part that will not stand on its own is dropped, and nothing was pushed at
 /// that point, so it has to leave no trace anywhere but the log.
 #[test]
@@ -604,6 +645,33 @@ fn a_dropped_part_takes_its_branch_and_its_record_with_it() {
     );
     assert!(!branches.contains(&branch), "{branches}");
     assert!(!repo.known_branches().contains_key(&branch));
+}
+
+/// Successful stacked parts have to remain available until every child pull
+/// request is opened, then all of their local worktrees and branches can go.
+#[test]
+fn two_stacked_part_worktrees_are_released_together() {
+    let fx = repo("split-stack-release");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (first_dir, first) = repo.worktree_for_split(12, 1, "main").unwrap();
+    commit(&first_dir, "one.rs", "one\n", "part one");
+    let (second_dir, second) = repo.worktree_for_split(12, 2, &first).unwrap();
+    commit(&second_dir, "two.rs", "two\n", "part two");
+
+    for (dir, branch) in [(&first_dir, &first), (&second_dir, &second)] {
+        repo.release_split_worktree(dir, branch);
+    }
+
+    assert!(!first_dir.is_dir(), "the first worktree survived");
+    assert!(!second_dir.is_dir(), "the second worktree survived");
+    let branches = git(
+        &fx.work,
+        &["for-each-ref", "refs/heads/", "--format=%(refname:short)"],
+    );
+    assert!(!branches.contains(&first), "{branches}");
+    assert!(!branches.contains(&second), "{branches}");
+    assert!(!repo.known_branches().contains_key(&first));
+    assert!(!repo.known_branches().contains_key(&second));
 }
 
 #[test]
@@ -1045,7 +1113,7 @@ fn a_local_note_that_cannot_be_written_reports_failure() {
     let mut cfg = cfg();
     cfg.loop_cfg.followups = Followups::Local;
     let repo = Repo::open(&fx.work, &cfg).unwrap();
-    let state = IssueRun::new(7, "t");
+    let mut state = IssueRun::new(7, "t");
 
     // A directory where the queue file goes: the append cannot open it.
     std::fs::create_dir_all(repo.followups_path()).unwrap();
@@ -1062,7 +1130,7 @@ fn a_local_note_that_cannot_be_written_reports_failure() {
             "why it matters",
             7,
             &cfg,
-            &state
+            &mut state
         )
     );
 }
@@ -1076,7 +1144,7 @@ fn a_tracker_that_cannot_be_reached_reports_failure() {
     let mut cfg = cfg();
     cfg.loop_cfg.followups = Followups::Issues;
     let repo = Repo::open(&fx.work, &cfg).unwrap();
-    let state = IssueRun::new(7, "t");
+    let mut state = IssueRun::new(7, "t");
 
     assert_eq!(
         Followup::Failed,
@@ -1086,7 +1154,7 @@ fn a_tracker_that_cannot_be_reached_reports_failure() {
             "why it matters",
             7,
             &cfg,
-            &state
+            &mut state
         )
     );
     assert!(!repo.followups_path().exists(), "nothing was written");
@@ -1100,9 +1168,9 @@ fn follow_ups_turned_off_are_dropped_rather_than_failed() {
     let mut cfg = cfg();
     cfg.loop_cfg.followups = Followups::None;
     let repo = Repo::open(&fx.work, &cfg).unwrap();
-    let state = IssueRun::new(7, "t");
+    let mut state = IssueRun::new(7, "t");
 
-    let outcome = file_followup(&repo, "Retry is unbounded", "why", 7, &cfg, &state);
+    let outcome = file_followup(&repo, "Retry is unbounded", "why", 7, &cfg, &mut state);
     assert!(matches!(outcome, Followup::Dropped(_)), "{outcome:?}");
     assert_eq!(None, outcome.url());
     assert!(!repo.followups_path().exists());
@@ -1120,7 +1188,7 @@ fn the_followup_cap_drops_rather_than_fails() {
     let mut state = IssueRun::new(7, "t");
     state.filed = vec!["note: one".into(), "note: two".into()];
 
-    let outcome = file_followup(&repo, "Retry is unbounded", "why", 7, &cfg, &state);
+    let outcome = file_followup(&repo, "Retry is unbounded", "why", 7, &cfg, &mut state);
     assert!(matches!(outcome, Followup::Dropped(_)), "{outcome:?}");
     assert!(!repo.followups_path().exists());
 }

@@ -24,22 +24,22 @@
 //!
 //! **spar never rewrites the branch behind somebody's pull request.** Splitting
 //! a pull request is purely additive: new branches, new pull requests, one
-//! comment. Nothing is force pushed, nothing closed, nothing rebased under
-//! anybody. Removing half of a pull request in place is destroying work in
-//! place, and two models agreeing does not make that reversible for the person
-//! who wrote it. `additive` is that invariant as code.
+//! comment. No existing branch is moved, nothing is closed, and nothing is
+//! rebased under anybody. Removing half of a pull request in place is destroying
+//! work in place, and two models agreeing does not make that reversible for the
+//! person who wrote it. `additive` is that invariant as code.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::agent::{self, Agent};
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{ErrorKind, Result, SparError};
 use crate::model::{
     Implementation, Issue, IssueRun, ItemKind, PrRow, PrView, SplitCheck, SplitPart, SplitProposal,
     SplitScreen, SplitScreenDoc, Status,
 };
-use crate::repo::Repo;
+use crate::repo::{Repo, SplitPushError};
 use crate::style::{self, Style};
 use crate::{bail, log, logdim, logwarn, schema, spar_err};
 
@@ -176,15 +176,15 @@ pub fn already_split(text: &str) -> bool {
 /// Each line carries its `#N`, which is what makes the parent an ordinary
 /// tracker: a checklist whose items are issue numbers.
 pub fn tracker_body(original: &str, parts: &[(String, i64)]) -> String {
-    let mut out = original.trim_end().to_string();
+    let mut out = original.to_string();
     if !out.is_empty() {
         if let Some(fence) = unclosed_fence(&out) {
             // A fence somebody left open swallows everything after it, so the
             // checklist would render as code rather than as a checklist.
-            out.push('\n');
+            end_line(&mut out);
             out.push_str(&fence);
         }
-        out.push_str("\n\n");
+        separate(&mut out);
     }
     out.push_str(SPLIT_MARKER);
     out.push_str("\n\n## Parts\n\nThis is now a tracker. Each part below is its own issue.\n\n");
@@ -192,6 +192,19 @@ pub fn tracker_body(original: &str, parts: &[(String, i64)]) -> String {
         out.push_str(&format!("- [ ] #{number} {}\n", title.trim()));
     }
     out
+}
+
+fn end_line(text: &mut String) {
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+}
+
+fn separate(text: &mut String) {
+    end_line(text);
+    if !text.ends_with("\n\n") {
+        text.push('\n');
+    }
 }
 
 /// The fence that closes this text, when it ends inside a fenced code block.
@@ -604,7 +617,7 @@ fn issue_inner(
             i + 1,
             decision.parts.len()
         );
-        match crate::review::file_as_issue(repo, &title, &body) {
+        match crate::review::file_as_issue_apart_from(repo, &title, &body, Some(number)) {
             Ok(filed) => {
                 log!("  {}", filed.describe(&title));
                 if let Some(url) = filed.url() {
@@ -634,21 +647,38 @@ fn issue_inner(
             }
             Err(e) => {
                 logwarn!("could not file '{title}': {e}");
+                if e.kind() == ErrorKind::UncertainWrite {
+                    record_uncertain_issue_part(
+                        &mut state,
+                        number,
+                        &title,
+                        &listed,
+                        &e.to_string(),
+                    );
+                    return Ok(state);
+                }
                 state.notes.push(format!("could not file {title}: {e}"));
             }
         }
     }
 
     if listed.len() < 2 {
-        // Nothing was decomposed in the end, so the parent is not a tracker and
-        // must not be rewritten into one.
-        log!("#{number} left whole: fewer than two parts were filed");
+        // One child is still an external write even though it is not a useful
+        // decomposition. Leaving it unrecorded and calling this whole invites
+        // a later run to make another one.
+        if !listed.is_empty() {
+            record_partial_issue_split(&mut state, number, &listed);
+            return Ok(state);
+        }
+        log!("#{number} left whole: no parts were filed");
         state.status = Status::Whole;
         return Ok(state);
     }
 
-    let wanted = tracker_body(issue.body_text(), &listed);
-    match repo.edit_issue_body(number, issue.body_text(), &wanted) {
+    let original = issue.body_text();
+    let wanted = tracker_body(original, &listed);
+    let inserted = &wanted[original.len()..];
+    match repo.edit_issue_body(number, original, &wanted, inserted) {
         Ok(()) => {
             log!("#{number} is now a tracker for {} part(s)", listed.len());
             state.status = Status::Split;
@@ -657,11 +687,7 @@ fn issue_inner(
             // The parts exist and the parent does not point at them, so `run`
             // would work the parent as a whole again. That needs somebody, so
             // it is an error rather than a note on a success.
-            state.status = Status::Error;
-            state.notes.push(format!(
-                "{e}\nThe parts were filed. Add them to #{number} by hand:\n{}",
-                checklist(&listed)
-            ));
+            record_issue_tracker_failure(&mut state, number, &listed, &e);
         }
     }
     Ok(state)
@@ -673,6 +699,69 @@ fn checklist(parts: &[(String, i64)]) -> String {
         .map(|(title, n)| format!("- [ ] #{n} {}", title.trim()))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn record_issue_tracker_failure(
+    state: &mut IssueRun,
+    number: i64,
+    parts: &[(String, i64)],
+    error: &SparError,
+) {
+    state.status = Status::Error;
+    let recovery = if error.kind() == ErrorKind::UncertainWrite {
+        format!(
+            "The parent write may already have landed. Do not rerun this split. Inspect the \
+             current body of #{number} for the split marker `{SPLIT_MARKER}` and every line in \
+             this exact checklist. If the marker and every line are present, do not add them \
+             again. Otherwise add only the missing marker or child links by hand:\n{}",
+            checklist(parts)
+        )
+    } else {
+        format!(
+            "The child issues were filed. Do not rerun this split. Add them to #{number} by \
+             hand:\n{}",
+            checklist(parts)
+        )
+    };
+    state.notes.push(format!("{error}\n{recovery}"));
+}
+
+fn record_partial_issue_split(state: &mut IssueRun, number: i64, parts: &[(String, i64)]) {
+    state.status = Status::Error;
+    state.notes.push(format!(
+        "Only one child issue survived, so #{number} was not rewritten into a tracker. Do not \
+         rerun this split while the child is unrecorded. Link it from #{number} by hand and decide \
+         which issue owns the work, or close it first if it was newly created and should not \
+         remain:\n{}",
+        checklist(parts)
+    ));
+}
+
+fn record_uncertain_issue_part(
+    state: &mut IssueRun,
+    number: i64,
+    title: &str,
+    listed: &[(String, i64)],
+    reason: &str,
+) {
+    state.status = Status::Error;
+    let recovery = if listed.is_empty() {
+        format!(
+            "Inspect recent issues for an exact `{title}` child before doing anything else. If it \
+             exists, add it to #{number} by hand. If it does not exist, this split can be run \
+             again."
+        )
+    } else {
+        format!(
+            "These earlier child issues were filed:\n{}\nInspect recent issues for an exact \
+             `{title}` child, then complete the tracker on #{number} by hand. Do not rerun this \
+             split while these partial results exist.",
+            checklist(listed)
+        )
+    };
+    state.notes.push(format!(
+        "{reason}\nWhether that child write landed is unknown. {recovery}"
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -700,11 +789,22 @@ fn pr_inner(
     let mut state = IssueRun::new(number, pr.title.clone());
     state.pr = Some(pr.url.clone());
 
-    if !mode.again && has_parts(repo, number)? {
-        log!("PR #{number} already has parts spar made. --again splits it again.");
-        state.status = Status::Whole;
-        state.notes.push("already split".into());
-        return Ok(state);
+    if !mode.again {
+        match prior_split(repo, number)? {
+            PriorSplit::None => {}
+            PriorSplit::Recorded => {
+                log!("PR #{number} already has parts spar made. --again splits it again.");
+                state.status = Status::Whole;
+                state.notes.push("already split".into());
+                return Ok(state);
+            }
+            PriorSplit::RetainedBranches => {
+                log!("PR #{number} has retained branches from an incomplete split");
+                state.status = Status::Error;
+                state.notes.push(retained_branches_note(number));
+                return Ok(state);
+            }
+        }
     }
 
     let base = if pr.base_ref_name.trim().is_empty() {
@@ -716,8 +816,15 @@ fn pr_inner(
 
     let head_ref = crate::repo::review_ref(number);
     let read_only = repo.worktree_for_pr_head(number)?;
+    let head_oid = repo
+        .git_at(Some(&read_only), &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    if head_oid.is_empty() {
+        bail!("could not read the fetched head of PR #{number}");
+    }
     let outcome = split_pr_inner(
-        agents, cfg, repo, &pr, &base, &head_ref, &read_only, mode, &mut state,
+        agents, cfg, repo, &pr, &base, &head_ref, &head_oid, &read_only, mode, &mut state,
     );
     if !cfg.loop_cfg.keep_worktrees {
         repo.release_review_worktree(number);
@@ -734,6 +841,7 @@ fn split_pr_inner(
     pr: &PrView,
     base: &str,
     head_ref: &str,
+    head_oid: &str,
     read_only: &Path,
     mode: &Mode,
     state: &mut IssueRun,
@@ -798,6 +906,7 @@ fn split_pr_inner(
     if pr.is_cross_repository {
         log!("PR #{number} comes from a fork, so the parts are proposed rather than made");
         let body = proposal_comment(number, &decision, &proposed_left, &repo.style);
+        ensure_parent_head(repo, number, head_oid)?;
         repo.comment_pr(number, &body)?;
         state.status = Status::Whole;
         state
@@ -810,12 +919,25 @@ fn split_pr_inner(
         number,
         base,
         head_ref,
+        head_oid,
         head_branch: pr.head_ref_name.trim(),
     };
-    let made = build_parts(agents, cfg, repo, &parent, &decision, state)?;
+    let built = build_parts(agents, cfg, repo, &parent, &decision, state)?;
+    let made_before_failure = built.made.len();
+    if let Some(reason) = built.failure {
+        state.status = Status::Error;
+        state.notes.push(with_partial_pr_recovery(
+            number,
+            made_before_failure,
+            &reason,
+        ));
+        return Ok(());
+    }
+    let made = built.made;
     if made.is_empty() {
         log!("PR #{number} left whole: no part would stand on its own");
         state.status = Status::Whole;
+        release_part_worktrees(repo, cfg, state.status, built.worktrees);
         return Ok(());
     }
 
@@ -825,14 +947,20 @@ fn split_pr_inner(
     // record of where anything went.
     let left = leftover(&changed, made.iter().map(|m| m.files.as_slice()));
     let body = parts_comment(&made, &left, &repo.style);
+    if let Err(e) = ensure_parent_head(repo, number, head_oid) {
+        state.status = Status::Error;
+        state.notes.push(format!(
+            "{e}. The part pull requests were opened, but the parent was left uncommented."
+        ));
+        return Ok(());
+    }
     if let Err(e) = repo.comment_pr(number, &body) {
         logwarn!(
             "made {} part(s) but could not say so on #{number}: {e}",
             made.len()
         );
-        state
-            .notes
-            .push(format!("could not comment on #{number}: {e}"));
+        record_parent_comment_failure(state, number, &body, &e);
+        return Ok(());
     }
     // A split into one part is not a split: everything that part carries is
     // still on the original, so the two would be reviewed twice over. It was
@@ -844,10 +972,79 @@ fn split_pr_inner(
         state
             .notes
             .push("only one part stood on its own, so nothing was decomposed".into());
+        release_part_worktrees(repo, cfg, state.status, built.worktrees);
         return Ok(());
     }
     state.status = Status::Split;
+    release_part_worktrees(repo, cfg, state.status, built.worktrees);
     Ok(())
+}
+
+fn ensure_parent_head(repo: &Repo, number: i64, expected: &str) -> Result<()> {
+    let live = repo.pr_head_oid(number)?;
+    same_parent_head(number, expected, &live)
+}
+
+fn same_parent_head(number: i64, expected: &str, live: &str) -> Result<()> {
+    if expected == live {
+        return Ok(());
+    }
+    bail!(
+        "PR #{number} changed from {expected} to {live} while it was being split; refusing to \
+         write parts from an unread head"
+    )
+}
+
+fn release_part_worktrees(
+    repo: &Repo,
+    cfg: &Config,
+    status: Status,
+    worktrees: Vec<(PathBuf, String)>,
+) {
+    release_part_worktrees_with(
+        cfg.loop_cfg.keep_worktrees,
+        status,
+        worktrees,
+        |dir, branch| repo.release_split_worktree(dir, branch),
+    );
+}
+
+fn release_part_worktrees_with(
+    configured: bool,
+    status: Status,
+    worktrees: Vec<(PathBuf, String)>,
+    mut release: impl FnMut(&Path, &str),
+) {
+    if keep_part_worktrees(configured, status) {
+        return;
+    }
+    for (dir, branch) in worktrees {
+        release(&dir, &branch);
+    }
+}
+
+fn keep_part_worktrees(configured: bool, status: Status) -> bool {
+    configured || status == Status::Error
+}
+
+fn record_parent_comment_failure(state: &mut IssueRun, number: i64, body: &str, error: &SparError) {
+    state.status = Status::Error;
+    let recovery = if error.kind() == ErrorKind::UncertainWrite {
+        format!(
+            "The comment may already have landed. The part branches stop an automatic retry. \
+             Inspect every top-level comment on #{number} for the exact body below. If it is \
+             present, do not post it again. If it is absent, post it once by hand to finish \
+             recording the split:\n{body}"
+        )
+    } else {
+        format!(
+            "The part branches stop an automatic retry. Post this comment by hand to finish \
+             recording the split. A normal rerun stops while those branches exist:\n{body}"
+        )
+    };
+    state.notes.push(format!(
+        "could not comment on #{number}: {error}\n{recovery}"
+    ));
 }
 
 /// What no proposed part claims. For the two paths that build nothing: a dry
@@ -861,6 +1058,66 @@ fn proposed_leftover(changed: &[String], decision: &Decision) -> Vec<String> {
 struct Built {
     pr: crate::model::PrRef,
     files: Vec<String>,
+}
+
+enum BuildOne {
+    Made(Built),
+    Declined,
+    Halted {
+        reason: String,
+        retain_worktree: bool,
+    },
+}
+
+impl BuildOne {
+    fn push_failed(branch: &str, error: &SplitPushError) -> Self {
+        let retain_worktree = error.retain_worktree();
+        let reason = if retain_worktree {
+            format!(
+                "{error}\nThe split stopped because `{branch}` may now exist on origin. Its local \
+                 worktree and branch record were kept. Inspect the exact remote ref before \
+                 continuing."
+            )
+        } else {
+            format!(
+                "could not create the new branch `{branch}`: {error}\nAnother writer may have \
+                 taken the name, so the split stopped before opening competing pull requests."
+            )
+        };
+        Self::Halted {
+            reason,
+            retain_worktree,
+        }
+    }
+}
+
+struct BuiltParts {
+    made: Vec<Made>,
+    worktrees: Vec<(PathBuf, String)>,
+    failure: Option<String>,
+}
+
+fn worktree_allocation_failure(
+    parent: i64,
+    index: usize,
+    made: usize,
+    error: &crate::error::SparError,
+) -> String {
+    let reason = format!("could not allocate part {index}: {}", error.last_line());
+    with_partial_pr_recovery(parent, made, &reason)
+}
+
+fn with_partial_pr_recovery(parent: i64, made: usize, reason: &str) -> String {
+    const LEAD: &str = "Earlier child pull requests and their worktrees were kept.";
+    if made == 0 || reason.contains(LEAD) {
+        return reason.to_string();
+    }
+    format!(
+        "{reason}\n{LEAD} {made} child pull request(s) already exist. Compare them with the \
+         current parent and record the partial result on #{parent} by hand. To start over, remove \
+         every retained local worktree and branch, child pull request, and remote split branch \
+         first."
+    )
 }
 
 /// One part that exists: its number, its title, its pull request, and the files
@@ -879,6 +1136,8 @@ struct Parent<'a> {
     base: &'a str,
     /// The fetched head, which the slices are taken out of.
     head_ref: &'a str,
+    /// The exact pull request head the proposal and check read.
+    head_oid: &'a str,
     /// The branch behind it, which nothing here may ever write to.
     head_branch: &'a str,
 }
@@ -890,10 +1149,11 @@ fn build_parts(
     parent: &Parent<'_>,
     decision: &Decision,
     state: &mut IssueRun,
-) -> Result<Vec<Made>> {
+) -> Result<BuiltParts> {
     let implementor = agent::find(agents, &cfg.first_implementor)?;
     let total = decision.parts.len();
     let mut made: Vec<Made> = Vec::new();
+    let mut worktrees: Vec<(PathBuf, String)> = Vec::new();
 
     // What the next part is branched from, and what its pull request is opened
     // against. Independent parts both stay on the base; stacked parts move to
@@ -904,6 +1164,13 @@ fn build_parts(
 
     for (i, part) in decision.parts.iter().enumerate() {
         let index = i + 1;
+        if let Err(e) = ensure_parent_head(repo, parent.number, parent.head_oid) {
+            return Ok(BuiltParts {
+                made,
+                worktrees,
+                failure: Some(e.to_string()),
+            });
+        }
         if part.files.is_empty() {
             log!("  part {index} carries no files, dropping it");
             state
@@ -912,7 +1179,21 @@ fn build_parts(
             continue;
         }
 
-        let (dir, branch) = repo.worktree_for_split(parent.number, index, &start)?;
+        let (dir, branch) = match repo.worktree_for_split(parent.number, index, &start) {
+            Ok(worktree) => worktree,
+            Err(e) => {
+                return Ok(BuiltParts {
+                    failure: Some(worktree_allocation_failure(
+                        parent.number,
+                        index,
+                        made.len(),
+                        &e,
+                    )),
+                    made,
+                    worktrees,
+                });
+            }
+        };
         let outcome = build_one(
             repo,
             implementor,
@@ -926,7 +1207,7 @@ fn build_parts(
             &against,
         );
         match outcome {
-            Ok(Some(built)) => {
+            Ok(BuildOne::Made(built)) => {
                 log!("  part {index}: {}", built.pr.url);
                 state.filed.push(built.pr.url.clone());
                 // The proposal's list only as a fallback. The branch was pushed
@@ -953,13 +1234,29 @@ fn build_parts(
                     url: built.pr.url,
                     files,
                 });
+                worktrees.push((dir, branch.clone()));
                 if decision.stacked {
                     start = branch.clone();
                     against = branch;
                 }
             }
-            Ok(None) => {
+            Ok(BuildOne::Declined) => {
                 repo.release_split_worktree(&dir, &branch);
+            }
+            Ok(BuildOne::Halted {
+                reason,
+                retain_worktree,
+            }) => {
+                if retain_worktree {
+                    worktrees.push((dir, branch));
+                } else {
+                    repo.release_split_worktree(&dir, &branch);
+                }
+                return Ok(BuiltParts {
+                    made,
+                    worktrees,
+                    failure: Some(reason),
+                });
             }
             Err(e) => {
                 logwarn!("  part {index} could not be made: {e}");
@@ -968,7 +1265,11 @@ fn build_parts(
             }
         }
     }
-    Ok(made)
+    Ok(BuiltParts {
+        made,
+        worktrees,
+        failure: None,
+    })
 }
 
 /// The paths this part changed that a part already made carries too.
@@ -1012,7 +1313,7 @@ fn build_one(
     dir: &Path,
     branch: &str,
     against: &str,
-) -> Result<Option<Built>> {
+) -> Result<BuildOne> {
     let number = parent.number;
     log!(
         "PR #{number}: building part {index} of {total} on {branch} ({} file(s))",
@@ -1049,7 +1350,7 @@ fn build_one(
                 &reason
             }
         );
-        return Ok(None);
+        return Ok(BuildOne::Declined);
     }
 
     // The slice is already committed, so a push would succeed with whatever the
@@ -1063,7 +1364,27 @@ fn build_one(
     // The invariant, asserted at the one place a split writes a branch.
     additive(branch, parent.head_branch, &repo.branch_prefix)?;
     repo.rewrite_commits_if_needed(dir, against)?;
-    repo.push(dir, branch)?;
+    if let Err(e) = ensure_parent_head(repo, number, parent.head_oid) {
+        return Ok(BuildOne::Halted {
+            reason: e.to_string(),
+            retain_worktree: false,
+        });
+    }
+    if let Err(e) = repo.push_split_branch(dir, branch) {
+        return Ok(BuildOne::push_failed(branch, &e));
+    }
+
+    if let Err(e) = ensure_parent_head(repo, number, parent.head_oid) {
+        return Ok(BuildOne::Halted {
+            reason: format!(
+                "{e}. Branch `{branch}` was pushed and its worktree was kept. Compare it with \
+                 the new parent head. If it is still valid, open its pull request by hand and \
+                 record it on #{number}. To start over, remove every retained local worktree and \
+                 branch, child pull request, and remote split branch first."
+            ),
+            retain_worktree: true,
+        });
+    }
 
     let title = format!("{} (part {index} of #{number})", part.title.trim());
     let body = part_body(number, index, total, part, &work, &repo.style);
@@ -1071,8 +1392,20 @@ fn build_one(
     // part needed to build, so what it carries is only knowable here, and this
     // list is what the comment on the original reports as taken.
     let files = repo.changed_files(dir, against);
-    repo.create_pr(dir, branch, against, &title, &body)
-        .map(|pr| Some(Built { pr, files }))
+    match repo.create_pr(dir, branch, against, &title, &body) {
+        Ok(pr) => Ok(BuildOne::Made(Built { pr, files })),
+        Err(e) => Ok(BuildOne::Halted {
+            reason: format!(
+                "branch `{branch}` was pushed, but its pull request could not be opened: {e}. Its \
+                 worktree and branch record were kept. Compare it with the current parent. If it \
+                 is still valid, open `{branch}` against `{against}` by hand with title `{title}`, \
+                 then record the new pull request on #{number}. To start over, remove every \
+                 retained local worktree and branch, child pull request, and remote split branch \
+                 first."
+            ),
+            retain_worktree: true,
+        }),
+    }
 }
 
 /// Whether anything in this tree is missing from the commit, untracked files
@@ -1190,12 +1523,19 @@ fn patch_path(dir: &Path) -> std::path::PathBuf {
     holder.join(format!("{name}.patch"))
 }
 
-/// Whether spar has already split this pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriorSplit {
+    None,
+    Recorded,
+    RetainedBranches,
+}
+
+/// Whether this pull request has a complete split or retained work from one.
 ///
-/// An error rather than false when the comments cannot be read. This is the
-/// only thing standing between a rerun and a second set of branches and pull
-/// requests, and a failed read is not evidence that the first set is not there.
-fn has_parts(repo: &Repo, number: i64) -> Result<bool> {
+/// An error rather than `None` when either source cannot be read. These checks
+/// are the only thing standing between a rerun and a second set of branches and
+/// pull requests, and a failed read is not evidence that the first set is gone.
+fn prior_split(repo: &Repo, number: i64) -> Result<PriorSplit> {
     let comments = repo.try_issue_comments(number).map_err(|e| {
         spar_err!(
             "could not read the comments on #{number}, so whether it has already been split is \
@@ -1203,11 +1543,36 @@ fn has_parts(repo: &Repo, number: i64) -> Result<bool> {
             e.last_line()
         )
     })?;
-    Ok(comments.iter().any(|c| {
+    if comments.iter().any(|c| {
         c.get("body")
             .and_then(serde_json::Value::as_str)
             .is_some_and(already_split)
-    }))
+    }) {
+        return Ok(PriorSplit::Recorded);
+    }
+    let retained = repo.has_remote_split_branch(number).map_err(|e| {
+        spar_err!(
+            "could not check whether branches for #{number} already exist, so whether it has \
+             already been split is unknown: {}",
+            e.last_line()
+        )
+    })?;
+    Ok(if retained {
+        PriorSplit::RetainedBranches
+    } else {
+        PriorSplit::None
+    })
+}
+
+fn retained_branches_note(number: i64) -> String {
+    format!(
+        "remote split branches for PR #{number} show that an earlier split did not finish \
+         cleanly. Inspect the retained branches and worktrees and compare each branch with the \
+         current parent. Open any missing child pull request only when its branch is still valid, \
+         then post the parts summary on #{number} by hand. To start over, remove every retained \
+         local worktree and branch, child pull request, and remote split branch first. --again \
+         starts a separate split and does not resume these branches."
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1586,11 +1951,205 @@ mod tests {
     /// after it. This is the one place spar rewrites prose it did not write.
     #[test]
     fn a_tracker_body_keeps_every_byte_of_the_original() {
-        let original = "The retry loop spins.\n\n```rust\nfn go() {}\n```\n\n## Impact\n\nBad.";
+        let original =
+            "The retry loop spins.\n\n```rust\nfn go() {}\n```\n\n## Impact\n\nBad.  \n\n";
         let out = tracker_body(original, &[("First".into(), 101), ("Second".into(), 102)]);
-        assert!(out.starts_with(original.trim_end()), "{out}");
+        assert!(out.starts_with(original), "{out}");
+        assert_eq!(original.as_bytes(), &out.as_bytes()[..original.len()]);
         assert!(out.contains("- [ ] #101 First"), "{out}");
         assert!(out.contains("- [ ] #102 Second"), "{out}");
+    }
+
+    #[test]
+    fn a_parent_head_must_still_be_the_one_the_agents_read() {
+        assert!(same_parent_head(34, "abc123", "abc123").is_ok());
+        let error = same_parent_head(34, "abc123", "def456").unwrap_err();
+        assert!(error.to_string().contains("unread head"), "{error}");
+    }
+
+    #[test]
+    fn filed_child_issues_require_manual_tracker_recovery() {
+        let mut state = IssueRun::new(34, "split this");
+        let parts = vec![("first".to_string(), 101), ("second".to_string(), 102)];
+        let error = SparError::new("parent changed");
+        record_issue_tracker_failure(&mut state, 34, &parts, &error);
+
+        assert_eq!(Status::Error, state.status);
+        let note = state.notes.join("\n");
+        assert!(note.contains("Do not rerun this split"), "{note}");
+        assert!(note.contains("Add them to #34 by hand"), "{note}");
+        assert!(note.contains("#101 first"), "{note}");
+        assert!(note.contains("#102 second"), "{note}");
+    }
+
+    #[test]
+    fn an_uncertain_tracker_write_requires_inspection_before_editing() {
+        let mut state = IssueRun::new(34, "split this");
+        let parts = vec![("first".to_string(), 101), ("second".to_string(), 102)];
+        let error = SparError::uncertain_write("the parent could not be reread");
+        record_issue_tracker_failure(&mut state, 34, &parts, &error);
+
+        assert_eq!(Status::Error, state.status);
+        let note = state.notes.join("\n");
+        assert!(note.contains("write may already have landed"), "{note}");
+        assert!(note.contains("current body of #34"), "{note}");
+        assert!(note.contains(SPLIT_MARKER), "{note}");
+        assert!(note.contains("do not add them again"), "{note}");
+        assert!(
+            note.contains("only the missing marker or child links"),
+            "{note}"
+        );
+        assert!(!note.contains("Add them to #34 by hand"), "{note}");
+        assert!(note.contains("#101 first"), "{note}");
+        assert!(note.contains("#102 second"), "{note}");
+    }
+
+    #[test]
+    fn one_confirmed_child_is_an_error_until_it_is_recorded_or_closed() {
+        let mut state = IssueRun::new(34, "split this");
+        let parts = vec![("first".to_string(), 101)];
+        record_partial_issue_split(&mut state, 34, &parts);
+
+        assert_eq!(Status::Error, state.status);
+        let note = state.notes.join("\n");
+        assert!(note.contains("Do not rerun this split"), "{note}");
+        assert!(note.contains("Link it from #34 by hand"), "{note}");
+        assert!(note.contains("close it first"), "{note}");
+        assert!(note.contains("#101 first"), "{note}");
+    }
+
+    #[test]
+    fn an_uncertain_child_write_stops_before_rewriting_the_parent() {
+        let mut state = IssueRun::new(34, "split this");
+        let listed = vec![("first".to_string(), 101)];
+        record_uncertain_issue_part(
+            &mut state,
+            34,
+            "second",
+            &listed,
+            "the result could not be verified",
+        );
+
+        assert_eq!(Status::Error, state.status);
+        let note = state.notes.join("\n");
+        assert!(note.contains("write landed is unknown"), "{note}");
+        assert!(note.contains("#101 first"), "{note}");
+        assert!(
+            note.contains("complete the tracker on #34 by hand"),
+            "{note}"
+        );
+        assert!(note.contains("Do not rerun this split"), "{note}");
+    }
+
+    #[test]
+    fn a_later_allocation_failure_preserves_partial_recovery_guidance() {
+        let error = crate::error::SparError::new("no free branch name");
+        let note = worktree_allocation_failure(34, 3, 2, &error);
+        assert!(note.contains("2 child pull request"), "{note}");
+        assert!(note.contains("worktrees were kept"), "{note}");
+        assert!(note.contains("record the partial result on #34"), "{note}");
+        assert!(note.contains("remove every retained"), "{note}");
+    }
+
+    #[test]
+    fn successful_stacked_worktrees_are_all_released_unless_kept() {
+        let worktrees = vec![
+            (PathBuf::from("one"), "split-34-1".to_string()),
+            (PathBuf::from("two"), "split-34-2".to_string()),
+        ];
+        let mut released = Vec::new();
+        release_part_worktrees_with(false, Status::Split, worktrees.clone(), |dir, branch| {
+            released.push((dir.to_path_buf(), branch.to_string()))
+        });
+        assert_eq!(worktrees, released);
+
+        for (configured, status) in [(true, Status::Split), (false, Status::Error)] {
+            let mut released = Vec::new();
+            release_part_worktrees_with(configured, status, worktrees.clone(), |dir, branch| {
+                released.push((dir.to_path_buf(), branch.to_string()))
+            });
+            assert!(released.is_empty(), "worktrees were not retained");
+        }
+    }
+
+    #[test]
+    fn a_missing_parent_comment_is_an_error_with_recovery_text() {
+        let mut state = IssueRun::new(34, "split this");
+        let error = SparError::new("offline");
+        record_parent_comment_failure(&mut state, 34, "the summary", &error);
+
+        assert_eq!(Status::Error, state.status);
+        let note = state.notes.join("\n");
+        assert!(note.contains("branches stop an automatic retry"), "{note}");
+        assert!(note.contains("finish recording the split"), "{note}");
+        assert!(note.contains("the summary"), "{note}");
+    }
+
+    #[test]
+    fn an_uncertain_parent_comment_requires_inspection_before_posting() {
+        let mut state = IssueRun::new(34, "split this");
+        let error = SparError::uncertain_write("the comments could not be reread");
+        record_parent_comment_failure(&mut state, 34, "the summary", &error);
+
+        assert_eq!(Status::Error, state.status);
+        let note = state.notes.join("\n");
+        assert!(note.contains("comment may already have landed"), "{note}");
+        assert!(
+            note.contains("Inspect every top-level comment on #34"),
+            "{note}"
+        );
+        assert!(note.contains("do not post it again"), "{note}");
+        assert!(note.contains("If it is absent, post it once"), "{note}");
+        assert!(!note.contains("Post this comment by hand"), "{note}");
+        assert!(note.contains("the summary"), "{note}");
+    }
+
+    #[test]
+    fn retained_branches_explain_manual_recovery_and_again() {
+        let note = retained_branches_note(34);
+        assert!(
+            note.contains("Open any missing child pull request"),
+            "{note}"
+        );
+        assert!(note.contains("current parent"), "{note}");
+        assert!(note.contains("local worktree and branch"), "{note}");
+        assert!(note.contains("remove every retained"), "{note}");
+        assert!(note.contains("does not resume"), "{note}");
+    }
+
+    #[test]
+    fn a_push_collision_halts_instead_of_dropping_one_part() {
+        let error = SplitPushError::new("the create-only lease was rejected", false);
+        match BuildOne::push_failed("split-34-1", &error) {
+            BuildOne::Halted {
+                reason,
+                retain_worktree,
+            } => {
+                assert!(!retain_worktree);
+                assert!(reason.contains("stopped"), "{reason}");
+                assert!(reason.contains("competing pull requests"), "{reason}");
+            }
+            _ => panic!("a push collision did not halt the split"),
+        }
+    }
+
+    #[test]
+    fn an_unverified_push_halts_and_keeps_the_worktree() {
+        let error = SplitPushError::new("origin could not be read", true);
+        match BuildOne::push_failed("split-34-1", &error) {
+            BuildOne::Halted {
+                reason,
+                retain_worktree,
+            } => {
+                assert!(retain_worktree);
+                assert!(reason.contains("may now exist on origin"), "{reason}");
+                assert!(
+                    reason.contains("worktree and branch record were kept"),
+                    "{reason}"
+                );
+            }
+            _ => panic!("an unverified push did not halt the split"),
+        }
     }
 
     /// The parent is what #29 consumes, so what is written has to be what is

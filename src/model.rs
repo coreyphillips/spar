@@ -956,6 +956,10 @@ pub struct IssueRun {
     pub noted: Vec<Finding>,
     #[serde(default)]
     pub notes: Vec<String>,
+    /// Runtime circuit breaker after an external follow-up write could not be
+    /// verified. A later invocation rechecks GitHub before any new write.
+    #[serde(skip)]
+    pub followup_writes_uncertain: bool,
 }
 
 impl IssueRun {
@@ -970,6 +974,7 @@ impl IssueRun {
             filed: Vec::new(),
             noted: Vec::new(),
             notes: Vec::new(),
+            followup_writes_uncertain: false,
         }
     }
 

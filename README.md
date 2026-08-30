@@ -450,9 +450,10 @@ Three restraints worth knowing, because this is the only thing spar does that
 rewrites text a person wrote:
 
 - **Only a checklist.** Task list items, never an agent's reading of your prose.
-  A tracker with no checklist behaves exactly as it did before. Anything inside
-  a fenced code block is not an item, and a line spar cannot rewrite
-  unambiguously is skipped with a reason.
+  A tracker with no checklist behaves exactly as it did before. Anything GitHub
+  does not render as a checkbox is not an item, so a code block or an HTML
+  comment is left alone, and a line spar cannot rewrite unambiguously is skipped
+  with a reason.
 - **It ticks a box and never unchecks one.** A checked box next to an open issue
   is left alone: every state that produces one is a state where you are right
   and the heuristic is wrong. An item linked by a fuzzy match is not ticked in

@@ -45,6 +45,12 @@ static ITEM: LazyLock<Regex> = LazyLock::new(|| {
     .expect("task item pattern")
 });
 
+/// Any list line, checkbox or not, so that a task nested under a plain bullet
+/// is still read as nested rather than as indented code.
+static LIST: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[ \t]*(?:[-*+]|[0-9]{1,9}[.)])(?:[ \t]|$)").expect("list pattern")
+});
+
 /// A fence, opening or closing. Info string included so that only a bare fence
 /// can close one.
 static FENCE: LazyLock<Regex> = LazyLock::new(|| {
@@ -55,10 +61,15 @@ static FENCE: LazyLock<Regex> = LazyLock::new(|| {
 static HASH_REF: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:^|[^\w])#(?P<number>[0-9]{1,9})\b").expect("hash pattern"));
 
-/// A link to an issue, on any host. Which repository it belongs to is decided
-/// later, against this one's name.
+/// A link to an issue or a pull request, on any host. Which repository it
+/// belongs to is decided later, against this one's name.
+///
+/// Pull requests are here because an item is very often written down as the
+/// change that closes it, and because `resolve` already answers for one: a
+/// merged pull request ticks the box, an open one is held. Reading only
+/// `/issues/` would file a second issue for work already in flight.
 static URL_REF: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?P<url>https?://[^\s)\]]*?/issues/(?P<number>[0-9]{1,9}))\b")
+    Regex::new(r"(?P<url>https?://[^\s)\]]*?/(?:issues|pull)/(?P<number>[0-9]{1,9}))\b")
         .expect("url pattern")
 });
 
@@ -81,7 +92,10 @@ impl Reference {
         match &self.url {
             None => Some(self.number),
             Some(url) => {
-                let owned = !slug.trim().is_empty() && url.contains(&format!("/{slug}/issues/"));
+                let slug = slug.trim();
+                let owned = !slug.is_empty()
+                    && (url.contains(&format!("/{slug}/issues/"))
+                        || url.contains(&format!("/{slug}/pull/")));
                 owned.then_some(self.number)
             }
         }
@@ -105,12 +119,18 @@ pub struct Item {
 
 /// Every task list item in the body, in order.
 ///
-/// Deliberately dull about what it will not treat as an item: anything inside a
-/// fenced code block, and anything that is not a task list line. Nested and
-/// indented items are ordinary items, since every edit here is line local.
+/// Deliberately dull about what it will not treat as an item: anything the
+/// reader of the issue does not see as a checkbox is not one. That is a fenced
+/// block, an indented code block, an HTML comment, and anything that is not a
+/// task list line. Nested items are ordinary items, since every edit here is
+/// line local.
 pub fn parse(body: &str) -> Vec<Item> {
     let mut out = Vec::new();
     let mut fence: Option<(char, usize)> = None;
+    let mut comment = false;
+    // The indent of the innermost list line still open, so that four spaces can
+    // be told apart: a code block outside a list, a nested item inside one.
+    let mut list: Option<usize> = None;
 
     for (index, raw) in split_keep(body).into_iter().enumerate() {
         let line = without_eol(raw);
@@ -132,6 +152,26 @@ pub fn parse(body: &str) -> Vec<Item> {
         if fence.is_some() {
             continue;
         }
+        // A comment is markdown a person wrote for the next person, often the
+        // items they decided against. GitHub renders none of it.
+        if comment {
+            comment = !line.contains("-->");
+            continue;
+        }
+        let indent = indent_width(line);
+        let listed = LIST.is_match(line);
+        if !listed && indent == 0 && !line.trim().is_empty() {
+            list = None;
+        }
+        // Four spaces with no list around them is a code block, which is the
+        // fence case wearing different clothes.
+        if indent >= 4 && list.is_none() {
+            continue;
+        }
+        if listed {
+            list = Some(indent);
+        }
+        comment = opens_comment(line);
         let Some(caps) = ITEM.captures(line) else {
             continue;
         };
@@ -194,6 +234,23 @@ fn split_keep(text: &str) -> Vec<&str> {
         out.push(&text[start..]);
     }
     out
+}
+
+/// Leading whitespace in columns, a tab counting as the four spaces markdown
+/// gives it when it decides what is indented far enough to be code.
+fn indent_width(line: &str) -> usize {
+    line.chars()
+        .take_while(|c| matches!(c, ' ' | '\t'))
+        .map(|c| if c == '\t' { 4 } else { 1 })
+        .sum()
+}
+
+/// Whether the line leaves an HTML comment open behind it.
+fn opens_comment(line: &str) -> bool {
+    match line.rfind("<!--") {
+        Some(at) => !line[at + 4..].contains("-->"),
+        None => false,
+    }
 }
 
 fn without_eol(line: &str) -> &str {
@@ -513,9 +570,15 @@ fn resolve(repo: &Repo, number: i64) -> Action {
     }
 }
 
+/// An issue that already covers this item, the tracker itself apart.
+///
+/// The tracker quotes every item in its own checklist, so it is the closest
+/// match for each one of them. Adopting it would link an item to the issue it
+/// is written in, and the run would then see the tracker as already handled and
+/// work nothing.
 fn search(repo: &Repo, tracker: i64, text: &str) -> Option<crate::repo::ExistingIssue> {
     let title = repo.clean_title(text).ok()?;
-    repo.find_similar_issue(&title, &child_body(text, tracker))
+    repo.find_similar_issue_apart_from(&title, &child_body(text, tracker), Some(tracker))
 }
 
 /// What a child issue says, when spar has to file one. The item's own words,
@@ -589,7 +652,20 @@ fn apply(repo: &Repo, tracker: i64, steps: &[Step]) -> Vec<i64> {
                     logdim!("  could not clean a title out of '{what}'");
                     continue;
                 };
-                match review::file_as_issue(repo, &title, &child_body(&step.item.text, tracker)) {
+                // Asked again, against the tracker as it stands, because filing
+                // is the one step that leaves something behind. An item
+                // somebody deleted while the run was working must not still get
+                // an issue for work the tracker no longer asks for.
+                if !still_asked_for(repo, tracker, &step.item.raw) {
+                    logdim!("  '{what}' is no longer in #{tracker}, so nothing was filed for it");
+                    continue;
+                }
+                match review::file_as_issue_apart_from(
+                    repo,
+                    &title,
+                    &child_body(&step.item.text, tracker),
+                    Some(tracker),
+                ) {
                     Ok(filed) => {
                         let number = filed.issue();
                         log!("  {} for '{what}'", filed.note());
@@ -598,14 +674,18 @@ fn apply(repo: &Repo, tracker: i64, steps: &[Step]) -> Vec<i64> {
                         // is then one item wide and falls on the side of filing
                         // twice rather than losing a link, which the similarity
                         // search catches next run like any other duplicate.
-                        if write(
+                        let linked = write(
                             repo,
                             tracker,
                             &step.item.raw,
                             &Change::Reference(format!("#{number}")),
-                        ) && filed.number().is_some()
-                        {
-                            children.push(number);
+                        );
+                        match linked {
+                            true if filed.number().is_some() => children.push(number),
+                            true => {}
+                            false => logwarn!(
+                                "  '{what}' went to #{number}, but #{tracker} does not link to it"
+                            ),
                         }
                     }
                     Err(e) => logdim!("  could not file an issue for '{what}': {e}"),
@@ -614,6 +694,26 @@ fn apply(repo: &Repo, tracker: i64, steps: &[Step]) -> Vec<i64> {
         }
     }
     children
+}
+
+/// Whether the tracker still carries this exact line, once and only once.
+///
+/// Unreadable counts as no: this gates filing, and an issue filed against a
+/// tracker that cannot be read is one nothing will link.
+fn still_asked_for(repo: &Repo, tracker: i64, raw: &str) -> bool {
+    match repo.read_issue(tracker) {
+        Ok(issue) => {
+            split_keep(issue.body_text())
+                .into_iter()
+                .filter(|line| without_eol(line) == raw)
+                .count()
+                == 1
+        }
+        Err(e) => {
+            logdim!("  could not re-read #{tracker}: {}", e.first_line());
+            false
+        }
+    }
 }
 
 /// Re-read, rewrite one line, write back.
@@ -819,6 +919,42 @@ mod tests {
         assert_eq!(vec!["real", "real again"], texts(body));
     }
 
+    /// Four spaces outside a list is a code block on GitHub, and filing an
+    /// issue for somebody's example is the failure the fence check exists to
+    /// prevent.
+    #[test]
+    fn an_indented_code_block_is_not_a_checklist() {
+        let body = "\
+Write the parts like this:
+
+    - [ ] an example, not an item
+
+- [ ] real
+  - [ ] nested
+- plain bullet
+    - [ ] nested under a bullet
+";
+        assert_eq!(vec!["real", "nested", "nested under a bullet"], texts(body));
+    }
+
+    /// The items somebody decided against are often kept in a comment. GitHub
+    /// renders none of it, so neither does this.
+    #[test]
+    fn an_item_inside_an_html_comment_is_not_one() {
+        let body = "\
+- [ ] real
+
+<!--
+- [ ] not real
+-->
+
+- [ ] real again
+<!-- - [ ] on one line, closed -->
+- [ ] last
+";
+        assert_eq!(vec!["real", "real again", "last"], texts(body));
+    }
+
     /// A fence closes on its own glyph only, so a stray one of the other kind
     /// inside does not end the block early.
     #[test]
@@ -851,6 +987,27 @@ mod tests {
         assert_eq!(Some(34), items[1].reference.as_ref().map(|r| r.number));
         assert_eq!(Some(56), items[2].reference.as_ref().map(|r| r.number));
         assert_eq!(None, items[3].reference);
+    }
+
+    /// An item is very often written down as the change that closes it.
+    /// `resolve` answers for a pull request already, so reading only `/issues/`
+    /// would file a second issue for work in flight.
+    #[test]
+    fn a_link_to_a_pull_request_is_a_reference_too() {
+        let items = parse(
+            "- [ ] one https://github.com/me/mine/pull/42\n\
+             - [ ] two https://github.com/me/mine/pull/43/files\n\
+             - [ ] three https://github.com/other/thing/pull/44\n",
+        );
+        assert_eq!(
+            Some(42),
+            items[0].reference.as_ref().unwrap().local("me/mine")
+        );
+        assert_eq!(
+            Some(43),
+            items[1].reference.as_ref().unwrap().local("me/mine")
+        );
+        assert_eq!(None, items[2].reference.as_ref().unwrap().local("me/mine"));
     }
 
     /// An item whose whole text is a link to somewhere else is not a reference

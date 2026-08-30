@@ -1047,6 +1047,20 @@ impl Repo {
     /// Titles alone are too thin to match on, so this compares titles and
     /// bodies together.
     pub fn find_similar_issue(&self, title: &str, body: &str) -> Option<ExistingIssue> {
+        self.find_similar_issue_apart_from(title, body, None)
+    }
+
+    /// The same search, with one issue that cannot be its own duplicate.
+    ///
+    /// A tracker's body quotes every item in its checklist, so searching for an
+    /// item's words matches the tracker before it matches anything else. That
+    /// would link an item to the issue it is written in.
+    pub fn find_similar_issue_apart_from(
+        &self,
+        title: &str,
+        body: &str,
+        apart_from: Option<i64>,
+    ) -> Option<ExistingIssue> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Row {
@@ -1086,6 +1100,7 @@ impl Repo {
         let wanted = format!("{title} {body}");
 
         rows.into_iter()
+            .filter(|row| Some(row.number) != apart_from)
             .find(|row| {
                 let theirs = format!("{} {}", row.title, row.body);
                 row.title.trim().eq_ignore_ascii_case(title.trim())

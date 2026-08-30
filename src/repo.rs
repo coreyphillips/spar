@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::config::{Config, Drafts, Followups, StateStore};
 use crate::error::Result;
-use crate::model::{Issue, IssueRef, ItemKind, PersistedState, PrRef, PrView};
+use crate::model::{Followup, Issue, IssueRef, ItemKind, PersistedState, PrRef, PrView};
 use crate::proc::{self, ExecOpts};
 use crate::style::{self, Style};
 use crate::textsim;
@@ -1131,22 +1131,26 @@ impl Repo {
 
     /// Append a follow-up to a local note instead of the tracker.
     ///
-    /// Deduplicated on the title, matching the issue path. Returns a display
-    /// string, or None when it was already recorded. The body arrives with its
-    /// provenance already stamped by the caller, so nothing is added here.
+    /// Deduplicated on the title, matching the issue path. The body arrives
+    /// with its provenance already stamped by the caller, so nothing is added
+    /// here.
+    ///
+    /// A write that did not happen is reported as such rather than as a
+    /// duplicate: the caller settles the point on the strength of this answer,
+    /// and settling it on a failed write is how a real defect is lost.
     ///
     /// Both files are checked, because `spar followup` removes an entry from
     /// the queue once it has filed it. Checking only the queue would let the
     /// next run that rediscovers the same defect append it again, on top of the
     /// issue that now exists for it.
-    pub fn append_local_followup(&self, title: &str, body: &str) -> Option<String> {
+    pub fn append_local_followup(&self, title: &str, body: &str) -> Followup {
         let path = self.followups_path();
         let heading = format!("## {}", title.trim());
         for seen in [&path, &self.worked_followups_path()] {
             if let Ok(existing) = std::fs::read_to_string(seen) {
                 if existing.contains(&heading) {
                     logdim!("follow-up already noted: {title}");
-                    return None;
+                    return Followup::Covered(format!("note: {}", title.trim()));
                 }
             }
         }
@@ -1166,13 +1170,16 @@ impl Repo {
             .append(true)
             .open(&path)
         {
-            Ok(mut file) => {
-                let _ = file.write_all(entry.as_bytes());
-                Some(format!("note: {}", title.trim()))
-            }
+            Ok(mut file) => match file.write_all(entry.as_bytes()) {
+                Ok(()) => Followup::Recorded(format!("note: {}", title.trim())),
+                Err(e) => {
+                    logdim!("could not write {}: {e}", path.display());
+                    Followup::Failed
+                }
+            },
             Err(e) => {
                 logdim!("could not write {}: {e}", path.display());
-                None
+                Followup::Failed
             }
         }
     }

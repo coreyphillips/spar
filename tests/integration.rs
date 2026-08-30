@@ -8,8 +8,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use spar::config::{self, Config};
+use spar::config::{self, Config, Followups};
+use spar::model::{Followup, IssueRun};
 use spar::repo::Repo;
+use spar::review::file_followup;
 
 const SPAR_BIN: &str = env!("CARGO_BIN_EXE_spar");
 
@@ -385,17 +387,21 @@ fn a_local_followup_is_written_once_and_only_once() {
     // The caller stamps provenance into the body, exactly as file_followup does.
     let body = |n: i64| format!("why it matters\n\nFound while working on #{n}.");
 
-    assert!(repo
-        .append_local_followup("Retry is unbounded", &body(42))
-        .is_some());
+    assert!(matches!(
+        repo.append_local_followup("Retry is unbounded", &body(42)),
+        Followup::Recorded(_)
+    ));
     assert!(
-        repo.append_local_followup("Retry is unbounded", &body(43))
-            .is_none(),
-        "a repeat across rounds must not file twice"
+        matches!(
+            repo.append_local_followup("Retry is unbounded", &body(43)),
+            Followup::Covered(_)
+        ),
+        "a repeat across rounds must not file twice, and is covered rather than failed"
     );
-    assert!(repo
-        .append_local_followup("A different thing", &body(44))
-        .is_some());
+    assert!(matches!(
+        repo.append_local_followup("A different thing", &body(44)),
+        Followup::Recorded(_)
+    ));
 
     let notes = std::fs::read_to_string(fx.work.join(".spar").join("followups.md")).unwrap();
     assert_eq!(1, notes.matches("## Retry is unbounded").count(), "{notes}");
@@ -430,7 +436,10 @@ fn a_followup_file_written_by_spar_is_read_back_by_the_parser() {
         ("Headers are restored only for the initiating instance", 43),
         ("A stale verdict overwrites a newer one", 44),
     ] {
-        assert!(repo.append_local_followup(title, &body(number)).is_some());
+        assert!(matches!(
+            repo.append_local_followup(title, &body(number)),
+            Followup::Recorded(_)
+        ));
     }
 
     let text = std::fs::read_to_string(repo.followups_path()).unwrap();
@@ -486,9 +495,10 @@ fn a_followup_already_dealt_with_is_not_recorded_again() {
     let repo = Repo::open(&fx.work, &cfg()).unwrap();
     let body = "why it matters\n\nFound while working on #7.";
 
-    assert!(repo
-        .append_local_followup("Retry is unbounded", body)
-        .is_some());
+    assert!(matches!(
+        repo.append_local_followup("Retry is unbounded", body),
+        Followup::Recorded(_)
+    ));
     let text = std::fs::read_to_string(repo.followups_path()).unwrap();
     let entries = spar::followups::parse(&text);
     repo.archive_followup(&entries[0].title, &entries[0].body, "Filed: #512");
@@ -499,8 +509,10 @@ fn a_followup_already_dealt_with_is_not_recorded_again() {
     .unwrap();
 
     assert!(
-        repo.append_local_followup("Retry is unbounded", body)
-            .is_none(),
+        matches!(
+            repo.append_local_followup("Retry is unbounded", body),
+            Followup::Covered(_)
+        ),
         "it was already filed, and recording it again puts it back in the queue forever"
     );
     assert_eq!(
@@ -508,6 +520,95 @@ fn a_followup_already_dealt_with_is_not_recorded_again() {
         std::fs::read_to_string(repo.followups_path()).unwrap(),
         "the queue is drained and must stay drained"
     );
+}
+
+/// A follow-up that could not be written has to say so. The caller settles the
+/// point on this answer and the ledger outlives the run, so a write failure
+/// reported as success suppresses a real defect on every later round too.
+#[test]
+fn a_local_note_that_cannot_be_written_reports_failure() {
+    let fx = repo("followup-write-fails");
+    let mut cfg = cfg();
+    cfg.loop_cfg.followups = Followups::Local;
+    let repo = Repo::open(&fx.work, &cfg).unwrap();
+    let state = IssueRun::new(7, "t");
+
+    // A directory where the queue file goes: the append cannot open it.
+    std::fs::create_dir_all(repo.followups_path()).unwrap();
+
+    assert_eq!(
+        Followup::Failed,
+        repo.append_local_followup("Retry is unbounded", "why it matters")
+    );
+    assert_eq!(
+        Followup::Failed,
+        file_followup(
+            &repo,
+            "Retry is unbounded",
+            "why it matters",
+            7,
+            &cfg,
+            &state
+        )
+    );
+}
+
+/// `origin` here is a bare repository on disk, so there is no tracker to reach.
+/// The point is not filed and nothing covers it, which is a retry rather than a
+/// settled point.
+#[test]
+fn a_tracker_that_cannot_be_reached_reports_failure() {
+    let fx = repo("followup-tracker-fails");
+    let mut cfg = cfg();
+    cfg.loop_cfg.followups = Followups::Issues;
+    let repo = Repo::open(&fx.work, &cfg).unwrap();
+    let state = IssueRun::new(7, "t");
+
+    assert_eq!(
+        Followup::Failed,
+        file_followup(
+            &repo,
+            "Retry is unbounded",
+            "why it matters",
+            7,
+            &cfg,
+            &state
+        )
+    );
+    assert!(!repo.followups_path().exists(), "nothing was written");
+}
+
+/// Turning follow-ups off is a decision, not a failure. Retrying it every round
+/// would spend the budget on a write that will never happen.
+#[test]
+fn follow_ups_turned_off_are_dropped_rather_than_failed() {
+    let fx = repo("followup-off");
+    let mut cfg = cfg();
+    cfg.loop_cfg.followups = Followups::None;
+    let repo = Repo::open(&fx.work, &cfg).unwrap();
+    let state = IssueRun::new(7, "t");
+
+    let outcome = file_followup(&repo, "Retry is unbounded", "why", 7, &cfg, &state);
+    assert!(matches!(outcome, Followup::Dropped(_)), "{outcome:?}");
+    assert_eq!(None, outcome.url());
+    assert!(!repo.followups_path().exists());
+}
+
+/// The cap is the backstop against a run that will not stop finding things.
+/// Reaching it drops the point deliberately, and says which.
+#[test]
+fn the_followup_cap_drops_rather_than_fails() {
+    let fx = repo("followup-cap");
+    let mut cfg = cfg();
+    cfg.loop_cfg.followups = Followups::Local;
+    cfg.loop_cfg.max_followups = 2;
+    let repo = Repo::open(&fx.work, &cfg).unwrap();
+    let mut state = IssueRun::new(7, "t");
+    state.filed = vec!["note: one".into(), "note: two".into()];
+
+    let outcome = file_followup(&repo, "Retry is unbounded", "why", 7, &cfg, &state);
+    assert!(matches!(outcome, Followup::Dropped(_)), "{outcome:?}");
+    assert!(!repo.followups_path().exists());
 }
 
 #[test]

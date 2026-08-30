@@ -539,9 +539,52 @@ fn a_branch_prefix_namespaces_a_part_branch_too() {
     let repo = Repo::open(&fx.work, &c).unwrap();
     assert_eq!("spar/split-12-2", repo.branch_for_split(12, 2));
 
-    let (_, branch) = repo.worktree_for_split(12, 2, "main").unwrap();
+    let (dir, branch) = repo.worktree_for_split(12, 2, "main").unwrap();
     assert_eq!("spar/split-12-2", branch);
-    repo.release_split_worktree(12, 2);
+    repo.release_split_worktree(&dir, &branch);
+}
+
+/// Splitting the same pull request again must not land on the names the first
+/// run used. `push` is `--force-with-lease` against a tracking ref that still
+/// matches, so reusing a name rewrites the branch behind a part's pull request
+/// rather than adding one.
+#[test]
+fn a_second_split_never_reuses_the_first_run_s_branches() {
+    let fx = repo("split-again");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    commit(&fx.work, "a.rs", "one\n", "on main");
+    git(&fx.work, &["push", "origin", "main"]);
+
+    let (first_dir, first) = repo.worktree_for_split(12, 1, "origin/main").unwrap();
+    commit(&first_dir, "part.rs", "the slice\n", "part one");
+    let landed = git(&first_dir, &["rev-parse", "HEAD"]);
+    git(&first_dir, &["push", "origin", &format!("HEAD:{first}")]);
+
+    // The branch is gone locally, the way it is after `clean`, and still on
+    // origin, where the part's pull request points at it.
+    git(
+        &fx.work,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            &first_dir.display().to_string(),
+        ],
+    );
+    git(&fx.work, &["branch", "-D", &first]);
+
+    let (_, second) = repo.worktree_for_split(12, 1, "origin/main").unwrap();
+
+    assert_ne!(
+        first, second,
+        "the second split took the first one's branch"
+    );
+    assert_eq!(
+        landed,
+        git(&fx.work, &["rev-parse", &format!("origin/{first}")]),
+        "the branch behind the first part moved"
+    );
+    assert!(repo.known_branches().contains_key(&second));
 }
 
 /// A part that will not stand on its own is dropped, and nothing was pushed at
@@ -552,7 +595,7 @@ fn a_dropped_part_takes_its_branch_and_its_record_with_it() {
     let repo = Repo::open(&fx.work, &cfg()).unwrap();
     let (path, branch) = repo.worktree_for_split(12, 1, "main").unwrap();
 
-    repo.release_split_worktree(12, 1);
+    repo.release_split_worktree(&path, &branch);
 
     assert!(!path.is_dir(), "the worktree survived");
     let branches = git(
@@ -576,9 +619,8 @@ fn a_part_branch_is_swept_by_clean_all_like_any_other() {
     assert!(!repo.known_branches().contains_key(&branch));
 }
 
-/// The mechanical heart of a pull request split, and the case it gets wrong:
-/// a file the change deleted is not there to check out, so it has to be removed
-/// rather than fetched. Everything the slice does not name stays as the base
+/// The mechanical heart of a pull request split: the slice carries the files it
+/// names, deletions included, and everything it does not name stays as the base
 /// had it.
 #[test]
 fn a_slice_carries_only_its_own_files_deletions_included() {
@@ -606,16 +648,11 @@ fn a_slice_carries_only_its_own_files_deletions_included() {
         vec!["a.rs", "b.rs", "c.rs", "new.rs"],
         repo.changed_files(&fx.work, "main")
     );
-    assert!(repo.path_exists_at(&fx.work, "theirs", "a.rs"));
-    assert!(
-        !repo.path_exists_at(&fx.work, "theirs", "c.rs"),
-        "a file the change deleted is not at its head"
-    );
     git(&fx.work, &["checkout", "main"]);
 
     let (dir, _) = repo.worktree_for_split(12, 1, "main").unwrap();
     let slice: Vec<String> = ["a.rs", "c.rs"].iter().map(|s| s.to_string()).collect();
-    assert!(spar::split::apply_slice(&repo, &dir, "theirs", &slice).unwrap());
+    assert!(spar::split::apply_slice(&repo, &dir, "main", "theirs", &slice).unwrap());
     git(&dir, &["commit", "-m", "part one"]);
 
     assert_eq!(
@@ -647,7 +684,104 @@ fn a_slice_that_changes_nothing_says_so_rather_than_committing() {
 
     let (dir, _) = repo.worktree_for_split(12, 1, "main").unwrap();
     let slice = vec!["README.md".to_string()];
-    assert!(!spar::split::apply_slice(&repo, &dir, "theirs", &slice).unwrap());
+    assert!(!spar::split::apply_slice(&repo, &dir, "main", "theirs", &slice).unwrap());
+}
+
+/// A slice is the pull request's own diff, not its version of the file. The
+/// branch starts from the base as it is now, so copying the head's blob over
+/// would revert whatever the base did to the same file since the pull request
+/// was opened, in a change advertised as one part of somebody else's.
+#[test]
+fn a_slice_keeps_what_the_base_did_after_the_pull_request_opened() {
+    let fx = repo("split-rebase");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    commit(&fx.work, "a.rs", "one\ntwo\nthree\n", "base");
+    git(&fx.work, &["push", "origin", "main"]);
+
+    git(&fx.work, &["checkout", "-b", "theirs"]);
+    commit(&fx.work, "a.rs", "one, changed\ntwo\nthree\n", "theirs");
+
+    git(&fx.work, &["checkout", "main"]);
+    commit(
+        &fx.work,
+        "a.rs",
+        "one\ntwo\nthree\nfour\n",
+        "on the base since",
+    );
+    git(&fx.work, &["push", "origin", "main"]);
+
+    let (dir, _) = repo.worktree_for_split(12, 1, "origin/main").unwrap();
+    let slice = vec!["a.rs".to_string()];
+    assert!(spar::split::apply_slice(&repo, &dir, "main", "theirs", &slice).unwrap());
+
+    assert_eq!(
+        "one, changed\ntwo\nthree\nfour\n",
+        std::fs::read_to_string(dir.join("a.rs")).unwrap(),
+        "the slice reverted a line the base added after the pull request opened"
+    );
+}
+
+/// A path is a filename, not a pattern. `--` ends the options and does nothing
+/// to pathspec matching, so a file actually named `*.txt` would otherwise drag
+/// in every other `.txt` the change touches, including one another part carries.
+#[test]
+fn a_slice_takes_its_paths_literally() {
+    let fx = repo("split-literal");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    std::fs::write(fx.work.join("*.txt"), "glob\n").unwrap();
+    std::fs::write(fx.work.join("victim.txt"), "victim\n").unwrap();
+    git(&fx.work, &["add", "-A"]);
+    git(&fx.work, &["commit", "-m", "base"]);
+    git(&fx.work, &["push", "origin", "main"]);
+
+    git(&fx.work, &["checkout", "-b", "theirs"]);
+    std::fs::write(fx.work.join("*.txt"), "glob, changed\n").unwrap();
+    std::fs::write(fx.work.join("victim.txt"), "victim, changed\n").unwrap();
+    git(&fx.work, &["add", "-A"]);
+    git(&fx.work, &["commit", "-m", "theirs"]);
+    git(&fx.work, &["checkout", "main"]);
+
+    let (dir, _) = repo.worktree_for_split(12, 1, "origin/main").unwrap();
+    let slice = vec!["*.txt".to_string()];
+    assert!(spar::split::apply_slice(&repo, &dir, "main", "theirs", &slice).unwrap());
+
+    assert_eq!(
+        "glob, changed\n",
+        std::fs::read_to_string(dir.join("*.txt")).unwrap()
+    );
+    assert_eq!(
+        "victim\n",
+        std::fs::read_to_string(dir.join("victim.txt")).unwrap(),
+        "a path was matched as a pattern, so another part's file came with it"
+    );
+}
+
+/// A rename shown as its destination alone leaves the source behind, and the
+/// part becomes a copy. Read as a deletion and an addition it is two paths, so
+/// a part either carries both or the source is reported as left over.
+#[test]
+fn a_rename_reads_as_both_of_its_paths() {
+    let fx = repo("split-rename");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    commit(&fx.work, "old.rs", "one\ntwo\nthree\nfour\n", "base");
+    git(&fx.work, &["push", "origin", "main"]);
+
+    git(&fx.work, &["checkout", "-b", "theirs"]);
+    git(&fx.work, &["mv", "old.rs", "new.rs"]);
+    git(&fx.work, &["commit", "-m", "renamed"]);
+
+    assert_eq!(
+        vec!["new.rs", "old.rs"],
+        repo.changed_files(&fx.work, "main")
+    );
+    git(&fx.work, &["checkout", "main"]);
+
+    let (dir, _) = repo.worktree_for_split(12, 1, "origin/main").unwrap();
+    let slice: Vec<String> = ["new.rs", "old.rs"].iter().map(|s| s.to_string()).collect();
+    assert!(spar::split::apply_slice(&repo, &dir, "main", "theirs", &slice).unwrap());
+
+    assert!(dir.join("new.rs").is_file());
+    assert!(!dir.join("old.rs").exists(), "the rename became a copy");
 }
 
 /// **spar never rewrites the branch behind somebody's pull request.** Splitting

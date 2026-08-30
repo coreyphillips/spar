@@ -316,16 +316,17 @@ fn reason_or(text: &str, fallback: &str) -> String {
     }
 }
 
-/// The files a change touches that no accepted part carries.
+/// The files a change touches that none of `carried` holds.
 ///
 /// Reported on the original, which stays open, so that nothing goes missing
-/// without somebody being told where it went.
-pub fn leftover(changed: &[String], parts: &[SplitPart]) -> Vec<String> {
-    let taken: BTreeSet<&str> = parts
-        .iter()
-        .flat_map(|p| p.files.iter())
-        .map(String::as_str)
-        .collect();
+/// without somebody being told where it went. Takes the file lists rather than
+/// the parts, because what a proposal claims and what was actually built are
+/// different answers and the record has to be the second one.
+pub fn leftover<'a>(
+    changed: &[String],
+    carried: impl IntoIterator<Item = &'a [String]>,
+) -> Vec<String> {
+    let taken: BTreeSet<&str> = carried.into_iter().flatten().map(String::as_str).collect();
     changed
         .iter()
         .filter(|path| !taken.contains(path.as_str()))
@@ -723,9 +724,9 @@ fn split_pr_inner(
         return Ok(());
     }
 
-    let left = leftover(&changed, &decision.parts);
+    let proposed_left = proposed_leftover(&changed, &decision);
     if mode.dry_run {
-        print_proposal(number, "pull request", &decision, &left);
+        print_proposal(number, "pull request", &decision, &proposed_left);
         state.status = Status::Whole;
         state.notes.push(format!(
             "dry run: {} part(s) proposed",
@@ -740,7 +741,7 @@ fn split_pr_inner(
     // fork.
     if pr.is_cross_repository {
         log!("PR #{number} comes from a fork, so the parts are proposed rather than made");
-        let body = proposal_comment(number, &decision, &left, &repo.style);
+        let body = proposal_comment(number, &decision, &proposed_left, &repo.style);
         repo.comment_pr(number, &body)?;
         state.status = Status::Whole;
         state
@@ -762,6 +763,11 @@ fn split_pr_inner(
         return Ok(());
     }
 
+    // From the parts that exist, not the ones that were proposed. A part
+    // dropped for carrying nothing, for failing, or for not standing on its own
+    // leaves its files on the original, and this comment is the only permanent
+    // record of where anything went.
+    let left = leftover(&changed, made.iter().map(|m| m.files.as_slice()));
     let body = parts_comment(&made, &left, &repo.style);
     if let Err(e) = repo.comment_pr(number, &body) {
         logwarn!(
@@ -776,11 +782,19 @@ fn split_pr_inner(
     Ok(())
 }
 
-/// One part that exists: its number, its title, and its pull request.
+/// What no proposed part claims. For the two paths that build nothing: a dry
+/// run and a fork, where the proposal is all there is.
+fn proposed_leftover(changed: &[String], decision: &Decision) -> Vec<String> {
+    leftover(changed, decision.parts.iter().map(|p| p.files.as_slice()))
+}
+
+/// One part that exists: its number, its title, its pull request, and the files
+/// it took with it.
 struct Made {
     index: usize,
     title: String,
     url: String,
+    files: Vec<String>,
 }
 
 /// The pull request being split, as the part builder needs it.
@@ -844,6 +858,7 @@ fn build_parts(
                     index,
                     title: part.title.clone(),
                     url: pr.url,
+                    files: part.files.clone(),
                 });
                 if decision.stacked {
                     start = branch.clone();
@@ -851,12 +866,12 @@ fn build_parts(
                 }
             }
             Ok(None) => {
-                repo.release_split_worktree(parent.number, index);
+                repo.release_split_worktree(&dir, &branch);
             }
             Err(e) => {
                 logwarn!("  part {index} could not be made: {e}");
                 state.notes.push(format!("dropped {}: {e}", label(part)));
-                repo.release_split_worktree(parent.number, index);
+                repo.release_split_worktree(&dir, &branch);
             }
         }
     }
@@ -885,7 +900,7 @@ fn build_one(
         "PR #{number}: building part {index} of {total} on {branch} ({} file(s))",
         part.files.len()
     );
-    if !apply_slice(repo, dir, parent.head_ref, &part.files)? {
+    if !apply_slice(repo, dir, parent.base, parent.head_ref, &part.files)? {
         bail!("applying its files changed nothing");
     }
     let subject = format!("{} (part {index} of #{number})", part.title.trim());
@@ -932,28 +947,102 @@ fn build_one(
 
 /// Put one slice of the parent's change on this branch.
 ///
-/// A file the change deleted is not there to check out, so it is removed rather
-/// than fetched. Reports whether anything is actually staged, because a slice
-/// that changed nothing is a part with no content.
+/// The parent's own diff for those paths, applied, rather than its versions of
+/// those files copied over. The branch starts from the base as it is now, and
+/// copying would revert whatever the base did to the same file after the pull
+/// request was opened, which is a deletion nobody asked for in a change
+/// advertised as one part of somebody else's.
 ///
-/// Public so that the deleted file case can be tested against a real
-/// repository, which is where it goes wrong.
-pub fn apply_slice(repo: &Repo, dir: &Path, head_ref: &str, files: &[String]) -> Result<bool> {
-    for path in files {
-        if repo.path_exists_at(dir, head_ref, path) {
-            repo.git_at(Some(dir), &["checkout", head_ref, "--", path])
-                .map_err(|e| {
-                    spar_err!("could not take `{path}` from the head: {}", e.last_line())
-                })?;
-        } else {
-            repo.git_try_at(Some(dir), &["rm", "-f", "--ignore-unmatch", "--", path]);
+/// Reports whether anything is actually staged, because a slice that changed
+/// nothing is a part with no content.
+///
+/// Public so that it can be tested against a real repository, which is where it
+/// goes wrong.
+pub fn apply_slice(
+    repo: &Repo,
+    dir: &Path,
+    base: &str,
+    head_ref: &str,
+    files: &[String],
+) -> Result<bool> {
+    let from = repo.merge_base(dir, base, head_ref)?;
+    let patch = patch_path(dir);
+    let written = write_patch(repo, dir, &from, head_ref, files, &patch);
+    let outcome = written.and_then(|carries| {
+        if !carries {
+            return Ok(false);
         }
-    }
-    repo.git_try_at(Some(dir), &["add", "-A"]);
-    Ok(!repo
-        .git_try_at(Some(dir), &["status", "--porcelain"])
-        .trim()
-        .is_empty())
+        // Three way so the slice still lands when the base has moved under the
+        // hunks. A conflict is an error rather than markers left in a commit:
+        // the part is dropped and said out loud, which is what every other way
+        // a part fails to stand on its own already does.
+        repo.git_at(
+            Some(dir),
+            &["apply", "--index", "--3way", &patch.display().to_string()],
+        )
+        .map_err(|e| spar_err!("could not apply its files onto {base}: {}", e.last_line()))?;
+        Ok(!repo
+            .git_try_at(Some(dir), &["status", "--porcelain"])
+            .trim()
+            .is_empty())
+    });
+    let _ = std::fs::remove_file(&patch);
+    outcome
+}
+
+/// The parent's diff for these paths alone, written to `patch`. False when it
+/// is empty.
+fn write_patch(
+    repo: &Repo,
+    dir: &Path,
+    from: &str,
+    head_ref: &str,
+    files: &[String],
+    patch: &Path,
+) -> Result<bool> {
+    let mut args: Vec<String> = vec![
+        "diff".into(),
+        // `--binary` so a change to an image or a fixture survives the round
+        // trip, `--no-renames` to match `changed_files`: a part carries paths,
+        // and a rename it holds only one end of has to stay a deletion and an
+        // addition rather than become a patch git cannot apply.
+        "--binary".into(),
+        "--no-renames".into(),
+        // Straight to a file rather than through stdout, since a diff of a
+        // file that is not valid UTF-8 does not survive being read as a string.
+        format!("--output={}", patch.display()),
+        from.to_string(),
+        head_ref.to_string(),
+        "--".into(),
+    ];
+    // `:(literal)` because `--` ends the options and does nothing to pathspec
+    // matching: a file actually named `*.txt` would otherwise pull in every
+    // other `.txt` the change touches, including ones another part carries.
+    args.extend(files.iter().map(|path| format!(":(literal){path}")));
+
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    repo.git_at(Some(dir), &argv).map_err(|e| {
+        spar_err!(
+            "could not read its files out of the head: {}",
+            e.last_line()
+        )
+    })?;
+    Ok(std::fs::metadata(patch)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false))
+}
+
+/// Beside the worktree rather than in it, so the patch is never something the
+/// slice could commit and never something `--output` writes into the tree it
+/// describes. The worktree directory is already spar's and already excluded
+/// from git.
+fn patch_path(dir: &Path) -> std::path::PathBuf {
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "part".to_string());
+    let holder = dir.parent().unwrap_or_else(|| Path::new("."));
+    holder.join(format!("{name}.patch"))
 }
 
 /// Whether spar has already split this pull request.
@@ -1376,12 +1465,40 @@ mod tests {
         assert!(additive("split-12-1", "split-12-1", "").is_err());
     }
 
+    fn carried(parts: &[SplitPart]) -> Vec<&[String]> {
+        parts.iter().map(|p| p.files.as_slice()).collect()
+    }
+
     #[test]
     fn what_no_part_carries_is_reported_as_left_over() {
         let changed = vec!["a.rs".to_string(), "b.rs".into(), "c.rs".into()];
         let parts = vec![part("one", &["a.rs"]), part("two", &["c.rs"])];
-        assert_eq!(vec!["b.rs".to_string()], leftover(&changed, &parts));
-        assert!(leftover(&changed, &[part("all", &["a.rs", "b.rs", "c.rs"])]).is_empty());
+        assert_eq!(
+            vec!["b.rs".to_string()],
+            leftover(&changed, carried(&parts))
+        );
+        let all = [part("all", &["a.rs", "b.rs", "c.rs"])];
+        assert!(leftover(&changed, carried(&all)).is_empty());
+    }
+
+    /// A part that was proposed and then dropped leaves its files on the
+    /// original, and the comment on the original is the only permanent record
+    /// of that. Counting from the proposal instead loses them silently.
+    #[test]
+    fn a_dropped_part_leaves_its_files_in_the_leftover_report() {
+        let changed = vec!["a.rs".to_string(), "b.rs".into()];
+        let made = vec![Made {
+            index: 1,
+            title: "one".into(),
+            url: "https://example.invalid/pull/1".into(),
+            files: vec!["a.rs".to_string()],
+        }];
+        let left = leftover(&changed, made.iter().map(|m| m.files.as_slice()));
+        assert_eq!(vec!["b.rs".to_string()], left);
+        assert!(
+            parts_comment(&made, &left, &Style::default()).contains("b.rs"),
+            "the file of the dropped part went unsaid"
+        );
     }
 
     /// The file list came from spar, so anything not in it is a paraphrase. A
@@ -1416,6 +1533,7 @@ mod tests {
             index: 1,
             title: "First".into(),
             url: "https://example.invalid/pull/201".into(),
+            files: vec!["first.rs".to_string()],
         }];
         let comment = parts_comment(&made, &["left.rs".to_string()], &style);
         assert!(already_split(&comment), "{comment}");

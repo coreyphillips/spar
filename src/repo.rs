@@ -37,6 +37,23 @@ pub const FOLLOWUP_MARKER: &str = "<!-- spar:followup -->";
 const WORKTREE_DIR: &str = ".spar-worktrees";
 const STATE_DIR: &str = ".spar";
 
+/// How many names one part of a split may be tried on before giving up. High
+/// enough that nobody reaches it by splitting the same pull request again, low
+/// enough that a repository where every name is taken says so rather than
+/// looping.
+const SPLIT_SLOTS: u32 = 20;
+
+/// The branch and worktree name for one part, on its `attempt`th name.
+///
+/// The unsuffixed name first, so the ordinary case reads as `split-12-1` and
+/// only a repeat split carries a suffix.
+fn split_slot(parent: i64, index: usize, attempt: u32) -> String {
+    match attempt {
+        1 => format!("split-{parent}-{index}"),
+        n => format!("split-{parent}-{index}-{n}"),
+    }
+}
+
 #[derive(Debug)]
 pub struct Repo {
     root: PathBuf,
@@ -233,8 +250,11 @@ impl Repo {
     /// Its own namespace rather than `issue-N`, because the parts of a split
     /// pull request have no issue of their own and would otherwise collide with
     /// the branch of the issue that happens to share the parent's number.
+    ///
+    /// The name a part is tried on first. `worktree_for_split` may end up on a
+    /// suffixed one, because this name is not free forever.
     pub fn branch_for_split(&self, parent: i64, index: usize) -> String {
-        format!("{}split-{parent}-{index}", self.branch_prefix)
+        format!("{}{}", self.branch_prefix, split_slot(parent, index, 1))
     }
 
     fn ledger_path(&self) -> PathBuf {
@@ -475,21 +495,31 @@ impl Repo {
     /// `start` is the base branch for independent parts and the previous part's
     /// branch for stacked ones, which is the only difference between the two
     /// shapes at this level.
+    ///
+    /// The branch is whatever name was free, which is why it is returned rather
+    /// than derived by the caller. Splitting the same pull request a second
+    /// time would otherwise land on the first run's names, and `push` is
+    /// `--force-with-lease` against a tracking ref that still matches, so the
+    /// branch behind an earlier part's pull request would be rewritten under
+    /// it.
     pub fn worktree_for_split(
         &self,
         parent: i64,
         index: usize,
         start: &str,
     ) -> Result<(PathBuf, String)> {
-        let branch = self.branch_for_split(parent, index);
-        let path = self.worktree_path(&format!("split-{parent}-{index}"));
+        let slot = self.free_split_slot(parent, index)?;
+        let branch = format!("{}{slot}", self.branch_prefix);
+        let path = self.worktree_path(&slot);
 
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
                 .map_err(|e| spar_err!("could not create {}: {e}", dir.display()))?;
         }
+        // The name is free, so there is no branch to delete. A directory can
+        // still be in the way, left by a worktree that was pruned from git's
+        // records without being removed from disk.
         self.remove_worktree_at(&path);
-        self.git_try(&["branch", "-D", &branch]);
 
         let path_str = path.display().to_string();
         self.git(&["worktree", "add", "-b", &branch, &path_str, start])
@@ -505,15 +535,40 @@ impl Repo {
         Ok((path, branch))
     }
 
+    /// The first part branch nothing is already sitting on.
+    ///
+    /// Origin as well as local, because a part's branch outlives the local one:
+    /// a second split of the same pull request finds its own earlier branches
+    /// deleted here but alive on origin, where the pull requests that reviewed
+    /// them still point at them.
+    fn free_split_slot(&self, parent: i64, index: usize) -> Result<String> {
+        for attempt in 1..=SPLIT_SLOTS {
+            let slot = split_slot(parent, index, attempt);
+            let branch = format!("{}{slot}", self.branch_prefix);
+            self.git_try(&["fetch", "origin", &branch]);
+            if !self.rev_exists(&self.root, &branch)
+                && !self.rev_exists(&self.root, &format!("origin/{branch}"))
+            {
+                return Ok(slot);
+            }
+        }
+        bail!(
+            "part {index} of #{parent} has no free branch name: {} and {SPLIT_SLOTS} suffixed \
+             names are all taken. Delete the stale ones and run this again.",
+            self.branch_for_split(parent, index)
+        )
+    }
+
     /// Throw one part away: its worktree, its branch, and its record.
     ///
     /// For a part that would not stand on its own. Nothing has been pushed at
-    /// that point, so this leaves no trace anywhere but the log.
-    pub fn release_split_worktree(&self, parent: i64, index: usize) {
-        self.remove_worktree_at(&self.worktree_path(&format!("split-{parent}-{index}")));
-        let branch = self.branch_for_split(parent, index);
-        self.git_try(&["branch", "-D", &branch]);
-        self.forget_branch(&branch);
+    /// that point, so this leaves no trace anywhere but the log. Takes what
+    /// `worktree_for_split` returned, since the name it settled on is not
+    /// derivable from the parent and the index.
+    pub fn release_split_worktree(&self, dir: &Path, branch: &str) {
+        self.remove_worktree_at(dir);
+        self.git_try(&["branch", "-D", branch]);
+        self.forget_branch(branch);
     }
 
     pub fn release_review_worktree(&self, number: i64) {
@@ -609,9 +664,14 @@ impl Repo {
     ///
     /// A three dot range, matching `diff_stat`: what the branch did, not what
     /// the base has done since.
+    ///
+    /// `--no-renames` because a rename reported as its destination alone leaves
+    /// the source out of the list, and a part carrying only the destination
+    /// would be a copy. As a deletion and an addition it is two paths, which a
+    /// part can carry together or leave to the leftover report.
     pub fn changed_files(&self, cwd: &Path, base: &str) -> Vec<String> {
         let range = format!("{}...HEAD", self.base_ref(cwd, base));
-        self.git_try_at(Some(cwd), &["diff", "--name-only", &range])
+        self.git_try_at(Some(cwd), &["diff", "--name-only", "--no-renames", &range])
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
@@ -619,16 +679,23 @@ impl Repo {
             .collect()
     }
 
-    /// Whether `path` exists at `refname`, so a slice can tell a file the change
-    /// added or edited from one it deleted.
-    pub fn path_exists_at(&self, cwd: &Path, refname: &str, path: &str) -> bool {
-        // `git cat-file -e` says so in its exit status and prints nothing, so
-        // the usual `git_try` shape, which reads stdout, cannot see the answer.
-        let spec = format!("{refname}:{path}");
-        let argv = ["git".to_string(), "cat-file".into(), "-e".into(), spec];
-        proc::exec(&argv, &self.git_opts(Some(cwd), false).timeout_secs(60))
-            .map(|out| out.ok())
-            .unwrap_or(false)
+    /// Where `refname` left the base: the commit its own change is measured
+    /// from, and the one a slice of that change has to be taken against.
+    pub fn merge_base(&self, cwd: &Path, base: &str, refname: &str) -> Result<String> {
+        let base_ref = self.base_ref(cwd, base);
+        let out = self
+            .git_at(Some(cwd), &["merge-base", &base_ref, refname])
+            .map_err(|e| {
+                spar_err!(
+                    "could not find where {refname} and {base_ref} diverged. {}",
+                    e.last_line()
+                )
+            })?;
+        let sha = out.trim().to_string();
+        if sha.is_empty() {
+            bail!("{refname} and {base_ref} share no history");
+        }
+        Ok(sha)
     }
 
     pub fn diff_stat(&self, cwd: &Path, base: &str) -> String {

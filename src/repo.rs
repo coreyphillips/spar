@@ -693,6 +693,23 @@ impl Repo {
         )
     }
 
+    /// Run gh with something on its stdin.
+    ///
+    /// A tracker body is far too long to pass on argv, and `--body-file -` is
+    /// how gh takes one. `proc::exec` already wires the pipe, so this is a
+    /// sibling of `gh_at` rather than anything new.
+    pub fn gh_stdin(&self, args: &[&str], stdin: &str) -> Result<String> {
+        let mut argv = vec!["gh".to_string()];
+        argv.extend(args.iter().map(|s| s.to_string()));
+        proc::run(
+            &argv,
+            &ExecOpts::new()
+                .cwd(&self.root)
+                .timeout_secs(300)
+                .stdin(stdin),
+        )
+    }
+
     pub fn gh_try(&self, args: &[&str]) -> String {
         let mut argv = vec!["gh".to_string()];
         argv.extend(args.iter().map(|s| s.to_string()));
@@ -748,6 +765,25 @@ impl Repo {
             bail!("`gh` reported an empty login. Run `gh auth status`.");
         }
         Ok(self.viewer.get_or_init(|| login))
+    }
+
+    /// One issue as it stands, open or closed.
+    ///
+    /// `fetch_issues` reads a queue to work: it drops a closed issue and fails
+    /// when nothing survives. Both are wrong for reading one issue back, where
+    /// closed is an answer and the empty case cannot arise.
+    pub fn read_issue(&self, number: i64) -> Result<Issue> {
+        let text = self
+            .gh(&[
+                "issue",
+                "view",
+                &number.to_string(),
+                "--json",
+                "number,title,body,labels,state,url",
+            ])
+            .map_err(|e| spar_err!("could not read issue #{number}: {}", e.last_line()))?;
+        serde_json::from_str(&text)
+            .map_err(|e| spar_err!("unexpected shape for issue #{number}: {e}"))
     }
 
     pub fn fetch_issues(&self, numbers: &[i64]) -> Result<Vec<Issue>> {
@@ -1012,6 +1048,30 @@ impl Repo {
             .trim()
             .to_string())
     }
+
+    /// Replace an issue body with `body`, cleaning only `inserted`.
+    ///
+    /// The one write path that does not run its payload through `clean`, and it
+    /// has to be: this is somebody's prose coming back unchanged but for a line
+    /// spar edited. `scrub` strips trailing whitespace, which is a markdown hard
+    /// break; it collapses blank runs; it trims; and `ATTRIBUTION_LINE` would
+    /// delete a whole line of somebody's writing that happened to match. So the
+    /// gate runs on the fragment spar inserted instead, which is the only text
+    /// here spar is answerable for. The caller names that fragment rather than
+    /// the gate being skipped silently.
+    pub fn edit_issue_body(&self, number: i64, body: &str, inserted: &str) -> Result<()> {
+        let cleaned = self.clean(inserted)?;
+        if cleaned.trim() != inserted.trim() {
+            bail!(
+                "the style gate rewrote {inserted:?} to {cleaned:?}, so it is not being inserted"
+            );
+        }
+        self.gh_stdin(
+            &["issue", "edit", &number.to_string(), "--body-file", "-"],
+            body,
+        )
+        .map(|_| ())
+    }
 }
 
 /// An issue that already covers what spar was about to file.
@@ -1033,6 +1093,20 @@ impl Repo {
     /// Titles alone are too thin to match on, so this compares titles and
     /// bodies together.
     pub fn find_similar_issue(&self, title: &str, body: &str) -> Option<ExistingIssue> {
+        self.find_similar_issue_apart_from(title, body, None)
+    }
+
+    /// The same search, with one issue that cannot be its own duplicate.
+    ///
+    /// A tracker's body quotes every item in its checklist, so searching for an
+    /// item's words matches the tracker before it matches anything else. That
+    /// would link an item to the issue it is written in.
+    pub fn find_similar_issue_apart_from(
+        &self,
+        title: &str,
+        body: &str,
+        apart_from: Option<i64>,
+    ) -> Option<ExistingIssue> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Row {
@@ -1072,6 +1146,7 @@ impl Repo {
         let wanted = format!("{title} {body}");
 
         rows.into_iter()
+            .filter(|row| Some(row.number) != apart_from)
             .find(|row| {
                 let theirs = format!("{} {}", row.title, row.body);
                 row.title.trim().eq_ignore_ascii_case(title.trim())

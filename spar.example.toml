@@ -123,6 +123,23 @@ absorb_new_issues = 0        # waves of newly filed follow-ups to fold back into
                              # next one. 0 is off. Each wave is triaged like any
                              # other issue, so both agents still have to agree.
                              # Multiplies what a run costs.
+decompose_trackers = false   # read the checklist in a tracking issue as work:
+                             # file an issue for each unchecked item that has
+                             # none, link one to the issue that already covers
+                             # it, work the children in this run, and tick an
+                             # item off once its issue is closed. The number is
+                             # written back beside the item, so the body is the
+                             # record and there is no state file to go stale.
+                             # Off by default, for the reason
+                             # file_non_blocking is: a tracker exists to
+                             # contain many things. Only ever acts on markdown
+                             # task list items, so it is opt in per issue too,
+                             # and `spar triage` prints the whole decomposition
+                             # without writing any of it. spar checks a box and
+                             # never unchecks one.
+max_tracker_children = 5     # most unchecked items from one tracker's
+                             # checklist one run will act on. A cap, not a
+                             # target. What it left is named out loud.
 followups         = "local"  # issues | local | none. Where a follow-up goes.
                              # local writes .spar/followups.md and leaves the
                              # tracker alone, which is the default because a

@@ -360,6 +360,21 @@ pub struct LoopCfg {
     /// wave can file follow-ups of its own. Every wave is triaged like any
     /// other issue, so both agents still have to agree it is worth doing.
     pub absorb_new_issues: u32,
+    /// Turn the checklist in a tracking issue into issues, and work them.
+    ///
+    /// Off by default, for the reason `file_non_blocking` is: a tracker exists
+    /// to contain many things, so this is the shape of feature that multiplies.
+    /// `max_tracker_children` caps it, a child that triage calls a tracker is
+    /// held rather than decomposed in turn, and both agents still gate every
+    /// child at triage.
+    ///
+    /// The trigger is the checklist, never a judgement about what the parts
+    /// are. Writing `- [ ]` lines is something a person does on purpose, which
+    /// makes this opt in per issue as well as per repository.
+    pub decompose_trackers: bool,
+    /// Most items from one tracker's checklist that one run may take on. A cap,
+    /// not a target, and what it left is named out loud.
+    pub max_tracker_children: usize,
     /// Whether a pull request spar opens starts as a draft.
     pub drafts: Drafts,
     /// Extra instructions handed to both agents with every request.
@@ -424,6 +439,8 @@ impl Default for LoopCfg {
             parallel_triage: true,
             min_number: 0,
             absorb_new_issues: 0,
+            decompose_trackers: false,
+            max_tracker_children: 5,
             drafts: Drafts::Never,
             instructions: String::new(),
             max_issue_chars: 60_000,

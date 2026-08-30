@@ -72,7 +72,7 @@ pub fn review() -> Value {
                         "severity": {
                             "type": "string",
                             "enum": ["blocking", "non-blocking", "nit"],
-                            "description": "blocking: the PR should not merge as is, real defects only. non-blocking: a genuine improvement that need not gate this PR. nit: style or taste."
+                            "description": "blocking: this should not merge as is, real defects only. non-blocking: real, and smaller than holding the merge for. A minor defect belongs here as much as an improvement does. nit: style or taste."
                         },
                         "title": {
                             "type": "string",
@@ -104,7 +104,7 @@ pub fn review() -> Value {
                         },
                         "in_scope": {
                             "type": "boolean",
-                            "description": "False only for a real defect that exists, that this PR did not cause, and that is worth somebody stopping to fix. It becomes a tracked item a maintainer has to read and triage, so the bar is a defect, not an observation. A thorough reviewer can always find something adjacent; that is not a reason to file it. If you are not sure it is worth a maintainer's time, leave this true and say your piece in the finding."
+                            "description": "False only for a real defect that exists, that this PR did not cause, and that is worth somebody stopping to fix. It becomes a tracked item a maintainer has to read and triage, so the bar is a defect, not an observation. A thorough reviewer can always find something adjacent; that is not a reason to file it. If you are not sure it is worth a maintainer's time, say your piece in the finding and label it non-blocking."
                         }
                     },
                     "required": [

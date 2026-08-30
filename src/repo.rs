@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -51,6 +51,19 @@ pub struct Repo {
     /// `std::thread::scope` whenever both agents are asked at the same time,
     /// and only `OnceLock` is `Sync`.
     viewer: OnceLock<String>,
+    /// Highest persisted checkpoint observed for each pull request.
+    ///
+    /// Kept in memory so a transient state read cannot reset the sequence
+    /// after a resume already loaded a newer checkpoint.
+    checkpoints: Mutex<BTreeMap<i64, u64>>,
+}
+
+fn merge_pr_args<'a>(number: &'a str, expected_head: Option<&'a str>) -> Vec<&'a str> {
+    let mut args = vec!["pr", "merge", number, "--squash", "--delete-branch"];
+    if let Some(expected_head) = expected_head {
+        args.extend(["--match-head-commit", expected_head]);
+    }
+    args
 }
 
 impl Repo {
@@ -75,6 +88,7 @@ impl Repo {
             followups: cfg.loop_cfg.followups,
             drafts: cfg.loop_cfg.drafts,
             viewer: OnceLock::new(),
+            checkpoints: Mutex::new(BTreeMap::new()),
         };
         repo.self_exclude();
         Ok(repo)
@@ -538,6 +552,36 @@ impl Repo {
             .collect()
     }
 
+    /// The commits `later` carries that `earlier` does not, oldest first, when
+    /// `earlier` is genuinely behind it.
+    ///
+    /// `None` when it is not an ancestor, which is not the same as nothing
+    /// having landed. `rewrite_commits_if_needed` rewrites hashes from the first
+    /// offending commit onward, so a head recorded before a round can still be a
+    /// readable object and no longer be on the branch. `git log` answers that
+    /// with every commit on the branch, so without the check the one caller
+    /// would report the whole branch as unread, which is the widest possible
+    /// wrong answer.
+    ///
+    /// No `base_ref` resolution, unlike its neighbours: these are commits rather
+    /// than branch names, and putting a sha through it logs a fallback line
+    /// every time.
+    pub fn commits_since(&self, cwd: &Path, earlier: &str, later: &str) -> Option<Vec<String>> {
+        let ancestor = self
+            .git_at(Some(cwd), &["merge-base", "--is-ancestor", earlier, later])
+            .is_ok();
+        if !ancestor {
+            return None;
+        }
+        let range = format!("{earlier}..{later}");
+        Some(
+            self.git_try_at(Some(cwd), &["log", &range, "--reverse", "--format=%h %s"])
+                .lines()
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+
     /// The subjects of the commits `refname` carries that the base does not,
     /// oldest first.
     pub fn commit_subjects(&self, cwd: &Path, refname: &str, base: &str) -> Vec<String> {
@@ -886,6 +930,23 @@ impl Repo {
             .unwrap_or_default()
     }
 
+    /// The commit currently exposed as a pull request's head.
+    pub fn pr_head_oid(&self, number: i64) -> Result<String> {
+        let text = self.gh(&["pr", "view", &number.to_string(), "--json", "headRefOid"])?;
+        let oid = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("headRefOid")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|oid| !oid.is_empty())
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| spar_err!("could not read the head commit for PR #{number}"))?;
+        Ok(oid)
+    }
+
     pub fn create_pr(
         &self,
         cwd: &Path,
@@ -1086,7 +1147,26 @@ impl Repo {
     /// Treating that as a failure reports work as lost when it is not.
     pub fn merge_pr(&self, number: i64) -> Result<()> {
         let n = number.to_string();
-        match self.gh(&["pr", "merge", &n, "--squash", "--delete-branch"]) {
+        match self.gh(&merge_pr_args(&n, None)) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if self.pr_state(number) == "MERGED" {
+                    logdim!(
+                        "PR #{number} merged; branch cleanup did not finish: {}",
+                        e.last_line()
+                    );
+                    Ok(())
+                } else {
+                    Err(spar_err!("could not merge PR #{number}. {}", e.last_line()))
+                }
+            }
+        }
+    }
+
+    /// Squash merge only if the pull request still exposes the reviewed head.
+    pub fn merge_pr_at_head(&self, number: i64, expected_head: &str) -> Result<()> {
+        let n = number.to_string();
+        match self.gh(&merge_pr_args(&n, Some(expected_head))) {
             Ok(_) => Ok(()),
             Err(e) => {
                 if self.pr_state(number) == "MERGED" {
@@ -1272,6 +1352,28 @@ impl Repo {
         None
     }
 
+    pub(crate) fn read_state_for_head(
+        &self,
+        pr: &PrView,
+        actual_head: &str,
+    ) -> Option<PersistedState> {
+        let local = self
+            .state_store
+            .writes_local()
+            .then(|| self.read_local_state(pr.number))
+            .flatten();
+        let remote = self
+            .state_store
+            .writes_pr()
+            .then(|| self.read_pr_state(pr.number))
+            .flatten();
+        let candidates: Vec<PersistedState> = [local, remote].into_iter().flatten().collect();
+        if let Some(checkpoint) = candidates.iter().map(|state| state.checkpoint).max() {
+            self.remember_checkpoint(pr.number, checkpoint);
+        }
+        choose_state_for_head(candidates, actual_head)
+    }
+
     fn read_pr_state(&self, number: i64) -> Option<PersistedState> {
         for body in self.state_comment_bodies(number).into_iter().rev() {
             if let Some(state) = parse_state_comment(&body) {
@@ -1282,13 +1384,53 @@ impl Repo {
     }
 
     pub fn write_state(&self, number: i64, state: &PersistedState) -> Result<()> {
+        let local_checkpoint = self
+            .state_store
+            .writes_local()
+            .then(|| self.read_local_state(number))
+            .flatten()
+            .map(|saved| saved.checkpoint)
+            .unwrap_or_default();
+        let remote_checkpoint = self
+            .state_store
+            .writes_pr()
+            .then(|| self.read_pr_state(number))
+            .flatten()
+            .map(|saved| saved.checkpoint)
+            .unwrap_or_default();
+        let mut stamped = state.clone();
+        stamped.checkpoint = state
+            .checkpoint
+            .max(local_checkpoint)
+            .max(remote_checkpoint)
+            .max(self.remembered_checkpoint(number))
+            .saturating_add(1);
+        self.remember_checkpoint(number, stamped.checkpoint);
         if self.state_store.writes_local() {
-            write_json_atomic(&self.state_path(number), state)?;
+            write_json_atomic(&self.state_path(number), &stamped)?;
         }
         if self.state_store.writes_pr() {
-            self.write_pr_state(number, state)?;
+            self.write_pr_state(number, &stamped)?;
         }
         Ok(())
+    }
+
+    fn remembered_checkpoint(&self, number: i64) -> u64 {
+        self.checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&number)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn remember_checkpoint(&self, number: i64, checkpoint: u64) {
+        let mut checkpoints = self
+            .checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let saved = checkpoints.entry(number).or_default();
+        *saved = (*saved).max(checkpoint);
     }
 
     fn write_pr_state(&self, number: i64, state: &PersistedState) -> Result<()> {
@@ -1302,8 +1444,9 @@ impl Repo {
         if let Some(id) = self.state_comment_id(number) {
             let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
             let field = format!("body={body}");
-            self.gh_try(&["api", "-X", "PATCH", &path, "-f", &field, "--silent"]);
-            return Ok(());
+            return self
+                .gh(&["api", "-X", "PATCH", &path, "-f", &field, "--silent"])
+                .map(|_| ());
         }
         self.gh(&["pr", "comment", &number.to_string(), "--body", &body])
             .map(|_| ())
@@ -1651,6 +1794,35 @@ pub fn parse_state_comment(body: &str) -> Option<PersistedState> {
     }
 }
 
+fn choose_state_for_head(
+    candidates: Vec<PersistedState>,
+    actual_head: &str,
+) -> Option<PersistedState> {
+    let matching: Vec<PersistedState> = candidates
+        .iter()
+        .filter(|state| state.pr_head == actual_head)
+        .cloned()
+        .collect();
+    if !matching.is_empty() {
+        return newest_state(matching);
+    }
+    newest_state(candidates)
+}
+
+fn newest_state(candidates: Vec<PersistedState>) -> Option<PersistedState> {
+    candidates.into_iter().reduce(|best, candidate| {
+        if (candidate.checkpoint, candidate.round) > (best.checkpoint, best.round) {
+            candidate
+        } else {
+            // The local candidate is supplied first. Keeping the first exact
+            // tie recovers correctly from a local write followed by a failed
+            // pull request state update, including legacy states with no
+            // checkpoint field.
+            best
+        }
+    })
+}
+
 /// Where this binary lives, so `git filter-branch` can call back into it.
 ///
 /// `SPAR_SELF_BIN` overrides the answer. That matters for the integration
@@ -1700,7 +1872,7 @@ pub fn style_from_env() -> Style {
 mod tests {
     use super::*;
     use crate::config::StateStore;
-    use crate::model::{Ledger, Status};
+    use crate::model::{Dispute, Finding, Ledger, Severity, Status};
 
     fn repo_for_titles() -> Repo {
         Repo {
@@ -1711,7 +1883,25 @@ mod tests {
             followups: crate::config::Followups::Issues,
             drafts: Drafts::Never,
             viewer: OnceLock::new(),
+            checkpoints: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    #[test]
+    fn guarded_merge_pins_the_reviewed_head() {
+        let args = merge_pr_args("36", Some("abc123"));
+        assert_eq!(
+            vec![
+                "pr",
+                "merge",
+                "36",
+                "--squash",
+                "--delete-branch",
+                "--match-head-commit",
+                "abc123"
+            ],
+            args
+        );
     }
 
     /// Follow-up deduplication compares a title it computed against the title
@@ -1783,11 +1973,31 @@ mod tests {
     fn state() -> PersistedState {
         PersistedState {
             version: 1,
+            checkpoint: 0,
             round: 4,
             next_actor: "codex".into(),
             status: Status::Pending,
+            pr_head: "abc123".into(),
             ledger: Ledger::new(),
             filed: vec![],
+            open_findings: vec![Finding {
+                severity: Severity::Blocking,
+                title: "Unchecked error".into(),
+                detail: "the failure is discarded".into(),
+                file: "src/a.rs:12".into(),
+                ..Finding::default()
+            }],
+            disputes: vec![Dispute {
+                title: "Retry limit".into(),
+                file: "src/net.rs".into(),
+                reasoning: "the caller already bounds it".into(),
+            }],
+            noted: vec![Finding {
+                severity: Severity::NonBlocking,
+                title: "Timeout is fixed".into(),
+                file: "src/config.rs".into(),
+                ..Finding::default()
+            }],
         }
     }
 
@@ -1800,6 +2010,79 @@ mod tests {
         let back = parse_state_comment(&body).unwrap();
         assert_eq!(4, back.round);
         assert_eq!("codex", back.next_actor);
+        assert_eq!("abc123", back.pr_head);
+        assert_eq!("Unchecked error", back.open_findings[0].title);
+        assert_eq!("src/net.rs", back.disputes[0].file);
+        assert_eq!("Timeout is fixed", back.noted[0].title);
+    }
+
+    #[test]
+    fn old_state_without_new_lists_still_parses() {
+        let body = format!(
+            "{STATE_MARKER}\n{{\"version\":1,\"round\":2,\"next_actor\":\"b\",\
+             \"status\":\"pending\",\"ledger\":{{}},\"filed\":[]}}\n-->"
+        );
+        let back = parse_state_comment(&body).expect("old state");
+        assert!(back.open_findings.is_empty());
+        assert!(back.disputes.is_empty());
+        assert!(back.noted.is_empty());
+        assert!(back.pr_head.is_empty());
+        assert_eq!(0, back.checkpoint);
+    }
+
+    #[test]
+    fn matching_remote_state_beats_a_newer_stale_local_checkpoint() {
+        let mut local = state();
+        local.pr_head = "old".into();
+        local.round = 9;
+        let mut remote = state();
+        remote.pr_head = "current".into();
+        remote.round = 4;
+
+        let chosen = choose_state_for_head(vec![local, remote], "current").unwrap();
+        assert_eq!("current", chosen.pr_head);
+        assert_eq!(4, chosen.round);
+    }
+
+    #[test]
+    fn checkpoint_order_breaks_same_round_ties() {
+        let mut local = state();
+        local.pr_head = "current".into();
+        local.round = 4;
+        local.checkpoint = 8;
+        let mut remote = local.clone();
+        remote.checkpoint = 7;
+        remote.open_findings.clear();
+
+        let chosen = choose_state_for_head(vec![local], "current").unwrap();
+        assert_eq!(8, chosen.checkpoint);
+
+        let mut local = state();
+        local.pr_head = "current".into();
+        local.round = 4;
+        local.checkpoint = 8;
+        let chosen = choose_state_for_head(vec![remote, local], "current").unwrap();
+        assert_eq!(8, chosen.checkpoint);
+    }
+
+    #[test]
+    fn legacy_same_round_tie_keeps_the_local_checkpoint() {
+        let mut local = state();
+        local.pr_head = "current".into();
+        local.round = 4;
+        local.open_findings.push(Finding {
+            title: "local checkpoint".into(),
+            ..Finding::default()
+        });
+        let mut remote = state();
+        remote.pr_head = "current".into();
+        remote.round = 4;
+
+        let chosen = choose_state_for_head(vec![local, remote], "current").unwrap();
+        assert_eq!(
+            "local checkpoint",
+            chosen.open_findings.last().unwrap().title
+        );
     }
 
     /// It must render as nothing, so PRs are not littered with machine state.

@@ -754,6 +754,7 @@ fn act(
         if item.ask == Ask::Decline {
             state.disputes.push(Dispute {
                 title: style::title(&item.request, &repo.style),
+                file: String::new(),
                 reasoning: style::summary(&item.reasoning, &repo.style),
             });
         }

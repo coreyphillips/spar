@@ -11,7 +11,7 @@ use crate::checkin;
 use crate::config::{self, Config};
 use crate::error::Result;
 use crate::followups;
-use crate::model::{Issue, IssueRun, ItemKind, Ledger, Plan, Status};
+use crate::model::{Issue, IssueRun, ItemKind, Plan, Status};
 use crate::proc::{self, ExecOpts};
 use crate::repo::Repo;
 use crate::review;
@@ -117,7 +117,7 @@ pub enum Command {
         common: Common,
         #[command(flatten)]
         loop_flags: LoopFlags,
-        /// Which agent reviews next, overriding the PR's saved state.
+        /// Which agent reviews next, overriding saved custody after the PR head changed.
         #[arg(long = "next", value_name = "AGENT")]
         next_actor: Option<String>,
     },
@@ -246,7 +246,7 @@ pub struct Common {
     /// Base branch. Defaults to whatever origin/HEAD points at.
     #[arg(long)]
     pub base: Option<String>,
-    /// Which agent implements first. A key from the [agents] table.
+    /// Which agent implements first. A key from the `[agents]` table.
     #[arg(long)]
     pub first: Option<String>,
     /// Cap on how many open items to take when none are named.
@@ -264,8 +264,8 @@ pub struct Common {
 
 #[derive(Args, Debug, Clone)]
 pub struct LoopFlags {
-    /// Review rounds this run may spend before escalating. Resuming grants a
-    /// fresh budget; it is not a lifetime cap on the pull request.
+    /// Review rounds this run may spend asking for changes. A closing pass,
+    /// when needed, is not one of them. Resuming grants a fresh budget.
     #[arg(long)]
     pub max_rounds: Option<u32>,
     /// Merge when no blocking findings remain. Off by default, deliberately.
@@ -681,7 +681,6 @@ fn work_issues(
     plan_out: &Path,
     results: &mut Vec<IssueRun>,
 ) -> Result<()> {
-    let mut ledger = Ledger::new();
     let mut handled: BTreeSet<i64> = BTreeSet::new();
     let mut wave = first_wave;
 
@@ -726,14 +725,7 @@ fn work_issues(
             let Some(issue) = fetched.iter().find(|i| i.number == item.issue) else {
                 continue;
             };
-            results.push(review::run_issue(
-                agents,
-                cfg,
-                repo,
-                item,
-                issue,
-                &mut ledger,
-            ));
+            results.push(review::run_issue(agents, cfg, repo, item, issue));
         }
 
         // Whatever this wave filed becomes the next one.
@@ -1248,7 +1240,7 @@ fn report_fallback(agent: &Agent) {
 type Setting = (bool, &'static str, &'static str);
 
 const LOOP_OPTIONS: &[Setting] = &[
-    (false, "max_rounds", "Review rounds one invocation may spend before escalating. Resuming grants a fresh budget, so this is not a lifetime cap on a pull request."),
+    (false, "max_rounds", "In the custody loop, review rounds one invocation may spend asking for changes. A full-budget run may then use one extra closing pass. In `spar review`, this selects up to three phases: independent review, cross-adjudication, and rebuttal. Resuming a custody run grants a fresh budget, so this is not a lifetime cap."),
     (false, "auto_merge", "Merge when no blocking findings remain. Off on purpose: two models agreeing is not the same as being right, and neither carries the consequences."),
     (false, "first_implementor", "Which agent takes the first pass. The other one reviews it."),
     (false, "worktrees", "Isolate each issue in its own git worktree. Set false to work in the main checkout."),
@@ -1309,7 +1301,7 @@ fn settings_block(first_implementor: &str) -> String {
         "# these are examples rather than defaults. Left out, each agent uses\n",
         "# the effort its own block asked for.\n",
         "# round_1 = \"high\"   # the deep first review\n",
-        "# rest    = \"low\"    # later rounds only see a small delta\n\n",
+        "# rest    = \"low\"    # later rounds and the closing pass\n\n",
     ));
     out.push_str("[style]\n");
     out.push_str(&option_lines(STYLE_OPTIONS, &value));
@@ -1605,7 +1597,16 @@ fn report(results: &[IssueRun], cfg: &Config) -> i32 {
             println!("       filed {url}");
         }
         for dispute in &r.disputes {
-            println!("       disputed: {}", dispute.title);
+            println!(
+                "       disputed: {}",
+                report_item(&dispute.title, &dispute.file)
+            );
+        }
+        for finding in &r.noted {
+            println!(
+                "       noted, not blocking: {}",
+                report_item(&finding.title, &finding.file)
+            );
         }
     }
     println!("{}", "=".repeat(60));
@@ -1627,10 +1628,26 @@ fn report(results: &[IssueRun], cfg: &Config) -> i32 {
     }
 }
 
+fn report_item(title: &str, file: &str) -> String {
+    match file.trim() {
+        "" => title.to_string(),
+        location => format!("{title} ({location})"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn report_items_include_their_location() {
+        assert_eq!(
+            "Same title (src/a.rs:10)",
+            report_item("Same title", "src/a.rs:10")
+        );
+        assert_eq!("General point", report_item("General point", ""));
+    }
 
     #[test]
     fn the_parser_is_internally_consistent() {

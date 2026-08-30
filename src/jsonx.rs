@@ -185,11 +185,8 @@ fn head(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
-/// A stable identity for a review finding, so a refutation survives across
-/// rounds even when the reviewer rewords the point.
-///
-/// Wording noise, punctuation, and case are all discarded; the file is not,
-/// because the same complaint about two different files is two complaints.
+/// The original public finding key, retained for persisted-state and library
+/// compatibility.
 pub fn finding_key(title: &str, file: &str) -> String {
     let basis: String = format!("{} {}", title.trim(), file.trim())
         .to_lowercase()
@@ -197,10 +194,63 @@ pub fn finding_key(title: &str, file: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '/' | '.' | '_' | '-'))
         .collect();
     let basis = basis.split_whitespace().collect::<Vec<_>>().join(" ");
+    short_hash(&basis)
+}
 
+/// An exact identity for a review finding within one answer.
+///
+/// Wording noise, punctuation, and title case are discarded. The full location
+/// is retained because the same complaint at two sites in one file is two
+/// complaints. Cross-round matching uses `stable_finding_key` as a guarded
+/// fallback instead of making this identity lossy.
+pub(crate) fn exact_finding_key(title: &str, file: &str) -> String {
+    identity_key(title, file.trim())
+}
+
+/// A location-tolerant identity used only for unambiguous cross-round matches.
+pub(crate) fn stable_finding_key(title: &str, file: &str) -> String {
+    identity_key(title, &finding_file(file))
+}
+
+fn identity_key(title: &str, file: &str) -> String {
+    let title: String = title
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || c.is_whitespace())
+        .collect();
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let basis = format!("{title}\0{file}");
+
+    short_hash(&basis)
+}
+
+fn short_hash(basis: &str) -> String {
     let digest = Sha256::digest(basis.as_bytes());
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     hex[..12].to_string()
+}
+
+/// A finding's repository path without an optional trailing line or column.
+///
+/// Review locations move as fixes land. The path identifies the point across
+/// rounds, while the full location is still kept on the finding for display.
+pub(crate) fn finding_file(file: &str) -> String {
+    let mut path = file.trim();
+    while let Some((head, suffix)) = path.rsplit_once(':') {
+        let is_number = !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
+        let is_range = suffix.split_once('-').is_some_and(|(start, end)| {
+            !start.is_empty()
+                && !end.is_empty()
+                && start.chars().all(|c| c.is_ascii_digit())
+                && end.chars().all(|c| c.is_ascii_digit())
+        });
+        if !is_number && !is_range {
+            break;
+        }
+        path = head.trim_end();
+    }
+    path.to_string()
 }
 
 #[cfg(test)]
@@ -287,16 +337,45 @@ mod tests {
     }
 
     #[test]
-    fn key_is_case_insensitive_in_the_path_too() {
+    fn public_key_keeps_its_original_case_insensitive_paths() {
         assert_eq!(
             finding_key("t", "src/Main.rs"),
             finding_key("t", "src/main.rs")
+        );
+        assert_ne!(
+            exact_finding_key("t", "src/Main.rs"),
+            exact_finding_key("t", "src/main.rs")
         );
     }
 
     #[test]
     fn key_is_stable_across_whitespace() {
         assert_eq!(finding_key("a  b", "x.rs"), finding_key(" a b ", "x.rs"));
+    }
+
+    #[test]
+    fn exact_key_keeps_distinct_locations() {
+        assert_ne!(
+            exact_finding_key("t", "src/net.rs:88"),
+            exact_finding_key("t", "src/net.rs:91")
+        );
+        assert_eq!(
+            stable_finding_key("t", "src/net.rs:88"),
+            stable_finding_key("t", "src/net.rs:91")
+        );
+        assert_eq!(
+            stable_finding_key("t", "src/net.rs:88-94"),
+            stable_finding_key("t", "src/net.rs")
+        );
+        assert_eq!(
+            stable_finding_key("t", "src/net.rs:88:12"),
+            stable_finding_key("t", "src/net.rs")
+        );
+    }
+
+    #[test]
+    fn a_numeric_filename_is_not_treated_as_a_line_number() {
+        assert_eq!("fixtures/2024", finding_file("fixtures/2024"));
     }
 
     #[test]

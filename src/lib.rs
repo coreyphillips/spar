@@ -20,6 +20,7 @@ pub mod repo;
 pub mod review;
 pub mod review_only;
 pub mod schema;
+pub mod split;
 pub mod style;
 pub mod textsim;
 pub mod tracker;

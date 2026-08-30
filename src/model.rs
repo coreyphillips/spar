@@ -187,6 +187,10 @@ string_enum! {
         Clean = "clean",
         /// Check-in: comments were read and answered.
         Answered = "answered",
+        /// Split: the item was broken into parts, which were filed or opened.
+        Split = "split",
+        /// Split: read, and left as one piece.
+        Whole = "whole",
     }
 }
 
@@ -321,6 +325,11 @@ pub fn de_opt_i64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Err
     })
 }
 
+/// A list of strings that may arrive as null or be missing entirely.
+fn de_string_vec<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    Ok(Option::<Vec<String>>::deserialize(d)?.unwrap_or_default())
+}
+
 fn de_bool_default_true<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
     #[derive(Deserialize)]
     struct Wrap(#[serde(deserialize_with = "de_bool")] bool);
@@ -384,6 +393,77 @@ pub struct ScreenVerdict {
 pub struct ScreenResponse {
     #[serde(default)]
     pub entries: Vec<ScreenVerdict>,
+}
+
+/// One agent's ruling on whether one open item is worth splitting at all.
+///
+/// The cheap screen the bare `spar split` runs over a whole queue, so that two
+/// agent calls per item are only spent on the ones where the answer might be
+/// yes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitScreen {
+    /// The issue or pull request number, which is spar's own data and so cannot
+    /// be paraphrased back wrong.
+    #[serde(deserialize_with = "de_i64")]
+    pub item: i64,
+    #[serde(deserialize_with = "de_bool")]
+    pub split: bool,
+    #[serde(default, deserialize_with = "de_string")]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitScreenDoc {
+    #[serde(default)]
+    pub items: Vec<SplitScreen>,
+}
+
+/// One piece of a proposed decomposition.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SplitPart {
+    #[serde(default, deserialize_with = "de_string")]
+    pub title: String,
+    /// The issue body, or the rationale for a pull request slice.
+    #[serde(default, deserialize_with = "de_string")]
+    pub body: String,
+    /// The paths this slice carries. Empty for an issue split, where there is
+    /// no diff to partition.
+    #[serde(default, deserialize_with = "de_string_vec")]
+    pub files: Vec<String>,
+}
+
+/// One agent's decomposition of an issue or a pull request.
+///
+/// Deliberately one proposal rather than two. Two agents asked to decompose the
+/// same thing return two decompositions that cannot be reconciled mechanically,
+/// and reconciling them is a third judgement nobody asked for.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SplitProposal {
+    #[serde(default, deserialize_with = "de_bool")]
+    pub should_split: bool,
+    #[serde(default, deserialize_with = "de_string")]
+    pub reason: String,
+    /// Whether the parts are sequential, so each is based on its predecessor
+    /// rather than on the base branch. A property of the change, not of the
+    /// repository, which is why it rides on the proposal.
+    #[serde(default, deserialize_with = "de_bool")]
+    pub stacked: bool,
+    #[serde(default)]
+    pub parts: Vec<SplitPart>,
+}
+
+/// The second agent's ruling on the first one's decomposition.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SplitCheck {
+    #[serde(default, deserialize_with = "de_bool")]
+    pub accept: bool,
+    #[serde(default, deserialize_with = "de_bool")]
+    pub stacked: bool,
+    /// Part numbers, from 1, that should not be split out.
+    #[serde(default, deserialize_with = "de_i64_vec")]
+    pub strike: Vec<i64>,
+    #[serde(default, deserialize_with = "de_string")]
+    pub reasoning: String,
 }
 
 /// One agent's judgement of one comment somebody left on a pull request.
@@ -906,6 +986,11 @@ impl IssueRun {
                 | Status::Reviewed
                 | Status::Clean
                 | Status::Answered
+                // A split that correctly decided nothing needed splitting did
+                // its job. Without Whole here, `spar split` over a tidy queue
+                // exits non-zero, which in a script reads as a failure.
+                | Status::Split
+                | Status::Whole
         )
     }
 }
@@ -1012,6 +1097,35 @@ pub struct PrRef {
 #[derive(Debug, Clone, Deserialize)]
 pub struct IssueRef {
     pub number: i64,
+}
+
+/// An open pull request's size, as one listing call reports it.
+///
+/// Enough for the screen to say whether a change is worth splitting without
+/// fetching its head, which would be one network round trip per pull request
+/// for a question whose answer is usually no.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrRow {
+    pub number: i64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub changed_files: i64,
+    #[serde(default)]
+    pub additions: i64,
+    #[serde(default)]
+    pub deletions: i64,
+}
+
+impl PrRow {
+    /// The size, as the screen prompt carries it.
+    pub fn size(&self) -> String {
+        format!(
+            "{} file(s), +{} -{}",
+            self.changed_files, self.additions, self.deletions
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1161,6 +1275,18 @@ mod tests {
             "severity": "showstopper-maybe", "title": "t", "detail": "d", "file": "a.rs"
         }));
         assert!(out.is_err());
+    }
+
+    /// A `spar split` that correctly decided nothing needed splitting did its
+    /// job. Without both of these in `succeeded`, it exits non-zero over a tidy
+    /// queue, which in a script reads as a failure.
+    #[test]
+    fn deciding_not_to_split_is_not_a_failure() {
+        for status in [Status::Split, Status::Whole] {
+            let mut run = IssueRun::new(1, "t");
+            run.status = status;
+            assert!(run.succeeded(), "{status}");
+        }
     }
 
     #[test]

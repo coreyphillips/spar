@@ -11,7 +11,7 @@ use crate::checkin;
 use crate::config::{self, Config};
 use crate::error::Result;
 use crate::followups;
-use crate::model::{Issue, IssueRun, ItemKind, Ledger, Plan, Status};
+use crate::model::{Issue, IssueRun, ItemKind, Plan, Status};
 use crate::proc::{self, ExecOpts};
 use crate::repo::Repo;
 use crate::review;
@@ -681,7 +681,6 @@ fn work_issues(
     plan_out: &Path,
     results: &mut Vec<IssueRun>,
 ) -> Result<()> {
-    let mut ledger = Ledger::new();
     let mut handled: BTreeSet<i64> = BTreeSet::new();
     let mut wave = first_wave;
 
@@ -726,14 +725,7 @@ fn work_issues(
             let Some(issue) = fetched.iter().find(|i| i.number == item.issue) else {
                 continue;
             };
-            results.push(review::run_issue(
-                agents,
-                cfg,
-                repo,
-                item,
-                issue,
-                &mut ledger,
-            ));
+            results.push(review::run_issue(agents, cfg, repo, item, issue));
         }
 
         // Whatever this wave filed becomes the next one.

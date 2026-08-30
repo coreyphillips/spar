@@ -259,7 +259,6 @@ pub fn run_issue(
     repo: &Repo,
     item: &PlanItem,
     issue: &Issue,
-    ledger: &mut Ledger,
 ) -> IssueRun {
     // Continue an existing PR rather than implementing over the top of it.
     //
@@ -278,6 +277,13 @@ pub fn run_issue(
     }
 
     let mut state = IssueRun::new(item.issue, item.title.clone());
+    // One ledger per pull request. It was one per invocation, held by
+    // `work_issues` and lent to every issue in the run, so the second issue was
+    // handed the first one's points and told to treat as settled a defect in a
+    // file its own branch does not touch. Both state files on this repository
+    // record it: `pr-34.json` carries `pr-33.json`'s two `src/tracker.rs`
+    // entries, on a branch with no tracker in it.
+    let mut ledger = Ledger::new();
     let base = cfg.base_branch().to_string();
 
     let prepared = if cfg.loop_cfg.worktrees {
@@ -300,7 +306,15 @@ pub fn run_issue(
     };
 
     let outcome = implement_and_review(
-        agents, cfg, repo, item, issue, ledger, &mut state, &work_dir, &branch,
+        agents,
+        cfg,
+        repo,
+        item,
+        issue,
+        &mut ledger,
+        &mut state,
+        &work_dir,
+        &branch,
     );
     if let Err(e) = outcome {
         state.status = Status::Error;

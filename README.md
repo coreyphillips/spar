@@ -75,7 +75,9 @@ Every command that writes has a way to not write. Worth knowing before the first
 run on a repository you care about:
 
 ```bash
-spar triage 42              # judges the issue, writes plan.json, touches nothing
+spar triage 42              # judges the issue, writes plan.json, touches nothing.
+                            # Prints the tracker decomposition too, with
+                            # decompose_trackers on
 spar review 108 --dry-run   # full two agent review, printed, nothing posted
 spar checkin 108 --dry-run  # every reply and every change, posted nowhere
 spar followup --screen-only # judges the queue, writes nothing, files nothing
@@ -405,6 +407,65 @@ changes what gets filed, which is the point.
 An entry is only removed after its issue exists, so a run that dies halfway
 files one thing twice rather than losing one. The duplicate is caught by the
 same search that catches every other one.
+
+## Working a tracking issue's checklist
+
+Both agents recognise a tracker and decline to open one pull request for it,
+which is right, and used to be the end of it: every run judged the same umbrella
+again, commented again, and none of the work written down in it moved. With
+`decompose_trackers = true` the checklist becomes the work.
+
+```toml
+[loop]
+decompose_trackers   = true
+max_tracker_children = 5
+```
+
+For each unchecked `- [ ]` item, in order:
+
+- It already names an issue (`#123`, or a link to one here): that is its issue.
+- It names none, but an issue already covers it: link it, file nothing.
+- Neither: file one, then link it.
+
+The number is written back beside the item, so the tracker body is the record.
+There is no state file to go stale, and you can correct a wrong link by editing
+one token in your own issue. An item whose issue is closed gets its box ticked,
+whoever closed it and whenever, so a tracker somebody has been working by hand
+catches up too.
+
+The children are a wave like any other: dependency order, cheapest first, and
+both agents triage each one before anything is implemented. An item that is
+stale or already fixed is declined there rather than guessed at here. A child
+that is itself a tracker is held rather than decomposed in turn.
+
+Read it before you let it act. With the setting on, `spar triage` prints the
+whole decomposition, item by item, with the exact body diff, and writes none of
+it. `triage` never calls the acting path, so this is the dry run:
+
+```bash
+spar triage 42    # what it would file, link, and tick, and the lines it would write
+```
+
+Three restraints worth knowing, because this is the only thing spar does that
+rewrites text a person wrote:
+
+- **Only a checklist.** Task list items, never an agent's reading of your prose.
+  A tracker with no checklist behaves exactly as it did before. Anything inside
+  a fenced code block is not an item, and a line spar cannot rewrite
+  unambiguously is skipped with a reason.
+- **It ticks a box and never unchecks one.** A checked box next to an open issue
+  is left alone: every state that produces one is a state where you are right
+  and the heuristic is wrong. An item linked by a fuzzy match is not ticked in
+  the same run that linked it, even when the match is closed, so the link is in
+  front of you first.
+- **Line surgery, proved.** A reference is appended to one line, or one `[ ]`
+  becomes `[x]`. Nothing is reflowed, reordered, or re-emitted from a parsed
+  model, every other line is checked byte identical before the write, and the
+  body is read again immediately before each one so an edit you make mid run is
+  not lost.
+
+A tracker is never closed by this, whatever `close_skipped` says. The parts
+landing is not the same as the issue being finished.
 
 ## Answering the comments on a pull request
 

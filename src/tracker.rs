@@ -40,10 +40,21 @@ use crate::{bail, log, logdim, logwarn, spar_err};
 /// than normalised, because nothing here rebuilds a line it did not have to.
 static ITEM: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"^(?P<indent>[ \t]*)(?:[-*+]|[0-9]{1,9}[.)])[ \t]+\[(?P<state>[ xX])\](?P<rest>[ \t].*|)$",
+        r"^(?P<indent>[ \t]*)(?:[-*+]|[0-9]{1,9}[.)])(?P<gap>[ \t]+)\[(?P<state>[ xX])\](?P<rest>[ \t].*|)$",
     )
     .expect("task item pattern")
 });
+
+/// The line read as a task list item, or `None` if it is not one.
+///
+/// More than four columns after the marker put the checkbox in an indented code
+/// block inside the item: markdown starts the content one column after the
+/// marker, and everything past that is code. `-     [ ] example` is somebody
+/// showing the syntax, which is the fence case again.
+fn item_of(line: &str) -> Option<regex::Captures<'_>> {
+    let caps = ITEM.captures(line)?;
+    (indent_width(&caps["gap"]) <= 4).then_some(caps)
+}
 
 /// Any list line, checkbox or not, so that a task nested under a plain bullet
 /// is still read as nested rather than as indented code. The marker and the
@@ -57,7 +68,7 @@ static LIST: LazyLock<Regex> = LazyLock::new(|| {
 /// The raw HTML blocks GitHub renders exactly as written, so a checkbox inside
 /// one is text somebody is showing rather than a box anybody can tick. Same
 /// shape as a fence, different clothes again.
-static HTML_OPEN: LazyLock<Regex> = LazyLock::new(|| {
+static HTML_VERBATIM: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^[ \t]*<(?:pre|script|style|textarea)\b").expect("html open pattern")
 });
 
@@ -65,15 +76,58 @@ static HTML_CLOSE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)</(?:pre|script|style|textarea)>").expect("html close pattern")
 });
 
+/// A line that starts a block level HTML tag. Markdown inside one of these is
+/// not parsed either: `<div>` then a checkbox on the next line renders as the
+/// literal text `- [ ] thing`. The block runs to the next blank line rather
+/// than to a closing tag, which is what makes the `<details>` a tracker is
+/// often written in still work: the blank line after `</summary>` ends it and
+/// the checklist below is a checklist.
+static HTML_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?i)^[ \t]*</?(?:address|article|aside|base|basefont|blockquote|body|caption|center",
+        r"|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form",
+        r"|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem",
+        r"|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot",
+        r"|th|thead|title|tr|track|ul)\b"
+    ))
+    .expect("html block pattern")
+});
+
+/// Which kind of raw HTML block is open, since the two end differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Html {
+    /// `<pre>` and friends, which run to their closing tag.
+    Verbatim,
+    /// Any other block tag, which runs to the next blank line.
+    Block,
+}
+
 /// A fence, opening or closing. Info string included so that only a bare fence
 /// can close one.
 static FENCE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^[ \t]*(?P<fence>`{3,}|~{3,})(?P<info>.*)$").expect("fence pattern")
 });
 
-/// `#123`, at the start of the text or after something that is not a word.
-static HASH_REF: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:^|[^\w])#(?P<number>[0-9]{1,9})\b").expect("hash pattern"));
+/// The three things GitHub turns into an issue link without a url: `#123`,
+/// `owner/repo#123`, and `GH-123`. All at the start of the text or after
+/// something that is neither a word nor a path separator, so that a fragment
+/// left in the middle of an address is not read as a number.
+static HASH_REF: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[^\w/])(?:(?P<slug>[\w.-]+/[\w.-]+)#|#|GH-)(?P<number>[0-9]{1,9})\b")
+        .expect("hash pattern")
+});
+
+/// A link, of any shape. Blanked before the bare numbers are read, because the
+/// `#8` in `https://example.com/guide/#8` is a fragment in somebody's address
+/// and not a reference to issue 8. The links that do name an issue are read by
+/// `URL_REF` from the text with them still in it.
+static LINK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"https?://[^\s<>)\]]*").expect("link pattern"));
+
+/// An HTML comment, closed or running to the end of the text. GitHub renders
+/// none of it, so a number parked in one is a note to a person.
+static COMMENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<!--.*?(?:-->|$)").expect("comment pattern"));
 
 /// A link to an issue or a pull request, on any host. Which repository it
 /// belongs to is decided later, against this one's name.
@@ -87,28 +141,39 @@ static URL_REF: LazyLock<Regex> = LazyLock::new(|| {
         .expect("url pattern")
 });
 
+/// Where the issue an item names lives, as the item spells it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// `#123` or `GH-123`, which can only mean this repository.
+    Here,
+    /// `owner/repo#123`. The host is left out of the shorthand, so it is this
+    /// repository whenever the path matches, wherever this one is served from.
+    Repo(String),
+    /// A link, host and all, which can name anybody's.
+    Url(String),
+}
+
 /// An issue an item's text already names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reference {
     pub number: i64,
-    /// Set when the reference was written as a link. A bare `#123` can only
-    /// mean this repository; a link can name anybody's.
-    pub url: Option<String>,
+    pub origin: Origin,
 }
 
 impl Reference {
     /// The issue number, when the reference is one this repository can act on.
     ///
-    /// A link to another repository's issue is not adoptable: taking the number
-    /// out of it would point the item at whatever happens to carry that number
-    /// here, which is the wrong link failure with no fuzziness to blame.
+    /// Another repository's issue is not adoptable: taking the number out of it
+    /// would point the item at whatever happens to carry that number here,
+    /// which is the wrong link failure with no fuzziness to blame.
     ///
     /// `home` is this repository's own address, host and all, so that another
     /// host serving the same `owner/repo` path is somebody else's.
     pub fn local(&self, home: &str) -> Option<i64> {
-        match &self.url {
-            None => Some(self.number),
-            Some(url) => {
+        match &self.origin {
+            Origin::Here => Some(self.number),
+            Origin::Repo(slug) => (slug == &owner_repo(home)).then_some(self.number),
+            Origin::Url(url) => {
                 let home = locator(home).trim_end_matches('/');
                 let url = locator(url);
                 let owned = !home.is_empty()
@@ -117,6 +182,26 @@ impl Reference {
                 owned.then_some(self.number)
             }
         }
+    }
+
+    /// The reference as it would be quoted back to somebody, for a log line.
+    pub fn names(&self) -> String {
+        match &self.origin {
+            Origin::Here => format!("#{}", self.number),
+            Origin::Repo(slug) => format!("{slug}#{}", self.number),
+            Origin::Url(url) => url.clone(),
+        }
+    }
+}
+
+/// The last two segments of an address, which are the owner and repository a
+/// `owner/repo#1` shorthand is measured against. Empty when there is no address
+/// to read, which matches no shorthand rather than guessing at one.
+fn owner_repo(home: &str) -> String {
+    let path: Vec<&str> = locator(home).trim_matches('/').split('/').collect();
+    match path.len() {
+        0..=2 => String::new(),
+        n => format!("{}/{}", path[n - 2], path[n - 1]),
     }
 }
 
@@ -150,14 +235,16 @@ pub struct Item {
 ///
 /// Deliberately dull about what it will not treat as an item: anything the
 /// reader of the issue does not see as a checkbox is not one. That is a fenced
-/// block, an indented code block, an HTML comment, a raw HTML block GitHub
-/// renders verbatim, and anything that is not a task list line. Nested items
-/// are ordinary items, since every edit here is line local.
+/// block, an indented code block, an HTML comment, anything inside a block
+/// level HTML tag, and anything that is not a task list line. Nested items are
+/// ordinary items, since every edit here is line local.
 pub fn parse(body: &str) -> Vec<Item> {
     let mut out = Vec::new();
-    let mut fence: Option<(char, usize)> = None;
+    // The glyph and length a close has to match, and the column it opened in,
+    // since a fence four columns further in is code rather than the close.
+    let mut fence: Option<(char, usize, usize)> = None;
     let mut comment = false;
-    let mut html = false;
+    let mut html: Option<Html> = None;
     // Where the content of each open list item starts, outermost first. Four
     // spaces mean code, but four spaces from where: the margin outside a list,
     // and the innermost item's own content column inside one.
@@ -171,29 +258,32 @@ pub fn parse(body: &str) -> Vec<Item> {
             comment = !line.contains("-->");
             continue;
         }
-        if html {
-            html = !HTML_CLOSE.is_match(line);
-            continue;
-        }
-        if let Some(caps) = FENCE.captures(line) {
-            let marker = &caps["fence"];
-            let (glyph, len) = (marker.chars().next().expect("a fence"), marker.len());
-            fence = match fence {
-                None => Some((glyph, len)),
-                // Only the same glyph, at least as long, with nothing after it.
-                Some((open, open_len))
-                    if glyph == open && len >= open_len && caps["info"].trim().is_empty() =>
-                {
-                    None
-                }
-                open => open,
+        if let Some(kind) = html {
+            let ends = match kind {
+                Html::Verbatim => HTML_CLOSE.is_match(line),
+                Html::Block => line.trim().is_empty(),
             };
-            continue;
-        }
-        if fence.is_some() {
+            if ends {
+                html = None;
+            }
             continue;
         }
         let indent = indent_width(line);
+        if let Some((glyph, len, column)) = fence {
+            // Only the same glyph, at least as long, with nothing after it, and
+            // not indented so far past the opening one that it is code.
+            if let Some(caps) = FENCE.captures(line) {
+                let marker = &caps["fence"];
+                let closes = marker.starts_with(glyph)
+                    && marker.len() >= len
+                    && caps["info"].trim().is_empty()
+                    && indent < column + 4;
+                if closes {
+                    fence = None;
+                }
+            }
+            continue;
+        }
         // A blank line closes nothing: a list survives one, and both markdown
         // and the person writing it expect the item after it to still be in.
         if !line.trim().is_empty() {
@@ -208,15 +298,30 @@ pub fn parse(body: &str) -> Vec<Item> {
         if !line.trim().is_empty() && indent >= margin + 4 {
             continue;
         }
+        // After the code check, so that four spaces in are a fence a person is
+        // showing rather than one they are opening.
+        if let Some(caps) = FENCE.captures(line) {
+            let marker = &caps["fence"];
+            fence = Some((
+                marker.chars().next().expect("a fence"),
+                marker.len(),
+                indent,
+            ));
+            continue;
+        }
         if let Some(column) = content_column(line) {
             open.push(column);
         }
-        if HTML_OPEN.is_match(line) {
-            html = !HTML_CLOSE.is_match(line);
+        if HTML_VERBATIM.is_match(line) {
+            html = (!HTML_CLOSE.is_match(line)).then_some(Html::Verbatim);
+            continue;
+        }
+        if HTML_BLOCK.is_match(line) {
+            html = Some(Html::Block);
             continue;
         }
         comment = opens_comment(line);
-        let Some(caps) = ITEM.captures(line) else {
+        let Some(caps) = item_of(line) else {
             continue;
         };
         let text = caps["rest"].trim().to_string();
@@ -250,15 +355,20 @@ fn content_column(line: &str) -> Option<usize> {
 
 /// The first issue this text names, by link or by number.
 ///
-/// Read from the text with code spans and link labels blanked out. A `#12` in
-/// backticks is somebody writing about a number rather than pointing at one,
-/// and a `#7` in a link's label captions the destination: without this,
+/// Read from the text with comments, code spans and link labels blanked out. A
+/// `#12` in backticks is somebody writing about a number rather than pointing
+/// at one, and a `#7` in a link's label captions the destination: without this,
 /// `[other/widgets #7](https://github.com/other/widgets/issues/7)` becomes a
 /// bare local #7 and the foreign repository check never sees it.
+///
+/// The bare numbers are read from a copy with the links blanked too, so that
+/// only `URL_REF` speaks for what is inside an address. Both copies are the
+/// same length as the original, so the two offsets can still be compared.
 fn reference_in(text: &str) -> Option<Reference> {
     let text = &readable(text);
     let url = URL_REF.captures(text);
-    let hash = HASH_REF.captures(text);
+    let outside = blank(text, &LINK);
+    let hash = HASH_REF.captures(&outside);
     let at = |caps: &Option<regex::Captures>| {
         caps.as_ref()
             .map(|c| c.get(0).expect("the whole match").start())
@@ -276,21 +386,38 @@ fn reference_in(text: &str) -> Option<Reference> {
 fn as_hash(caps: regex::Captures) -> Reference {
     Reference {
         number: caps["number"].parse().unwrap_or_default(),
-        url: None,
+        origin: match caps.name("slug") {
+            Some(slug) => Origin::Repo(slug.as_str().to_string()),
+            None => Origin::Here,
+        },
     }
 }
 
 fn as_url(caps: regex::Captures) -> Reference {
     Reference {
         number: caps["number"].parse().unwrap_or_default(),
-        url: Some(caps["url"].to_string()),
+        origin: Origin::Url(caps["url"].to_string()),
     }
 }
 
-/// The text with code spans and inline link labels replaced by spaces, byte for
-/// byte so that offsets into it still line up with the original. A link's
-/// destination is left standing, because that is the part that names an issue.
+/// The text with every match of `what` replaced by spaces, byte for byte so
+/// that offsets into it still line up with the original.
+fn blank(text: &str, what: &Regex) -> String {
+    let mut out = text.as_bytes().to_vec();
+    for found in what.find_iter(text) {
+        out[found.range()].fill(b' ');
+    }
+    // Whole matches are blanked, so no character is left half replaced.
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
+}
+
+/// The text with comments, code spans and inline link labels replaced by
+/// spaces, byte for byte so that offsets into it still line up with the
+/// original. A link's destination is left standing, because that is the part
+/// that names an issue.
 fn readable(text: &str) -> String {
+    let text = blank(text, &COMMENT);
+    let text = text.as_str();
     let bytes = text.as_bytes();
     let mut out = bytes.to_vec();
     let mut at = 0;
@@ -485,9 +612,7 @@ pub fn rewrite(body: &str, raw: &str, change: &Change) -> Result<String> {
 /// One line, changed. Nothing is reflowed, normalised, or re-emitted from a
 /// parsed model: the untouched parts of the line are copied through as bytes.
 fn changed(line: &str, change: &Change) -> Result<String> {
-    let caps = ITEM
-        .captures(line)
-        .ok_or_else(|| spar_err!("that line is no longer a checklist item"))?;
+    let caps = item_of(line).ok_or_else(|| spar_err!("that line is no longer a checklist item"))?;
 
     match change {
         Change::Tick => {
@@ -620,7 +745,7 @@ fn shape(body: &str, home: &str, max: usize) -> Vec<(Item, Shape)> {
                     }
                     None => Shape::Hold(format!(
                         "it names an issue in another repository: {}",
-                        reference.url.clone().unwrap_or_default()
+                        reference.names()
                     )),
                 },
                 None => {
@@ -1133,6 +1258,46 @@ Write the parts like this:
         assert_eq!(vec!["real", "real again"], texts(body));
     }
 
+    /// Markdown inside a block tag is not markdown: GitHub prints the checkbox
+    /// as the text it is. The block ends at a blank line and not at the closing
+    /// tag, which is what keeps the `<details>` a tracker is often written in
+    /// working.
+    #[test]
+    fn an_item_inside_a_block_tag_is_not_one() {
+        let body = "\
+<div>
+- [ ] not real
+</div>
+
+<details>
+<summary>the parts</summary>
+
+- [ ] real
+</details>
+";
+        assert_eq!(vec!["real"], texts(body));
+    }
+
+    /// More than four columns after the marker put the checkbox in an indented
+    /// code block inside the item, which is how somebody writes down the syntax
+    /// itself.
+    #[test]
+    fn a_checkbox_pushed_past_its_own_content_column_is_code() {
+        assert_eq!(Vec::<String>::new(), texts("-     [ ] an example\n"));
+        assert_eq!(vec!["real"], texts("-    [ ] real\n"));
+    }
+
+    /// A fence four columns in is a fence somebody is showing, so it neither
+    /// opens a block nor closes the one it sits in.
+    #[test]
+    fn a_fence_indented_into_code_neither_opens_nor_closes() {
+        let body = "```\n- [ ] not real\n    ```\n- [ ] still not real\n";
+        assert_eq!(Vec::<String>::new(), texts(body));
+
+        let body = "Like this:\n\n    ```\n- [ ] real\n";
+        assert_eq!(vec!["real"], texts(body));
+    }
+
     /// The items somebody decided against are often kept in a comment. GitHub
     /// renders none of it, so neither does this.
     #[test]
@@ -1267,6 +1432,59 @@ Write the parts like this:
         assert_eq!(None, items[1].reference);
     }
 
+    /// A comment is not rendered, so a number left in one is a note to a person
+    /// and never the issue the item is about. Ticking the box because that
+    /// issue happens to be closed would call somebody's work done.
+    #[test]
+    fn a_number_in_a_comment_names_nothing() {
+        let items = parse(
+            "- [ ] ship it <!-- old note: #7 -->\n\
+             - [ ] and this one <!-- #7 --> #8\n",
+        );
+        assert_eq!(None, items[0].reference);
+        assert_eq!(Some(8), items[1].reference.as_ref().map(|r| r.number));
+    }
+
+    /// The `#8` in an address is a fragment of it. Only a link that names an
+    /// issue by path is read as one.
+    #[test]
+    fn a_fragment_in_a_link_is_not_an_issue_number() {
+        let items = parse(
+            "- [ ] update [docs](https://example.com/guide/#8)\n\
+             - [ ] see https://example.com/guide#9 and #10\n",
+        );
+        assert_eq!(None, items[0].reference);
+        assert_eq!(Some(10), items[1].reference.as_ref().map(|r| r.number));
+    }
+
+    /// GitHub links both of these without a url, so an item that carries one is
+    /// an item that already names its issue. Reading neither filed a second
+    /// issue for work the tracker had already written down.
+    #[test]
+    fn the_shorthands_github_links_are_references_too() {
+        let items = parse(
+            "- [ ] one me/mine#12\n\
+             - [ ] two other/thing#13\n\
+             - [ ] three GH-14\n",
+        );
+        assert_eq!(Some(12), items[0].reference.as_ref().unwrap().local(HOME));
+        let foreign = items[1].reference.as_ref().expect("a reference");
+        assert_eq!(None, foreign.local(HOME), "somebody else's repository");
+        assert_eq!("other/thing#13", foreign.names());
+        assert_eq!(Some(14), items[2].reference.as_ref().unwrap().local(HOME));
+    }
+
+    /// The shorthand leaves the host out, so it means this repository wherever
+    /// this repository is served from. The path still has to be this one's.
+    #[test]
+    fn a_shorthand_is_read_against_this_repositorys_path() {
+        let items = parse("- [ ] work me/mine#7\n");
+        let reference = items[0].reference.as_ref().expect("a reference");
+        assert_eq!(Some(7), reference.local("https://ghe.example/me/mine"));
+        assert_eq!(None, reference.local("https://github.com/me/other"));
+        assert_eq!(None, reference.local(""), "no address to measure against");
+    }
+
     /// A link's label captions its destination. Reading the label first turned
     /// another repository's issue into a bare local number, which is exactly
     /// the adoption the foreign repository check exists to refuse.
@@ -1277,7 +1495,10 @@ Write the parts like this:
              - [ ] [me/mine #7](https://github.com/me/mine/issues/7)\n",
         );
         let foreign = items[0].reference.as_ref().expect("a reference");
-        assert!(foreign.url.is_some(), "the destination, not the label");
+        assert!(
+            matches!(foreign.origin, Origin::Url(_)),
+            "the destination, not the label"
+        );
         assert_eq!(None, foreign.local(HOME));
         assert_eq!(Some(7), items[1].reference.as_ref().unwrap().local(HOME));
     }
@@ -1536,3 +1757,4 @@ That is all.
         );
     }
 }
+

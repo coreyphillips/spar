@@ -105,6 +105,40 @@ Then choose next_action:
 - hand_back: there are blocking findings the author should address.
 {answers}{settled}{round}";
 
+const CLOSE_PROMPT: &str = "\
+This closes the review of issue #{number}: {title}
+
+The branch has been read round by round already, and this call is not another
+audit of it. It answers one question: is there anything in what those rounds
+produced that must not merge.
+{landed}{answers}{settled}
+A finding here is one of two things: a point above that the code does not
+actually answer, or a defect in what landed since the last round. Go and look
+before you raise either. Run the test that covers it, or read the lines the fix
+touched and follow them to the caller, and say in the detail what you did.
+
+Something you could have raised in an earlier round and did not does not block
+now. You read that code and passed it, and holding the branch for it spends
+somebody's week on a pull request two agents have already been over. If it is
+real and worth somebody's time it is a follow-up: set in_scope=false and the
+harness files it, which keeps the point without stopping this. That is not free
+either, so keep the ones that would bite somebody and drop the rest.
+
+Nothing you raise here will be fixed, because there is no round after this. A
+finding means the pull request stays open with that finding on it for a person
+to weigh, which is the right outcome for a defect and an expensive one for an
+observation. No findings means the branch merges on your word, so do not return
+an empty list because the list was long. Both mistakes cost somebody. Only one
+of them ships.
+
+Set next_action to merge when you raise nothing blocking, and hand_back when you
+do. Nothing acts on it here, and the findings are what decide.
+
+This call reads and nothing else. Do not edit the code, do not commit, and do
+not push. A pass that writes has judged a branch the rollback then takes away,
+so anything you leave behind is rolled back and the sign off does not stand.
+Writing a scratch file to check a claim is fine.";
+
 const FIX_PROMPT: &str = "\
 You reviewed this branch and chose to fix the blocking findings yourself.
 Implement those fixes now and commit them.
@@ -623,6 +657,10 @@ fn review_loop(
     // budget rather than an error telling them to raise a number they cannot
     // see from the outside.
     let (first, last_allowed) = round_window(ctx.start_round, cfg.loop_cfg.max_rounds);
+    // The head the last review in this invocation read. Empty until one has
+    // run, and in-invocation on purpose: a resumed run's closing pass reads what
+    // this invocation's rounds produced, not what some earlier one did.
+    let mut audited_head = String::new();
     let mut last_round = first.saturating_sub(1);
 
     for round in first..=last_allowed {
@@ -638,6 +676,9 @@ fn review_loop(
 
         let prompt = review_prompt(&base, ctx.subject, &ctx.title, ledger, round, last_allowed);
         let before_review = snapshot(repo, &ctx.work_dir);
+        // The commit this round is judging, kept for the closing pass, which
+        // reads what landed after the last one of these.
+        audited_head = before_review.head.clone();
         let review: Review = reviewer.review(
             &base,
             &prompt,
@@ -702,29 +743,7 @@ fn review_loop(
         }
 
         if approval_stands(&blocking, review_wrote) {
-            state.status = Status::Approved;
-            post_outcome(repo, ctx.pr_number, state, ledger, Ending::Approved);
-            persist(repo, ctx.pr_number, state, ledger, round, &holder);
-            // Before the merge, not after: a draft cannot be merged, and the
-            // state the draft was signalling, that two agents were still
-            // arguing about it, has just stopped being true.
-            if cfg.loop_cfg.drafts == Drafts::UntilApproved && repo.mark_ready(ctx.pr_number) {
-                log!("{}: out of draft", ctx.label);
-            }
-            if cfg.loop_cfg.auto_merge {
-                // Release the worktree first. `gh pr merge --delete-branch`
-                // fails if anything still has the branch checked out, and it
-                // fails *after* merging, so the merge lands while the command
-                // reports failure.
-                ctx.release(repo);
-                repo.merge_pr(ctx.pr_number)?;
-                state.status = Status::Merged;
-                repo.clear_state(ctx.pr_number); // nothing left to resume
-                log!("{}: merged", ctx.label);
-            } else {
-                log!("{}: approved, awaiting human merge", ctx.label);
-            }
-            return Ok(());
+            return approve(cfg, repo, ctx, state, ledger, round, &holder);
         }
 
         if blocking.is_empty() {
@@ -821,12 +840,222 @@ fn review_loop(
         persist(repo, ctx.pr_number, state, ledger, round, &holder);
     }
 
+    // Falling out of the budget is not an outcome. Every path above returns
+    // with the head already read by somebody who did not write it; this is the
+    // one that does not, because a round is review and then fix and the fix
+    // comes last. Leaving it as the ending is what made every long run finish
+    // on a commit nobody had seen, and made "we stopped" the only thing spar
+    // could say about a pull request it had spent an hour on.
+    close_out(
+        agents,
+        cfg,
+        repo,
+        ctx,
+        state,
+        ledger,
+        &holder,
+        last_round,
+        &audited_head,
+    )
+}
+
+/// The closing pass: one look at what the last round left, and the verdict.
+///
+/// Not a round. It cannot ask for a fix, there is nothing after it, and it is
+/// the only way a run that spends its whole budget ends in a merge. Folding it
+/// into the `for` would mean a round that behaves differently on its last
+/// iteration, and a round that behaves differently on its last iteration is how
+/// the last iteration came to be the one nobody reviewed.
+///
+/// It inherits PR #24's invariant from the same place the rounds do, and not
+/// from a rule of its own: the closer is `holder`, which `next_reviewer` has
+/// already moved off whoever wrote the head.
+#[allow(clippy::too_many_arguments)]
+fn close_out(
+    agents: &[Agent],
+    cfg: &Config,
+    repo: &Repo,
+    ctx: &LoopCtx,
+    state: &mut IssueRun,
+    ledger: &mut Ledger,
+    holder: &str,
+    round: u32,
+    audited_head: &str,
+) -> Result<()> {
+    let out_of_rounds = |state: &mut IssueRun, ledger: &Ledger| {
+        state.status = Status::Escalated;
+        state.notes.push(exhausted_note(ctx.start_round, round));
+        post_outcome(repo, ctx.pr_number, state, ledger, Ending::OutOfRounds);
+        persist(repo, ctx.pr_number, state, ledger, round, holder);
+    };
+
+    // Nothing to close over. The last round changed no code and claimed no fix,
+    // so the branch in front of the closer is the branch a round already read at
+    // full breadth, and asking again is the unbounded re-audit this whole change
+    // exists to stop.
+    let landed = (!audited_head.is_empty())
+        .then(|| repo.commits_since(&ctx.work_dir, audited_head, "HEAD"))
+        .flatten();
+    if audited_head.is_empty()
+        || (landed.as_ref().is_some_and(|l| l.is_empty()) && !any_fixes(ledger))
+    {
+        logdim!(
+            "{}: nothing landed after the last review, so there is nothing to close over",
+            ctx.label
+        );
+        out_of_rounds(state, ledger);
+        return Ok(());
+    }
+
+    let closer = agent::find(agents, holder)?;
+    let effort = cfg.effort_for_round(&closer.spec, round);
+    log!(
+        "{}: closing, {holder} checking what the last round left ({})",
+        ctx.label,
+        effort.as_deref().unwrap_or("default effort")
+    );
+
+    let prompt = close_prompt(
+        ctx.subject,
+        &ctx.title,
+        audited_head,
+        landed.as_deref(),
+        ledger,
+    );
+    let before = snapshot(repo, &ctx.work_dir);
+    // `ask_json` rather than `Agent::review`, whose appended paragraph pins the
+    // scope to the whole of `base..HEAD` and says not to read only the diff.
+    // That is the right instruction for an audit and the wrong one here: this
+    // call carries its own scope, and widening it back out is what the rounds
+    // already did three times.
+    let pass: Review =
+        match closer.ask_json(&prompt, &schema::review(), &ctx.work_dir, effort.as_deref()) {
+            Ok(pass) => pass,
+            Err(e) => {
+                // Never propagated. The run has an account of itself by now, and
+                // losing all of it to an unreachable model on the last call is worse
+                // than ending where it would have ended before this existed.
+                logwarn!("{}: the closing pass failed: {e}", ctx.label);
+                out_of_rounds(state, ledger);
+                return Ok(());
+            }
+        };
+
+    // Held to the same rule as a review, for the same reason: a pass that judged
+    // a tree the rollback then takes away judged code that is not there.
+    let mut close_wrote = snapshot(repo, &ctx.work_dir) != before;
+    if close_wrote {
+        logwarn!(
+            "{}: {holder} changed the branch while closing, which the prompt forbids. Rolling it \
+             back.",
+            ctx.label
+        );
+        if undo_edits(repo, &ctx.work_dir, &before).head != before.head {
+            state
+                .notes
+                .push(format!("{holder} committed during the closing pass"));
+            // Push it rather than strand it. The run is about to escalate and
+            // keep the worktree, and a commit the pull request does not have is
+            // one the next invocation reviews without anybody being able to see
+            // it on the pull request.
+            repo.rewrite_commits_if_needed(&ctx.work_dir, cfg.base_branch())?;
+            repo.push(&ctx.work_dir, &ctx.branch)?;
+        }
+        close_wrote = true;
+    }
+
+    file_out_of_scope(repo, &pass.findings, ctx.subject, state, cfg);
+    file_nonblocking(repo, &pass.findings, ctx.subject, state, cfg);
+    note_downgraded(&pass.findings, state);
+
+    let blocking: Vec<Finding> = pass
+        .findings
+        .iter()
+        .filter(|f| f.blocks())
+        .cloned()
+        .collect();
+
+    if check_relitigation(ledger, &blocking, state) {
+        state.status = Status::Escalated;
+        post_outcome(
+            repo,
+            ctx.pr_number,
+            state,
+            ledger,
+            Ending::Deadlocked(&blocking),
+        );
+        persist(repo, ctx.pr_number, state, ledger, round, holder);
+        return Ok(());
+    }
+
+    if approval_stands(&blocking, close_wrote) {
+        return approve(cfg, repo, ctx, state, ledger, round, holder);
+    }
+
     state.status = Status::Escalated;
-    state
-        .notes
-        .push(exhausted_note(ctx.start_round, last_round));
-    post_outcome(repo, ctx.pr_number, state, ledger, Ending::OutOfRounds);
-    persist(repo, ctx.pr_number, state, ledger, last_round, &holder);
+    state.notes.push(unresolved_note(blocking.len()));
+    post_outcome(
+        repo,
+        ctx.pr_number,
+        state,
+        ledger,
+        Ending::Unresolved(&blocking),
+    );
+    persist(repo, ctx.pr_number, state, ledger, round, holder);
+    Ok(())
+}
+
+/// Whether the author claimed a fix that a closing pass could ask about.
+fn any_fixes(ledger: &Ledger) -> bool {
+    ledger.values().any(|e| e.outcome == Settled::Fixed)
+}
+
+/// What the run says about itself when the closing pass did not sign off.
+///
+/// Not "no convergence after three rounds". A count of rounds is a fact about
+/// spar, and what is left is a fact about the branch.
+fn unresolved_note(left: usize) -> String {
+    match left {
+        1 => "one point left after the closing pass".to_string(),
+        n => format!("{n} points left after the closing pass"),
+    }
+}
+
+/// End the run on a pass: post, persist, leave draft, and merge if asked.
+///
+/// Extracted because the closing pass ends the same way a round does. Written
+/// twice, the two would drift, and the half that drifted would be the one that
+/// merges.
+fn approve(
+    cfg: &Config,
+    repo: &Repo,
+    ctx: &LoopCtx,
+    state: &mut IssueRun,
+    ledger: &Ledger,
+    round: u32,
+    holder: &str,
+) -> Result<()> {
+    state.status = Status::Approved;
+    post_outcome(repo, ctx.pr_number, state, ledger, Ending::Approved);
+    persist(repo, ctx.pr_number, state, ledger, round, holder);
+    // Before the merge, not after: a draft cannot be merged, and the state the
+    // draft was signalling, that two agents were still arguing about it, has
+    // just stopped being true.
+    if cfg.loop_cfg.drafts == Drafts::UntilApproved && repo.mark_ready(ctx.pr_number) {
+        log!("{}: out of draft", ctx.label);
+    }
+    if cfg.loop_cfg.auto_merge {
+        // Release the worktree first. `gh pr merge --delete-branch` fails if
+        // anything still has the branch checked out, and it fails *after*
+        // merging, so the merge lands while the command reports failure.
+        ctx.release(repo);
+        repo.merge_pr(ctx.pr_number)?;
+        state.status = Status::Merged;
+        repo.clear_state(ctx.pr_number); // nothing left to resume
+        log!("{}: merged", ctx.label);
+    } else {
+        log!("{}: approved, awaiting human merge", ctx.label);
+    }
     Ok(())
 }
 
@@ -969,6 +1198,21 @@ fn settled_block(ledger: &Ledger) -> String {
     )
 }
 
+/// The points the author says it fixed, one line each, with the claim attached.
+///
+/// One formatter for the two blocks that print them, because two copies of a
+/// list are two copies to drift.
+fn fixed_lines(ledger: &Ledger) -> Vec<String> {
+    ledger
+        .values()
+        .filter(|e| e.outcome == Settled::Fixed)
+        .map(|e| match e.file.trim() {
+            "" => format!("- {}. The author said: {}", e.title, e.reasoning),
+            file => format!("- {} ({file}). The author said: {}", e.title, e.reasoning),
+        })
+        .collect()
+}
+
 /// What a later round is told about the fixes it asked for.
 ///
 /// The ledger used to hold only the points the reviewer lost, so a round that
@@ -977,14 +1221,7 @@ fn settled_block(ledger: &Ledger) -> String {
 /// point is an argument to weigh, a fixed point is a claim to check, and printed
 /// under one heading a claim to check reads as an argument already won.
 fn answers_block(ledger: &Ledger) -> String {
-    let lines: Vec<String> = ledger
-        .values()
-        .filter(|e| e.outcome == Settled::Fixed)
-        .map(|e| match e.file.trim() {
-            "" => format!("- {}. The author said: {}", e.title, e.reasoning),
-            file => format!("- {} ({file}). The author said: {}", e.title, e.reasoning),
-        })
-        .collect();
+    let lines = fixed_lines(ledger);
     if lines.is_empty() {
         return String::new();
     }
@@ -1545,9 +1782,12 @@ fn located(finding: &Finding, style: &Style) -> String {
 pub enum Ending<'a> {
     /// Nothing blocks a merge.
     Approved,
-    /// The round budget ran out. The last round's fixes were pushed but never
-    /// reviewed, which is the part a maintainer has to know.
+    /// The closing pass could not run, so the last round's fixes were pushed and
+    /// nothing has read them, which is the part a maintainer has to know.
     OutOfRounds,
+    /// The closing pass read what the last round left and did not sign it off.
+    /// Nothing more will be fixed here, so what is left is a person's to weigh.
+    Unresolved(&'a [Finding]),
     /// A point that ran out of tries: refuted and raised again anyway, or fixed
     /// twice and raised again. Nobody is going to break the tie but a person.
     Deadlocked(&'a [Finding]),
@@ -1645,6 +1885,21 @@ pub fn outcome_comment(
         Ending::OutOfRounds => out.push(
             "Not signed off: the last round of fixes was pushed but has not been reviewed.".into(),
         ),
+        Ending::Unresolved(points) => {
+            let lines: Vec<String> = points
+                .iter()
+                .map(|f| {
+                    already.push(style::title(&f.title, style));
+                    format!(
+                        "{}. {}",
+                        located(f, style),
+                        style::sentence(&f.detail, style)
+                    )
+                })
+                .collect();
+            out.push("Not signed off. The last round was read, and this is what is left:".into());
+            out.push(bullets(&lines));
+        }
         Ending::Deadlocked(points) => {
             // Rendered once, with the argument attached. A deadlocked point is
             // by definition one that was settled earlier, so the reasoning is
@@ -1735,6 +1990,63 @@ pub fn outcome_comment(
     }
 
     Some(out.join("\n\n"))
+}
+
+/// What the closing pass is asked, and the one piece of scope it is given.
+///
+/// `landed` is `None` when the harness cannot say what is new. Commit messages
+/// are rewritten when they break the style rules, which moves every hash from
+/// the first offender onward, so a head recorded before a round can stop being
+/// on the branch. Saying that plainly is the only honest option: the alternative
+/// is `git log` reporting the whole branch as unread and this pass quietly
+/// becoming the full audit it exists to replace.
+fn close_prompt(
+    number: i64,
+    title: &str,
+    from: &str,
+    landed: Option<&[String]>,
+    ledger: &Ledger,
+) -> String {
+    let landed = match landed {
+        Some([]) => "\nNothing landed after the last round of review. What it asked for was \
+                     answered in words rather than in code, so the branch in front of you is the \
+                     branch that was already read.\n"
+            .to_string(),
+        Some(lines) => format!(
+            "\nThis landed after the last round of review, and nobody has read it:\n{}\n\nRead it \
+             with `git diff {from}..HEAD`.\n",
+            lines
+                .iter()
+                .map(|l| format!("- {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        None => "\nThe commits on this branch were rewritten after the last round of review, so \
+                 the harness cannot say which of them are new. Read the branch against its base.\n"
+            .to_string(),
+    };
+    CLOSE_PROMPT
+        .replace("{number}", &number.to_string())
+        .replace("{title}", title)
+        .replace("{landed}", &landed)
+        .replace("{answers}", &closing_answers(ledger))
+        .replace("{settled}", &settled_block(ledger))
+}
+
+/// The claimed fixes, as the closing pass is told about them.
+///
+/// The same points `answers_block` gives a round, asked as the thing this pass
+/// is for rather than as context for a wider read.
+fn closing_answers(ledger: &Ledger) -> String {
+    let lines = fixed_lines(ledger);
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\nThese points were raised on this pull request and the author says it fixed them. \
+         Nobody has checked that:\n{}\n",
+        lines.join("\n")
+    )
 }
 
 /// What the reviewer is asked, with what it already answered behind it.
@@ -2553,6 +2865,118 @@ mod tests {
         assert!(disposition_comment("claude", &response, &[], &[], &[], &style()).is_none());
     }
 
+    // -- the closing pass -------------------------------------------------
+
+    /// The closing pass is the only way a run that spends its budget merges, so
+    /// PR #24's invariant has to hold for it too. It inherits it from
+    /// `next_reviewer` rather than from a rule of its own, which is why this
+    /// asserts on that function: whoever closes is `holder`, and `holder` has
+    /// already been moved off whoever wrote the head.
+    #[test]
+    fn nobody_closes_over_their_own_edit() {
+        let cfg = cfg_with(true, false);
+        for holder in ["a", "b"] {
+            for editor in ["a", "b"] {
+                assert_ne!(editor, next_reviewer(&cfg, holder, Some(editor)));
+            }
+            // Nothing landed, so the head is the one this holder already read
+            // without writing, and it keeps the pull request.
+            assert_eq!(holder, next_reviewer(&cfg, holder, None));
+        }
+    }
+
+    /// A pass that wrote judged a tree the rollback then takes away, so its
+    /// "nothing blocking" was said about code that is not there. Same gate as a
+    /// round, and deliberately the same function.
+    #[test]
+    fn a_close_that_wrote_the_branch_cannot_sign_it_off() {
+        assert!(approval_stands(&[], false));
+        assert!(!approval_stands(&[], true));
+    }
+
+    #[test]
+    fn a_ledger_with_no_claimed_fix_has_nothing_to_close_over() {
+        assert!(!any_fixes(&ledger_with("refuted point", "a.rs")));
+        let mut fixed = ledger_with("fixed point", "b.rs");
+        for entry in fixed.values_mut() {
+            entry.outcome = Settled::Fixed;
+        }
+        assert!(any_fixes(&fixed));
+    }
+
+    /// A count of rounds is a fact about spar, and what is left is a fact about
+    /// the branch.
+    #[test]
+    fn the_closing_note_counts_points_rather_than_rounds() {
+        assert_eq!("one point left after the closing pass", unresolved_note(1));
+        assert_eq!("3 points left after the closing pass", unresolved_note(3));
+        assert!(!unresolved_note(2).contains("round"));
+    }
+
+    fn fixed_ledger() -> Ledger {
+        let mut ledger = ledger_with("Unbounded loop", "src/x.rs");
+        for entry in ledger.values_mut() {
+            entry.outcome = Settled::Fixed;
+            entry.reasoning = "bounded it on max_attempts".into();
+        }
+        ledger
+    }
+
+    #[test]
+    fn the_closing_prompt_names_every_fix_it_has_to_check() {
+        let landed = vec!["abc1234 Bound the retry loop".to_string()];
+        let prompt = close_prompt(42, "Retry a 429", "9f8e7d6", Some(&landed), &fixed_ledger());
+        assert!(prompt.contains("Unbounded loop"), "{prompt}");
+        assert!(prompt.contains("bounded it on max_attempts"), "{prompt}");
+        assert!(prompt.contains("abc1234 Bound the retry loop"), "{prompt}");
+        assert!(prompt.contains("git diff 9f8e7d6..HEAD"), "{prompt}");
+        assert!(!prompt.contains('{'), "{prompt}");
+    }
+
+    /// Nothing landed is a real answer and a different one from "the harness
+    /// cannot tell", and neither may leave a heading with nothing under it.
+    #[test]
+    fn a_close_with_nothing_landed_says_so_rather_than_leaving_a_hole() {
+        let prompt = close_prompt(42, "Retry a 429", "9f8e7d6", Some(&[]), &Ledger::new());
+        assert!(
+            prompt.contains("Nothing landed after the last round"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains('{'), "{prompt}");
+    }
+
+    /// A commit message that breaks the style rules is rewritten, which moves
+    /// every hash after it, so the head a round recorded can stop being on the
+    /// branch. `git log` answers that with the whole branch, and reporting all
+    /// of it as unread would turn this pass back into the full audit it replaces.
+    #[test]
+    fn a_rewritten_branch_admits_it_cannot_say_what_landed() {
+        let prompt = close_prompt(42, "Retry a 429", "9f8e7d6", None, &fixed_ledger());
+        assert!(prompt.contains("were rewritten"), "{prompt}");
+        assert!(!prompt.contains("nobody has read it"), "{prompt}");
+        assert!(!prompt.contains('{'), "{prompt}");
+    }
+
+    /// The pass may not write, and the loop rolls back and says the prompt
+    /// forbids it, so the prompt has to actually forbid it.
+    #[test]
+    fn the_closing_prompt_forbids_the_writing_the_loop_rolls_back() {
+        let prompt = close_prompt(42, "t", "9f8e7d6", Some(&[]), &Ledger::new());
+        assert!(prompt.contains("do not commit"), "{prompt}");
+    }
+
+    /// Reopening code an earlier round read and passed is the behaviour that
+    /// kept these runs going, and this is the one call with no round after it.
+    #[test]
+    fn the_closing_prompt_does_not_reopen_what_a_round_already_passed() {
+        let prompt = close_prompt(42, "t", "9f8e7d6", Some(&[]), &Ledger::new());
+        assert!(
+            prompt.contains("does not block\nnow. You read that code and passed it"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Only one\nof them ships"), "{prompt}");
+    }
+
     // -- the review prompt ----------------------------------------------
 
     /// A round that fixed nine findings left nothing behind, so the next round
@@ -3022,6 +3446,32 @@ mod outcome_tests {
         assert!(text.contains("Filed separately: #485, #486"), "{text}");
     }
 
+    /// "Not signed off: the last round was pushed and nobody read it" tells a
+    /// maintainer nothing they can act on. What is left, with where it is, is
+    /// three lines and a decision.
+    #[test]
+    fn an_unresolved_close_names_what_is_still_wrong() {
+        let state = state_with(vec![], vec![]);
+        let left = vec![Finding {
+            detail: "The guard sits after the early return.".into(),
+            ..finding("The retry fix never reaches the 429 path", "src/net.rs:88")
+        }];
+        let text =
+            outcome_comment(&state, &Ledger::new(), &Ending::Unresolved(&left), &style()).unwrap();
+        assert!(text.contains("this is what is left"), "{text}");
+        assert!(
+            text.contains("The retry fix never reaches the 429 path (src/net.rs:88)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("The guard sits after the early return."),
+            "{text}"
+        );
+        // The sentence the budget used to end on, which is now only true when
+        // the closing pass could not run at all.
+        assert!(!text.contains("has not been reviewed"), "{text}");
+    }
+
     /// The real PR ended with "5 fixed" followed by "no convergence", which
     /// reads as a contradiction. What a maintainer needs is that the fixes went
     /// in and nobody checked them.
@@ -3079,7 +3529,12 @@ mod outcome_tests {
             vec![("A point", "a reason")],
             vec!["https://github.com/you/thing/issues/485"],
         );
-        for ending in [Ending::Approved, Ending::OutOfRounds] {
+        let left = vec![finding("A point", "a.rs")];
+        for ending in [
+            Ending::Approved,
+            Ending::OutOfRounds,
+            Ending::Unresolved(&left),
+        ] {
             let text = outcome_comment(&state, &Ledger::new(), &ending, &style()).unwrap();
             let lower = text.to_lowercase();
             for banned in ["claude", "codex", "blocking,", "nit,", " fixed."] {

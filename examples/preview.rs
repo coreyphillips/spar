@@ -215,6 +215,34 @@ fn main() {
     );
     println!("\n  (and a clean run that filed nothing posts no comment at all)");
 
+    rule("What a run leaves when the closing pass did not sign it off");
+    let mut left = IssueRun::new(482, "t");
+    left.noted = vec![finding(
+        "non-blocking",
+        "Timeout is not configurable",
+        "The retry budget is fixed at three.",
+        "src/net.rs",
+        true,
+    )];
+    let unresolved = vec![finding(
+        "blocking",
+        "The retry fix never reaches the 429 path",
+        "The guard added in round 2 sits after the early return on line 88, so a rate limited \
+         response still takes the old path. Reproduced with the 429 test.",
+        "src/net.rs:88",
+        true,
+    )];
+    println!(
+        "{}",
+        outcome_comment(
+            &left,
+            &spar::model::Ledger::new(),
+            &Ending::Unresolved(&unresolved),
+            &style
+        )
+        .unwrap_or_default()
+    );
+
     rule("A review of somebody else's pull request (spar review)");
     let judged = |standing, severity, title: &str, detail: &str, file: &str, by: &str| Judged {
         finding: finding(severity, title, detail, file, true),

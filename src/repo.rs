@@ -538,6 +538,36 @@ impl Repo {
             .collect()
     }
 
+    /// The commits `later` carries that `earlier` does not, oldest first, when
+    /// `earlier` is genuinely behind it.
+    ///
+    /// `None` when it is not an ancestor, which is not the same as nothing
+    /// having landed. `rewrite_commits_if_needed` rewrites hashes from the first
+    /// offending commit onward, so a head recorded before a round can still be a
+    /// readable object and no longer be on the branch. `git log` answers that
+    /// with every commit on the branch, so without the check the one caller
+    /// would report the whole branch as unread, which is the widest possible
+    /// wrong answer.
+    ///
+    /// No `base_ref` resolution, unlike its neighbours: these are commits rather
+    /// than branch names, and putting a sha through it logs a fallback line
+    /// every time.
+    pub fn commits_since(&self, cwd: &Path, earlier: &str, later: &str) -> Option<Vec<String>> {
+        let ancestor = self
+            .git_at(Some(cwd), &["merge-base", "--is-ancestor", earlier, later])
+            .is_ok();
+        if !ancestor {
+            return None;
+        }
+        let range = format!("{earlier}..{later}");
+        Some(
+            self.git_try_at(Some(cwd), &["log", &range, "--reverse", "--format=%h %s"])
+                .lines()
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+
     /// The subjects of the commits `refname` carries that the base does not,
     /// oldest first.
     pub fn commit_subjects(&self, cwd: &Path, refname: &str, base: &str) -> Vec<String> {

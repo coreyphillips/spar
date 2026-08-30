@@ -1919,6 +1919,84 @@ fn post_refuses_a_file_for_several_pull_requests() {
 }
 
 // ---------------------------------------------------------------------------
+// What landed after the last round of review
+// ---------------------------------------------------------------------------
+
+/// The closing pass is told what nobody has read yet, which is whatever landed
+/// after the head the last review recorded.
+#[test]
+fn what_landed_after_the_last_review_comes_back_from_git() {
+    let fx = repo("landed");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    commit(&fx.work, "parser.rs", "one\n", "Add the parser");
+    let audited = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    commit(&fx.work, "empty.rs", "two\n", "Cover the empty input case");
+
+    let landed = repo
+        .commits_since(&fx.work, &audited, "HEAD")
+        .expect("the recorded head is still on the branch");
+    assert_eq!(1, landed.len(), "{landed:?}");
+    assert!(
+        landed[0].contains("Cover the empty input case"),
+        "{landed:?}"
+    );
+}
+
+/// Nothing landed is a real answer, and a different one from not being able to
+/// tell. The loop keeps today's ending for the first and asks anyway for the
+/// second.
+#[test]
+fn a_head_nothing_was_added_to_reports_nothing_landed() {
+    let fx = repo("landednothing");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    commit(&fx.work, "parser.rs", "one\n", "Add the parser");
+    let audited = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+
+    assert_eq!(
+        Some(Vec::new()),
+        repo.commits_since(&fx.work, &audited, "HEAD")
+    );
+}
+
+/// `rewrite_commits_if_needed` rewrites every hash from the first offending
+/// commit onward, so a head recorded before a round can still be a readable
+/// object and no longer be on the branch. `git log old..HEAD` answers that with
+/// the whole branch, so without the ancestor check the closing pass would be
+/// handed every commit as unread and become the full audit it replaces.
+#[test]
+fn a_head_that_was_rewritten_off_the_branch_reports_nothing_rather_than_everything() {
+    let fx = repo("landedrewritten");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let seed = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    commit(&fx.work, "parser.rs", "one\n", "Add the parser");
+    let audited = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    commit(&fx.work, "empty.rs", "two\n", "Cover the empty input case");
+
+    // What a message rewrite does to a branch: the same trees under new hashes,
+    // from the first offending commit onward. `audited` is one that moved, so it
+    // is still a readable object and no longer on the branch.
+    git(&fx.work, &["reset", "--hard", &seed]);
+    commit(&fx.work, "parser.rs", "one\n", "Add the parser, tidily");
+    commit(&fx.work, "empty.rs", "two\n", "Cover the empty input case");
+    assert!(
+        !git(&fx.work, &["log", "--format=%H"]).contains(&audited),
+        "the rewrite has to have taken the recorded head off the branch"
+    );
+    assert!(
+        !git(&fx.work, &["rev-parse", "--verify", "--quiet", &audited])
+            .trim()
+            .is_empty(),
+        "and has to have left it readable, or this tests the wrong failure"
+    );
+
+    assert_eq!(
+        None,
+        repo.commits_since(&fx.work, &audited, "HEAD"),
+        "the recorded head is off the branch, so the harness cannot say what is new"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Work whose author never got to describe it
 // ---------------------------------------------------------------------------
 

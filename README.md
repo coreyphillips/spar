@@ -247,11 +247,17 @@ the other, which reviews with full repo context rather than a bare diff. Each
 finding is labelled `blocking`, `non-blocking`, or `nit`.
 
 **Rounds.** `max_rounds` is a budget for one invocation, not a lifetime cap on
-the PR. A run that escalates after three rounds and is then resumed gets three
-more, because a person looked at it and chose to continue. Round numbers keep
-counting up (4, 5, 6) so the refutation ledger and the PR history stay coherent,
-and the escalation comment says both how many rounds this run spent and how many
-the PR has seen in total.
+the PR, and it bounds the asking rather than the run. A run that escalates after
+three rounds and is then resumed gets three more, because a person looked at it
+and chose to continue. Round numbers keep counting up (4, 5, 6) so the ledger and
+the PR history stay coherent.
+
+**The close.** A round is review and then fix, so the fix comes last and the
+budget used to run out on a commit nobody had read. After the last round, one
+closing pass by the agent that did not write the head reads what landed and the
+points the author says it fixed, and the run ends in a merge or in named points
+for a person. That is one review call more than `max_rounds` on a run that spends
+its whole budget, and none on a run that converges before it.
 
 **Follow-ups.** A review that finds something real but out of scope files it as
 its own issue. Before filing, spar looks for an issue that already describes the
@@ -269,9 +275,16 @@ With the default `followups = "local"` they go to `.spar/followups.md` instead
 of the tracker, and `spar followup` is what works that file. See below.
 
 **Convergence.** Only `blocking` findings gate the merge. Everything else is
-filed as a follow-up issue and the PR proceeds. This matters: a competent
-reviewer can always find something, so "no objections remaining" is not a
-stopping condition, but "no blocking objections" is.
+filed as a follow-up issue, listed on the PR, and the PR proceeds. This matters:
+a competent reviewer can always find something, so "no objections remaining" is
+not a stopping condition, but "no blocking objections" is. A real defect too
+small to be worth another round is `non-blocking`, and every one of those a
+reviewer chose not to gate on is listed under "Noted, not blocking", so
+downgrading a point is visible rather than a way to delete it.
+
+A run ends in one of four ways, three of which say something about the branch:
+approved, unresolved with the remaining points named, deadlocked with the
+argument attached, or unread when the closing pass itself could not run.
 
 ## Resuming work someone else started
 
@@ -625,7 +638,18 @@ cargo run --example preview -- --loose # the same input with the gate off
 Cross-model review loops break in specific ways. These are handled explicitly.
 
 **The nitpick spiral.** Round 6 findings are worse than round 1 findings and a
-naive loop cannot tell. Severity gating means only real defects block.
+naive loop cannot tell. Severity gating means only real defects block. That
+needs somewhere for a real defect that is minor to go, or the ladder has a hole
+in it and everything real lands on `blocking`, so `non-blocking` is "real, and
+smaller than another round" rather than "a genuine improvement".
+
+**No endgame.** A round is review and then fix, so the last thing a long run did
+was push a commit nobody had read, and running out of rounds was the only ending
+it could reach. Two pull requests spent three rounds each, added around 800 lines
+apiece answering reviews, and both ended by telling the maintainer the newest
+code was unreviewed. The budget now bounds the asking. After it, one closing pass
+by the agent that did not write the head is handed what landed and the fixes the
+author claimed, and asked the one question a merge turns on.
 
 **Re-litigation.** If A refutes a point and B raises it again next round, the
 loop never ends. Refuted points are hashed into a ledger carried across rounds

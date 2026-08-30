@@ -302,7 +302,8 @@ impl Trust {
 pub struct EffortSchedule {
     /// The deep first review.
     pub round_1: Option<String>,
-    /// Later rounds only see a small delta.
+    /// Every round after the first, and the closing pass. Both are asked a
+    /// narrower question than the first review, so neither buys its depth again.
     pub rest: Option<String>,
 }
 
@@ -312,6 +313,9 @@ pub struct EffortSchedule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LoopCfg {
+    /// Review rounds one invocation may spend asking for changes. Every run then
+    /// closes with one pass over what the last round left, which is not one of
+    /// them.
     pub max_rounds: u32,
     pub auto_merge: bool,
     pub first_implementor: Option<String>,

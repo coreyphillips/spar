@@ -1240,7 +1240,7 @@ fn report_fallback(agent: &Agent) {
 type Setting = (bool, &'static str, &'static str);
 
 const LOOP_OPTIONS: &[Setting] = &[
-    (false, "max_rounds", "Review rounds one invocation may spend before escalating. Resuming grants a fresh budget, so this is not a lifetime cap on a pull request."),
+    (false, "max_rounds", "Review rounds one invocation may spend asking for changes. Every run then closes with one pass over what the last round left, which is not one of them. Resuming a pull request grants a fresh budget, so this is not a lifetime cap."),
     (false, "auto_merge", "Merge when no blocking findings remain. Off on purpose: two models agreeing is not the same as being right, and neither carries the consequences."),
     (false, "first_implementor", "Which agent takes the first pass. The other one reviews it."),
     (false, "worktrees", "Isolate each issue in its own git worktree. Set false to work in the main checkout."),

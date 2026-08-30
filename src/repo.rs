@@ -1529,9 +1529,22 @@ impl Repo {
 
     /// Top level comments. Works for issues and pull requests alike, because
     /// GitHub serves both from the issues endpoint.
+    ///
+    /// Nothing when they cannot be read, which suits a reader that is going to
+    /// go on regardless. A caller deciding whether it has already written here
+    /// wants `try_issue_comments`, since for that one no comments and no answer
+    /// are opposite answers.
     pub fn issue_comments(&self, number: i64) -> Vec<Value> {
+        self.try_issue_comments(number).unwrap_or_default()
+    }
+
+    pub fn try_issue_comments(&self, number: i64) -> Result<Vec<Value>> {
         let path = format!("repos/{{owner}}/{{repo}}/issues/{number}/comments");
-        parse_comment_pages(&self.gh_try(&["api", "--paginate", &path]))
+        Ok(parse_comment_pages(&self.gh(&[
+            "api",
+            "--paginate",
+            &path,
+        ])?))
     }
 
     fn state_comments(&self, number: i64) -> Vec<(i64, String)> {

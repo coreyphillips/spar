@@ -178,6 +178,11 @@ pub fn already_split(text: &str) -> bool {
 pub fn tracker_body(original: &str, parts: &[(String, i64)]) -> String {
     let mut out = original.trim_end().to_string();
     if !out.is_empty() {
+        if unclosed_fence(&out) {
+            // A fence somebody left open swallows everything after it, so the
+            // checklist would render as code rather than as a checklist.
+            out.push_str("\n```");
+        }
         out.push_str("\n\n");
     }
     out.push_str(SPLIT_MARKER);
@@ -186,6 +191,32 @@ pub fn tracker_body(original: &str, parts: &[(String, i64)]) -> String {
         out.push_str(&format!("- [ ] #{number} {}\n", title.trim()));
     }
     out
+}
+
+/// Whether the text ends inside a fenced code block.
+///
+/// Tracked rather than counted, because a fence of one character inside a block
+/// opened with the other is content and not a fence at all. Counting them would
+/// close a block that was never open, which puts the checklist inside a fence
+/// this wrote.
+fn unclosed_fence(text: &str) -> bool {
+    let mut open: Option<char> = None;
+    for line in text.lines() {
+        let start = line.trim_start();
+        let Some(ch @ ('`' | '~')) = start.chars().next() else {
+            continue;
+        };
+        if start.chars().take_while(|c| *c == ch).count() < 3 {
+            continue;
+        }
+        match open {
+            None => open = Some(ch),
+            // A closing fence is the same character and carries no info string.
+            Some(c) if c == ch && start.trim_end().chars().all(|c| c == ch) => open = None,
+            Some(_) => {}
+        }
+    }
+    open.is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -571,7 +602,24 @@ fn issue_inner(
                 if let Some(url) = filed.url() {
                     state.filed.push(url.to_string());
                 }
+                // `file_as_issue` answers with an existing issue when the part
+                // is already filed, and what a part resembles most is the issue
+                // it came out of. A parent listed as its own child is a tracker
+                // pointing at itself, and two parts that resolved to one issue
+                // are one part twice.
                 match filed.number() {
+                    Some(n) if n == number => {
+                        logwarn!("'{title}' came back as #{number} itself, so it is not a part");
+                        state
+                            .notes
+                            .push(format!("dropped {title}: it matched #{number} itself"));
+                    }
+                    Some(n) if listed.iter().any(|(_, listed)| *listed == n) => {
+                        logwarn!("'{title}' came back as #{n}, which another part already is");
+                        state
+                            .notes
+                            .push(format!("dropped {title}: #{n} is already a part"));
+                    }
                     Some(n) => listed.push((title, n)),
                     None => state.notes.push(format!("{title}: {}", filed.note())),
                 }
@@ -644,7 +692,7 @@ fn pr_inner(
     let mut state = IssueRun::new(number, pr.title.clone());
     state.pr = Some(pr.url.clone());
 
-    if !mode.again && has_parts(repo, number) {
+    if !mode.again && has_parts(repo, number)? {
         log!("PR #{number} already has parts spar made. --again splits it again.");
         state.status = Status::Whole;
         state.notes.push("already split".into());
@@ -777,6 +825,18 @@ fn split_pr_inner(
         state
             .notes
             .push(format!("could not comment on #{number}: {e}"));
+    }
+    // A split into one part is not a split: everything that part carries is
+    // still on the original, so the two would be reviewed twice over. It was
+    // pushed before that was knowable and is named on the original for that
+    // reason, but this run did not decompose anything.
+    if made.len() < 2 {
+        log!("PR #{number} left whole: only one part stood on its own");
+        state.status = Status::Whole;
+        state
+            .notes
+            .push("only one part stood on its own, so nothing was decomposed".into());
+        return Ok(());
     }
     state.status = Status::Split;
     Ok(())
@@ -934,6 +994,14 @@ fn build_one(
         return Ok(None);
     }
 
+    // The slice is already committed, so a push would succeed with whatever the
+    // stand-alone pass left in the tree missing from it. That is the one shape
+    // of failure this cannot see afterwards: the part arrives without exactly
+    // the fixes that were supposed to make it stand on its own.
+    if crate::review::snapshot(repo, dir).dirty {
+        bail!("it left its stand-alone fixes uncommitted");
+    }
+
     // The invariant, asserted at the one place a split writes a branch.
     additive(branch, parent.head_branch, &repo.branch_prefix)?;
     repo.rewrite_commits_if_needed(dir, against)?;
@@ -1046,12 +1114,23 @@ fn patch_path(dir: &Path) -> std::path::PathBuf {
 }
 
 /// Whether spar has already split this pull request.
-fn has_parts(repo: &Repo, number: i64) -> bool {
-    repo.issue_comments(number).iter().any(|c| {
+///
+/// An error rather than false when the comments cannot be read. This is the
+/// only thing standing between a rerun and a second set of branches and pull
+/// requests, and a failed read is not evidence that the first set is not there.
+fn has_parts(repo: &Repo, number: i64) -> Result<bool> {
+    let comments = repo.try_issue_comments(number).map_err(|e| {
+        spar_err!(
+            "could not read the comments on #{number}, so whether it has already been split is \
+             unknown: {}",
+            e.last_line()
+        )
+    })?;
+    Ok(comments.iter().any(|c| {
         c.get("body")
             .and_then(serde_json::Value::as_str)
             .is_some_and(already_split)
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1200,19 +1279,27 @@ fn part_body(
 /// It says what was made and what was left over, and it says that the pull
 /// request itself was not touched, because that is the thing somebody opening
 /// this wants to know first.
+///
+/// One part is a separate sentence rather than a count of one. Every other part
+/// was dropped, so nothing was decomposed and the one that exists duplicates a
+/// piece of this pull request. Somebody has to be told that plainly, because
+/// the only thing to do with it is close it or close this.
 fn parts_comment(made: &[Made], left: &[String], style: &Style) -> String {
     let listed: Vec<String> = made
         .iter()
         .map(|m| format!("part {}: {} {}", m.index, m.url, m.title.trim()))
         .collect();
-    let mut out = vec![
-        SPLIT_MARKER.to_string(),
-        format!("Split into {} pull request(s):", made.len()),
-        bullets(&listed),
-    ];
+    let lead = if made.len() < 2 {
+        "Only one part of this stood on its own, so it has not been split. That part was already \
+         opened as its own pull request, and it carries files this one still carries:"
+            .to_string()
+    } else {
+        format!("Split into {} pull request(s):", made.len())
+    };
+    let mut out = vec![SPLIT_MARKER.to_string(), lead, bullets(&listed)];
     if !left.is_empty() {
         out.push(format!(
-            "{} file(s) are in none of them, and are still only here:\n{}",
+            "{} file(s) are in no part, and are still only here:\n{}",
             left.len(),
             bullets(left)
         ));
@@ -1438,6 +1525,38 @@ mod tests {
         assert!(already_split(&out), "{out}");
     }
 
+    /// A fence somebody left open would otherwise swallow the checklist, which
+    /// then renders as code while `already_split` still says the parent is a
+    /// tracker: it looks untouched and no later run comes back to it.
+    #[test]
+    fn a_fence_left_open_is_closed_before_the_checklist() {
+        let out = tracker_body("Here:\n\n```rust\nfn unfinished() {}", &[("a".into(), 1)]);
+        assert!(out.contains("fn unfinished"), "{out}");
+        let after = out.split("fn unfinished() {}").nth(1).unwrap();
+        assert!(after.trim_start().starts_with("```"), "{out}");
+        assert!(already_split(&out), "{out}");
+    }
+
+    /// The other half of that: a body whose fences are balanced must not have
+    /// one opened for it, which would put the checklist inside a code block
+    /// this wrote.
+    #[test]
+    fn a_closed_fence_is_left_alone() {
+        for original in [
+            "Here:\n\n```rust\nfn done() {}\n```",
+            // A fence of the other character inside a block is content, not a
+            // fence, so counting them would find three and close one.
+            "Here:\n\n```\n~~~\n```",
+            "no fences at all",
+        ] {
+            let out = tracker_body(original, &[("a".into(), 1)]);
+            assert!(
+                out.starts_with(&format!("{original}\n\n{SPLIT_MARKER}")),
+                "{out}"
+            );
+        }
+    }
+
     /// An empty body is not a reason to write a checklist with a blank line
     /// above it, or to lose the marker.
     #[test]
@@ -1549,6 +1668,25 @@ mod tests {
         let proposed = proposal_comment(12, &decision, &[], &style);
         assert!(already_split(&proposed), "{proposed}");
         assert!(proposed.contains("Nothing has been changed"), "{proposed}");
+    }
+
+    /// One surviving part is not a decomposition: the original still carries
+    /// everything that part carries. It exists and cannot be unmade, so it is
+    /// still named, but the comment must not call that a split.
+    #[test]
+    fn one_surviving_part_is_not_announced_as_a_split() {
+        let made = vec![Made {
+            index: 1,
+            title: "First".into(),
+            url: "https://example.invalid/pull/201".into(),
+            files: vec!["first.rs".to_string()],
+        }];
+        let comment = parts_comment(&made, &[], &Style::default());
+        assert!(!comment.contains("Split into"), "{comment}");
+        assert!(comment.contains("has not been split"), "{comment}");
+        assert!(comment.contains("/pull/201"), "{comment}");
+        // Still recognisable, or the next run makes a second copy of it.
+        assert!(already_split(&comment), "{comment}");
     }
 
     /// A part with no title cannot be filed and cannot be branched, so it is

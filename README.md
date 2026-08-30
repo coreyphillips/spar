@@ -538,8 +538,12 @@ rather than asked for in a prompt.
 
 A slice that will not stand alone is not a slice. If the agent cannot make a part
 build and pass on its own branch it says so, and the part is dropped rather than
-pushed broken. The whole value of splitting is that each part can be reviewed and
-merged on its own, and a part that does not build has none of it.
+pushed broken. So is a part whose fixes were left uncommitted, since what is not
+committed is not what gets pushed. The whole value of splitting is that each part
+can be reviewed and merged on its own, and a part that does not build has none of
+it. If dropping parts leaves only one, nothing was decomposed: the one that was
+made is still named on the original, and the run reports the pull request as left
+whole.
 
 Whether the parts are independent or stacked is a property of the change rather
 than of the repository, so it rides on the proposal instead of `spar.toml`.

@@ -484,6 +484,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             };
 
             let mut results = Vec::new();
+            let mut seen: BTreeSet<i64> = BTreeSet::new();
             for (number, kind) in picked {
                 // An issue whose work is half done produces children describing
                 // work that already exists on a branch, so it routes to the
@@ -495,6 +496,14 @@ fn dispatch(cli: Cli) -> Result<i32> {
                         pr.number
                     }),
                 };
+                // An issue and the pull request it routes to can both be named,
+                // and the queue can hold both. Splitting one pull request twice
+                // makes two sets of branches and pull requests out of it, which
+                // `--again` would not stop.
+                if !seen.insert(target.unwrap_or(number)) {
+                    logdim!("#{number} was already covered by this run, skipping it");
+                    continue;
+                }
                 results.push(match target {
                     Some(pr) => split::split_pr(&agents, &cfg, &repo, pr, &mode),
                     None => split::split_issue(&agents, &cfg, &repo, number, &mode),

@@ -11,7 +11,7 @@ use std::process::Command;
 use spar::config::{self, Config, Followups};
 use spar::model::{Followup, IssueRun};
 use spar::repo::Repo;
-use spar::review::file_followup;
+use spar::review::{drop_uncommitted, file_followup, park, snapshot, undo_edits};
 
 const SPAR_BIN: &str = env!("CARGO_BIN_EXE_spar");
 
@@ -282,6 +282,136 @@ fn a_committed_branch_has_changes_and_a_diffstat() {
         stat.lines().count() == 1,
         "the PR body wants one line, not a file list: {stat}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Custody follows the commit that landed
+// ---------------------------------------------------------------------------
+
+/// The review prompt says not to write, and this is what makes that true. A
+/// commit made while reviewing would be a commit its own author reviews next
+/// round, which is the one thing the alternating loop exists to prevent.
+#[test]
+fn a_commit_made_while_reviewing_is_rolled_back() {
+    let fx = repo("reviewcommit");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let before = snapshot(&repo, &fx.work);
+
+    commit(
+        &fx.work,
+        "README.md",
+        "reviewer was here\n",
+        "Sneak a fix in",
+    );
+    let during = snapshot(&repo, &fx.work);
+    assert!(during.landed_over(&before), "the fixture committed nothing");
+
+    let after = undo_edits(&repo, &fx.work, &before);
+    assert_eq!(before, after);
+    assert_eq!(
+        "seed\n",
+        std::fs::read_to_string(fx.work.join("README.md")).unwrap()
+    );
+}
+
+/// The review prompt asks for a scratch file when a claim needs running to
+/// check it. Counting one as a mutation would roll back every review that did
+/// as it was told, and throw away the scratch file with it.
+#[test]
+fn a_scratch_file_written_while_reviewing_is_not_a_mutation() {
+    let fx = repo("scratch");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let before = snapshot(&repo, &fx.work);
+
+    std::fs::write(fx.work.join("check.sh"), "echo hi\n").unwrap();
+    assert_eq!(before, snapshot(&repo, &fx.work));
+
+    // And the rollback a real mutation triggers leaves it where it is.
+    std::fs::write(fx.work.join("README.md"), "edited\n").unwrap();
+    git(&fx.work, &["commit", "-m", "Sneak a fix in", "README.md"]);
+    undo_edits(&repo, &fx.work, &before);
+    assert!(fx.work.join("check.sh").exists());
+}
+
+/// An edit left in the working tree is never pushed, so it must not be carried
+/// into the round that follows either.
+#[test]
+fn an_uncommitted_edit_made_while_reviewing_is_rolled_back() {
+    let fx = repo("reviewdirty");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let before = snapshot(&repo, &fx.work);
+
+    std::fs::write(fx.work.join("README.md"), "reviewer was here\n").unwrap();
+    let during = snapshot(&repo, &fx.work);
+    assert!(during.dirty);
+    assert!(!during.landed_over(&before));
+
+    assert_eq!(before, undo_edits(&repo, &fx.work, &before));
+}
+
+/// A fix left in the working tree is code the next review reads and the pull
+/// request does not have, so it goes. What the call did commit stays.
+#[test]
+fn a_fix_left_uncommitted_does_not_reach_the_next_round() {
+    let fx = repo("dirtyfix");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    commit(&fx.work, "a.txt", "one\n", "Fix the finding");
+    let committed = snapshot(&repo, &fx.work);
+
+    std::fs::write(fx.work.join("a.txt"), "two\n").unwrap();
+    std::fs::write(fx.work.join("check.sh"), "echo hi\n").unwrap();
+
+    assert_eq!(committed, drop_uncommitted(&repo, &fx.work));
+    assert_eq!(
+        "one\n",
+        std::fs::read_to_string(fx.work.join("a.txt")).unwrap()
+    );
+    assert!(
+        fx.work.join("check.sh").exists(),
+        "scratch files are not ours"
+    );
+}
+
+/// A shared checkout is the user's own, and nothing here can tell an agent's
+/// leftovers from an edit somebody made while a call was running, so what the
+/// rollback throws away is recoverable. The stash stack is left alone: it
+/// belongs to whoever is working in the repository.
+#[test]
+fn what_the_rollback_throws_away_is_saved_first() {
+    let fx = repo("parked");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let before = snapshot(&repo, &fx.work);
+    std::fs::write(fx.work.join("README.md"), "somebody was editing this\n").unwrap();
+
+    // The rollback parks the same way; doing it here is how the test gets hold
+    // of the handle the log prints.
+    let parked = park(&repo, &fx.work).expect("a dirty tree has something to save");
+    assert_eq!(before, undo_edits(&repo, &fx.work, &before));
+    assert_eq!(
+        "seed\n",
+        std::fs::read_to_string(fx.work.join("README.md")).unwrap()
+    );
+    assert!(git(&fx.work, &["stash", "list"]).trim().is_empty());
+
+    git(&fx.work, &["stash", "apply", &parked]);
+    assert_eq!(
+        "somebody was editing this\n",
+        std::fs::read_to_string(fx.work.join("README.md")).unwrap()
+    );
+}
+
+/// The `fix_myself` bug, at the level the loop reads. A call that returns
+/// successfully having committed nothing leaves the head with whoever wrote it,
+/// and `landed_over` is what says so.
+#[test]
+fn a_call_that_returns_without_committing_leaves_the_head_alone() {
+    let fx = repo("nofix");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let before = snapshot(&repo, &fx.work);
+    assert!(!snapshot(&repo, &fx.work).landed_over(&before));
+
+    commit(&fx.work, "a.txt", "one\n", "Fix the finding");
+    assert!(snapshot(&repo, &fx.work).landed_over(&before));
 }
 
 // ---------------------------------------------------------------------------

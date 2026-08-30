@@ -2,7 +2,9 @@
 //!
 //! Roles are not fixed. Whoever holds the PR may implement, review, fix, or
 //! file follow-ups, and then hands custody to the other. An agent never
-//! reviews its own most recent edit.
+//! reviews its own most recent edit, and custody follows the commit that
+//! landed rather than the action a reviewer asked for: a call that returns is
+//! not a call that wrote anything.
 //!
 //! Three failure modes are handled explicitly here, because each one breaks a
 //! naive loop:
@@ -124,6 +126,117 @@ Copy each finding's title and file across exactly as given, so your answer can
 be matched back to the review.
 
 Commit any fixes. Do not push, do not merge.";
+
+// ---------------------------------------------------------------------------
+// Evidence
+// ---------------------------------------------------------------------------
+
+/// What the branch looked like at one point in a round.
+///
+/// Untracked files are deliberately not dirt. The review prompt asks for a
+/// scratch file when a claim needs running to check it, so counting one as a
+/// mutation would reject every review that did as it was told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    pub head: String,
+    /// Tracked files differing from the index or the head.
+    pub dirty: bool,
+}
+
+impl Snapshot {
+    /// Whether a commit landed between the two. An empty head means git could
+    /// not be read, which is not evidence that anything was written.
+    pub fn landed_over(&self, before: &Snapshot) -> bool {
+        !self.head.is_empty() && self.head != before.head
+    }
+}
+
+pub fn snapshot(repo: &Repo, work_dir: &Path) -> Snapshot {
+    Snapshot {
+        head: repo
+            .git_try_at(Some(work_dir), &["rev-parse", "HEAD"])
+            .trim()
+            .to_string(),
+        dirty: !repo
+            .git_try_at(
+                Some(work_dir),
+                &["status", "--porcelain", "--untracked-files=no"],
+            )
+            .trim()
+            .is_empty(),
+    }
+}
+
+/// Copy the tracked edits in the tree to somewhere they can be got back from.
+///
+/// `git stash create` writes them as a dangling commit and, unlike `git stash
+/// push`, leaves the stash stack alone: the stack belongs to whoever is working
+/// in the repository, and every worktree of it shares the same one. `None` when
+/// there was nothing to save.
+pub fn park(repo: &Repo, work_dir: &Path) -> Option<String> {
+    let saved = repo
+        .git_try_at(Some(work_dir), &["stash", "create"])
+        .trim()
+        .to_string();
+    (!saved.is_empty()).then_some(saved)
+}
+
+/// Reset the tree to `target`, saving what that throws away.
+///
+/// With `--no-worktrees` the checkout is the user's own, and nothing here can
+/// tell an edit an agent left behind from one a person made while a call was
+/// running. So the discard is never silent and never final: the changes are
+/// parked first and the log says how to put them back.
+fn reset_saving(repo: &Repo, work_dir: &Path, target: &str) {
+    let parked = park(repo, work_dir);
+    if let Err(e) = repo.git_at(Some(work_dir), &["reset", "--hard", target]) {
+        logdim!("could not roll the working tree back: {e}");
+        return;
+    }
+    if let Some(saved) = parked {
+        logdim!("`git stash apply {saved}` puts the discarded changes back");
+    }
+}
+
+/// Put the branch back where the review found it.
+///
+/// Nothing here was ever pushed: the loop pushes at the end of a round, so the
+/// head a review starts from is the head the pull request already has. What is
+/// discarded is therefore only what the review wrote after being told not to,
+/// and keeping it would hand the reviewer its own commit to review next round.
+///
+/// Returns the state afterwards, which equals `before` when the rollback took.
+/// The caller compares, because a rollback that did not take means the reviewer
+/// wrote the head and custody has to follow it there.
+pub fn undo_edits(repo: &Repo, work_dir: &Path, before: &Snapshot) -> Snapshot {
+    let current = snapshot(repo, work_dir);
+    if before.head.is_empty() {
+        return current;
+    }
+    if current.landed_over(before) {
+        logdim!(
+            "the commits being rolled back are still at {}",
+            current.head
+        );
+    }
+    reset_saving(repo, work_dir, &before.head);
+    snapshot(repo, work_dir)
+}
+
+/// Drop what a call left uncommitted, keeping whatever it committed.
+///
+/// Only commits reach the pull request, but the next review reads the working
+/// tree, so an edit left behind is code the reviewer judges and the diff does
+/// not have. That is how an agent comes to approve a fix of its own that
+/// nobody else can see.
+pub fn drop_uncommitted(repo: &Repo, work_dir: &Path) -> Snapshot {
+    let current = snapshot(repo, work_dir);
+    if !current.dirty || current.head.is_empty() {
+        return current;
+    }
+    reset_saving(repo, work_dir, &current.head);
+    snapshot(repo, work_dir)
+}
 
 /// A worktree is only worth keeping when a person has to look at it locally.
 /// Anything else strands a checked-out branch that blocks
@@ -494,6 +607,7 @@ fn review_loop(
             .replace("{number}", &ctx.subject.to_string())
             .replace("{title}", &ctx.title)
             .replace("{settled}", &settled_block(ledger));
+        let before_review = snapshot(repo, &ctx.work_dir);
         let review: Review = reviewer.review(
             &base,
             &prompt,
@@ -501,6 +615,25 @@ fn review_loop(
             &ctx.work_dir,
             effort.as_deref(),
         )?;
+
+        // Who actually wrote the head this round, which is the only thing that
+        // decides who reviews it next. None so far: a review is not supposed to
+        // write anything.
+        let mut editor: Option<String> = None;
+        let review_wrote = snapshot(repo, &ctx.work_dir) != before_review;
+        if review_wrote {
+            logwarn!(
+                "{}: {holder} changed the branch while reviewing it, which the review prompt \
+                 forbids. Rolling it back.",
+                ctx.label
+            );
+            if undo_edits(repo, &ctx.work_dir, &before_review).head != before_review.head {
+                state
+                    .notes
+                    .push(format!("{holder} committed during its own review"));
+                editor = Some(holder.clone());
+            }
+        }
 
         let blocking: Vec<Finding> = review
             .findings
@@ -537,7 +670,7 @@ fn review_loop(
             return Ok(());
         }
 
-        if blocking.is_empty() {
+        if approval_stands(&blocking, review_wrote) {
             state.status = Status::Approved;
             post_outcome(repo, ctx.pr_number, state, ledger, Ending::Approved);
             persist(repo, ctx.pr_number, state, ledger, round, &holder);
@@ -563,10 +696,41 @@ fn review_loop(
             return Ok(());
         }
 
-        if review.next_action == NextAction::FixMyself {
+        if blocking.is_empty() {
+            // Nothing blocking, but the branch it said that about is not the
+            // branch that is there now. Falling through gives the next round
+            // whatever the rollback left: the same reviewer when it took, the
+            // other agent when the review's commit survived it.
+            logwarn!(
+                "{}: {holder} found nothing blocking on a branch it had changed itself, so the \
+                 approval does not carry.",
+                ctx.label
+            );
+            state.notes.push(format!(
+                "{holder} passed the branch in round {round} after editing it; the edit was rolled \
+                 back and the approval did not stand"
+            ));
+        } else if review.next_action == NextAction::FixMyself {
             log!("{}: {holder} fixing its own findings", ctx.label);
             let prompt = FIX_PROMPT.replace("{findings}", &findings_for_prompt(&blocking));
+            let before_fix = snapshot(repo, &ctx.work_dir);
             reviewer.ask(&prompt, &ctx.work_dir, effort.as_deref())?;
+            match editor_after(repo, &ctx.work_dir, &before_fix, &ctx.label, &holder) {
+                Some(who) => editor = Some(who),
+                None => {
+                    // Handing over here is what the bug was: the head is still
+                    // the author's, so the author would be reading its own work.
+                    logwarn!(
+                        "{}: {holder} said it would fix its own findings and committed nothing, \
+                         so it keeps the pull request.",
+                        ctx.label
+                    );
+                    state.notes.push(format!(
+                        "{holder} chose to fix its own findings in round {round} and committed \
+                         nothing"
+                    ));
+                }
+            }
         } else {
             let author_name = cfg.other(&holder);
             let author = agent::find(agents, &author_name)?;
@@ -578,12 +742,32 @@ fn review_loop(
             let prompt = RESPOND_PROMPT
                 .replace("{number}", &ctx.subject.to_string())
                 .replace("{findings}", &findings_for_prompt(&blocking));
+            let before_response = snapshot(repo, &ctx.work_dir);
             let response: ResponseDoc = author.ask_json(
                 &prompt,
                 &schema::response(),
                 &ctx.work_dir,
                 cfg.effort_for_round(&author.spec, round).as_deref(),
             )?;
+            if let Some(who) = editor_after(
+                repo,
+                &ctx.work_dir,
+                &before_response,
+                &ctx.label,
+                &author_name,
+            ) {
+                editor = Some(who);
+            } else if response
+                .dispositions
+                .iter()
+                .any(|d| d.action == Action::Fixed)
+            {
+                logwarn!(
+                    "{}: {author_name} reported fixes but committed nothing, so the diff does not \
+                     have them.",
+                    ctx.label
+                );
+            }
             apply_dispositions(
                 repo,
                 cfg,
@@ -598,9 +782,11 @@ fn review_loop(
             );
         }
 
-        repo.rewrite_commits_if_needed(&ctx.work_dir, &base)?;
-        repo.push(&ctx.work_dir, &ctx.branch)?;
-        holder = next_reviewer(cfg, &holder, review.next_action);
+        if editor.is_some() {
+            repo.rewrite_commits_if_needed(&ctx.work_dir, &base)?;
+            repo.push(&ctx.work_dir, &ctx.branch)?;
+        }
+        holder = next_reviewer(cfg, &holder, editor.as_deref());
         persist(repo, ctx.pr_number, state, ledger, round, &holder);
     }
 
@@ -613,22 +799,59 @@ fn review_loop(
     Ok(())
 }
 
-/// Who reviews the next round: never the agent that made the last commit.
+/// Whether a review with nothing blocking can end the run.
 ///
-/// `fix_myself` leaves the reviewer holding its own edit, so the PR changes
-/// hands. `hand_back` leaves the author holding it, so the reviewer keeps the PR
-/// and reads the fix it asked for. Handing it to the author instead puts an
-/// agent in front of its own fix, and an agent that reviews its own fix approves
-/// it, which ends the loop.
+/// A review that wrote to the branch judged a tree the rollback then takes
+/// away, so "nothing blocking" was said about code that is not there any more:
+/// a reviewer that quietly fixes what it finds and reports clean would merge
+/// the defect it fixed. Another round on the restored branch is cheaper than
+/// that.
+fn approval_stands(blocking: &[Finding], review_wrote: bool) -> bool {
+    blocking.is_empty() && !review_wrote
+}
+
+/// Who reviews the next round: never the agent that wrote the head it will
+/// read.
 ///
-/// `merge` cannot arrive here with blocking findings outstanding, but a reviewer
-/// that raises them and asks to merge anyway takes the hand back path, so it is
-/// grouped with it.
-fn next_reviewer(cfg: &Config, reviewer: &str, action: NextAction) -> String {
-    match action {
-        NextAction::FixMyself => cfg.other(reviewer),
-        NextAction::HandBack | NextAction::Merge => reviewer.to_string(),
+/// `editor` is whoever moved HEAD this round, observed rather than inferred
+/// from `next_action`. The two came apart in both directions: a `fix_myself`
+/// call that returned without committing handed the author its own commit back,
+/// and a reviewer that committed during `hand_back` kept a PR whose head it had
+/// written.
+///
+/// Nothing landing at all leaves the head with the author, which by this rule's
+/// own invariant is not the reviewer, so the reviewer keeps the pull request and
+/// reads the same commit again.
+fn next_reviewer(cfg: &Config, reviewer: &str, editor: Option<&str>) -> String {
+    match editor {
+        Some(editor) => cfg.other(editor),
+        None => reviewer.to_string(),
     }
+}
+
+/// Who wrote the head after a call that was asked to commit, if anybody did.
+///
+/// A call that returns successfully is not evidence of a commit, and custody is
+/// decided on this answer, so it is read from git rather than taken from the
+/// agent's word for it. Anything it left uncommitted goes the same way as a
+/// review's edits, and for the same reason: the round it hands over is the diff
+/// on the branch, not the state of somebody's checkout.
+fn editor_after(
+    repo: &Repo,
+    work_dir: &Path,
+    before: &Snapshot,
+    label: &str,
+    who: &str,
+) -> Option<String> {
+    let after = snapshot(repo, work_dir);
+    if after.dirty {
+        logwarn!(
+            "{label}: {who} left tracked files uncommitted. Only commits are pushed and the next \
+             review reads the tree, so they are discarded."
+        );
+        drop_uncommitted(repo, work_dir);
+    }
+    after.landed_over(before).then(|| who.to_string())
 }
 
 /// The inclusive range of round numbers this invocation will work through.
@@ -1666,8 +1889,8 @@ mod tests {
     #[test]
     fn fixing_your_own_findings_hands_the_pr_over() {
         let cfg = cfg_with(true, false);
-        assert_eq!("a", next_reviewer(&cfg, "b", NextAction::FixMyself));
-        assert_eq!("b", next_reviewer(&cfg, "a", NextAction::FixMyself));
+        assert_eq!("a", next_reviewer(&cfg, "b", Some("b")));
+        assert_eq!("b", next_reviewer(&cfg, "a", Some("a")));
     }
 
     /// The author wrote the head, so the reviewer keeps the PR. Flipping here
@@ -1676,20 +1899,84 @@ mod tests {
     #[test]
     fn handing_back_keeps_the_reviewer_for_the_next_round() {
         let cfg = cfg_with(true, false);
-        assert_eq!("b", next_reviewer(&cfg, "b", NextAction::HandBack));
-        assert_eq!("a", next_reviewer(&cfg, "a", NextAction::HandBack));
+        assert_eq!("b", next_reviewer(&cfg, "b", Some("a")));
+        assert_eq!("a", next_reviewer(&cfg, "a", Some("b")));
     }
 
-    /// Whoever holds round 2 did not write what it is reading, on either path.
-    /// `a` implements, so `b` reviews round 1.
+    /// Whoever holds round 2 did not write what it is reading, whoever wrote
+    /// it. `a` implements, so `b` reviews round 1.
     #[test]
     fn nobody_reviews_their_own_edit() {
         let cfg = cfg_with(true, false);
         let round_1 = cfg.other(&cfg.first_implementor);
         assert_eq!("b", round_1);
-        for (action, editor) in [(NextAction::FixMyself, "b"), (NextAction::HandBack, "a")] {
-            assert_ne!(editor, next_reviewer(&cfg, &round_1, action), "{action}");
+        for editor in ["a", "b"] {
+            assert_ne!(editor, next_reviewer(&cfg, &round_1, Some(editor)));
         }
+    }
+
+    /// The `fix_myself` half of the bug. The reviewer said it would fix its own
+    /// findings and the call returned without committing, so the head is still
+    /// the author's and handing over would put the author in front of its own
+    /// work.
+    #[test]
+    fn a_fix_that_committed_nothing_leaves_the_pr_where_it_is() {
+        let cfg = cfg_with(true, false);
+        assert_eq!("b", next_reviewer(&cfg, "b", None));
+        assert_eq!("a", next_reviewer(&cfg, "a", None));
+    }
+
+    /// The `hand_back` half. The reviewer committed while reviewing and the
+    /// author answered without committing, so the head is the reviewer's and
+    /// keeping it would have it read its own commit.
+    #[test]
+    fn a_reviewer_that_wrote_the_head_gives_the_pr_up() {
+        let cfg = cfg_with(true, false);
+        assert_eq!("a", next_reviewer(&cfg, "b", Some("b")));
+    }
+
+    /// A reviewer that fixes what it finds and then reports nothing blocking
+    /// approved its own fix, and the rollback takes that fix out again. The
+    /// head that would merge is not the head that passed.
+    #[test]
+    fn a_review_that_wrote_cannot_approve_what_is_left() {
+        assert!(!approval_stands(&[], true));
+    }
+
+    #[test]
+    fn a_clean_review_of_an_untouched_branch_approves() {
+        assert!(approval_stands(&[], false));
+    }
+
+    #[test]
+    fn a_blocking_finding_never_approves() {
+        let blocking = vec![finding("blocking", "Broken", "detail", "src/x.rs", true)];
+        assert!(!approval_stands(&blocking, false));
+    }
+
+    /// Custody is decided on what git says, not on the call returning.
+    #[test]
+    fn only_a_moved_head_counts_as_a_commit() {
+        let before = Snapshot {
+            head: "abc".into(),
+            dirty: false,
+        };
+        assert!(!Snapshot {
+            head: "abc".into(),
+            dirty: true,
+        }
+        .landed_over(&before));
+        assert!(Snapshot {
+            head: "def".into(),
+            dirty: false,
+        }
+        .landed_over(&before));
+        // git could not be read, which is not evidence that anything landed.
+        assert!(!Snapshot {
+            head: String::new(),
+            dirty: false,
+        }
+        .landed_over(&before));
     }
 
     // -- round budget ----------------------------------------------------

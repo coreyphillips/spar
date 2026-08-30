@@ -827,21 +827,6 @@ impl Repo {
         self.open_numbers("pr", limit, min_number)
     }
 
-    /// `owner/repo`, for telling a link to this repository's issues from a link
-    /// to somebody else's.
-    pub fn name_with_owner(&self) -> Option<String> {
-        let text = self.gh_try(&[
-            "repo",
-            "view",
-            "--json",
-            "nameWithOwner",
-            "--jq",
-            ".nameWithOwner",
-        ]);
-        let slug = text.trim();
-        (!slug.is_empty()).then(|| slug.to_string())
-    }
-
     pub fn pr_for_branch(&self, branch: &str) -> Option<PrRef> {
         self.branch_prs(branch, "open").into_iter().next()
     }

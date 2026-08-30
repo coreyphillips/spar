@@ -46,9 +46,23 @@ static ITEM: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Any list line, checkbox or not, so that a task nested under a plain bullet
-/// is still read as nested rather than as indented code.
+/// is still read as nested rather than as indented code. The marker and the
+/// gap after it are captured because they decide where the item's content
+/// starts, and that is what four spaces are measured against.
 static LIST: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[ \t]*(?:[-*+]|[0-9]{1,9}[.)])(?:[ \t]|$)").expect("list pattern")
+    Regex::new(r"^(?P<indent>[ \t]*)(?P<marker>[-*+]|[0-9]{1,9}[.)])(?P<gap>[ \t]*)(?P<rest>.*)$")
+        .expect("list pattern")
+});
+
+/// The raw HTML blocks GitHub renders exactly as written, so a checkbox inside
+/// one is text somebody is showing rather than a box anybody can tick. Same
+/// shape as a fence, different clothes again.
+static HTML_OPEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^[ \t]*<(?:pre|script|style|textarea)\b").expect("html open pattern")
+});
+
+static HTML_CLOSE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)</(?:pre|script|style|textarea)>").expect("html close pattern")
 });
 
 /// A fence, opening or closing. Info string included so that only a bare fence
@@ -88,18 +102,33 @@ impl Reference {
     /// A link to another repository's issue is not adoptable: taking the number
     /// out of it would point the item at whatever happens to carry that number
     /// here, which is the wrong link failure with no fuzziness to blame.
-    pub fn local(&self, slug: &str) -> Option<i64> {
+    ///
+    /// `home` is this repository's own address, host and all, so that another
+    /// host serving the same `owner/repo` path is somebody else's.
+    pub fn local(&self, home: &str) -> Option<i64> {
         match &self.url {
             None => Some(self.number),
             Some(url) => {
-                let slug = slug.trim();
-                let owned = !slug.is_empty()
-                    && (url.contains(&format!("/{slug}/issues/"))
-                        || url.contains(&format!("/{slug}/pull/")));
+                let home = locator(home).trim_end_matches('/');
+                let url = locator(url);
+                let owned = !home.is_empty()
+                    && (url.starts_with(&format!("{home}/issues/"))
+                        || url.starts_with(&format!("{home}/pull/")));
                 owned.then_some(self.number)
             }
         }
     }
+}
+
+/// A url reduced to what identifies it. The scheme and a leading `www.` are
+/// two spellings of the same place, and matching on the rest from the front
+/// keeps `elsewhere.example/me/mine/issues/7` out of `me/mine`.
+fn locator(url: &str) -> &str {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    rest.strip_prefix("www.").unwrap_or(rest)
 }
 
 /// One task list item, as it stands in the body.
@@ -121,19 +150,31 @@ pub struct Item {
 ///
 /// Deliberately dull about what it will not treat as an item: anything the
 /// reader of the issue does not see as a checkbox is not one. That is a fenced
-/// block, an indented code block, an HTML comment, and anything that is not a
-/// task list line. Nested items are ordinary items, since every edit here is
-/// line local.
+/// block, an indented code block, an HTML comment, a raw HTML block GitHub
+/// renders verbatim, and anything that is not a task list line. Nested items
+/// are ordinary items, since every edit here is line local.
 pub fn parse(body: &str) -> Vec<Item> {
     let mut out = Vec::new();
     let mut fence: Option<(char, usize)> = None;
     let mut comment = false;
-    // The indent of the innermost list line still open, so that four spaces can
-    // be told apart: a code block outside a list, a nested item inside one.
-    let mut list: Option<usize> = None;
+    let mut html = false;
+    // Where the content of each open list item starts, outermost first. Four
+    // spaces mean code, but four spaces from where: the margin outside a list,
+    // and the innermost item's own content column inside one.
+    let mut open: Vec<usize> = Vec::new();
 
     for (index, raw) in split_keep(body).into_iter().enumerate() {
         let line = without_eol(raw);
+        // A comment is markdown a person wrote for the next person, often the
+        // items they decided against. GitHub renders none of it.
+        if comment {
+            comment = !line.contains("-->");
+            continue;
+        }
+        if html {
+            html = !HTML_CLOSE.is_match(line);
+            continue;
+        }
         if let Some(caps) = FENCE.captures(line) {
             let marker = &caps["fence"];
             let (glyph, len) = (marker.chars().next().expect("a fence"), marker.len());
@@ -152,24 +193,27 @@ pub fn parse(body: &str) -> Vec<Item> {
         if fence.is_some() {
             continue;
         }
-        // A comment is markdown a person wrote for the next person, often the
-        // items they decided against. GitHub renders none of it.
-        if comment {
-            comment = !line.contains("-->");
-            continue;
-        }
         let indent = indent_width(line);
-        let listed = LIST.is_match(line);
-        if !listed && indent == 0 && !line.trim().is_empty() {
-            list = None;
+        // A blank line closes nothing: a list survives one, and both markdown
+        // and the person writing it expect the item after it to still be in.
+        if !line.trim().is_empty() {
+            while open.last().is_some_and(|col| indent < *col) {
+                open.pop();
+            }
         }
-        // Four spaces with no list around them is a code block, which is the
-        // fence case wearing different clothes.
-        if indent >= 4 && list.is_none() {
+        // Four spaces past wherever the content of this line belongs is a code
+        // block, which is the fence case wearing different clothes. `- outer`
+        // then six spaces is an example inside that item, not a nested task.
+        let margin = open.last().copied().unwrap_or(0);
+        if !line.trim().is_empty() && indent >= margin + 4 {
             continue;
         }
-        if listed {
-            list = Some(indent);
+        if let Some(column) = content_column(line) {
+            open.push(column);
+        }
+        if HTML_OPEN.is_match(line) {
+            html = !HTML_CLOSE.is_match(line);
+            continue;
         }
         comment = opens_comment(line);
         let Some(caps) = ITEM.captures(line) else {
@@ -187,8 +231,32 @@ pub fn parse(body: &str) -> Vec<Item> {
     out
 }
 
+/// Where a list line's content starts, in columns, or `None` if it is not one.
+///
+/// Markdown puts the content one column after the marker when the gap is
+/// nothing or wider than four, and at the gap otherwise.
+fn content_column(line: &str) -> Option<usize> {
+    let caps = LIST.captures(line)?;
+    let gap = indent_width(&caps["gap"]);
+    if gap == 0 && !caps["rest"].is_empty() {
+        return None;
+    }
+    let gap = match (1..=4).contains(&gap) && !caps["rest"].trim().is_empty() {
+        true => gap,
+        false => 1,
+    };
+    Some(indent_width(&caps["indent"]) + caps["marker"].len() + gap)
+}
+
 /// The first issue this text names, by link or by number.
+///
+/// Read from the text with code spans and link labels blanked out. A `#12` in
+/// backticks is somebody writing about a number rather than pointing at one,
+/// and a `#7` in a link's label captions the destination: without this,
+/// `[other/widgets #7](https://github.com/other/widgets/issues/7)` becomes a
+/// bare local #7 and the foreign repository check never sees it.
 fn reference_in(text: &str) -> Option<Reference> {
+    let text = &readable(text);
     let url = URL_REF.captures(text);
     let hash = HASH_REF.captures(text);
     let at = |caps: &Option<regex::Captures>| {
@@ -217,6 +285,65 @@ fn as_url(caps: regex::Captures) -> Reference {
         number: caps["number"].parse().unwrap_or_default(),
         url: Some(caps["url"].to_string()),
     }
+}
+
+/// The text with code spans and inline link labels replaced by spaces, byte for
+/// byte so that offsets into it still line up with the original. A link's
+/// destination is left standing, because that is the part that names an issue.
+fn readable(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'`' => {
+                let start = at;
+                while at < bytes.len() && bytes[at] == b'`' {
+                    at += 1;
+                }
+                if let Some(end) = backtick_run(bytes, at, at - start) {
+                    out[start..end].fill(b' ');
+                    at = end;
+                }
+            }
+            b'[' => match label_end(bytes, at) {
+                Some(end) => {
+                    out[at..end].fill(b' ');
+                    at = end;
+                }
+                None => at += 1,
+            },
+            _ => at += 1,
+        }
+    }
+    // Only whole regions delimited by ASCII are blanked, so this holds.
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
+}
+
+/// The end of the next run of exactly `len` backticks, which is what closes a
+/// code span opened by one that long.
+fn backtick_run(bytes: &[u8], from: usize, len: usize) -> Option<usize> {
+    let mut at = from;
+    while at < bytes.len() {
+        if bytes[at] != b'`' {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < bytes.len() && bytes[at] == b'`' {
+            at += 1;
+        }
+        if at - start == len {
+            return Some(at);
+        }
+    }
+    None
+}
+
+/// The end of an inline link's label, `[` to `]`, when a destination follows.
+fn label_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let close = open + 1 + bytes[open + 1..].iter().position(|b| *b == b']')?;
+    (bytes.get(close + 1) == Some(&b'(')).then_some(close + 1)
 }
 
 /// Lines with their terminators kept, so concatenating them is the original
@@ -463,7 +590,7 @@ pub struct Step {
 ///
 /// Checked items are absent by construction: spar checks a box and never
 /// unchecks one, so there is nothing to decide about them.
-fn shape(body: &str, slug: &str, max: usize) -> Vec<(Item, Shape)> {
+fn shape(body: &str, home: &str, max: usize) -> Vec<(Item, Shape)> {
     let items = parse(body);
     // A line that appears twice cannot be rewritten unambiguously, and there is
     // no reading of two identical items that makes filing two issues right.
@@ -486,7 +613,7 @@ fn shape(body: &str, slug: &str, max: usize) -> Vec<(Item, Shape)> {
             Shape::Over
         } else {
             match &item.reference {
-                Some(reference) => match reference.local(slug) {
+                Some(reference) => match reference.local(home) {
                     Some(number) => {
                         taken += 1;
                         Shape::Names(number)
@@ -512,8 +639,8 @@ fn shape(body: &str, slug: &str, max: usize) -> Vec<(Item, Shape)> {
 /// Reads only: the state of an issue an item already names, and the similarity
 /// search for one that does not. `spar triage` prints exactly this and the
 /// acting path applies it, so the preview and the run cannot drift apart.
-pub fn plan(repo: &Repo, cfg: &Config, tracker: i64, body: &str, slug: &str) -> Vec<Step> {
-    shape(body, slug, cfg.loop_cfg.max_tracker_children)
+pub fn plan(repo: &Repo, cfg: &Config, tracker: i64, body: &str, home: &str) -> Vec<Step> {
+    shape(body, home, cfg.loop_cfg.max_tracker_children)
         .into_iter()
         .map(|(item, shape)| {
             let action = match shape {
@@ -696,19 +823,28 @@ fn apply(repo: &Repo, tracker: i64, steps: &[Step]) -> Vec<i64> {
     children
 }
 
-/// Whether the tracker still carries this exact line, once and only once.
+/// Whether the tracker still carries this exact line, once and only once, and
+/// still reads it as a checklist item.
+///
+/// Both halves, because an edit that lands mid-run can leave the bytes exactly
+/// as they were and still change what they mean. Fencing the line, or opening
+/// a comment above it, is a person saying not this one, and matching the raw
+/// text alone would file for it and rewrite it inside the fence.
+fn still_an_item(body: &str, raw: &str) -> bool {
+    let lines = split_keep(body)
+        .into_iter()
+        .filter(|line| without_eol(line) == raw)
+        .count();
+    lines == 1 && parse(body).iter().filter(|item| item.raw == raw).count() == 1
+}
+
+/// The same question, asked of the tracker as it stands.
 ///
 /// Unreadable counts as no: this gates filing, and an issue filed against a
 /// tracker that cannot be read is one nothing will link.
 fn still_asked_for(repo: &Repo, tracker: i64, raw: &str) -> bool {
     match repo.read_issue(tracker) {
-        Ok(issue) => {
-            split_keep(issue.body_text())
-                .into_iter()
-                .filter(|line| without_eol(line) == raw)
-                .count()
-                == 1
-        }
+        Ok(issue) => still_an_item(issue.body_text(), raw),
         Err(e) => {
             logdim!("  could not re-read #{tracker}: {}", e.first_line());
             false
@@ -720,8 +856,9 @@ fn still_asked_for(repo: &Repo, tracker: i64, raw: &str) -> bool {
 ///
 /// The body is read again here rather than reused from the copy this run
 /// parsed. A run is long, and somebody editing the tracker while it goes must
-/// not lose that edit: if the line has moved or changed, this is a skip with a
-/// log line, never a write.
+/// not lose that edit: if the line has moved or changed, or the markdown around
+/// it has stopped making it an item, this is a skip with a log line, never a
+/// write.
 fn write(repo: &Repo, tracker: i64, raw: &str, change: &Change) -> bool {
     let body = match repo.read_issue(tracker) {
         Ok(issue) => issue.body_text().to_string(),
@@ -730,6 +867,10 @@ fn write(repo: &Repo, tracker: i64, raw: &str, change: &Change) -> bool {
             return false;
         }
     };
+    if !still_an_item(&body, raw) {
+        logdim!("  not editing #{tracker}: that line is no longer a checklist item in it");
+        return false;
+    }
     let updated = match rewrite(&body, raw, change) {
         Ok(updated) => updated,
         Err(e) => {
@@ -770,14 +911,25 @@ fn read(repo: &Repo, tracker: i64) -> Option<(String, String)> {
     // issue that trips it. Parsing a shortened body drops the last items and
     // looks identical to a tracker that had fewer.
     match repo.read_issue(tracker) {
-        Ok(issue) => Some((
-            issue.body_text().to_string(),
-            repo.name_with_owner().unwrap_or_default(),
-        )),
+        Ok(issue) => Some((issue.body_text().to_string(), home_of(&issue.url))),
         Err(e) => {
             logdim!("could not read #{tracker}: {}", e.first_line());
             None
         }
+    }
+}
+
+/// This repository's address, taken from the tracker's own url by dropping the
+/// `/issues/29` off the end.
+///
+/// Read rather than assembled from `owner/repo`, because the host is half the
+/// answer: a link to `elsewhere.example/me/mine/issues/7` shares the path and
+/// is not this repository's issue. Empty when there is no url to read, which
+/// holds every linked item rather than guessing at one.
+fn home_of(url: &str) -> String {
+    match url.rfind("/issues/") {
+        Some(at) => url[..at].to_string(),
+        None => String::new(),
     }
 }
 
@@ -868,6 +1020,9 @@ fn diff(before: &str, after: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Where the tests' own repository lives, as `read` would work it out.
+    const HOME: &str = "https://github.com/me/mine";
+
     fn texts(body: &str) -> Vec<String> {
         parse(body).into_iter().map(|i| i.text).collect()
     }
@@ -937,6 +1092,47 @@ Write the parts like this:
         assert_eq!(vec!["real", "nested", "nested under a bullet"], texts(body));
     }
 
+    /// Four spaces is measured from the enclosing item's content, not from the
+    /// margin: under `- outer` the content starts in column 2, so six spaces
+    /// are an example inside that item and two are a nested task.
+    #[test]
+    fn code_indented_inside_a_list_item_is_still_code() {
+        let body = "\
+- outer
+
+      - [ ] an example, not an item
+
+  - [ ] nested
+- plain
+    - [ ] nested under a bullet
+        - [ ] and under that one
+";
+        assert_eq!(
+            vec!["nested", "nested under a bullet", "and under that one"],
+            texts(body)
+        );
+    }
+
+    /// GitHub renders the inside of these verbatim, so a checkbox in one is
+    /// text somebody is showing.
+    #[test]
+    fn an_item_inside_raw_html_is_not_one() {
+        let body = "\
+- [ ] real
+
+<pre>
+- [ ] not real
+</pre>
+
+<textarea>
+- [ ] also not real
+</textarea>
+
+- [ ] real again
+";
+        assert_eq!(vec!["real", "real again"], texts(body));
+    }
+
     /// The items somebody decided against are often kept in a comment. GitHub
     /// renders none of it, so neither does this.
     #[test]
@@ -999,15 +1195,9 @@ Write the parts like this:
              - [ ] two https://github.com/me/mine/pull/43/files\n\
              - [ ] three https://github.com/other/thing/pull/44\n",
         );
-        assert_eq!(
-            Some(42),
-            items[0].reference.as_ref().unwrap().local("me/mine")
-        );
-        assert_eq!(
-            Some(43),
-            items[1].reference.as_ref().unwrap().local("me/mine")
-        );
-        assert_eq!(None, items[2].reference.as_ref().unwrap().local("me/mine"));
+        assert_eq!(Some(42), items[0].reference.as_ref().unwrap().local(HOME));
+        assert_eq!(Some(43), items[1].reference.as_ref().unwrap().local(HOME));
+        assert_eq!(None, items[2].reference.as_ref().unwrap().local(HOME));
     }
 
     /// An item whose whole text is a link to somewhere else is not a reference
@@ -1025,8 +1215,8 @@ Write the parts like this:
     fn a_link_to_another_repository_is_not_adoptable() {
         let items = parse("- [ ] see https://github.com/other/thing/issues/7\n");
         let reference = items[0].reference.as_ref().expect("a reference");
-        assert_eq!(None, reference.local("me/mine"));
-        assert_eq!(Some(7), reference.local("other/thing"));
+        assert_eq!(None, reference.local(HOME));
+        assert_eq!(Some(7), reference.local("https://github.com/other/thing"));
     }
 
     /// A bare number can only mean this repository, so it needs no slug.
@@ -1034,6 +1224,62 @@ Write the parts like this:
     fn a_bare_number_resolves_wherever_it_is_read() {
         let items = parse("- [ ] work #7\n");
         assert_eq!(Some(7), items[0].reference.as_ref().unwrap().local(""));
+    }
+
+    /// The path is half the answer. Another host serving `me/mine` is somebody
+    /// else's, and adopting it would tick a local issue nobody named.
+    #[test]
+    fn a_link_to_the_same_path_on_another_host_is_not_this_repository() {
+        for url in [
+            "https://gitlab.example/me/mine/issues/7",
+            "https://github.com/mirror/me/mine/issues/7",
+        ] {
+            let items = parse(&format!("- [ ] see {url}\n"));
+            let reference = items[0].reference.as_ref().expect("a reference");
+            assert_eq!(None, reference.local(HOME), "{url}");
+        }
+    }
+
+    /// http and https to the same issue are the same issue.
+    #[test]
+    fn the_scheme_is_not_what_makes_a_link_somebody_elses() {
+        let items = parse("- [ ] see http://github.com/me/mine/issues/7\n");
+        assert_eq!(Some(7), items[0].reference.as_ref().unwrap().local(HOME));
+    }
+
+    /// An issue url with the tail taken off is the address every other link is
+    /// measured against.
+    #[test]
+    fn home_is_read_off_the_trackers_own_url() {
+        assert_eq!(HOME, home_of("https://github.com/me/mine/issues/29"));
+        assert_eq!("", home_of(""));
+    }
+
+    /// A number in backticks is somebody writing about it, and the reference
+    /// they meant is the one outside.
+    #[test]
+    fn a_number_in_a_code_span_names_nothing() {
+        let items = parse(
+            "- [ ] Handle the literal `#12`, tracked in #34\n\
+             - [ ] Only ``a #12 in a double span``\n",
+        );
+        assert_eq!(Some(34), items[0].reference.as_ref().map(|r| r.number));
+        assert_eq!(None, items[1].reference);
+    }
+
+    /// A link's label captions its destination. Reading the label first turned
+    /// another repository's issue into a bare local number, which is exactly
+    /// the adoption the foreign repository check exists to refuse.
+    #[test]
+    fn a_link_is_read_from_its_destination_and_not_its_label() {
+        let items = parse(
+            "- [ ] [other/widgets #7](https://github.com/other/widgets/issues/7)\n\
+             - [ ] [me/mine #7](https://github.com/me/mine/issues/7)\n",
+        );
+        let foreign = items[0].reference.as_ref().expect("a reference");
+        assert!(foreign.url.is_some(), "the destination, not the label");
+        assert_eq!(None, foreign.local(HOME));
+        assert_eq!(Some(7), items[1].reference.as_ref().unwrap().local(HOME));
     }
 
     // -- the line surgery -------------------------------------------------
@@ -1115,10 +1361,7 @@ Write the parts like this:
     // -- shaping ----------------------------------------------------------
 
     fn shapes(body: &str, max: usize) -> Vec<Shape> {
-        shape(body, "me/mine", max)
-            .into_iter()
-            .map(|(_, s)| s)
-            .collect()
+        shape(body, HOME, max).into_iter().map(|(_, s)| s).collect()
     }
 
     #[test]
@@ -1186,10 +1429,7 @@ and the rest of it.
 
 That is all.
 ";
-        let shapes: Vec<Shape> = shape(body, "me/mine", 5)
-            .into_iter()
-            .map(|(_, s)| s)
-            .collect();
+        let shapes: Vec<Shape> = shape(body, HOME, 5).into_iter().map(|(_, s)| s).collect();
         assert_eq!(
             vec![Shape::Needs, Shape::Names(40), Shape::Needs],
             shapes,
@@ -1263,6 +1503,24 @@ That is all.
         assert_eq!(None, Action::Adopt(7).change());
         assert_eq!(None, Action::Over.change());
         assert_eq!(None, Action::Hold("any reason".into()).change());
+    }
+
+    // -- the guard before a write -----------------------------------------
+
+    /// The bytes of the line are not the whole of what it means. Somebody
+    /// fencing an item mid-run is saying not this one, and the raw text is
+    /// still there to match.
+    #[test]
+    fn a_line_that_stopped_being_an_item_is_not_written_to() {
+        let raw = "- [ ] ship it";
+        assert!(still_an_item("intro\n\n- [ ] ship it\n", raw));
+        assert!(!still_an_item("```\n- [ ] ship it\n```\n", raw));
+        assert!(!still_an_item("<!--\n- [ ] ship it\n-->\n", raw));
+        assert!(!still_an_item("- [ ] something else\n", raw));
+        assert!(
+            !still_an_item("- [ ] ship it\n- [ ] ship it\n", raw),
+            "two alike is a line the edit could go to either of"
+        );
     }
 
     // -- the preview ------------------------------------------------------

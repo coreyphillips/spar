@@ -649,6 +649,23 @@ impl Repo {
         )
     }
 
+    /// Run gh with something on its stdin.
+    ///
+    /// A tracker body is far too long to pass on argv, and `--body-file -` is
+    /// how gh takes one. `proc::exec` already wires the pipe, so this is a
+    /// sibling of `gh_at` rather than anything new.
+    pub fn gh_stdin(&self, args: &[&str], stdin: &str) -> Result<String> {
+        let mut argv = vec!["gh".to_string()];
+        argv.extend(args.iter().map(|s| s.to_string()));
+        proc::run(
+            &argv,
+            &ExecOpts::new()
+                .cwd(&self.root)
+                .timeout_secs(300)
+                .stdin(stdin),
+        )
+    }
+
     pub fn gh_try(&self, args: &[&str]) -> String {
         let mut argv = vec!["gh".to_string()];
         argv.extend(args.iter().map(|s| s.to_string()));
@@ -704,6 +721,25 @@ impl Repo {
             bail!("`gh` reported an empty login. Run `gh auth status`.");
         }
         Ok(self.viewer.get_or_init(|| login))
+    }
+
+    /// One issue as it stands, open or closed.
+    ///
+    /// `fetch_issues` reads a queue to work: it drops a closed issue and fails
+    /// when nothing survives. Both are wrong for reading one issue back, where
+    /// closed is an answer and the empty case cannot arise.
+    pub fn read_issue(&self, number: i64) -> Result<Issue> {
+        let text = self
+            .gh(&[
+                "issue",
+                "view",
+                &number.to_string(),
+                "--json",
+                "number,title,body,labels,state,url",
+            ])
+            .map_err(|e| spar_err!("could not read issue #{number}: {}", e.last_line()))?;
+        serde_json::from_str(&text)
+            .map_err(|e| spar_err!("unexpected shape for issue #{number}: {e}"))
     }
 
     pub fn fetch_issues(&self, numbers: &[i64]) -> Result<Vec<Issue>> {
@@ -789,6 +825,21 @@ impl Repo {
 
     pub fn list_open_prs(&self, limit: usize, min_number: i64) -> Result<Vec<i64>> {
         self.open_numbers("pr", limit, min_number)
+    }
+
+    /// `owner/repo`, for telling a link to this repository's issues from a link
+    /// to somebody else's.
+    pub fn name_with_owner(&self) -> Option<String> {
+        let text = self.gh_try(&[
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "--jq",
+            ".nameWithOwner",
+        ]);
+        let slug = text.trim();
+        (!slug.is_empty()).then(|| slug.to_string())
     }
 
     pub fn pr_for_branch(&self, branch: &str) -> Option<PrRef> {
@@ -950,6 +1001,30 @@ impl Repo {
             .gh(&["issue", "create", "--title", &title, "--body", &body])?
             .trim()
             .to_string())
+    }
+
+    /// Replace an issue body with `body`, cleaning only `inserted`.
+    ///
+    /// The one write path that does not run its payload through `clean`, and it
+    /// has to be: this is somebody's prose coming back unchanged but for a line
+    /// spar edited. `scrub` strips trailing whitespace, which is a markdown hard
+    /// break; it collapses blank runs; it trims; and `ATTRIBUTION_LINE` would
+    /// delete a whole line of somebody's writing that happened to match. So the
+    /// gate runs on the fragment spar inserted instead, which is the only text
+    /// here spar is answerable for. The caller names that fragment rather than
+    /// the gate being skipped silently.
+    pub fn edit_issue_body(&self, number: i64, body: &str, inserted: &str) -> Result<()> {
+        let cleaned = self.clean(inserted)?;
+        if cleaned.trim() != inserted.trim() {
+            bail!(
+                "the style gate rewrote {inserted:?} to {cleaned:?}, so it is not being inserted"
+            );
+        }
+        self.gh_stdin(
+            &["issue", "edit", &number.to_string(), "--body-file", "-"],
+            body,
+        )
+        .map(|_| ())
     }
 }
 

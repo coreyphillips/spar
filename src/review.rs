@@ -1231,6 +1231,17 @@ impl Filed {
         }
     }
 
+    /// The issue this went to, whatever state it is in. `number` answers the
+    /// narrower question of what there is to work.
+    pub fn issue(&self) -> i64 {
+        match self {
+            Filed::Opened(n, _)
+            | Filed::AddedTo(n, _)
+            | Filed::Covered(n, _)
+            | Filed::AlreadyClosed(n, _) => *n,
+        }
+    }
+
     /// The issue to work, when there is one to work.
     pub fn number(&self) -> Option<i64> {
         match self {

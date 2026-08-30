@@ -80,6 +80,11 @@ impl ExecOpts {
         self.env.push((key.into(), value.into()));
         self
     }
+
+    pub fn stdin(mut self, text: impl Into<String>) -> Self {
+        self.stdin = Some(text.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone)]

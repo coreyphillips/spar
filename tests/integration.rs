@@ -3980,16 +3980,22 @@ fn a_direct_commit_with_ignored_output_stops_before_push() {
 }
 
 #[test]
-fn ignored_rust_build_artifacts_do_not_stop_a_managed_commit_or_push() {
+fn ignored_build_artifacts_do_not_stop_a_managed_commit_or_push() {
     let fx = repo("managed-commit-with-build-artifacts");
-    commit(&fx.work, ".gitignore", "target/\n", "ignore build output");
+    commit(
+        &fx.work,
+        ".gitignore",
+        "target/\ndist/\n",
+        "ignore build output",
+    );
     git(&fx.work, &["push", "-q", "origin", "main"]);
     let repo = Repo::open(&fx.work, &cfg()).unwrap();
     let mut config = cfg();
     let answer = r#"{"summary":"changed it","problem":"","changes":[],"testing":["tests passed"],"notes":""}"#;
     let script = format!(
-        "printf 'tracked change\\n' > README.md; mkdir -p target/debug; \
-         printf 'compiler output\\n' > target/debug/artifact; printf '%s\\n' '{answer}'"
+        "printf 'tracked change\\n' > README.md; mkdir -p target/debug dist/cli; \
+         printf 'rust output\\n' > target/debug/artifact; \
+         printf 'typescript output\\n' > dist/cli/index.js; printf '%s\\n' '{answer}'"
     );
     config.agents[0].command = vec![
         CommandPart::One("/bin/sh".into()),
@@ -4020,9 +4026,26 @@ fn ignored_rust_build_artifacts_do_not_stop_a_managed_commit_or_push() {
     assert_eq!(Status::Error, state.status);
     assert_eq!("changed it\n", git(&path, &["log", "-1", "--format=%s"]));
     assert_eq!(
-        "compiler output\n",
+        "rust output\n",
         std::fs::read_to_string(path.join("target/debug/artifact")).unwrap()
     );
+    assert_eq!(
+        "typescript output\n",
+        std::fs::read_to_string(path.join("dist/cli/index.js")).unwrap()
+    );
+    assert!(git(
+        &path,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "HEAD",
+            "--",
+            "target/debug/artifact",
+            "dist/cli/index.js"
+        ]
+    )
+    .is_empty());
     assert!(!git(&fx.work, &["ls-remote", "--heads", "origin", "issue-83"]).is_empty());
     assert!(git(&path, &["status", "--porcelain"]).is_empty());
     repo.worktree_remove(83);

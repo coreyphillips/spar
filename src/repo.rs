@@ -274,6 +274,7 @@ impl IgnoredState {
 fn is_generated_artifact(path: &Path) -> bool {
     const DIRECTORIES: &[&str] = &[
         "target",
+        "dist",
         "node_modules",
         "__pycache__",
         ".pytest_cache",
@@ -6379,8 +6380,12 @@ mod tests {
     #[test]
     fn only_known_build_and_cache_directories_are_generated_artifacts() {
         assert!(is_generated_artifact(Path::new("target/debug/artifact")));
+        assert!(is_generated_artifact(Path::new("dist/cli/index.js")));
         assert!(is_generated_artifact(Path::new(
             "package/node_modules/dependency/file.js"
+        )));
+        assert!(!is_generated_artifact(Path::new(
+            "distribution/required-package.js"
         )));
         assert!(!is_generated_artifact(Path::new(
             "generated/required-fixture.txt"

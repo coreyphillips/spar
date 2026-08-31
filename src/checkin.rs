@@ -24,7 +24,7 @@ use crate::model::{
 };
 use crate::repo::Repo;
 use crate::style::{self, Style};
-use crate::{log, logdim, logwarn, schema, spar_err};
+use crate::{bail, log, logdim, logwarn, schema, spar_err};
 
 // ---------------------------------------------------------------------------
 // Prompts
@@ -96,10 +96,10 @@ Their decisions:
 
 const FIX_PROMPT: &str = "\
 Both agents agreed each comment below asks for a change worth making on this
-branch. Make exactly those changes and commit them.
+branch. Make exactly those changes and leave them uncommitted for the harness.
 
-Exactly those and nothing else. This is an answer to specific comments, and a
-commit that also tidies something nearby is one the person who commented cannot
+Exactly those and nothing else. This is an answer to specific comments, and an
+edit that also tidies something nearby is one the person who commented cannot
 check against what they asked for.
 
 If one of them turns out to be wrong once you are in the code, leave it alone
@@ -483,6 +483,13 @@ fn failed(number: i64, label: String, e: crate::error::SparError) -> IssueRun {
     state
 }
 
+#[derive(Debug)]
+enum FixPublication {
+    NoCommit,
+    Pushed,
+    Unpublished(String),
+}
+
 fn inner_pr(
     agents: &[Agent],
     cfg: &Config,
@@ -516,8 +523,11 @@ fn inner_pr(
         log!("PR #{number} comes from a fork, so nothing can be pushed. Answering the comments.");
         (repo.worktree_for_pr_head(number)?, None)
     };
+    let read_phase_checkpoint = repo.worktree_checkpoint(&work_dir)?;
+    let read_only_checkpoint = (!can_push).then(|| read_phase_checkpoint.clone());
 
-    let outcome = act(
+    let before_act = repo.head_oid_checked(&work_dir)?;
+    let mut outcome = act(
         agents,
         cfg,
         repo,
@@ -525,6 +535,7 @@ fn inner_pr(
         &pr.title,
         &found,
         &work_dir,
+        &read_phase_checkpoint,
         branch.as_deref(),
         can_push,
         mode,
@@ -532,12 +543,69 @@ fn inner_pr(
         seen,
     );
 
-    if !cfg.loop_cfg.keep_worktrees {
+    if let Err(e) = &outcome {
+        if e.kind() == crate::error::ErrorKind::UncertainWrite {
+            logwarn!(
+                "PR #{number}: Git state could not be restored safely, so the worktree was kept \
+                 at {}",
+                work_dir.display()
+            );
+            return Err(e.clone());
+        }
+    }
+    if let Some(checkpoint) = &read_only_checkpoint {
+        repo.require_unchanged_worktree(
+            &work_dir,
+            checkpoint,
+            &format!("review worktree for PR #{number}"),
+        )?;
+    }
+
+    let after_act = repo.head_oid_checked(&work_dir);
+    let dirty = match repo.has_uncommitted_changes(&work_dir) {
+        Ok(dirty) => dirty,
+        Err(e) => {
+            if outcome.is_ok() {
+                outcome = Err(spar_err!(
+                    "could not verify whether the worktree at {} is clean: {}",
+                    work_dir.display(),
+                    e.last_line()
+                ));
+            }
+            true
+        }
+    };
+    let unpublished = match &outcome {
+        Ok(FixPublication::Unpublished(reason)) => Some(reason.clone()),
+        _ => None,
+    };
+    let head_changed_or_unknown = match &after_act {
+        Ok(after) => after != &before_act,
+        Err(_) => true,
+    };
+    let failed_work =
+        unpublished.is_some() || (outcome.is_err() && (dirty || head_changed_or_unknown));
+
+    if !cfg.loop_cfg.keep_worktrees && !failed_work {
         if can_push {
             repo.release_pr_worktree(number);
         } else {
-            repo.release_review_worktree(number);
+            repo.release_review_worktree_checked(
+                number,
+                read_only_checkpoint
+                    .as_ref()
+                    .expect("fork review checkout has a checkpoint"),
+            )?;
         }
+    } else if failed_work {
+        logwarn!(
+            "PR #{number}: failed work was kept at {} for recovery",
+            work_dir.display()
+        );
+    }
+    if let Some(reason) = unpublished {
+        state.status = Status::Error;
+        state.notes.push(reason);
     }
     outcome?;
     Ok(state)
@@ -569,7 +637,8 @@ fn inner_issue(
         "#{number} is an issue with no open pull request, so nothing can be changed. Answering \
          the comments."
     );
-    act(
+    let checkpoint = repo.worktree_checkpoint(repo.root())?;
+    let _ = act(
         agents,
         cfg,
         repo,
@@ -577,6 +646,7 @@ fn inner_issue(
         &issue.title,
         &found,
         repo.root(),
+        &checkpoint,
         None,
         false,
         mode,
@@ -619,12 +689,13 @@ fn act(
     title: &str,
     found: &Gathered,
     work_dir: &Path,
+    read_phase_checkpoint: &crate::repo::WorktreeCheckpoint,
     branch: Option<&str>,
     can_push: bool,
     mode: &Mode,
     state: &mut IssueRun,
     mut seen: Answered,
-) -> Result<()> {
+) -> Result<FixPublication> {
     let cap = cfg.loop_cfg.max_checkin_comments;
     let mut pending: Vec<Pending> = found.pending.clone();
     if pending.len() > cap {
@@ -671,6 +742,7 @@ fn act(
         cfg.effort_for_round(&checker.spec, 2).as_deref(),
     ) {
         Ok(doc) => doc.checks,
+        Err(e) if e.kind() == crate::error::ErrorKind::UncertainWrite => return Err(e),
         Err(e) => {
             // Not a degraded run that carries on regardless: with no second
             // opinion nothing may be implemented, and `settle` enforces that.
@@ -684,6 +756,7 @@ fn act(
             Vec::new()
         }
     };
+    repo.require_unchanged_worktree(work_dir, read_phase_checkpoint, "read-only check-in phase")?;
 
     // -- settle -----------------------------------------------------------
     let mut items: Vec<Settled> = Vec::new();
@@ -715,9 +788,11 @@ fn act(
     }
 
     // -- fix --------------------------------------------------------------
-    if items.iter().any(|i| i.ask == Ask::Implement) {
-        implement(agents, cfg, repo, number, work_dir, branch, &mut items)?;
-    }
+    let publication = if items.iter().any(|i| i.ask == Ask::Implement) {
+        implement(agents, cfg, repo, number, work_dir, branch, &mut items)?
+    } else {
+        FixPublication::NoCommit
+    };
 
     // -- file -------------------------------------------------------------
     for item in items.iter_mut().filter(|i| i.ask == Ask::Defer) {
@@ -760,7 +835,7 @@ fn act(
         }
     }
     state.status = Status::Answered;
-    Ok(())
+    Ok(publication)
 }
 
 fn render_verdicts(verdicts: &[CommentVerdict]) -> String {
@@ -789,7 +864,7 @@ fn implement(
     work_dir: &Path,
     branch: Option<&str>,
     items: &mut [Settled],
-) -> Result<()> {
+) -> Result<FixPublication> {
     let wanted: Vec<&Pending> = items
         .iter()
         .filter(|i| i.ask == Ask::Implement)
@@ -799,23 +874,41 @@ fn implement(
     let implementor = agent::find(agents, &name)?;
     log!("#{number}: {name} making {} agreed change(s)", wanted.len());
 
-    let before = repo
-        .git_try_at(Some(work_dir), &["rev-parse", "HEAD"])
-        .trim()
-        .to_string();
-    let report: FixReport = implementor.ask_json(
+    let before = repo.head_oid_checked(work_dir)?;
+    let worktree_baseline = repo.worktree_baseline(work_dir)?;
+    let report: FixReport = match implementor.edit_json(
         &FIX_PROMPT
             .replace("{fence}", NOT_INSTRUCTION)
             .replace("{comments}", &listed(&wanted)),
         &schema::checkin_fix(),
         work_dir,
         cfg.effort_for_round(&implementor.spec, 1).as_deref(),
-    )?;
-    let after = repo
-        .git_try_at(Some(work_dir), &["rev-parse", "HEAD"])
-        .trim()
-        .to_string();
-
+    ) {
+        Ok(report) => report,
+        Err(call) if call.kind() == crate::error::ErrorKind::UncertainWrite => return Err(call),
+        Err(call) => {
+            if let Err(recovery) =
+                repo.refuse_unrepresented_tracked_changes(work_dir, &worktree_baseline)
+            {
+                return Err(crate::error::SparError::uncertain_write(format!(
+                    "{}\n{}",
+                    call.message(),
+                    recovery.message()
+                )));
+            }
+            match repo.refuse_new_ignored_files(work_dir, &worktree_baseline) {
+                Ok(()) => return Err(call),
+                Err(recovery) => {
+                    return Err(crate::error::SparError::uncertain_write(format!(
+                        "{}\n{}",
+                        call.message(),
+                        recovery.message()
+                    )));
+                }
+            }
+        }
+    };
+    repo.refuse_changed_attributes(work_dir, &worktree_baseline)?;
     for item in items.iter_mut().filter(|i| i.ask == Ask::Implement) {
         if let Some(done) = report
             .done
@@ -845,14 +938,48 @@ fn implement(
         }
     };
 
-    if before == after || after.is_empty() {
+    let changed: Vec<&str> = items
+        .iter()
+        .filter(|item| item.ask == Ask::Implement && item.changed)
+        .map(|item| item.summary.trim())
+        .filter(|summary| !summary.is_empty())
+        .collect();
+    let has_reported_change = items
+        .iter()
+        .any(|item| item.ask == Ask::Implement && item.changed);
+    if has_reported_change {
+        repo.commit_pending_changes(
+            work_dir,
+            &worktree_baseline,
+            &changed.join("; "),
+            &format!("Address review comments on #{number}"),
+        )?;
+        repo.refuse_unrepresented_tracked_changes(work_dir, &worktree_baseline)?;
+    } else {
+        repo.refuse_unrepresented_tracked_changes(work_dir, &worktree_baseline)?;
+        let dirty = repo.has_uncommitted_changes(work_dir)?;
+        let after = repo.head_oid_checked(work_dir)?;
+        if !dirty && before == after {
+            repo.refuse_new_ignored_files(work_dir, &worktree_baseline)?;
+        }
+        require_no_unreported_work(work_dir, before.as_str(), after.as_str(), dirty)?;
         logwarn!("#{number}: nothing was committed, so nothing is being claimed as fixed");
         downgrade(items, "nothing was committed");
-        return Ok(());
+        return Ok(FixPublication::NoCommit);
+    }
+    let after = repo.head_oid_checked(work_dir)?;
+
+    if before == after {
+        repo.refuse_new_ignored_files(work_dir, &worktree_baseline)?;
+        logwarn!("#{number}: nothing was committed, so nothing is being claimed as fixed");
+        downgrade(items, "nothing was committed");
+        return Ok(FixPublication::NoCommit);
     }
     let Some(branch) = branch else {
         downgrade(items, "the branch is on a fork, so spar cannot push to it");
-        return Ok(());
+        return Ok(FixPublication::Unpublished(
+            "the local fix commit could not be pushed because the branch is on a fork".into(),
+        ));
     };
 
     repo.rewrite_commits_if_needed(work_dir, cfg.base_branch())?;
@@ -862,13 +989,33 @@ fn implement(
                 item.pushed = true;
             }
             log!("#{number}: pushed to {branch}");
+            Ok(FixPublication::Pushed)
         }
         Err(e) => {
             logwarn!("#{number}: could not push, so nothing is being claimed as fixed.\n{e}");
             downgrade(items, "the push was refused");
+            Ok(FixPublication::Unpublished(format!(
+                "the local fix commit was kept at {} because the push was refused: {e}",
+                work_dir.display()
+            )))
         }
     }
-    Ok(())
+}
+
+fn require_no_unreported_work(
+    work_dir: &Path,
+    before: &str,
+    after: &str,
+    dirty: bool,
+) -> Result<()> {
+    if !dirty && before == after {
+        return Ok(());
+    }
+    bail!(
+        "the implementation reported no requested changes after changing {}. The worktree was \
+         kept for recovery.",
+        work_dir.display()
+    )
 }
 
 /// Reply in each thread, then post one comment for everything with no thread,
@@ -1297,6 +1444,21 @@ mod tests {
         let out = thread_reply(&item, &Style::default());
         assert!(out.contains("Not pushed"), "{out}");
         assert!(out.contains("the push was refused"), "{out}");
+    }
+
+    #[test]
+    fn a_report_of_no_changes_requires_the_head_to_stay_put() {
+        let path = Path::new("/tmp/checkin-recovery");
+        require_no_unreported_work(path, "before", "before", false).unwrap();
+
+        let committed = require_no_unreported_work(path, "before", "after", false).unwrap_err();
+        assert!(committed
+            .message()
+            .contains("reported no requested changes"));
+        assert!(committed.message().contains("/tmp/checkin-recovery"));
+
+        let dirty = require_no_unreported_work(path, "before", "before", true).unwrap_err();
+        assert!(dirty.message().contains("kept for recovery"));
     }
 
     /// The absence of anything to say is the message, on the same principle as

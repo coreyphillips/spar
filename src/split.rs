@@ -39,7 +39,7 @@ use crate::model::{
     Implementation, Issue, IssueRun, ItemKind, PrRow, PrView, SplitCheck, SplitPart, SplitProposal,
     SplitScreen, SplitScreenDoc, Status,
 };
-use crate::repo::{Repo, SplitPushError};
+use crate::repo::{Repo, SplitPushError, WorktreeCheckpoint};
 use crate::style::{self, Style};
 use crate::{bail, log, logdim, logwarn, schema, spar_err};
 
@@ -132,10 +132,11 @@ This branch holds one part of pull request #{parent}, split out of it. The other
 parts are not here and are not coming.
 
 Make this part stand on its own against `{base}`. Read what is here, add whatever
-it needs to build and to pass its tests without the rest, and commit.
+it needs to build and to pass its tests without the rest, and leave those edits
+uncommitted for the harness.
 
 If it cannot stand on its own, set not_worth_doing=true and give the reason. Make
-no further commits in that case, and the part is dropped rather than pushed
+no changes in that case, and the part is dropped rather than pushed
 broken. The whole value of splitting is that each part can be reviewed and merged
 independently, and a part that does not build has none of it.
 
@@ -816,6 +817,7 @@ fn pr_inner(
 
     let head_ref = crate::repo::review_ref(number);
     let read_only = repo.worktree_for_pr_head(number)?;
+    let checkpoint = repo.worktree_checkpoint(&read_only)?;
     let head_oid = repo
         .git_at(Some(&read_only), &["rev-parse", "HEAD"])?
         .trim()
@@ -824,12 +826,22 @@ fn pr_inner(
         bail!("could not read the fetched head of PR #{number}");
     }
     let outcome = split_pr_inner(
-        agents, cfg, repo, &pr, &base, &head_ref, &head_oid, &read_only, mode, &mut state,
+        agents,
+        cfg,
+        repo,
+        &pr,
+        &base,
+        &head_ref,
+        &head_oid,
+        &read_only,
+        &checkpoint,
+        mode,
+        &mut state,
     );
-    if !cfg.loop_cfg.keep_worktrees {
-        repo.release_review_worktree(number);
-    }
     outcome?;
+    if !cfg.loop_cfg.keep_worktrees {
+        repo.release_review_worktree_checked(number, &checkpoint)?;
+    }
     Ok(state)
 }
 
@@ -843,6 +855,7 @@ fn split_pr_inner(
     head_ref: &str,
     head_oid: &str,
     read_only: &Path,
+    checkpoint: &WorktreeCheckpoint,
     mode: &Mode,
     state: &mut IssueRun,
 ) -> Result<()> {
@@ -868,6 +881,11 @@ fn split_pr_inner(
         &format!("PR #{number}"),
         &prompt,
         &format!("pull request #{number}"),
+    )?;
+    repo.require_unchanged_worktree(
+        read_only,
+        checkpoint,
+        &format!("review worktree for PR #{number}"),
     )?;
     for path in confine(&mut decision.parts, &changed) {
         logdim!("PR #{number}: a part named `{path}`, which this change does not touch");
@@ -1062,21 +1080,58 @@ struct Built {
 
 enum BuildOne {
     Made(Built),
-    Declined,
+    Declined {
+        disposable_head: String,
+    },
     Halted {
         reason: String,
-        retain_worktree: bool,
+        /// An exact mechanical-slice tip that may be discarded. `None` means
+        /// the worktree contains or may contain recovery work and must stay.
+        disposable_head: Option<String>,
     },
 }
 
 impl BuildOne {
-    fn push_failed(branch: &str, error: &SplitPushError) -> Self {
-        let retain_worktree = error.retain_worktree();
-        let reason = if retain_worktree {
+    fn parent_moved(
+        error: &crate::error::SparError,
+        dir: &Path,
+        disposable_head: Option<String>,
+    ) -> Self {
+        let reason = if disposable_head.is_none() {
+            format!(
+                "{error}. The stand-alone worktree was not confirmed to match its mechanical \
+                 slice, so it was kept at {} for recovery.",
+                dir.display()
+            )
+        } else {
+            error.to_string()
+        };
+        Self::Halted {
+            reason,
+            disposable_head,
+        }
+    }
+
+    fn push_failed(
+        branch: &str,
+        error: &SplitPushError,
+        mut disposable_head: Option<String>,
+    ) -> Self {
+        let remote_uncertain = error.retain_worktree();
+        if remote_uncertain {
+            disposable_head = None;
+        }
+        let reason = if remote_uncertain {
             format!(
                 "{error}\nThe split stopped because `{branch}` may now exist on origin. Its local \
                  worktree and branch record were kept. Inspect the exact remote ref before \
                  continuing."
+            )
+        } else if disposable_head.is_none() {
+            format!(
+                "could not create the new branch `{branch}`: {error}\nThe stand-alone worktree was \
+                 not confirmed to match its mechanical slice, so its worktree and branch record \
+                 were kept for recovery."
             )
         } else {
             format!(
@@ -1086,7 +1141,7 @@ impl BuildOne {
         };
         Self::Halted {
             reason,
-            retain_worktree,
+            disposable_head,
         }
     }
 }
@@ -1240,17 +1295,37 @@ fn build_parts(
                     against = branch;
                 }
             }
-            Ok(BuildOne::Declined) => {
-                repo.release_split_worktree(&dir, &branch);
+            Ok(BuildOne::Declined { disposable_head }) => {
+                if !repo.discard_split_worktree(&dir, &branch, &disposable_head) {
+                    let reason = format!(
+                        "part {index} was declined, but its exact mechanical slice could not be \
+                         discarded safely. The worktree and branch were kept at {} for recovery.",
+                        dir.display()
+                    );
+                    worktrees.push((dir, branch));
+                    return Ok(BuiltParts {
+                        made,
+                        worktrees,
+                        failure: Some(reason),
+                    });
+                }
             }
             Ok(BuildOne::Halted {
-                reason,
-                retain_worktree,
+                mut reason,
+                disposable_head,
             }) => {
-                if retain_worktree {
-                    worktrees.push((dir, branch));
-                } else {
-                    repo.release_split_worktree(&dir, &branch);
+                match disposable_head {
+                    Some(head) => {
+                        if !repo.discard_split_worktree(&dir, &branch, &head) {
+                            reason.push_str(&format!(
+                                "\nThe exact mechanical slice could not be discarded safely. Its \
+                                 worktree and branch were kept at {} for recovery.",
+                                dir.display()
+                            ));
+                            worktrees.push((dir, branch));
+                        }
+                    }
+                    None => worktrees.push((dir, branch)),
                 }
                 return Ok(BuiltParts {
                     made,
@@ -1259,9 +1334,19 @@ fn build_parts(
                 });
             }
             Err(e) => {
-                logwarn!("  part {index} could not be made: {e}");
-                state.notes.push(format!("dropped {}: {e}", label(part)));
-                repo.release_split_worktree(&dir, &branch);
+                let reason = format!(
+                    "part {index} could not be completed: {e}. Its worktree and branch were kept \
+                     at {} for recovery.",
+                    dir.display()
+                );
+                logwarn!("  {reason}");
+                state.notes.push(format!("halted {}: {e}", label(part)));
+                worktrees.push((dir, branch));
+                return Ok(BuiltParts {
+                    made,
+                    worktrees,
+                    failure: Some(reason),
+                });
             }
         }
     }
@@ -1322,9 +1407,14 @@ fn build_one(
     if !apply_slice(repo, dir, parent.base, parent.head_ref, &part.files)? {
         bail!("applying its files changed nothing");
     }
-    let subject = format!("{} (part {index} of #{number})", part.title.trim());
-    repo.git_at(Some(dir), &["commit", "-m", &subject])
-        .map_err(|e| spar_err!("could not commit the slice: {}", e.last_line()))?;
+    let raw_subject = format!("{} (part {index} of #{number})", part.title.trim());
+    let mut subject = repo.clean_title(&raw_subject)?;
+    if subject.trim().is_empty() {
+        subject = format!("Make part {index} of #{number}");
+    }
+    repo.commit_staged_changes(dir, &subject)
+        .map_err(|e| e.with_message(format!("could not commit the slice: {}", e.last_line())))?;
+    let slice_head = repo.head_oid_checked(dir)?;
 
     let prompt = STAND_ALONE_PROMPT
         .replace("{parent}", &number.to_string())
@@ -1334,13 +1424,115 @@ fn build_one(
         .replace("{title}", part.title.trim())
         .replace("{body}", part.body.trim())
         .replace("{files}", &listed(&part.files));
-    let work: Implementation = implementor.ask_json(
+    let worktree_baseline = repo.worktree_baseline(dir)?;
+    let work: Implementation = match implementor.edit_json(
         &prompt,
         &schema::implementation(),
         dir,
         cfg.effort_for_round(&implementor.spec, 1).as_deref(),
-    )?;
+    ) {
+        Ok(work) => work,
+        Err(e) if e.kind() == ErrorKind::UncertainWrite => {
+            return Ok(BuildOne::Halted {
+                reason: format!(
+                    "{e}. Git state could not be restored safely, so the worktree was kept at {} \
+                     for recovery.",
+                    dir.display()
+                ),
+                disposable_head: None,
+            });
+        }
+        Err(e) => {
+            if let Err(recovery) =
+                repo.refuse_unrepresented_tracked_changes(dir, &worktree_baseline)
+            {
+                return Ok(BuildOne::Halted {
+                    reason: format!(
+                        "{e}. The editing call also changed tracked working-file bytes or modes: \
+                         {recovery}. The worktree was kept at {} for recovery.",
+                        dir.display()
+                    ),
+                    disposable_head: None,
+                });
+            }
+            if let Err(ignored) = repo.refuse_new_ignored_files(dir, &worktree_baseline) {
+                return Ok(BuildOne::Halted {
+                    reason: format!(
+                        "{e}. The editing call also left ignored work or its ignored files could \
+                         not be checked: {ignored}. The worktree was kept at {} for recovery.",
+                        dir.display()
+                    ),
+                    disposable_head: None,
+                });
+            }
+            return failed_part_edit(repo, dir, &slice_head, e);
+        }
+    };
+    if let Err(e) = repo.refuse_changed_attributes(dir, &worktree_baseline) {
+        return Ok(BuildOne::Halted {
+            reason: format!(
+                "the stand-alone edit changed an attribute file: {e}. The worktree was kept at \
+                 {} for recovery.",
+                dir.display()
+            ),
+            disposable_head: None,
+        });
+    }
     if work.not_worth_doing {
+        if let Err(e) = repo.refuse_changed_existing_untracked(dir, &worktree_baseline) {
+            return Ok(BuildOne::Halted {
+                reason: format!(
+                    "part {index} was declined after changing existing untracked work: {e}. The \
+                     worktree was kept at {} for recovery.",
+                    dir.display()
+                ),
+                disposable_head: None,
+            });
+        }
+        if let Err(e) = repo.refuse_unrepresented_tracked_changes(dir, &worktree_baseline) {
+            return Ok(BuildOne::Halted {
+                reason: format!(
+                    "part {index} was declined after changing tracked working-file bytes or modes: \
+                     {e}. The worktree was kept at {} for recovery.",
+                    dir.display()
+                ),
+                disposable_head: None,
+            });
+        }
+        match work_since_slice(repo, dir, &slice_head) {
+            Ok(true) => {
+                return Ok(BuildOne::Halted {
+                    reason: format!(
+                        "part {index} was declined after its worktree changed. The worktree was \
+                         kept at {} for recovery.",
+                        dir.display()
+                    ),
+                    disposable_head: None,
+                });
+            }
+            Err(e) => {
+                return Ok(BuildOne::Halted {
+                    reason: format!(
+                        "part {index} was declined, but its worktree state could not be verified: \
+                         {e}. The worktree was kept at {} for recovery.",
+                        dir.display()
+                    ),
+                    disposable_head: None,
+                });
+            }
+            Ok(false) => {
+                if let Err(e) = repo.refuse_new_ignored_files(dir, &worktree_baseline) {
+                    return Ok(BuildOne::Halted {
+                        reason: format!(
+                            "part {index} created ignored work that could not be included: {e}. \
+                             The worktree was kept at {} for recovery.",
+                            dir.display()
+                        ),
+                        disposable_head: None,
+                    });
+                }
+            }
+        }
         let reason = style::sentence(&work.reason, &repo.style);
         log!(
             "  part {index} will not stand on its own, dropping it: {}",
@@ -1350,28 +1542,73 @@ fn build_one(
                 &reason
             }
         );
-        return Ok(BuildOne::Declined);
-    }
-
-    // The slice is already committed, so a push would succeed with whatever the
-    // stand-alone pass left in the tree missing from it. That is the one shape
-    // of failure this cannot see afterwards: the part arrives without exactly
-    // the fixes that were supposed to make it stand on its own.
-    if uncommitted(repo, dir) {
-        bail!("it left its stand-alone fixes uncommitted");
-    }
-
-    // The invariant, asserted at the one place a split writes a branch.
-    additive(branch, parent.head_branch, &repo.branch_prefix)?;
-    repo.rewrite_commits_if_needed(dir, against)?;
-    if let Err(e) = ensure_parent_head(repo, number, parent.head_oid) {
-        return Ok(BuildOne::Halted {
-            reason: e.to_string(),
-            retain_worktree: false,
+        return Ok(BuildOne::Declined {
+            disposable_head: slice_head,
         });
     }
+
+    let committed = repo
+        .commit_pending_changes(
+            dir,
+            &worktree_baseline,
+            &work.summary,
+            &format!("Make part {index} of #{number} stand alone"),
+        )
+        .and_then(|committed| {
+            repo.refuse_unrepresented_tracked_changes(dir, &worktree_baseline)?;
+            Ok(committed)
+        });
+    if let Err(e) = committed {
+        return failed_part_edit(repo, dir, &slice_head, e);
+    }
+    let stand_alone_work = match work_since_slice(repo, dir, &slice_head) {
+        Ok(false) => {
+            if let Err(e) = repo.refuse_new_ignored_files(dir, &worktree_baseline) {
+                return Ok(BuildOne::Halted {
+                    reason: format!(
+                        "the stand-alone edit created ignored work that could not be included: \
+                         {e}. The worktree was kept at {} for recovery.",
+                        dir.display()
+                    ),
+                    disposable_head: None,
+                });
+            }
+            false
+        }
+        Ok(true) => true,
+        Err(e) => {
+            return Ok(BuildOne::Halted {
+                reason: format!(
+                    "the stand-alone worktree could not be verified after editing: {e}. It was \
+                     kept at {} for recovery.",
+                    dir.display()
+                ),
+                disposable_head: None,
+            });
+        }
+    };
+
+    // Every failure from here to a confirmed push is classified against the
+    // mechanical slice. Stand-alone work is kept, while a clean slice with no
+    // additional edit preserves the old drop behavior.
+    if let Err(e) = additive(branch, parent.head_branch, &repo.branch_prefix) {
+        return failed_part_edit(repo, dir, &slice_head, e);
+    }
+    if let Err(e) = repo.rewrite_commits_if_needed(dir, against) {
+        return failed_part_edit(repo, dir, &slice_head, e);
+    }
+    let disposable_head = if stand_alone_work {
+        None
+    } else if repo.head_oid_checked(dir)? == slice_head {
+        Some(slice_head.clone())
+    } else {
+        None
+    };
+    if let Err(e) = ensure_parent_head(repo, number, parent.head_oid) {
+        return Ok(BuildOne::parent_moved(&e, dir, disposable_head));
+    }
     if let Err(e) = repo.push_split_branch(dir, branch) {
-        return Ok(BuildOne::push_failed(branch, &e));
+        return Ok(BuildOne::push_failed(branch, &e, disposable_head));
     }
 
     if let Err(e) = ensure_parent_head(repo, number, parent.head_oid) {
@@ -1382,7 +1619,7 @@ fn build_one(
                  record it on #{number}. To start over, remove every retained local worktree and \
                  branch, child pull request, and remote split branch first."
             ),
-            retain_worktree: true,
+            disposable_head: None,
         });
     }
 
@@ -1403,9 +1640,55 @@ fn build_one(
                  retained local worktree and branch, child pull request, and remote split branch \
                  first."
             ),
-            retain_worktree: true,
+            disposable_head: None,
         }),
     }
+}
+
+fn failed_part_edit(
+    repo: &Repo,
+    dir: &Path,
+    slice_head: &str,
+    error: crate::error::SparError,
+) -> Result<BuildOne> {
+    if error.kind() == crate::error::ErrorKind::UncertainWrite {
+        return Ok(BuildOne::Halted {
+            reason: format!(
+                "{error}. Git state could not be restored safely, so the worktree was kept at {} \
+                 for recovery.",
+                dir.display()
+            ),
+            disposable_head: None,
+        });
+    }
+    match work_since_slice(repo, dir, slice_head) {
+        Ok(false) => Ok(BuildOne::Halted {
+            reason: error.to_string(),
+            disposable_head: Some(slice_head.to_string()),
+        }),
+        Ok(true) => Ok(BuildOne::Halted {
+            reason: format!(
+                "{error}. The editing worktree was kept at {} for recovery.",
+                dir.display()
+            ),
+            disposable_head: None,
+        }),
+        Err(probe) => Ok(BuildOne::Halted {
+            reason: format!(
+                "{error}. The editing worktree could not be verified: {probe}. It was kept at {} \
+                 for recovery.",
+                dir.display()
+            ),
+            disposable_head: None,
+        }),
+    }
+}
+
+fn work_since_slice(repo: &Repo, dir: &Path, slice_head: &str) -> Result<bool> {
+    if repo.has_uncommitted_changes(dir)? {
+        return Ok(true);
+    }
+    Ok(repo.head_oid_checked(dir)? != slice_head)
 }
 
 /// Whether anything in this tree is missing from the commit, untracked files
@@ -1417,10 +1700,7 @@ fn build_one(
 ///
 /// Public so that it can be tested against a real repository.
 pub fn uncommitted(repo: &Repo, dir: &Path) -> bool {
-    !repo
-        .git_try_at(Some(dir), &["status", "--porcelain"])
-        .trim()
-        .is_empty()
+    repo.has_uncommitted_changes(dir).unwrap_or(true)
 }
 
 /// Put one slice of the parent's change on this branch.
@@ -2120,12 +2400,12 @@ mod tests {
     #[test]
     fn a_push_collision_halts_instead_of_dropping_one_part() {
         let error = SplitPushError::new("the create-only lease was rejected", false);
-        match BuildOne::push_failed("split-34-1", &error) {
+        match BuildOne::push_failed("split-34-1", &error, Some("slice".into())) {
             BuildOne::Halted {
                 reason,
-                retain_worktree,
+                disposable_head,
             } => {
-                assert!(!retain_worktree);
+                assert_eq!(Some("slice".to_string()), disposable_head);
                 assert!(reason.contains("stopped"), "{reason}");
                 assert!(reason.contains("competing pull requests"), "{reason}");
             }
@@ -2136,12 +2416,12 @@ mod tests {
     #[test]
     fn an_unverified_push_halts_and_keeps_the_worktree() {
         let error = SplitPushError::new("origin could not be read", true);
-        match BuildOne::push_failed("split-34-1", &error) {
+        match BuildOne::push_failed("split-34-1", &error, Some("slice".into())) {
             BuildOne::Halted {
                 reason,
-                retain_worktree,
+                disposable_head,
             } => {
-                assert!(retain_worktree);
+                assert!(disposable_head.is_none());
                 assert!(reason.contains("may now exist on origin"), "{reason}");
                 assert!(
                     reason.contains("worktree and branch record were kept"),
@@ -2149,6 +2429,42 @@ mod tests {
                 );
             }
             _ => panic!("an unverified push did not halt the split"),
+        }
+    }
+
+    #[test]
+    fn a_definite_push_refusal_keeps_stand_alone_edit_work() {
+        let error = SplitPushError::new("origin is known not to contain the branch", false);
+        match BuildOne::push_failed("split-34-1", &error, None) {
+            BuildOne::Halted {
+                reason,
+                disposable_head,
+            } => {
+                assert!(disposable_head.is_none());
+                assert!(
+                    reason.contains("not confirmed to match its mechanical slice"),
+                    "{reason}"
+                );
+                assert!(reason.contains("kept for recovery"), "{reason}");
+            }
+            _ => panic!("a local edit was dropped after the push refusal"),
+        }
+    }
+
+    #[test]
+    fn a_parent_move_keeps_stand_alone_edit_work() {
+        let error = SparError::new("the parent head moved before the push");
+        match BuildOne::parent_moved(&error, Path::new("/tmp/split-part"), None) {
+            BuildOne::Halted {
+                reason,
+                disposable_head,
+            } => {
+                assert!(disposable_head.is_none());
+                assert!(reason.contains("parent head moved"), "{reason}");
+                assert!(reason.contains("/tmp/split-part"), "{reason}");
+                assert!(reason.contains("kept"), "{reason}");
+            }
+            _ => panic!("a local edit was dropped after the parent moved"),
         }
     }
 

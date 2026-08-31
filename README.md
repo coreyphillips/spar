@@ -383,12 +383,13 @@ rebuttal.
 This is also the cheapest way to adopt spar. No agent writes a feature from
 scratch; it only reviews what already exists.
 
-Resuming needs state that GitHub cannot provide. Every agent commits and
-comments as the same git identity, so `author` is always the human who ran spar,
-and authorship reveals nothing about who acted last. So spar keeps its own
-state: round number, whose turn is next, and the full disputed ledger. That
-lives in `.spar/state/` by default, and can also travel on the PR as a hidden
-comment (`state_store = "pr"`) if a run might be picked up from another machine.
+Resuming needs state that GitHub cannot provide. Spar records accepted changes
+and comments through the same git and GitHub identities, so `author` is always
+the human who ran spar and authorship reveals nothing about who acted last. Spar
+therefore keeps its own state: round number, whose turn is next, and the full
+disputed ledger. That lives in `.spar/state/` by default, and can also travel on
+the PR as a hidden comment (`state_store = "pr"`) if a run might be picked up
+from another machine.
 
 Each checkpoint is bound to the exact published PR head. If the branch moves
 without a matching checkpoint, `resume` refuses to guess who may safely review
@@ -631,12 +632,12 @@ These are code-level guards, not requests left to a prompt.
 
 A slice that will not stand alone is not a slice. If the agent cannot make a part
 build and pass on its own branch it says so, and the part is dropped rather than
-pushed broken. So is a part whose fixes were left uncommitted, since what is not
-committed is not what gets pushed. The whole value of splitting is that each part
-can be reviewed and merged on its own, and a part that does not build has none of
-it. If dropping parts leaves only one, nothing was decomposed: the one that was
-made is still named on the original, and the run reports the pull request as left
-whole.
+pushed broken. Spar commits a successful stand-alone edit before pushing it. If
+the edit or commit fails after changing files, the split stops and keeps that
+part's worktree for recovery. The whole value of splitting is that each part can
+be reviewed and merged on its own, and a part that does not build has none of it.
+If dropping parts leaves only one, nothing was decomposed: the one that was made
+is still named on the original, and the run reports the pull request as left whole.
 
 Whether the parts are independent or stacked is a property of the change rather
 than of the repository, so it rides on the proposal instead of `spar.toml`.
@@ -654,7 +655,8 @@ retained local worktree and branch, child pull request, and remote split branch.
 
 Once every child pull request exists, successful part worktrees and local
 branches are released together unless `[loop] keep_worktrees = true`. A failure
-after a push keeps them so the partial result can be inspected and recovered.
+after an editing call changes files or commits, or after a push, keeps them so
+the partial result can be inspected and recovered.
 
 A pull request from a fork is proposed, not split: spar cannot push to the fork,
 and carving somebody's contribution into pull requests of your own without asking
@@ -849,20 +851,20 @@ blocking-findings-empty rather than reviewer-satisfied.
 
 **A reviewer reading its own commit.** "Neither agent reviews its own most
 recent edit" was enforced from what the reviewer said it would do next rather
-than from what landed. A `fix_myself` call that returned without committing
-handed the author back its own commit, and a reviewer that committed during the
-review kept a pull request whose head it had written. Custody follows `HEAD`,
-which is recorded either side of every call: a review that writes is rolled
-back, and the next reviewer is chosen from whoever actually moved it. A review
-that wrote cannot approve either, because the branch it passed is the one the
-rollback has just taken away.
+than from what landed. Custody now follows checked `HEAD` values on both sides
+of every call. Spar commits an accepted fix before choosing the next reviewer.
+The custody loop rolls back a review pass that writes before it can count as
+approval. Detached review, split, and check-in inspections instead stop and keep
+the worktree if files or `HEAD` change.
 
-Only commits reach the pull request, so tracked files a call leaves uncommitted
-are discarded rather than shown to the next reviewer as if they were the diff.
-Nothing is discarded silently: it is parked with `git stash create` first, and
-the log prints the `git stash apply` that puts it back. That matters most with
-`--no-worktrees`, where the checkout is yours and an edit you make while a call
-is running is indistinguishable from one an agent left behind.
+Successful editing calls leave their files uncommitted, and spar stages and
+commits them only after accepting the structured report. A failed editing call
+that changed files is not retried or handed to a fallback. Unsafe Git state or
+uncommitted output stops the run and keeps the worktree and diagnostic for
+recovery. A failed initial implementation that already made durable commits can
+continue from those commits. With `--no-worktrees`, spar refuses to reset dirty
+or unpreserved work in the shared checkout, including an off-checkout target
+branch left by an earlier run.
 
 **Merge authority.** Two models agreeing is not the same as being right, and
 neither carries the consequences. `--auto-merge` is off by default; the terminal
@@ -961,6 +963,25 @@ Placeholders: `{prompt}` `{system}` `{model}` `{effort}` `{cwd}` `{schema}`
 
 An argument group whose placeholder is unset is dropped whole, so omitting
 `model` drops the `-m` flag rather than passing an empty string.
+
+Spar does not add writable Git metadata paths to editing commands. They leave
+changes in the working tree, then spar stages and commits them after the
+structured report is accepted. A command that already runs in a sandbox can
+therefore edit a linked worktree without being granted direct write access to
+the repository's objects, refs, config, or hooks. Commands without their own
+sandbox keep their normal host permissions. Managed commits disable signing and
+commit hooks; the eventual merge can still be signed. On Unix, spar also stops
+remaining descendants when the direct command exits before inspecting the
+worktree. On other platforms, a command must not return until its children have
+finished writing. Spar refuses to stage a changed `.gitattributes` or gitlink,
+since attributes can select an external Git filter and nested repository
+objects may exist only in that worktree. If a call leaves uncommitted output or
+unsafe Git state, spar keeps the worktree and reports its path for recovery. A
+failed initial implementation that already made durable commits can continue
+from them. Ignored files outside known build and cache directories stop the
+commit because they may be required work. Recognized test and build artifacts,
+such as files under `target/`, are left in place with a warning and do not block
+the tracked change from reaching review.
 
 Include `{schema}` or `{schema_file}` and spar uses the CLI's native structured
 output. This is worth doing rather than optional: without it spar asks for JSON
@@ -1085,16 +1106,32 @@ spar init --force             # overwrite an existing config
 the only command that triages and so the only one that can decline an issue.
 
 Each issue gets its own git worktree so a failed run cannot poison the next
-one's base. A worktree is released as soon as its run reaches a terminal
-outcome, and kept only on `escalated` or `error`, where you may want to inspect
-local state. Commands that expose the run flags accept `--keep-worktrees` to
-hold on to them regardless, or `--no-worktrees` to work directly in the main
-checkout. `split` takes neither lifecycle flag; set `[loop] keep_worktrees =
-true` when its successful part worktrees should remain.
+one's base. When a run reaches a terminal outcome, spar releases its worktree
+only after proving that removal will not discard recoverable files or Git
+state. An `escalated` or `error` outcome keeps it for inspection. Commands that
+expose the run flags accept `--keep-worktrees` to hold on to them regardless,
+or `--no-worktrees` to work directly in the main checkout. `split` takes neither
+lifecycle flag; set `[loop] keep_worktrees = true` when its successful part
+worktrees should remain.
+
+Managed commits require the isolated worktree. In `--no-worktrees` mode, an
+editing command that leaves files uncommitted stops the run and keeps them in
+the shared checkout. Spar cannot safely distinguish those files from edits its
+owner made while the command was running. A command that commits directly keeps
+the prior shared-checkout behavior.
 
 Releasing matters for more than tidiness: a stranded worktree holds its branch
 checked out, which makes a later `gh pr merge --delete-branch` fail to clean up.
-Runs also sweep any finished worktrees on start.
+Runs also sweep finished worktrees on start, but ordinary cleanup keeps any
+worktree with dirty, ignored, or untracked files; changed raw bytes or modes;
+initialized submodules or nested repositories; unreadable Git state; detached
+or reflog-only commits; per-worktree refs or configuration; or a local commit
+that no shared ref preserves. Checkouts with external filters, encodings,
+identity expansion, or ambiguous line-ending rules are also retained when exact
+reconstruction cannot be proved. It verifies that a candidate path belongs to
+this repository before removing it, and ordinary cleanup never forces removal.
+`spar clean --all` is the explicit force path for worktrees and branches spar
+recorded owning.
 
 Cleanup only ever touches local branches spar recorded creating. Branch names
 default to `issue-N`, `pr-N`, and `split-N-I`, with a numeric suffix when a split

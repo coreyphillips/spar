@@ -1,12 +1,17 @@
 //! git and gh. Every outbound string passes through the style and concision
 //! gates before it reaches GitHub.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
+use std::fs::OpenOptions;
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use serde::Deserialize;
 use serde_json::Value;
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
 
 use crate::config::{Config, Drafts, Followups, StateStore};
 use crate::error::Result;
@@ -14,7 +19,7 @@ use crate::model::{Followup, Issue, IssueRef, ItemKind, PersistedState, PrRef, P
 use crate::proc::{self, ExecOpts};
 use crate::style::{self, Style};
 use crate::textsim;
-use crate::{bail, logdim, spar_err};
+use crate::{bail, logdim, logwarn, spar_err};
 
 /// gh returns newest first, so its `--limit` cannot be used to take the lowest
 /// numbered items: it would slice the newest N and then sorting that slice
@@ -102,8 +107,190 @@ pub struct Repo {
     checkpoints: Mutex<BTreeMap<i64, u64>>,
 }
 
-fn merge_pr_args<'a>(number: &'a str, expected_head: Option<&'a str>) -> Vec<&'a str> {
-    let mut args = vec!["pr", "merge", number, "--squash", "--delete-branch"];
+/// Ignored, untracked paths present before an editing call starts.
+///
+/// Existing build artifacts are deliberately part of the baseline. Callers can
+/// therefore distinguish them from an ignored file the editing call created
+/// and avoid deleting the latter as if no work had happened.
+#[derive(Debug, Clone)]
+pub(crate) struct WorktreeBaseline {
+    attributes: AttributeState,
+    ignored_untracked: IgnoredState,
+    git_state: GitState,
+}
+
+/// The recorded Git state of a worktree that must remain read only.
+///
+/// Read-only agent calls are still ordinary processes. Capturing the complete
+/// working state lets callers refuse to publish their answer or delete the
+/// checkout if a call writes despite its instructions.
+#[derive(Debug, Clone)]
+pub(crate) struct WorktreeCheckpoint {
+    path: PathBuf,
+    attributes: AttributeState,
+    git_state: GitState,
+    ignored_untracked: IgnoredState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AttributeState {
+    files: BTreeMap<PathBuf, [u8; 32]>,
+}
+
+/// Exact paths and fingerprints for every untracked file, plus ignored paths.
+///
+/// Paths stay as operating-system strings so a non-UTF-8 filename cannot be
+/// merged with another path by lossy command-output conversion.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct IgnoredState {
+    files: BTreeMap<PathBuf, UntrackedFile>,
+    ignored: BTreeSet<PathBuf>,
+}
+
+/// A bounded-cost fingerprint for an untracked filesystem entry.
+///
+/// Content hashing every ignored compiler artifact made each checkpoint read
+/// gigabytes. File identity, type, size, timestamps, and mode detect ordinary
+/// writes without rereading build output. Unix change time also changes when a
+/// writer restores the modification time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UntrackedFile {
+    kind: u8,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    created: Option<std::time::SystemTime>,
+    readonly: bool,
+    symlink_target: Option<Vec<u8>>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    change_seconds: i64,
+    #[cfg(unix)]
+    change_nanoseconds: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GitState {
+    repositories: BTreeMap<PathBuf, RepositoryState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepositoryState {
+    head: String,
+    unsafe_index_flags: Vec<u8>,
+    tracked: BTreeMap<PathBuf, TrackedEntry>,
+    gitlinks: BTreeMap<PathBuf, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrackedEntry {
+    index_mode: String,
+    index_oid: String,
+    worktree: Option<WorktreeFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorktreeFile {
+    mode: String,
+    #[cfg(unix)]
+    permissions: u32,
+    raw_oid: String,
+    fingerprint: [u8; 32],
+    content: [u8; 32],
+}
+
+struct Gitlink {
+    path: PathBuf,
+    oid: String,
+}
+
+struct IndexEntry {
+    path: PathBuf,
+    mode: String,
+    oid: String,
+}
+
+impl IgnoredState {
+    fn is_ignored(&self, path: &Path) -> bool {
+        self.ignored.contains(path)
+    }
+
+    fn changed_paths(&self, after: &Self) -> Vec<PathBuf> {
+        let mut paths: BTreeSet<PathBuf> = self.files.keys().cloned().collect();
+        paths.extend(after.files.keys().cloned());
+        paths
+            .into_iter()
+            .filter(|path| self.files.get(path) != after.files.get(path))
+            .collect()
+    }
+
+    fn changed_existing_paths(&self, after: &Self) -> Vec<PathBuf> {
+        self.files
+            .iter()
+            .filter(|(path, state)| after.files.get(*path) != Some(*state))
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    fn new_ordinary_paths(&self, after: &Self) -> Vec<PathBuf> {
+        after
+            .files
+            .keys()
+            .filter(|path| !after.is_ignored(path) && !self.files.contains_key(*path))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Generated directories that test and build commands routinely create.
+///
+/// Files under these directories are never deleted or committed. They may
+/// remain beside an accepted edit, with a warning, so running the requested
+/// tests does not prevent the tracked change from reaching review.
+fn is_generated_artifact(path: &Path) -> bool {
+    const DIRECTORIES: &[&str] = &[
+        "target",
+        "node_modules",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        ".nox",
+        ".venv",
+        "venv",
+        ".gradle",
+        ".build",
+        "DerivedData",
+        ".next",
+        ".nuxt",
+        ".svelte-kit",
+        ".turbo",
+        "coverage",
+    ];
+    path.components().any(|component| {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        DIRECTORIES
+            .iter()
+            .any(|directory| name == OsStr::new(directory))
+    })
+}
+
+fn merge_pr_args<'a>(
+    number: &'a str,
+    expected_head: Option<&'a str>,
+    delete_branch: bool,
+) -> Vec<&'a str> {
+    let mut args = vec!["pr", "merge", number, "--squash"];
+    if delete_branch {
+        args.push("--delete-branch");
+    }
     if let Some(expected_head) = expected_head {
         args.extend(["--match-head-commit", expected_head]);
     }
@@ -447,9 +634,27 @@ impl Repo {
     }
 
     pub fn git_at(&self, cwd: Option<&Path>, args: &[&str]) -> Result<String> {
-        let mut argv = vec!["git".to_string()];
-        argv.extend(args.iter().map(|s| s.to_string()));
+        let argv = git_without_maintenance_argv(args);
         proc::run(&argv, &self.git_opts(cwd, true))
+    }
+
+    /// Run a parent-side Git operation without inherited background helpers.
+    ///
+    /// Editing calls are untrusted. Once one returns, status, staging, and
+    /// committing happen in this process, so an inherited fsmonitor or automatic
+    /// maintenance command must not become a way to execute outside its sandbox.
+    fn git_at_without_automation(&self, cwd: &Path, args: &[&str]) -> Result<String> {
+        let argv = git_without_automation_argv(args);
+        proc::run(
+            &argv,
+            &self.git_opts(Some(cwd), true).stop_descendants(true),
+        )
+    }
+
+    fn git_try_without_automation(&self, args: &[&str]) -> Result<bool> {
+        let argv = git_without_automation_argv(args);
+        proc::exec(&argv, &self.git_opts(None, false).stop_descendants(true))
+            .map(|output| output.ok())
     }
 
     /// Run git, tolerating failure. Returns whatever landed on stdout.
@@ -458,8 +663,7 @@ impl Repo {
     }
 
     pub fn git_try_at(&self, cwd: Option<&Path>, args: &[&str]) -> String {
-        let mut argv = vec!["git".to_string()];
-        argv.extend(args.iter().map(|s| s.to_string()));
+        let argv = git_without_maintenance_argv(args);
         proc::run(&argv, &self.git_opts(cwd, false)).unwrap_or_default()
     }
 
@@ -546,61 +750,29 @@ impl Repo {
         let branch = self.branch_for_issue(issue);
         let path = self.worktree_path(&format!("issue-{issue}"));
 
-        self.git_try(&["fetch", "origin", base]);
+        self.refuse_issue_branch_rebuild(issue, base)?;
+        self.refuse_dirty_worktree(&path, &format!("worktree for issue #{issue}"))?;
 
-        // Never rebuild a branch that already carries work.
-        //
-        // `run_issue` sends an issue with an open pull request to the resume
-        // path, so reaching here with a remote branch ahead of the base means
-        // commits were pushed that no open PR accounts for. Rebuilding would
-        // force push over them, and the lease is no protection: the remote
-        // tracking ref survives the local branch being deleted, so it still
-        // matches and the push succeeds.
-        self.git_try(&["fetch", "origin", &branch]);
-        let remote_branch = format!("origin/{branch}");
-        if self.rev_exists(&self.root, &remote_branch) {
-            let ahead = self.commit_count(&self.root, &remote_branch, base);
-            if ahead > 0 {
-                bail!(
-                    "origin/{branch} already has {ahead} commit(s) that are not on {base}, and no \
-                     open pull request accounts for them. Rebuilding it would force push over \
-                     that work.\nOpen a pull request for the branch and run `spar resume <pr>` to \
-                     continue it, or delete it with `git push origin --delete {branch}` if it is \
-                     stale."
-                );
-            }
+        if !self.branch_deletion_is_safe(&branch)? {
+            bail!(
+                "the existing branch {branch} has a tip or reflog-only commit that no surviving \
+                 ref preserves. Rebuilding it would delete recovery history. Inspect the branch \
+                 before retrying."
+            );
         }
 
-        // The same guard, for commits that never reached the remote at all.
-        //
-        // An agent commits as it goes, so a run that dies after the commits and
-        // before the push leaves the local branch holding the only copy. With
-        // nothing on origin there is no remote branch to guard and no pull
-        // request to find the work by, and `git branch -D` below would leave it
-        // reachable from the reflog alone, which nothing would tell anyone to
-        // look at.
-        if self.rev_exists(&self.root, &branch) {
-            let ahead = self.commit_count(&self.root, &branch, base);
-            if ahead > 0 && !self.pull_request_holds(&branch, base) {
-                let listed = self
-                    .commit_lines(&self.root, &branch, base)
-                    .iter()
-                    .map(|line| format!("  {line}"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                bail!(
-                    "the local branch {branch} has {ahead} commit(s) that are not on {base}, and \
-                     nothing accounts for them: no branch on origin and no pull request that \
-                     holds them. Rebuilding it would delete the only copy.\n{listed}\nPush it \
-                     and run `spar \
-                     resume <pr>` on the pull request to continue it, or delete it with `git \
-                     branch -D {branch}` if it is stale."
-                );
-            }
+        if !self.remove_worktree_at(&path)? {
+            bail!(
+                "the existing worktree for issue #{issue} could not be removed safely. Its \
+                 branch was kept."
+            );
         }
-
-        self.worktree_remove(issue);
-        self.git_try(&["branch", "-D", &branch]);
+        if !self.delete_branch_if_safe(&branch)? {
+            bail!(
+                "the existing branch {branch} changed or remained checked out while its \
+                 worktree was being rebuilt. It was kept."
+            );
+        }
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -626,6 +798,62 @@ impl Repo {
         Ok((path, branch))
     }
 
+    /// Refuse to reset the local or remote branch assigned to an issue when it
+    /// carries work that no pull request preserves.
+    ///
+    /// Both linked-worktree mode and shared-checkout mode rebuild the same
+    /// branch name. Keeping the guard here prevents either path from silently
+    /// replacing recovery commits left by an earlier run.
+    pub(crate) fn refuse_issue_branch_rebuild(&self, issue: i64, base: &str) -> Result<()> {
+        let branch = self.branch_for_issue(issue);
+        self.git_try(&["fetch", "origin", base]);
+        self.git_try(&["fetch", "origin", &branch]);
+
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        if self.exact_ref_exists_checked(&self.root, &remote_ref)? {
+            let ahead = self.commit_count_checked(&self.root, &remote_ref, base)?;
+            if ahead > 0 {
+                bail!(
+                    "origin/{branch} already has {ahead} commit(s) that are not on {base}, and no \
+                     open pull request accounts for them. Rebuilding it would force push over \
+                     that work.\nOpen a pull request for the branch and run `spar resume <pr>` to \
+                     continue it, or delete it with `git push origin --delete {branch}` if it is \
+                     stale."
+                );
+            }
+        }
+
+        let local_ref = format!("refs/heads/{branch}");
+        if self.exact_ref_exists_checked(&self.root, &local_ref)? {
+            let ahead = self.commit_count_checked(&self.root, &local_ref, base)?;
+            let recorded_pr = self
+                .known_branches()
+                .get(&branch)
+                .is_some_and(|record| record.kind == "pr");
+            let preserved = ahead == 0
+                || if recorded_pr {
+                    self.local_branch_is_preserved(&branch)?
+                } else {
+                    self.pull_request_holds(&branch, base)
+                };
+            if !preserved {
+                let listed = self
+                    .commit_lines(&self.root, &local_ref, base)
+                    .iter()
+                    .map(|line| format!("  {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                bail!(
+                    "the local branch {branch} has {ahead} commit(s) that are not on {base}, and \
+                     no pull request preserves them. Rebuilding it would delete the only copy.\n\
+                     {listed}\nPush it and run `spar resume <pr>` on the pull request to continue \
+                     it, or delete it with `git branch -D {branch}` if it is stale."
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Whether a pull request already holds every commit `branch` has beyond
     /// `base`.
     ///
@@ -646,9 +874,159 @@ impl Repo {
         if self.git(&["fetch", "origin", &refspec]).is_err() {
             return false;
         }
-        let held = self.commits_held_by(branch, base, &head);
+        let branch_ref = format!("refs/heads/{branch}");
+        let held = self.commits_held_by(&branch_ref, base, &head);
         self.git_try(&["update-ref", "-d", &head]);
         held
+    }
+
+    fn is_ancestor_checked(&self, cwd: &Path, older: &str, newer: &str) -> Result<bool> {
+        let argv = vec![
+            "git".to_string(),
+            "merge-base".to_string(),
+            "--is-ancestor".to_string(),
+            older.to_string(),
+            newer.to_string(),
+        ];
+        let out = proc::exec(&argv, &self.git_opts(Some(cwd), false))?;
+        match out.code {
+            0 => Ok(true),
+            1 => Ok(false),
+            _ => Err(spar_err!("{}", proc::failure_message(&argv, &out))),
+        }
+    }
+
+    fn pr_head_contains_checked(&self, number: i64, branch_ref: &str) -> Result<bool> {
+        let head = format!("refs/spar/pr-head/{number}");
+        let refspec = format!("+refs/pull/{number}/head:{head}");
+        self.git(&["fetch", "origin", &refspec]).map_err(|e| {
+            spar_err!(
+                "could not verify the immutable head of PR #{number}: {}",
+                e.last_line()
+            )
+        })?;
+        let held = self.is_ancestor_checked(&self.root, branch_ref, &head);
+        self.git_try(&["update-ref", "-d", &head]);
+        held
+    }
+
+    fn branch_prs_checked(&self, branch: &str) -> Result<Vec<PrRef>> {
+        let text = self.gh(&[
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--json",
+            "number,url,title",
+        ])?;
+        serde_json::from_str(text.trim())
+            .map_err(|e| spar_err!("could not read pull requests for {branch}: {e}"))
+    }
+
+    fn branch_is_preserved_checked(&self, branch: &str, record: &BranchRecord) -> Result<bool> {
+        let branch_ref = format!("refs/heads/{branch}");
+        if record.kind == "pr" {
+            return self.pr_head_contains_checked(record.number, &branch_ref);
+        }
+        let prs = self.branch_prs_checked(branch)?;
+        if prs.is_empty() {
+            return Ok(false);
+        }
+        for pr in prs {
+            if self.pr_head_contains_checked(pr.number, &branch_ref)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn branch_deletion_is_safe(&self, branch: &str) -> Result<bool> {
+        let local_ref = format!("refs/heads/{branch}");
+        if !self.exact_ref_exists_checked(&self.root, &local_ref)? {
+            return Ok(true);
+        }
+        let oid = self
+            .git_at(Some(&self.root), &["rev-parse", "--verify", &local_ref])?
+            .trim()
+            .to_string();
+        let mut durable_tip = commit_has_shared_ref_except(&self.root, &oid, Some(&local_ref))?;
+        if !durable_tip {
+            let remote_ref = format!("refs/heads/{branch}");
+            let remote = self.git(&["ls-remote", "--heads", "origin", &remote_ref])?;
+            durable_tip = remote.lines().any(|line| {
+                line.split_whitespace()
+                    .next()
+                    .is_some_and(|remote_oid| remote_oid == oid)
+            });
+        }
+        if !durable_tip {
+            if let Some(record) = self.known_branches().get(branch) {
+                durable_tip = self.branch_is_preserved_checked(branch, record)?;
+            }
+        }
+        if !durable_tip {
+            return Ok(false);
+        }
+        ref_reflog_is_preserved(&self.root, &local_ref, &oid)
+    }
+
+    /// Delete a branch only if its exact current tip and reflog are still safe.
+    /// The expected old value makes a concurrent ref update fail instead of
+    /// deleting work that appeared after the preservation check.
+    fn delete_branch_if_safe(&self, branch: &str) -> Result<bool> {
+        let local_ref = format!("refs/heads/{branch}");
+        if !self.exact_ref_exists_checked(&self.root, &local_ref)? {
+            return Ok(true);
+        }
+        let expected = self
+            .git_at(Some(&self.root), &["rev-parse", "--verify", &local_ref])?
+            .trim()
+            .to_string();
+        if !self.branch_deletion_is_safe(branch)? {
+            return Ok(false);
+        }
+        let checked_out = self
+            .git_at(Some(&self.root), &["worktree", "list", "--porcelain"])?
+            .lines()
+            .any(|line| line == format!("branch {local_ref}"));
+        if checked_out {
+            return Ok(false);
+        }
+        self.git_at_without_automation(&self.root, &["update-ref", "-d", &local_ref, &expected])?;
+        Ok(!self.exact_ref_exists_checked(&self.root, &local_ref)?)
+    }
+
+    fn review_ref_deletion_is_safe(&self, number: i64) -> Result<bool> {
+        let local_ref = review_ref(number);
+        if !self.exact_ref_exists_checked(&self.root, &local_ref)? {
+            return Ok(true);
+        }
+        let oid = self
+            .git_at(Some(&self.root), &["rev-parse", "--verify", &local_ref])?
+            .trim()
+            .to_string();
+        if !self.pr_head_contains_checked(number, &local_ref)? {
+            return Ok(false);
+        }
+        ref_reflog_is_preserved(&self.root, &local_ref, &oid)
+    }
+
+    fn delete_review_ref_if_safe(&self, number: i64) -> Result<bool> {
+        let local_ref = review_ref(number);
+        if !self.exact_ref_exists_checked(&self.root, &local_ref)? {
+            return Ok(true);
+        }
+        let expected = self
+            .git_at(Some(&self.root), &["rev-parse", "--verify", &local_ref])?
+            .trim()
+            .to_string();
+        if !self.review_ref_deletion_is_safe(number)? {
+            return Ok(false);
+        }
+        self.git_at_without_automation(&self.root, &["update-ref", "-d", &local_ref, &expected])?;
+        Ok(!self.exact_ref_exists_checked(&self.root, &local_ref)?)
     }
 
     /// Whether `other` already contains every commit `branch` has beyond
@@ -661,17 +1039,213 @@ impl Repo {
             == "0"
     }
 
-    pub fn worktree_remove(&self, issue: i64) {
-        self.remove_worktree_at(&self.worktree_path(&format!("issue-{issue}")));
+    pub fn worktree_remove(&self, issue: i64) -> bool {
+        let path = self.worktree_path(&format!("issue-{issue}"));
+        match self.remove_worktree_at(&path) {
+            Ok(removed) => removed,
+            Err(error) => {
+                logdim!(
+                    "kept {} because removal did not reach a confirmed quiet point: {}",
+                    path.display(),
+                    error.last_line()
+                );
+                false
+            }
+        }
     }
 
-    fn remove_worktree_at(&self, path: &Path) {
-        let path_str = path.display().to_string();
-        self.git_try(&["worktree", "remove", "--force", &path_str]);
-        if path.is_dir() {
-            let _ = std::fs::remove_dir_all(path);
+    /// Verify both the common Git directory and the worktree top level.
+    ///
+    /// A stale worktree entry is not ownership proof. An unrelated repository
+    /// can later occupy the same path and must survive cleanup.
+    fn worktree_belongs_to_repo(&self, path: &Path) -> Result<bool> {
+        let wanted = std::fs::canonicalize(path)
+            .map_err(|e| spar_err!("could not resolve {}: {e}", path.display()))?;
+        // Every SPAR worktree path is built from the canonical repository root.
+        // A different canonical path therefore means the final component or
+        // one of its parents is a symlink. Passing that alias to `git worktree
+        // remove` can delete the worktree at its real target.
+        if wanted != path {
+            return Ok(false);
         }
-        self.git_try(&["worktree", "prune"]);
+        let resolve = |cwd: &Path, value: &str| -> Result<PathBuf> {
+            let raw = PathBuf::from(value.trim());
+            let joined = if raw.is_absolute() {
+                raw
+            } else {
+                cwd.join(raw)
+            };
+            std::fs::canonicalize(&joined)
+                .map_err(|e| spar_err!("could not resolve {}: {e}", joined.display()))
+        };
+        let expected =
+            self.git_at_without_automation(&self.root, &["rev-parse", "--git-common-dir"])?;
+        let actual = self.git_at_without_automation(path, &["rev-parse", "--git-common-dir"])?;
+        let top = self.git_at_without_automation(path, &["rev-parse", "--show-toplevel"])?;
+        let expected = resolve(&self.root, &expected)?;
+        let actual = resolve(path, &actual)?;
+        let top = resolve(path, &top)?;
+        Ok(expected == actual && top == wanted)
+    }
+
+    /// Remove only a worktree that belongs to this repository.
+    ///
+    /// The path sits under a predictable directory, but that does not establish
+    /// ownership. A clean independent repository at the same path must survive
+    /// even when `git worktree remove` rejects it.
+    fn remove_worktree_at_with_force(&self, path: &Path, force: bool) -> Result<bool> {
+        let existed = path.exists();
+        if path.exists() {
+            match self.worktree_belongs_to_repo(path) {
+                Ok(true) => {}
+                Ok(false) => {
+                    logdim!(
+                        "kept {} because it is not a worktree owned by this repository",
+                        path.display()
+                    );
+                    return Ok(false);
+                }
+                Err(e) => {
+                    logdim!(
+                        "kept {} because its worktree ownership could not be verified: {}",
+                        path.display(),
+                        e.last_line()
+                    );
+                    return Ok(false);
+                }
+            }
+            if !force {
+                match self.has_recoverable_work(path) {
+                    Ok(true) => {
+                        logdim!(
+                            "kept {} because it contains recoverable files or repository state",
+                            path.display()
+                        );
+                        return Ok(false);
+                    }
+                    Err(e) => {
+                        logdim!(
+                            "kept {} because its recoverable state could not be checked: {}",
+                            path.display(),
+                            e.last_line()
+                        );
+                        return Ok(false);
+                    }
+                    Ok(false) => {}
+                }
+            }
+        }
+        let path_str = path.display().to_string();
+        let command_ok = if force {
+            self.git_try_without_automation(&["worktree", "remove", "--force", &path_str])?
+        } else {
+            self.git_try_without_automation(&["worktree", "remove", &path_str])?
+        };
+        Ok((command_ok || !existed) && !path.exists())
+    }
+
+    fn remove_worktree_at(&self, path: &Path) -> Result<bool> {
+        self.remove_worktree_at_with_force(path, false)
+    }
+
+    /// Force removal is reserved for the explicit `clean --all` path.
+    fn remove_worktree_at_force(&self, path: &Path) -> bool {
+        match self.remove_worktree_at_with_force(path, true) {
+            Ok(removed) => removed,
+            Err(error) => {
+                logdim!(
+                    "kept {} because removal did not reach a confirmed quiet point: {}",
+                    path.display(),
+                    error.last_line()
+                );
+                false
+            }
+        }
+    }
+
+    /// Remove a worktree only after a caller has verified it is unchanged.
+    ///
+    /// There is deliberately no force fallback, so Git can still refuse a
+    /// removal if tracked or non-ignored work appears after the final check.
+    fn remove_worktree_at_checked(&self, path: &Path) -> Result<bool> {
+        if path.exists() && !self.worktree_belongs_to_repo(path)? {
+            bail!(
+                "{} is not a worktree owned by this repository, so it was kept",
+                path.display()
+            );
+        }
+        if path.exists() && self.has_recoverable_work(path)? {
+            bail!(
+                "the verified worktree at {} contains recoverable files or repository state. It \
+                 was kept.",
+                path.display()
+            );
+        }
+        let path_str = path.display().to_string();
+        self.git_at_without_automation(&self.root, &["worktree", "remove", &path_str])
+            .map_err(|e| {
+                e.with_message(format!(
+                    "could not remove the verified worktree at {}: {}. It was kept.",
+                    path.display(),
+                    e.last_line()
+                ))
+            })?;
+        Ok(!path.exists())
+    }
+
+    fn refuse_dirty_worktree(&self, path: &Path, label: &str) -> Result<()> {
+        if !path.is_dir() {
+            return Ok(());
+        }
+        let has_files = std::fs::read_dir(path)
+            .map_err(|e| spar_err!("could not inspect {}: {e}", path.display()))?
+            .next()
+            .is_some();
+        let owned = self.worktree_belongs_to_repo(path).map_err(|e| {
+            spar_err!(
+                "could not verify whether the existing {label} at {} belongs to this repository, \
+                 so it was kept: {}",
+                path.display(),
+                e.last_line()
+            )
+        })?;
+        if !owned {
+            if has_files {
+                bail!(
+                    "the existing {label} at {} is not a worktree owned by \
+                     this repository. Refusing to remove it.",
+                    path.display()
+                );
+            }
+            return Ok(());
+        }
+        if !path.join(".git").exists() {
+            if has_files {
+                bail!(
+                    "the existing {label} at {} is not a readable Git worktree and is not empty. \
+                     Refusing to remove it.",
+                    path.display()
+                );
+            }
+            return Ok(());
+        }
+        let dirty = self.has_recoverable_work(path).map_err(|e| {
+            spar_err!(
+                "could not verify whether the existing {label} at {} is clean, so it was kept: \
+                 {}",
+                path.display(),
+                e.last_line()
+            )
+        })?;
+        if dirty {
+            bail!(
+                "the existing {label} contains uncommitted changes or ignored files at {}. \
+                 Rebuilding it would delete those files.\nCommit or recover them before running this \
+                 command again, or use `spar clean --all` if they are not needed.",
+                path.display()
+            );
+        }
+        Ok(())
     }
 
     /// Check an existing PR branch out into an isolated worktree.
@@ -690,11 +1264,44 @@ impl Repo {
                 e.last_line()
             )
         })?;
-        self.remove_worktree_at(&path);
-        self.git_try(&["branch", "-D", &local]);
+        let start = format!("origin/{head}");
+        let start_ref = format!("refs/remotes/origin/{head}");
+        let local_ref = format!("refs/heads/{local}");
+        if self.exact_ref_exists_checked(&self.root, &local_ref)? {
+            let unpushed = self.commits_not_in_checked(&self.root, &local_ref, &start_ref)?;
+            if unpushed > 0 {
+                bail!(
+                    "the existing worktree for PR #{} has {unpushed} local commit(s) that are not \
+                     on {start}. Rebuilding it would delete their branch.\nInspect the worktree at \
+                     {} and push or recover those commits before running this command again.",
+                    pr.number,
+                    path.display()
+                );
+            }
+        }
+        self.refuse_dirty_worktree(&path, &format!("worktree for PR #{}", pr.number))?;
+        if !self.branch_deletion_is_safe(&local)? {
+            bail!(
+                "the existing branch {local} has a tip or reflog-only commit that no surviving \
+                 ref preserves. Rebuilding it would delete recovery history. Inspect the branch \
+                 before retrying."
+            );
+        }
+        if !self.remove_worktree_at(&path)? {
+            bail!(
+                "the existing worktree for PR #{} could not be removed safely. Its branch was \
+                 kept.",
+                pr.number
+            );
+        }
+        if !self.delete_branch_if_safe(&local)? {
+            bail!(
+                "the existing branch {local} changed or remained checked out while the PR \
+                 worktree was being rebuilt. It was kept."
+            );
+        }
 
         let path_str = path.display().to_string();
-        let start = format!("origin/{head}");
         self.git(&["worktree", "add", "-B", &local, &path_str, &start])?;
         self.record_branch(&local, "pr", pr.number);
         Ok((path, head))
@@ -714,6 +1321,8 @@ impl Repo {
         let local_ref = review_ref(number);
         let refspec = format!("+refs/pull/{number}/head:{local_ref}");
 
+        self.refuse_review_worktree_changes(number)?;
+
         self.git(&["fetch", "origin", &refspec]).map_err(|e| {
             spar_err!(
                 "could not fetch the head of PR #{number}. {}\nGitHub serves refs/pull/N/head for \
@@ -727,10 +1336,48 @@ impl Repo {
             std::fs::create_dir_all(parent)
                 .map_err(|e| spar_err!("could not create {}: {e}", parent.display()))?;
         }
-        self.remove_worktree_at(&path);
+        if !self.remove_worktree_at(&path)? {
+            bail!(
+                "the existing review worktree for PR #{number} could not be removed safely. Its \
+                 reference was kept."
+            );
+        }
         let path_str = path.display().to_string();
         self.git(&["worktree", "add", "--detach", &path_str, &local_ref])?;
         Ok(path)
+    }
+
+    fn refuse_review_worktree_changes(&self, number: i64) -> Result<()> {
+        let path = self.worktree_path(&format!("review-{number}"));
+        if !path.is_dir() {
+            return Ok(());
+        }
+        let local_ref = review_ref(number);
+        if !self.worktree_belongs_to_repo(&path)? {
+            return Ok(());
+        }
+        if !self.exact_ref_exists_checked(&self.root, &local_ref)? {
+            bail!(
+                "the existing review worktree for PR #{number} has no recorded head at \
+                 {local_ref}. Refusing to rebuild {}.",
+                path.display()
+            );
+        }
+        let worktree_head = self.head_oid_checked(&path)?;
+        let recorded_head = self
+            .git_at(Some(&self.root), &["rev-parse", "--verify", &local_ref])?
+            .trim()
+            .to_string();
+        if worktree_head != recorded_head {
+            bail!(
+                "the existing review worktree for PR #{number} has a local commit that is not on \
+                 {local_ref}. Rebuilding it would delete the only checkout of that work. Inspect \
+                 {} before retrying.",
+                path.display()
+            );
+        }
+        self.refuse_dirty_worktree(&path, &format!("review worktree for PR #{number}"))?;
+        Ok(())
     }
 
     /// A worktree for one part of a split, on a new branch off `start`.
@@ -759,10 +1406,16 @@ impl Repo {
             std::fs::create_dir_all(dir)
                 .map_err(|e| spar_err!("could not create {}: {e}", dir.display()))?;
         }
+        self.refuse_dirty_worktree(&path, &format!("worktree for part {index} of PR #{parent}"))?;
         // The name is free, so there is no branch to delete. A directory can
         // still be in the way, left by a worktree that was pruned from git's
         // records without being removed from disk.
-        self.remove_worktree_at(&path);
+        if !self.remove_worktree_at(&path)? {
+            bail!(
+                "the existing worktree for part {index} of PR #{parent} could not be removed \
+                 safely. No branch was created."
+            );
+        }
 
         let path_str = path.display().to_string();
         self.git(&["worktree", "add", "-b", &branch, &path_str, start])
@@ -824,22 +1477,270 @@ impl Repo {
     /// `worktree_for_split` returned, since the name it settled on is not
     /// derivable from the parent and the index.
     pub fn release_split_worktree(&self, dir: &Path, branch: &str) {
-        self.remove_worktree_at(dir);
-        self.git_try(&["branch", "-D", branch]);
-        self.forget_branch(branch);
+        match self.branch_deletion_is_safe(branch) {
+            Ok(true) => {}
+            Ok(false) => {
+                logdim!(
+                    "kept {branch} and {} because no surviving ref preserves its tip",
+                    dir.display()
+                );
+                return;
+            }
+            Err(error) => {
+                logdim!(
+                    "kept {branch} and {} because preservation could not be verified: {}",
+                    dir.display(),
+                    error.last_line()
+                );
+                return;
+            }
+        }
+        match self.remove_worktree_at(dir) {
+            Ok(true) => match self.delete_branch_if_safe(branch) {
+                Ok(true) => self.forget_branch(branch),
+                Ok(false) => {
+                    logdim!("kept {branch} because its tip or reflog changed before deletion")
+                }
+                Err(error) => logdim!(
+                    "kept {branch} because deletion safety could not be rechecked: {}",
+                    error.last_line()
+                ),
+            },
+            Ok(false) => {}
+            Err(error) => logdim!(
+                "kept {branch} and {} because removal did not reach a confirmed quiet point: {}",
+                dir.display(),
+                error.last_line()
+            ),
+        }
+    }
+
+    /// Discard one exact mechanical slice that the split workflow just made.
+    ///
+    /// Unlike ordinary release, this intentionally removes an unpushed commit.
+    /// The caller supplies the exact disposable tip, and every file, worktree,
+    /// ownership, and ref check must still match before anything is removed.
+    pub fn discard_split_worktree(&self, dir: &Path, branch: &str, disposable_head: &str) -> bool {
+        let record = self.known_branches().get(branch).cloned();
+        if record.is_none_or(|record| record.kind != "split") {
+            logdim!("kept {branch} because no split branch record proves ownership");
+            return false;
+        }
+        let local_ref = format!("refs/heads/{branch}");
+        let expected = match self.git_at(Some(&self.root), &["rev-parse", "--verify", &local_ref]) {
+            Ok(value) => value.trim().to_string(),
+            Err(error) => {
+                logdim!(
+                    "kept {branch} because its tip could not be checked: {}",
+                    error.last_line()
+                );
+                return false;
+            }
+        };
+        if expected != disposable_head {
+            logdim!("kept {branch} because it moved beyond the disposable slice");
+            return false;
+        }
+        match ref_reflog_is_preserved(&self.root, &local_ref, disposable_head) {
+            Ok(true) => {}
+            Ok(false) => {
+                logdim!(
+                    "kept {branch} because its reflog contains work outside the disposable slice"
+                );
+                return false;
+            }
+            Err(error) => {
+                logdim!(
+                    "kept {branch} because its reflog could not be checked: {}",
+                    error.last_line()
+                );
+                return false;
+            }
+        }
+        match self.head_oid_checked(dir) {
+            Ok(head) if head == disposable_head => {}
+            Ok(_) => {
+                logdim!(
+                    "kept {branch} and {} because the worktree moved beyond the disposable slice",
+                    dir.display()
+                );
+                return false;
+            }
+            Err(error) => {
+                logdim!(
+                    "kept {branch} and {} because its head could not be checked: {}",
+                    dir.display(),
+                    error.last_line()
+                );
+                return false;
+            }
+        }
+        match self.remove_worktree_at_checked(dir) {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => {
+                logdim!(
+                    "kept {branch} and {} because the disposable slice could not be verified: {}",
+                    dir.display(),
+                    error.last_line()
+                );
+                return false;
+            }
+        }
+        if let Err(error) =
+            self.git_at_without_automation(&self.root, &["update-ref", "-d", &local_ref, &expected])
+        {
+            logdim!(
+                "kept {branch} because its exact disposable tip could not be deleted: {}",
+                error.last_line()
+            );
+            return false;
+        }
+        match self.exact_ref_exists_checked(&self.root, &local_ref) {
+            Ok(false) => {
+                self.forget_branch(branch);
+                true
+            }
+            Ok(true) => {
+                logdim!("kept {branch} because its ref still exists after deletion");
+                false
+            }
+            Err(error) => {
+                logdim!(
+                    "kept the branch record for {branch} because deletion could not be verified: {}",
+                    error.last_line()
+                );
+                false
+            }
+        }
     }
 
     pub fn release_review_worktree(&self, number: i64) {
-        self.remove_worktree_at(&self.worktree_path(&format!("review-{number}")));
-        self.git_try(&["update-ref", "-d", &review_ref(number)]);
+        let path = self.worktree_path(&format!("review-{number}"));
+        match self.review_ref_deletion_is_safe(number) {
+            Ok(true) => {}
+            Ok(false) => {
+                logdim!(
+                    "kept {} because no surviving ref preserves its review history",
+                    path.display()
+                );
+                return;
+            }
+            Err(error) => {
+                logdim!(
+                    "kept {} because review history could not be verified: {}",
+                    path.display(),
+                    error.last_line()
+                );
+                return;
+            }
+        }
+        match self.remove_worktree_at(&path) {
+            Ok(true) => match self.delete_review_ref_if_safe(number) {
+                Ok(true) => {}
+                Ok(false) => logdim!(
+                    "kept {} because its review history changed before deletion",
+                    review_ref(number)
+                ),
+                Err(error) => logdim!(
+                    "kept {} because deletion safety could not be rechecked: {}",
+                    review_ref(number),
+                    error.last_line()
+                ),
+            },
+            Ok(false) => {}
+            Err(error) => logdim!(
+                "kept {} because removal did not reach a confirmed quiet point: {}",
+                path.display(),
+                error.last_line()
+            ),
+        }
     }
 
-    pub fn release_pr_worktree(&self, number: i64) {
+    /// Release a read-only review checkout only when every observed part of
+    /// its Git state still matches the checkpoint captured before the calls.
+    pub(crate) fn release_review_worktree_checked(
+        &self,
+        number: i64,
+        checkpoint: &WorktreeCheckpoint,
+    ) -> Result<()> {
+        let path = self.worktree_path(&format!("review-{number}"));
+        self.require_unchanged_worktree(
+            &path,
+            checkpoint,
+            &format!("review worktree for PR #{number}"),
+        )?;
+        if !self.review_ref_deletion_is_safe(number)? {
+            bail!(
+                "the review reference for PR #{number} has reflog-only recovery history. The \
+                 worktree and reference were kept."
+            );
+        }
+        if !self.remove_worktree_at_checked(&path)? {
+            bail!(
+                "the verified review worktree at {} could not be removed, so its reference was \
+                 kept",
+                path.display()
+            );
+        }
+        if !self.delete_review_ref_if_safe(number)? {
+            bail!(
+                "the review reference for PR #{number} changed before deletion. The reference was \
+                 kept."
+            );
+        }
+        Ok(())
+    }
+
+    pub fn release_pr_worktree(&self, number: i64) -> bool {
         let path = self.worktree_path(&format!("pr-{number}"));
-        self.remove_worktree_at(&path);
         let local = self.branch_for_pr(number);
-        self.git_try(&["branch", "-D", &local]);
-        self.forget_branch(&local);
+        match self.branch_deletion_is_safe(&local) {
+            Ok(true) => {}
+            Ok(false) => {
+                logdim!(
+                    "kept {local} and {} because no surviving ref preserves its tip",
+                    path.display()
+                );
+                return false;
+            }
+            Err(error) => {
+                logdim!(
+                    "kept {local} and {} because preservation could not be verified: {}",
+                    path.display(),
+                    error.last_line()
+                );
+                return false;
+            }
+        }
+        match self.remove_worktree_at(&path) {
+            Ok(true) => match self.delete_branch_if_safe(&local) {
+                Ok(true) => {
+                    self.forget_branch(&local);
+                    true
+                }
+                Ok(false) => {
+                    logdim!("kept {local} because its tip or reflog changed before deletion");
+                    false
+                }
+                Err(error) => {
+                    logdim!(
+                        "kept {local} because deletion safety could not be rechecked: {}",
+                        error.last_line()
+                    );
+                    false
+                }
+            },
+            Ok(false) => false,
+            Err(error) => {
+                logdim!(
+                    "kept {local} and {} because removal did not reach a confirmed quiet point: {}",
+                    path.display(),
+                    error.last_line()
+                );
+                false
+            }
+        }
     }
 
     // -- branch state -----------------------------------------------------
@@ -879,6 +1780,648 @@ impl Repo {
             .git_try_at(Some(cwd), &["log", &range, "--oneline"])
             .trim()
             .is_empty()
+    }
+
+    fn exact_ref_exists_checked(&self, cwd: &Path, refname: &str) -> Result<bool> {
+        let found = self.git_at(Some(cwd), &["for-each-ref", "--format=%(refname)", refname])?;
+        Ok(found.lines().any(|line| line.trim() == refname))
+    }
+
+    fn commits_not_in_checked(&self, cwd: &Path, tip: &str, published: &str) -> Result<usize> {
+        let count = self.git_at(Some(cwd), &["rev-list", "--count", tip, "--not", published])?;
+        count.trim().parse::<usize>().map_err(|e| {
+            spar_err!(
+                "git returned an invalid commit count for {tip} outside {published}: {:?} ({e})",
+                count.trim()
+            )
+        })
+    }
+
+    pub(crate) fn base_ref_checked(&self, cwd: &Path, base: &str) -> Result<String> {
+        let remote = format!("refs/remotes/origin/{base}");
+        if self.exact_ref_exists_checked(cwd, &remote)? {
+            return Ok(remote);
+        }
+        let local = format!("refs/heads/{base}");
+        if self.exact_ref_exists_checked(cwd, &local)? {
+            return Ok(local);
+        }
+        bail!("neither origin/{base} nor local branch {base} resolves")
+    }
+
+    pub(crate) fn commit_count_checked(
+        &self,
+        cwd: &Path,
+        refname: &str,
+        base: &str,
+    ) -> Result<usize> {
+        let range = format!("{}..{refname}", self.base_ref_checked(cwd, base)?);
+        let count = self.git_at(Some(cwd), &["rev-list", "--count", &range])?;
+        count.trim().parse::<usize>().map_err(|e| {
+            spar_err!(
+                "git returned an invalid commit count for {range}: {:?} ({e})",
+                count.trim()
+            )
+        })
+    }
+
+    pub(crate) fn has_changes_checked(&self, cwd: &Path, base: &str) -> Result<bool> {
+        Ok(self.commit_count_checked(cwd, "HEAD", base)? > 0)
+    }
+
+    pub(crate) fn head_oid_checked(&self, cwd: &Path) -> Result<String> {
+        let head = self.git_at(Some(cwd), &["rev-parse", "--verify", "HEAD^{commit}"])?;
+        let head = head.trim().to_string();
+        if head.is_empty() {
+            bail!("git returned an empty HEAD for {}", cwd.display());
+        }
+        Ok(head)
+    }
+
+    /// Whether a recorded SPAR branch's exact tip is retained by a pull request.
+    ///
+    /// Pull request head refs remain available after close or merge, so this is
+    /// stronger than requiring an open pull request or a live remote branch.
+    pub(crate) fn current_branch_is_preserved(&self, cwd: &Path) -> Result<bool> {
+        let branch = self.git_at(Some(cwd), &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+        self.local_branch_is_preserved(branch.trim())
+    }
+
+    /// Whether a recorded local branch's exact tip is retained by its pull
+    /// request head, regardless of which branch is currently checked out.
+    pub(crate) fn local_branch_is_preserved(&self, branch: &str) -> Result<bool> {
+        let known = self.known_branches();
+        let Some(record) = known.get(branch) else {
+            return Ok(false);
+        };
+        self.branch_is_preserved_checked(branch, record)
+    }
+
+    /// Whether tracked, staged, or non-ignored untracked files are uncommitted.
+    pub(crate) fn has_uncommitted_changes(&self, cwd: &Path) -> Result<bool> {
+        has_uncommitted_work(cwd)
+    }
+
+    /// Whether removing a worktree would delete any local file Git does not
+    /// reproduce from its commits, including ignored untracked files.
+    fn has_recoverable_work(&self, cwd: &Path) -> Result<bool> {
+        repository_has_recoverable_work(cwd, true)
+    }
+
+    /// Record ignored artifacts that existed before an editing call.
+    pub(crate) fn worktree_baseline(&self, cwd: &Path) -> Result<WorktreeBaseline> {
+        let attributes = attribute_state(cwd)?;
+        Ok(WorktreeBaseline {
+            attributes,
+            ignored_untracked: ignored_untracked_state(cwd)?,
+            git_state: safe_git_state(cwd)?,
+        })
+    }
+
+    /// Capture the Git state of a checkout intended to remain read only while
+    /// external commands inspect it.
+    pub(crate) fn worktree_checkpoint(&self, cwd: &Path) -> Result<WorktreeCheckpoint> {
+        let attributes = attribute_state(cwd)?;
+        Ok(WorktreeCheckpoint {
+            path: std::fs::canonicalize(cwd)
+                .map_err(|e| spar_err!("could not resolve {}: {e}", cwd.display()))?,
+            attributes,
+            git_state: safe_git_state(cwd)?,
+            ignored_untracked: ignored_untracked_state(cwd)?,
+        })
+    }
+
+    /// Require a read-only checkout to match a previously captured checkpoint.
+    /// Any probe failure is an error because deletion cannot be proven safe.
+    pub(crate) fn require_unchanged_worktree(
+        &self,
+        cwd: &Path,
+        checkpoint: &WorktreeCheckpoint,
+        label: &str,
+    ) -> Result<()> {
+        let resolved = std::fs::canonicalize(cwd).map_err(|e| {
+            crate::error::SparError::uncertain_write(format!(
+                "could not resolve the {label} at {} after inspection: {e}. It was kept.",
+                cwd.display()
+            ))
+        })?;
+        if resolved != checkpoint.path {
+            return Err(uncertain_worktree_change(
+                cwd,
+                format!(
+                    "the {label} moved from {} to {} during inspection. It was kept.",
+                    checkpoint.path.display(),
+                    resolved.display()
+                ),
+            ));
+        }
+        let attributes = attribute_state(cwd).map_err(|e| {
+            uncertain_worktree_change(
+                cwd,
+                format!(
+                    "could not verify attribute files in the {label} at {}: {}. It was kept.",
+                    cwd.display(),
+                    e.last_line()
+                ),
+            )
+        })?;
+        if attributes != checkpoint.attributes {
+            return Err(uncertain_worktree_change(
+                cwd,
+                format!(
+                    "attribute files in the {label} at {} changed during inspection. It was \
+                     kept for recovery.",
+                    cwd.display()
+                ),
+            ));
+        }
+        let git_state = git_state(cwd).map_err(|e| {
+            uncertain_worktree_change(
+                cwd,
+                format!(
+                    "could not verify the Git state of the {label} at {}: {}. It was kept.",
+                    cwd.display(),
+                    e.last_line()
+                ),
+            )
+        })?;
+        let ignored = ignored_untracked_state(cwd).map_err(|e| {
+            uncertain_worktree_change(
+                cwd,
+                format!(
+                    "could not verify untracked files in the {label} at {}: {}. It was kept.",
+                    cwd.display(),
+                    e.last_line()
+                ),
+            )
+        })?;
+        if git_state != checkpoint.git_state || ignored != checkpoint.ignored_untracked {
+            return Err(uncertain_worktree_change(
+                cwd,
+                format!(
+                    "the {label} at {} changed during a read-only inspection. It was kept for \
+                     recovery.",
+                    cwd.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuse to discard ignored files that appeared during an editing call.
+    ///
+    /// Call this when the edit reported success but produced no commit-worthy
+    /// status. Existing ignored build output is harmless because it is present
+    /// in `baseline`; only newly created paths stop cleanup.
+    pub(crate) fn refuse_new_ignored_files(
+        &self,
+        cwd: &Path,
+        baseline: &WorktreeBaseline,
+    ) -> Result<()> {
+        self.check_new_ignored_files(cwd, baseline, false)
+    }
+
+    fn allow_generated_ignored_files(&self, cwd: &Path, baseline: &WorktreeBaseline) -> Result<()> {
+        self.check_new_ignored_files(cwd, baseline, true)
+    }
+
+    fn check_new_ignored_files(
+        &self,
+        cwd: &Path,
+        baseline: &WorktreeBaseline,
+        allow_generated: bool,
+    ) -> Result<()> {
+        self.refuse_changed_attributes(cwd, baseline)?;
+        let after = ignored_untracked_state(cwd).map_err(|e| {
+            uncertain_worktree_change(
+                cwd,
+                format!(
+                    "could not verify untracked files in {} after editing: {}. The worktree was \
+                     kept for recovery.",
+                    cwd.display(),
+                    e.last_line()
+                ),
+            )
+        })?;
+        let changed = baseline.ignored_untracked.changed_paths(&after);
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let (generated, changed): (Vec<_>, Vec<_>) = changed.into_iter().partition(|path| {
+            allow_generated && after.is_ignored(path) && is_generated_artifact(path)
+        });
+        if !generated.is_empty() {
+            logwarn!(
+                "the editing call left {} generated artifact(s) under a known build or cache \
+                 directory in {}. They are not part of the commit and will keep the worktree \
+                 available for inspection.",
+                generated.len(),
+                cwd.display()
+            );
+        }
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let mut listed = changed
+            .iter()
+            .take(5)
+            .map(|path| format!("{:?}", path.as_os_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if changed.len() > 5 {
+            listed.push_str(&format!(", and {} more", changed.len() - 5));
+        }
+        Err(uncertain_worktree_change(
+            cwd,
+            format!(
+                "the editing call created or changed untracked or ignored file(s) in {} that \
+                 cannot be represented by a managed commit: {listed}. The worktree was kept for \
+                 recovery.",
+                cwd.display()
+            ),
+        ))
+    }
+
+    /// Existing untracked files belong to the checkout owner, even when an
+    /// editing call also produces a valid tracked change. Refuse their
+    /// modification or deletion before accepting the tracked result. Newly
+    /// created build output is handled by ordinary removal preflight instead.
+    pub(crate) fn refuse_changed_existing_untracked(
+        &self,
+        cwd: &Path,
+        baseline: &WorktreeBaseline,
+    ) -> Result<()> {
+        self.check_changed_existing_untracked(cwd, baseline, false)
+    }
+
+    fn allow_changed_generated_artifacts(
+        &self,
+        cwd: &Path,
+        baseline: &WorktreeBaseline,
+    ) -> Result<()> {
+        self.check_changed_existing_untracked(cwd, baseline, true)
+    }
+
+    fn check_changed_existing_untracked(
+        &self,
+        cwd: &Path,
+        baseline: &WorktreeBaseline,
+        allow_generated: bool,
+    ) -> Result<()> {
+        self.refuse_changed_attributes(cwd, baseline)?;
+        let after = ignored_untracked_state(cwd).map_err(|e| {
+            uncertain_worktree_change(
+                cwd,
+                format!(
+                    "could not verify existing untracked files in {} after editing: {}. The \
+                     worktree was kept for recovery.",
+                    cwd.display(),
+                    e.last_line()
+                ),
+            )
+        })?;
+        let changed = baseline.ignored_untracked.changed_existing_paths(&after);
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let (generated, changed): (Vec<_>, Vec<_>) = changed.into_iter().partition(|path| {
+            allow_generated
+                && baseline.ignored_untracked.is_ignored(path)
+                && after.is_ignored(path)
+                && is_generated_artifact(path)
+        });
+        if !generated.is_empty() {
+            logwarn!(
+                "the editing call changed {} existing generated artifact(s) under a known build \
+                 or cache directory in {}. They are not part of the commit and will keep the \
+                 worktree available for inspection.",
+                generated.len(),
+                cwd.display()
+            );
+        }
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let mut listed = changed
+            .iter()
+            .take(5)
+            .map(|path| format!("{:?}", path.as_os_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if changed.len() > 5 {
+            listed.push_str(&format!(", and {} more", changed.len() - 5));
+        }
+        Err(uncertain_worktree_change(
+            cwd,
+            format!(
+                "the editing call changed or deleted existing untracked file(s) in {}: \
+                 {listed}. The worktree was kept for recovery.",
+                cwd.display()
+            ),
+        ))
+    }
+
+    /// Refuse a byte or mode change that the index did not represent.
+    ///
+    /// Clean filters can normalize a working file back to its existing blob,
+    /// and index flags can hide a change from porcelain status. Comparing the
+    /// actual tracked files on both sides keeps those bytes from being treated
+    /// as disposable just because Git has no diff for them.
+    pub(crate) fn refuse_unrepresented_tracked_changes(
+        &self,
+        cwd: &Path,
+        baseline: &WorktreeBaseline,
+    ) -> Result<()> {
+        self.refuse_changed_attributes(cwd, baseline)?;
+        let after = safe_git_state(cwd).map_err(|e| {
+            uncertain_worktree_change(
+                cwd,
+                format!(
+                    "could not verify tracked files in {} after editing: {}. The worktree was \
+                     kept for recovery.",
+                    cwd.display(),
+                    e.last_line()
+                ),
+            )
+        })?;
+        let mut changed = Vec::new();
+        let before_filter_untracked = ignored_untracked_state(cwd).map_err(|e| {
+            uncertain_worktree_change(
+                cwd,
+                format!(
+                    "could not record untracked files before verifying transformed content in {}: \
+                     {}. The worktree was kept for recovery.",
+                    cwd.display(),
+                    e.last_line()
+                ),
+            )
+        })?;
+        let mut filter_was_run = false;
+        let mut filter_problem = None;
+        let mut repositories: BTreeSet<PathBuf> =
+            baseline.git_state.repositories.keys().cloned().collect();
+        repositories.extend(after.repositories.keys().cloned());
+        'repositories: for repository_path in repositories {
+            let before_repository = baseline.git_state.repositories.get(&repository_path);
+            let after_repository = after.repositories.get(&repository_path);
+            if before_repository.is_none() || after_repository.is_none() {
+                changed.push(repository_path.clone());
+                continue;
+            }
+            if before_repository.map(|repository| &repository.gitlinks)
+                != after_repository.map(|repository| &repository.gitlinks)
+            {
+                changed.push(repository_path.join("<gitlinks>"));
+            }
+            let mut paths = BTreeSet::new();
+            if let Some(repository) = before_repository {
+                paths.extend(repository.tracked.keys().cloned());
+            }
+            if let Some(repository) = after_repository {
+                paths.extend(repository.tracked.keys().cloned());
+            }
+            for path in paths {
+                let before = before_repository.and_then(|repository| repository.tracked.get(&path));
+                let current = after_repository.and_then(|repository| repository.tracked.get(&path));
+                let worktree_changed =
+                    before.map(|entry| &entry.worktree) != current.map(|entry| &entry.worktree);
+                let index_changed = before.map(|entry| (&entry.index_mode, &entry.index_oid))
+                    != current.map(|entry| (&entry.index_mode, &entry.index_oid));
+                if !worktree_changed {
+                    continue;
+                }
+                if !index_changed {
+                    changed.push(repository_path.join(&path));
+                    continue;
+                }
+                let before_worktree = before.and_then(|entry| entry.worktree.as_ref());
+                let current_worktree = current.and_then(|entry| entry.worktree.as_ref());
+                let Some(current_entry) = current else {
+                    continue;
+                };
+                let Some(current_worktree) = current_worktree else {
+                    continue;
+                };
+                let content_changed =
+                    before_worktree.map(|file| file.content) != Some(current_worktree.content);
+                let mode_changed = before_worktree.map(|file| file.mode.as_str())
+                    != Some(current_worktree.mode.as_str());
+                let repository = cwd.join(&repository_path);
+                let represented_content = if content_changed {
+                    filter_was_run = true;
+                    let result =
+                        filtered_index_content(&repository, &path, &current_entry.index_oid);
+                    self.refuse_changed_attributes(cwd, baseline)?;
+                    match result {
+                        Ok(expected) => expected == current_worktree.content,
+                        Err(error) => {
+                            filter_problem = Some(format!(
+                                "could not verify transformed content for {:?}: {}",
+                                repository_path.join(&path),
+                                error.last_line()
+                            ));
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
+                let represented_mode =
+                    !mode_changed || current_worktree.mode == current_entry.index_mode;
+                if !represented_content || !represented_mode {
+                    changed.push(repository_path.join(&path));
+                }
+                if filter_problem.is_some() {
+                    break 'repositories;
+                }
+            }
+        }
+        if filter_was_run {
+            self.refuse_changed_attributes(cwd, baseline)?;
+            let verified = safe_git_state(cwd).map_err(|e| {
+                uncertain_worktree_change(
+                    cwd,
+                    format!(
+                        "could not recheck tracked files after verifying transformed content in \
+                         {}: {}. The worktree was kept for recovery.",
+                        cwd.display(),
+                        e.last_line()
+                    ),
+                )
+            })?;
+            let verified_untracked = ignored_untracked_state(cwd).map_err(|e| {
+                uncertain_worktree_change(
+                    cwd,
+                    format!(
+                        "could not recheck untracked files after verifying transformed content \
+                         in {}: {}. The worktree was kept for recovery.",
+                        cwd.display(),
+                        e.last_line()
+                    ),
+                )
+            })?;
+            if verified != after || verified_untracked != before_filter_untracked {
+                return Err(uncertain_worktree_change(
+                    cwd,
+                    "a content filter changed the worktree while SPAR verified the managed \
+                     commit. The worktree was kept for recovery.",
+                ));
+            }
+            self.refuse_changed_existing_untracked(cwd, baseline)?;
+        }
+        if let Some(problem) = filter_problem {
+            return Err(uncertain_worktree_change(
+                cwd,
+                format!("{problem}. The worktree was kept for recovery."),
+            ));
+        }
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let mut listed = changed
+            .iter()
+            .take(5)
+            .map(|path| format!("{:?}", path.as_os_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if changed.len() > 5 {
+            listed.push_str(&format!(", and {} more", changed.len() - 5));
+        }
+        Err(uncertain_worktree_change(
+            cwd,
+            format!(
+                "the editing call changed tracked working-file bytes, modes, repositories, or \
+                 gitlinks outside an accepted commit: {listed}. The worktree was kept for \
+                 recovery."
+            ),
+        ))
+    }
+
+    pub(crate) fn refuse_changed_attributes(
+        &self,
+        cwd: &Path,
+        baseline: &WorktreeBaseline,
+    ) -> Result<()> {
+        let after = attribute_state(cwd).map_err(|e| {
+            uncertain_worktree_change(
+                cwd,
+                format!(
+                    "could not verify attribute files in {} after editing: {}. The worktree was \
+                     kept for recovery.",
+                    cwd.display(),
+                    e.last_line()
+                ),
+            )
+        })?;
+        if after == baseline.attributes {
+            return Ok(());
+        }
+        Err(uncertain_worktree_change(
+            cwd,
+            format!(
+                "the editing call changed a .gitattributes file in {}. It was kept, but SPAR \
+                 refused to run a Git operation that could select a new external filter.",
+                cwd.display()
+            ),
+        ))
+    }
+
+    /// Commit a successful editing call from the trusted harness process.
+    ///
+    /// Editing sandboxes only need the working tree. They never need writable
+    /// access to the repository's object database, refs, config, or hooks.
+    pub(crate) fn commit_pending_changes(
+        &self,
+        cwd: &Path,
+        baseline: &WorktreeBaseline,
+        preferred_subject: &str,
+        fallback_subject: &str,
+    ) -> Result<bool> {
+        self.refuse_changed_attributes(cwd, baseline)?;
+        self.allow_changed_generated_artifacts(cwd, baseline)?;
+        refuse_unsafe_index_flags(cwd)?;
+        if !self.has_uncommitted_changes(cwd)? {
+            self.allow_generated_ignored_files(cwd, baseline)?;
+            return Ok(false);
+        }
+        self.stage_managed_changes(cwd, baseline).map_err(|e| {
+            e.with_message(format!(
+                "could not stage changes in {}: {}",
+                cwd.display(),
+                e.last_line()
+            ))
+        })?;
+        // Ignored paths remain untracked after staging. Only known generated
+        // output may remain beside an otherwise complete managed commit.
+        self.allow_generated_ignored_files(cwd, baseline)?;
+        let changed_gitlinks = changed_staged_gitlinks(cwd)?;
+        if !changed_gitlinks.is_empty() {
+            let listed = changed_gitlinks
+                .iter()
+                .take(5)
+                .map(|path| format!("{:?}", path.as_os_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "the editing call added or changed a gitlink at {listed}. It was staged but not \
+                 committed because the referenced repository objects might exist only inside \
+                 this worktree. The worktree was kept for recovery."
+            );
+        }
+        let mut subject = self.clean_title(preferred_subject)?;
+        if subject.trim().is_empty() {
+            subject = self.clean_title(fallback_subject)?;
+        }
+        self.commit_staged_changes(cwd, &subject).map_err(|e| {
+            e.with_message(format!(
+                "could not commit changes in {}: {}. The staged files were kept.",
+                cwd.display(),
+                e.last_line()
+            ))
+        })?;
+        if has_tracked_or_staged_work(cwd)? {
+            bail!(
+                "the commit in {} left additional uncommitted files. They were kept for \
+                 recovery.",
+                cwd.display()
+            );
+        }
+        self.allow_changed_generated_artifacts(cwd, baseline)?;
+        self.allow_generated_ignored_files(cwd, baseline)?;
+        Ok(true)
+    }
+
+    fn stage_managed_changes(&self, cwd: &Path, baseline: &WorktreeBaseline) -> Result<()> {
+        let after = ignored_untracked_state(cwd)?;
+        self.git_at_without_automation(cwd, &["add", "-u"])?;
+        let paths = baseline.ignored_untracked.new_ordinary_paths(&after);
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut input = Vec::new();
+        for path in paths {
+            input.extend(os_str_bytes(path.as_os_str())?);
+            input.push(0);
+        }
+        let argv = git_without_automation_argv(&[
+            "--literal-pathspecs",
+            "add",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ]);
+        proc::run_with_input_bytes(
+            &argv,
+            &self.git_opts(Some(cwd), true).stop_descendants(true),
+            &input,
+        )?;
+        Ok(())
+    }
+
+    /// Commit an index prepared by the parent without signing, hooks, or
+    /// inherited repository automation.
+    pub(crate) fn commit_staged_changes(&self, cwd: &Path, subject: &str) -> Result<()> {
+        self.git_at_without_automation(cwd, &["commit", "--no-verify", "-m", subject])
+            .map(|_| ())
     }
 
     /// How many commits `refname` carries that the base does not.
@@ -1810,7 +3353,7 @@ impl Repo {
     /// Treating that as a failure reports work as lost when it is not.
     pub fn merge_pr(&self, number: i64) -> Result<()> {
         let n = number.to_string();
-        match self.gh(&merge_pr_args(&n, None)) {
+        match self.gh(&merge_pr_args(&n, None, true)) {
             Ok(_) => Ok(()),
             Err(e) => {
                 if self.pr_state(number) == "MERGED" {
@@ -1827,9 +3370,14 @@ impl Repo {
     }
 
     /// Squash merge only if the pull request still exposes the reviewed head.
-    pub fn merge_pr_at_head(&self, number: i64, expected_head: &str) -> Result<()> {
+    pub fn merge_pr_at_head(
+        &self,
+        number: i64,
+        expected_head: &str,
+        delete_branch: bool,
+    ) -> Result<()> {
         let n = number.to_string();
-        match self.gh(&merge_pr_args(&n, Some(expected_head))) {
+        match self.gh(&merge_pr_args(&n, Some(expected_head), delete_branch)) {
             Ok(_) => Ok(()),
             Err(e) => {
                 if self.pr_state(number) == "MERGED" {
@@ -2233,6 +3781,7 @@ impl Repo {
     pub fn prune_worktrees(&self, force_all: bool) -> Vec<String> {
         let base = self.root.join(WORKTREE_DIR);
         let mut removed = Vec::new();
+        let known = self.known_branches();
 
         if let Ok(entries) = std::fs::read_dir(&base) {
             let mut names: Vec<String> = entries
@@ -2250,22 +3799,147 @@ impl Repo {
                     if !(force_all || is_finished(&self.pr_state(number))) {
                         continue;
                     }
-                    self.release_review_worktree(number);
-                    removed.push(name);
+                    let path = base.join(&name);
+                    if force_all {
+                        let owned = self.worktree_belongs_to_repo(&path).and_then(|belongs| {
+                            if !belongs {
+                                return Ok(false);
+                            }
+                            let local_ref = review_ref(number);
+                            if !self.exact_ref_exists_checked(&self.root, &local_ref)? {
+                                return Ok(false);
+                            }
+                            let head = self.head_oid_checked(&path)?;
+                            let recorded = self
+                                .git_at(Some(&self.root), &["rev-parse", "--verify", &local_ref])?
+                                .trim()
+                                .to_string();
+                            Ok(head == recorded)
+                        });
+                        match owned {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                logdim!(
+                                    "kept {} because no matching SPAR review reference proves \
+                                     ownership",
+                                    path.display()
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                logdim!(
+                                    "kept {} because review ownership could not be verified: {}",
+                                    path.display(),
+                                    e.last_line()
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        if let Err(e) = self.refuse_review_worktree_changes(number) {
+                            logdim!(
+                                "kept {} because its review state could not be verified as \
+                                 disposable: {}",
+                                path.display(),
+                                e.last_line()
+                            );
+                            continue;
+                        }
+                    }
+                    if force_all {
+                        if self.remove_worktree_at_force(&path) {
+                            self.git_try(&["update-ref", "-d", &review_ref(number)]);
+                        }
+                    } else {
+                        self.release_review_worktree(number);
+                    }
+                    if !path.exists() {
+                        removed.push(name);
+                    }
                     continue;
                 }
                 let branch = format!("{}{name}", self.branch_prefix);
                 if !(force_all || self.worktree_is_done(&branch)) {
                     continue;
                 }
-                self.remove_worktree_at(&base.join(&name));
-                self.git_try(&["branch", "-D", &branch]);
-                self.forget_branch(&branch);
+                if !known.contains_key(&branch) {
+                    logdim!("kept {branch} because it has no branch record");
+                    continue;
+                }
+                let path = base.join(&name);
+                if !force_all {
+                    match self.has_recoverable_work(&path) {
+                        Ok(true) => {
+                            logdim!(
+                                "kept {} because it contains uncommitted changes or ignored files",
+                                path.display()
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            logdim!(
+                                "kept {} because its Git state could not be checked: {}",
+                                path.display(),
+                                e.last_line()
+                            );
+                            continue;
+                        }
+                        Ok(false) => {}
+                    }
+                    match self.branch_deletion_is_safe(&branch) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            logdim!(
+                                "kept {branch} because no surviving ref preserves its tip or \
+                                 reflog-only commits"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            logdim!(
+                                "kept {branch} because preservation could not be verified: {}",
+                                e.last_line()
+                            );
+                            continue;
+                        }
+                    }
+                }
+                let removed_worktree = if force_all {
+                    self.remove_worktree_at_force(&path)
+                } else {
+                    match self.remove_worktree_at(&path) {
+                        Ok(removed) => removed,
+                        Err(error) => {
+                            logdim!(
+                                "kept {branch} and {} because removal did not reach a confirmed \
+                                 quiet point: {}",
+                                path.display(),
+                                error.last_line()
+                            );
+                            false
+                        }
+                    }
+                };
+                if !removed_worktree {
+                    continue;
+                }
+                if force_all {
+                    self.git_try(&["branch", "-D", &branch]);
+                    self.forget_branch(&branch);
+                } else {
+                    match self.delete_branch_if_safe(&branch) {
+                        Ok(true) => self.forget_branch(&branch),
+                        Ok(false) => logdim!(
+                            "kept {branch} because its tip or reflog changed before deletion"
+                        ),
+                        Err(error) => logdim!(
+                            "kept {branch} because deletion safety could not be rechecked: {}",
+                            error.last_line()
+                        ),
+                    }
+                }
                 removed.push(name);
             }
-        }
-        if !removed.is_empty() {
-            self.git_try(&["worktree", "prune"]);
         }
         removed.extend(self.prune_branches(force_all));
         removed
@@ -2278,7 +3952,8 @@ impl Repo {
     /// person would call a branch themselves, so a name alone can never
     /// establish ownership. This is the data loss guard.
     pub fn prune_branches(&self, force_all: bool) -> Vec<String> {
-        let branches: Vec<String> = self.known_branches().keys().cloned().collect();
+        let known = self.known_branches();
+        let branches: Vec<String> = known.keys().cloned().collect();
         if branches.is_empty() {
             return Vec::new();
         }
@@ -2309,10 +3984,40 @@ impl Repo {
             if !(force_all || self.worktree_is_done(&branch)) {
                 continue;
             }
-            match self.git(&["branch", "-D", &branch]) {
-                Ok(_) => {
+            if !force_all {
+                let Some(_record) = known.get(&branch) else {
+                    continue;
+                };
+                match self.branch_deletion_is_safe(&branch) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        logdim!(
+                            "kept {branch} because no surviving ref preserves its tip or \
+                             reflog-only commits"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        logdim!(
+                            "kept {branch} because preservation could not be verified: {}",
+                            e.last_line()
+                        );
+                        continue;
+                    }
+                }
+            }
+            let deleted = if force_all {
+                self.git(&["branch", "-D", &branch]).map(|_| true)
+            } else {
+                self.delete_branch_if_safe(&branch)
+            };
+            match deleted {
+                Ok(true) => {
                     self.forget_branch(&branch);
                     removed.push(format!("branch {branch}"));
+                }
+                Ok(false) => {
+                    logdim!("kept {branch} because its tip or reflog changed before deletion");
                 }
                 Err(e) => {
                     // A branch that silently survives pruning looks like a spar
@@ -2353,6 +4058,1801 @@ impl Repo {
 // ---------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------
+
+/// Read attribute files without asking Git to inspect working-tree content.
+///
+/// A newly written attribute can select a clean or smudge filter. It must be
+/// detected before a post-call status, diff, or add command has a chance to run
+/// that filter in the parent process.
+pub(crate) fn attribute_state(cwd: &Path) -> Result<AttributeState> {
+    let root = std::fs::canonicalize(cwd)
+        .map_err(|e| spar_err!("could not resolve {}: {e}", cwd.display()))?;
+    let mut files = BTreeMap::new();
+    let mut visited = BTreeSet::new();
+    collect_attribute_files(&root, &root, Path::new(""), &mut visited, &mut files)?;
+    Ok(AttributeState { files })
+}
+
+fn collect_attribute_files(
+    root: &Path,
+    repository: &Path,
+    prefix: &Path,
+    visited: &mut BTreeSet<PathBuf>,
+    files: &mut BTreeMap<PathBuf, [u8; 32]>,
+) -> Result<()> {
+    let canonical = std::fs::canonicalize(repository)
+        .map_err(|e| spar_err!("could not resolve {}: {e}", repository.display()))?;
+    if !visited.insert(canonical) {
+        bail!("submodule recursion revisited {}", repository.display());
+    }
+    let entries = index_entries(repository)?;
+    let mut paths: BTreeSet<PathBuf> = entries
+        .iter()
+        .filter(|entry| entry.path.file_name() == Some(OsStr::new(".gitattributes")))
+        .map(|entry| entry.path.clone())
+        .collect();
+    let untracked = run_git_bytes(
+        repository,
+        &[
+            "ls-files",
+            "--others",
+            "-z",
+            "--",
+            ".gitattributes",
+            ":(glob)**/.gitattributes",
+        ],
+    )?;
+    if !untracked.is_empty() && !untracked.ends_with(&[0]) {
+        bail!(
+            "git returned an unterminated attribute-file listing for {}",
+            repository.display()
+        );
+    }
+    for raw in untracked
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        paths.insert(safe_git_path(raw, "attribute")?);
+    }
+    for path in paths {
+        let from_root = prefix.join(&path);
+        let state = attribute_file_fingerprint(&root.join(&from_root))?;
+        files.insert(from_root, state);
+    }
+    for entry in entries.into_iter().filter(|entry| entry.mode == "160000") {
+        let Some(submodule) = initialized_submodule(repository, &entry.path)? else {
+            continue;
+        };
+        collect_attribute_files(root, &submodule, &prefix.join(&entry.path), visited, files)?;
+    }
+    Ok(())
+}
+
+/// Leave a visible, untracked reason ordinary cleanup can detect on a later
+/// run even when Git status normalizes the original working-file change away.
+pub(crate) fn uncertain_worktree_change(
+    cwd: &Path,
+    message: impl Into<String>,
+) -> crate::error::SparError {
+    let message = message.into();
+    let marker = write_recovery_marker(cwd, &message);
+    let note = match marker {
+        Ok(path) => format!(" Recovery marker: {}.", path.display()),
+        Err(e) => format!(
+            " A recovery marker could not be written: {}.",
+            e.last_line()
+        ),
+    };
+    crate::error::SparError::uncertain_write(format!("{message}{note}"))
+}
+
+fn write_recovery_marker(cwd: &Path, detail: &str) -> Result<PathBuf> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    for _ in 0..1000 {
+        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = cwd.join(format!(
+            ".spar-recovery-needed-{}-{serial}",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut file) => {
+                file.write_all(detail.as_bytes())
+                    .and_then(|_| file.write_all(b"\n"))
+                    .map_err(|e| spar_err!("could not write {}: {e}", path.display()))?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(spar_err!(
+                    "could not create a recovery marker in {}: {e}",
+                    cwd.display()
+                ))
+            }
+        }
+    }
+    bail!(
+        "could not choose a free recovery marker name in {}",
+        cwd.display()
+    )
+}
+
+/// Build a Git command that cannot launch automatic repository maintenance.
+///
+/// A fetch may otherwise prune missing linked worktree registrations. SPAR
+/// must only remove registrations it has proven it owns.
+fn git_without_maintenance_argv(args: &[&str]) -> Vec<String> {
+    let mut argv = vec![
+        "git".to_string(),
+        "-c".to_string(),
+        "maintenance.auto=false".to_string(),
+        "-c".to_string(),
+        "gc.auto=0".to_string(),
+    ];
+    argv.extend(args.iter().map(|arg| (*arg).to_string()));
+    argv
+}
+
+fn git_without_automation_argv(args: &[&str]) -> Vec<String> {
+    let mut argv = git_without_maintenance_argv(&[]);
+    argv.extend([
+        "-c".to_string(),
+        "core.fsmonitor=".to_string(),
+        "-c".to_string(),
+        "commit.gpgsign=false".to_string(),
+        "-c".to_string(),
+        "core.hooksPath=/dev/null".to_string(),
+    ]);
+    argv.extend(args.iter().map(|arg| (*arg).to_string()));
+    argv
+}
+
+/// Snapshot every untracked file, including ignored files, without changing
+/// path bytes.
+///
+/// Without an exclude option, Git lists both ordinary and ignored untracked
+/// entries. Metadata fingerprints make overwriting an existing path observable
+/// without hashing a potentially multi-gigabyte build tree on every call.
+pub(crate) fn ignored_untracked_state(cwd: &Path) -> Result<IgnoredState> {
+    let root = std::fs::canonicalize(cwd)
+        .map_err(|e| spar_err!("could not resolve {}: {e}", cwd.display()))?;
+    let mut files = BTreeMap::new();
+    let mut ignored = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    collect_untracked_files(
+        &root,
+        &root,
+        Path::new(""),
+        &mut visited,
+        &mut files,
+        &mut ignored,
+    )?;
+    Ok(IgnoredState { files, ignored })
+}
+
+fn collect_untracked_files(
+    root: &Path,
+    repository: &Path,
+    prefix: &Path,
+    visited: &mut BTreeSet<PathBuf>,
+    files: &mut BTreeMap<PathBuf, UntrackedFile>,
+    ignored: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let canonical = std::fs::canonicalize(repository)
+        .map_err(|e| spar_err!("could not resolve {}: {e}", repository.display()))?;
+    if !visited.insert(canonical.clone()) {
+        bail!("submodule recursion revisited {}", canonical.display());
+    }
+    let listed = run_git_bytes(repository, &["ls-files", "--others", "-z"])?;
+    if !listed.is_empty() && !listed.ends_with(&[0]) {
+        bail!(
+            "git returned an unterminated untracked-file list for {}",
+            repository.display()
+        );
+    }
+
+    for raw in listed
+        .split(|byte| *byte == 0)
+        .filter(|raw| !raw.is_empty())
+    {
+        let relative = safe_git_path(raw, "untracked")?;
+        let from_root = prefix.join(&relative);
+        let fingerprint = ignored_file_fingerprint(&root.join(&from_root))?;
+        if files.insert(from_root.clone(), fingerprint).is_some() {
+            bail!(
+                "git returned the untracked path more than once: {:?}",
+                from_root
+            );
+        }
+    }
+
+    let ignored_listed = run_git_bytes(
+        repository,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ],
+    )?;
+    if !ignored_listed.is_empty() && !ignored_listed.ends_with(&[0]) {
+        bail!(
+            "git returned an unterminated ignored-file list for {}",
+            repository.display()
+        );
+    }
+    for raw in ignored_listed
+        .split(|byte| *byte == 0)
+        .filter(|raw| !raw.is_empty())
+    {
+        let relative = safe_git_path(raw, "ignored")?;
+        let from_root = prefix.join(relative);
+        if !files.contains_key(&from_root) {
+            bail!(
+                "git classified an unlisted path as ignored: {:?}",
+                from_root
+            );
+        }
+        if !ignored.insert(from_root.clone()) {
+            bail!(
+                "git returned the ignored path more than once: {:?}",
+                from_root
+            );
+        }
+    }
+
+    for link in gitlinks(repository)? {
+        let Some(submodule) = initialized_submodule(repository, &link.path)? else {
+            continue;
+        };
+        collect_untracked_files(
+            root,
+            &submodule,
+            &prefix.join(&link.path),
+            visited,
+            files,
+            ignored,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let argv = git_without_automation_argv(args);
+    proc::run_bytes(
+        &argv,
+        &ExecOpts::new()
+            .cwd(cwd)
+            .timeout_secs(30)
+            .stop_descendants(true),
+    )
+}
+
+fn run_git_text(cwd: &Path, args: &[&str]) -> Result<String> {
+    let argv = git_without_automation_argv(args);
+    proc::run(
+        &argv,
+        &ExecOpts::new()
+            .cwd(cwd)
+            .timeout_secs(30)
+            .stop_descendants(true),
+    )
+}
+
+fn filtered_index_content(cwd: &Path, path: &Path, oid: &str) -> Result<[u8; 32]> {
+    let path = path.to_str().ok_or_else(|| {
+        spar_err!(
+            "cannot verify filtered content for a non-UTF-8 path in {}",
+            cwd.display()
+        )
+    })?;
+    let path_arg = format!("--path={path}");
+    let bytes = run_git_bytes(cwd, &["cat-file", "--filters", &path_arg, oid])?;
+    Ok(Sha256::digest(bytes).into())
+}
+
+fn safe_git_path(raw: &[u8], kind: &str) -> Result<PathBuf> {
+    let relative = path_from_git_bytes(raw)?;
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        bail!("git returned an unsafe {kind} path: {:?}", relative);
+    }
+    Ok(relative)
+}
+
+fn index_entries(cwd: &Path) -> Result<Vec<IndexEntry>> {
+    let listed = run_git_bytes(cwd, &["ls-files", "--stage", "-z"])?;
+    if !listed.is_empty() && !listed.ends_with(&[0]) {
+        bail!(
+            "git returned an unterminated index listing for {}",
+            cwd.display()
+        );
+    }
+    let mut entries = Vec::new();
+    for record in listed
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+            bail!(
+                "git returned a malformed index record for {}",
+                cwd.display()
+            );
+        };
+        let header = &record[..tab];
+        let fields = header.split(|byte| *byte == b' ').collect::<Vec<_>>();
+        if fields.len() != 3 {
+            bail!(
+                "git returned a malformed index header for {}",
+                cwd.display()
+            );
+        }
+        if fields[2] != b"0" {
+            continue;
+        }
+        let mode = std::str::from_utf8(fields[0])
+            .map_err(|_| spar_err!("git returned a non-UTF-8 index mode"))?
+            .to_string();
+        let oid = std::str::from_utf8(fields[1])
+            .map_err(|_| spar_err!("git returned a non-UTF-8 object id"))?
+            .to_string();
+        entries.push(IndexEntry {
+            path: safe_git_path(&record[tab + 1..], "index")?,
+            mode,
+            oid,
+        });
+    }
+    Ok(entries)
+}
+
+fn attributes_may_be_modified(cwd: &Path) -> Result<bool> {
+    let untracked = run_git_bytes(
+        cwd,
+        &[
+            "ls-files",
+            "--others",
+            "-z",
+            "--",
+            ".gitattributes",
+            ":(glob)**/.gitattributes",
+        ],
+    )?;
+    if !untracked.is_empty() {
+        return Ok(true);
+    }
+
+    let index = index_entries(cwd)?
+        .into_iter()
+        .filter(|entry| entry.path.file_name() == Some(OsStr::new(".gitattributes")))
+        .map(|entry| (entry.path, (entry.mode, entry.oid)))
+        .collect::<BTreeMap<_, _>>();
+    let head = tree_entries(cwd, "HEAD")?
+        .into_iter()
+        .filter(|entry| entry.path.file_name() == Some(OsStr::new(".gitattributes")))
+        .map(|entry| (entry.path, (entry.mode, entry.oid)))
+        .collect::<BTreeMap<_, _>>();
+    if index != head {
+        return Ok(true);
+    }
+
+    let effective = check_attributes(cwd, index.keys().cloned())?;
+    for (path, (_mode, oid)) in index {
+        let Some(worktree) = tracked_worktree_file(&cwd.join(&path), oid.len())? else {
+            return Ok(true);
+        };
+        let attributes = effective
+            .get(&path)
+            .ok_or_else(|| spar_err!("git omitted attributes for {}", cwd.join(&path).display()))?;
+        if allows_expected_crlf(cwd, attributes)? {
+            if worktree.mode == "120000" {
+                return Ok(true);
+            }
+            let (normalized, every_lf_was_crlf) =
+                normalized_git_blob_oid(&cwd.join(&path), oid.len())?;
+            if !every_lf_was_crlf || normalized != oid {
+                return Ok(true);
+            }
+        } else if worktree.raw_oid != oid {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn gitlinks(cwd: &Path) -> Result<Vec<Gitlink>> {
+    Ok(index_entries(cwd)?
+        .into_iter()
+        .filter(|entry| entry.mode == "160000")
+        .map(|entry| Gitlink {
+            path: entry.path,
+            oid: entry.oid,
+        })
+        .collect())
+}
+
+fn tracked_entries(cwd: &Path) -> Result<BTreeMap<PathBuf, TrackedEntry>> {
+    let mut tracked = BTreeMap::new();
+    for entry in index_entries(cwd)? {
+        if entry.mode == "160000" {
+            continue;
+        }
+        let worktree = tracked_worktree_file(&cwd.join(&entry.path), entry.oid.len())?;
+        tracked.insert(
+            entry.path,
+            TrackedEntry {
+                index_mode: entry.mode,
+                index_oid: entry.oid,
+                worktree,
+            },
+        );
+    }
+    Ok(tracked)
+}
+
+fn tracked_worktree_file(path: &Path, oid_len: usize) -> Result<Option<WorktreeFile>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(spar_err!(
+                "could not inspect tracked file {}: {e}",
+                path.display()
+            ))
+        }
+    };
+    let mut fingerprint = Sha256::new();
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(path)
+            .map_err(|e| spar_err!("could not read tracked symlink {}: {e}", path.display()))?;
+        let bytes = os_str_bytes(target.as_os_str())?;
+        fingerprint.update(b"symlink\0");
+        fingerprint.update(&bytes);
+        let content = Sha256::digest(&bytes).into();
+        return Ok(Some(WorktreeFile {
+            mode: "120000".to_string(),
+            #[cfg(unix)]
+            permissions: 0,
+            raw_oid: git_blob_oid(oid_len, &bytes)?,
+            fingerprint: fingerprint.finalize().into(),
+            content,
+        }));
+    }
+    if !metadata.is_file() {
+        bail!("tracked path {} is not a file or symlink", path.display());
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| spar_err!("could not read tracked file {}: {e}", path.display()))?;
+    let before = file
+        .metadata()
+        .map_err(|e| spar_err!("could not inspect tracked file {}: {e}", path.display()))?;
+    let mode = tracked_file_mode(&before);
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::MetadataExt;
+        before.mode() & 0o7777
+    };
+    fingerprint.update(b"file\0");
+    fingerprint.update(mode.as_bytes());
+    #[cfg(unix)]
+    fingerprint.update(permissions.to_le_bytes());
+    fingerprint.update(before.len().to_le_bytes());
+    let mut content = Sha256::new();
+    let header = format!("blob {}\0", before.len());
+    let mut object = ObjectHasher::new(oid_len, header.as_bytes())?;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .map_err(|e| spar_err!("could not read tracked file {}: {e}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        fingerprint.update(&buf[..read]);
+        content.update(&buf[..read]);
+        object.update(&buf[..read]);
+    }
+    let after = file
+        .metadata()
+        .map_err(|e| spar_err!("could not recheck tracked file {}: {e}", path.display()))?;
+    if before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || before.permissions() != after.permissions()
+    {
+        bail!(
+            "tracked file {} changed while it was being inspected",
+            path.display()
+        );
+    }
+    let current = std::fs::symlink_metadata(path)
+        .map_err(|e| spar_err!("could not recheck tracked file {}: {e}", path.display()))?;
+    if !same_file(&after, &current) {
+        bail!(
+            "tracked file {} was replaced while it was being inspected",
+            path.display()
+        );
+    }
+    Ok(Some(WorktreeFile {
+        mode,
+        #[cfg(unix)]
+        permissions,
+        raw_oid: object.finish(),
+        fingerprint: fingerprint.finalize().into(),
+        content: content.finalize().into(),
+    }))
+}
+
+fn attribute_file_fingerprint(path: &Path) -> Result<[u8; 32]> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| spar_err!("could not inspect attribute file {}: {e}", path.display()))?;
+    let mut digest = Sha256::new();
+    if metadata.file_type().is_symlink() {
+        digest.update(b"symlink\0");
+        let target = std::fs::read_link(path)
+            .map_err(|e| spar_err!("could not read attribute symlink {}: {e}", path.display()))?;
+        digest.update(os_str_bytes(target.as_os_str())?);
+        return Ok(digest.finalize().into());
+    }
+    if !metadata.is_file() {
+        bail!("attribute path {} is not a file or symlink", path.display());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| spar_err!("could not read attribute file {}: {e}", path.display()))?;
+    let before = file
+        .metadata()
+        .map_err(|e| spar_err!("could not inspect attribute file {}: {e}", path.display()))?;
+    digest.update(b"file\0");
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .map_err(|e| spar_err!("could not read attribute file {}: {e}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buf[..read]);
+    }
+    let after = file
+        .metadata()
+        .map_err(|e| spar_err!("could not recheck attribute file {}: {e}", path.display()))?;
+    let current = std::fs::symlink_metadata(path)
+        .map_err(|e| spar_err!("could not recheck attribute file {}: {e}", path.display()))?;
+    if before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || !same_file(&after, &current)
+    {
+        bail!(
+            "attribute file {} changed while it was being inspected",
+            path.display()
+        );
+    }
+    Ok(digest.finalize().into())
+}
+
+enum ObjectHasher {
+    Sha1(Sha1),
+    Sha256(Sha256),
+}
+
+impl ObjectHasher {
+    fn new(oid_len: usize, header: &[u8]) -> Result<Self> {
+        let mut hasher = match oid_len {
+            40 => Self::Sha1(<Sha1 as sha1::Digest>::new()),
+            64 => Self::Sha256(Sha256::new()),
+            _ => bail!("git returned an object id with an unsupported length: {oid_len}"),
+        };
+        hasher.update(header);
+        Ok(hasher)
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Sha1(hasher) => sha1::Digest::update(hasher, bytes),
+            Self::Sha256(hasher) => hasher.update(bytes),
+        }
+    }
+
+    fn finish(self) -> String {
+        let bytes = match self {
+            Self::Sha1(hasher) => sha1::Digest::finalize(hasher).to_vec(),
+            Self::Sha256(hasher) => hasher.finalize().to_vec(),
+        };
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
+fn git_blob_oid(oid_len: usize, bytes: &[u8]) -> Result<String> {
+    let header = format!("blob {}\0", bytes.len());
+    let mut hasher = ObjectHasher::new(oid_len, header.as_bytes())?;
+    hasher.update(bytes);
+    Ok(hasher.finish())
+}
+
+fn normalized_git_blob_oid(path: &Path, oid_len: usize) -> Result<(String, bool)> {
+    let mut first = open_regular_file(path)?;
+    let first_before = first
+        .metadata()
+        .map_err(|e| spar_err!("could not inspect tracked file {}: {e}", path.display()))?;
+    let mut raw_len = 0u64;
+    let mut crlf_pairs = 0u64;
+    let mut previous_was_cr = false;
+    let mut every_lf_was_crlf = true;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = first
+            .read(&mut buf)
+            .map_err(|e| spar_err!("could not read tracked file {}: {e}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        raw_len = raw_len
+            .checked_add(read as u64)
+            .ok_or_else(|| spar_err!("tracked file {} is too large", path.display()))?;
+        for byte in &buf[..read] {
+            if *byte == b'\n' {
+                if previous_was_cr {
+                    crlf_pairs += 1;
+                } else {
+                    every_lf_was_crlf = false;
+                }
+            }
+            previous_was_cr = *byte == b'\r';
+        }
+    }
+    let first_after = first
+        .metadata()
+        .map_err(|e| spar_err!("could not recheck tracked file {}: {e}", path.display()))?;
+    let current = std::fs::symlink_metadata(path)
+        .map_err(|e| spar_err!("could not recheck tracked file {}: {e}", path.display()))?;
+    if raw_len != first_before.len()
+        || !stable_file_metadata(&first_before, &first_after)
+        || !stable_file_metadata(&first_after, &current)
+    {
+        bail!(
+            "tracked file {} changed while line endings were inspected",
+            path.display()
+        );
+    }
+
+    let normalized_len = raw_len
+        .checked_sub(crlf_pairs)
+        .ok_or_else(|| spar_err!("could not normalize tracked file {}", path.display()))?;
+    let header = format!("blob {normalized_len}\0");
+    let mut object = ObjectHasher::new(oid_len, header.as_bytes())?;
+    let mut second = open_regular_file(path)?;
+    let second_before = second
+        .metadata()
+        .map_err(|e| spar_err!("could not inspect tracked file {}: {e}", path.display()))?;
+    if !stable_file_metadata(&first_after, &second_before) {
+        bail!(
+            "tracked file {} changed between line-ending checks",
+            path.display()
+        );
+    }
+    let mut pending_cr = false;
+    loop {
+        let read = second
+            .read(&mut buf)
+            .map_err(|e| spar_err!("could not read tracked file {}: {e}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        for byte in &buf[..read] {
+            if pending_cr {
+                if *byte == b'\n' {
+                    object.update(b"\n");
+                    pending_cr = false;
+                    continue;
+                }
+                object.update(b"\r");
+                pending_cr = false;
+            }
+            if *byte == b'\r' {
+                pending_cr = true;
+            } else {
+                object.update(std::slice::from_ref(byte));
+            }
+        }
+    }
+    if pending_cr {
+        object.update(b"\r");
+    }
+    let second_after = second
+        .metadata()
+        .map_err(|e| spar_err!("could not recheck tracked file {}: {e}", path.display()))?;
+    let current = std::fs::symlink_metadata(path)
+        .map_err(|e| spar_err!("could not recheck tracked file {}: {e}", path.display()))?;
+    if !stable_file_metadata(&second_before, &second_after)
+        || !stable_file_metadata(&second_after, &current)
+    {
+        bail!(
+            "tracked file {} changed while line endings were hashed",
+            path.display()
+        );
+    }
+    Ok((object.finish(), every_lf_was_crlf))
+}
+
+fn open_regular_file(path: &Path) -> Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| spar_err!("could not read tracked file {}: {e}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| spar_err!("could not inspect tracked file {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("tracked path {} is not a regular file", path.display());
+    }
+    Ok(file)
+}
+
+fn stable_file_metadata(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    if !same_file(left, right)
+        || left.len() != right.len()
+        || left.modified().ok() != right.modified().ok()
+        || left.permissions() != right.permissions()
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.ctime() == right.ctime() && left.ctime_nsec() == right.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        left.created().ok() == right.created().ok()
+    }
+}
+
+fn check_attributes(
+    cwd: &Path,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<BTreeMap<PathBuf, BTreeMap<String, String>>> {
+    const NAMES: [&str; 6] = [
+        "filter",
+        "working-tree-encoding",
+        "ident",
+        "text",
+        "eol",
+        "crlf",
+    ];
+    let paths = paths.into_iter().collect::<BTreeSet<_>>();
+    if paths.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut input = String::new();
+    for path in &paths {
+        let path = path.to_str().ok_or_else(|| {
+            spar_err!(
+                "cannot inspect attributes for a non-UTF-8 path in {}",
+                cwd.display()
+            )
+        })?;
+        input.push_str(path);
+        input.push('\0');
+    }
+    let argv = git_without_automation_argv(&[
+        "check-attr",
+        "-z",
+        "--cached",
+        "--stdin",
+        "filter",
+        "working-tree-encoding",
+        "ident",
+        "text",
+        "eol",
+        "crlf",
+    ]);
+    let output = proc::run_bytes(
+        &argv,
+        &ExecOpts::new()
+            .cwd(cwd)
+            .timeout_secs(30)
+            .stdin(input)
+            .stop_descendants(true),
+    )?;
+    if !output.is_empty() && !output.ends_with(&[0]) {
+        bail!(
+            "git returned an unterminated attribute result for {}",
+            cwd.display()
+        );
+    }
+    let fields = output
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    if fields.len() != paths.len() * NAMES.len() * 3 {
+        bail!(
+            "git returned an unexpected attribute result for {}",
+            cwd.display()
+        );
+    }
+    let mut values: BTreeMap<PathBuf, BTreeMap<String, String>> = BTreeMap::new();
+    for record in fields.chunks_exact(3) {
+        let path = safe_git_path(record[0], "attribute")?;
+        if !paths.contains(&path) {
+            bail!(
+                "git returned attributes for the wrong path in {}",
+                cwd.display()
+            );
+        }
+        let name = std::str::from_utf8(record[1])
+            .map_err(|_| spar_err!("git returned a non-UTF-8 attribute name"))?;
+        let value = std::str::from_utf8(record[2])
+            .map_err(|_| spar_err!("git returned a non-UTF-8 attribute value"))?;
+        values
+            .entry(path)
+            .or_default()
+            .insert(name.to_string(), value.to_string());
+    }
+    if paths.iter().any(|path| {
+        values
+            .get(path)
+            .is_none_or(|attributes| attributes.len() != NAMES.len())
+    }) {
+        bail!(
+            "git omitted an attribute result for a tracked path in {}",
+            cwd.display()
+        );
+    }
+    Ok(values)
+}
+
+fn attribute_is_active(value: Option<&String>) -> bool {
+    !matches!(
+        value.map(String::as_str),
+        None | Some("unspecified") | Some("unset")
+    )
+}
+
+fn path_has_external_transform(values: &BTreeMap<String, String>) -> bool {
+    attribute_is_active(values.get("filter"))
+        || attribute_is_active(values.get("working-tree-encoding"))
+}
+
+fn path_has_ambiguous_transform(cwd: &Path, values: &BTreeMap<String, String>) -> Result<bool> {
+    if path_has_external_transform(values)
+        || attribute_is_active(values.get("ident"))
+        || attribute_is_active(values.get("crlf"))
+    {
+        return Ok(true);
+    }
+    let text = values.get("text").map(String::as_str);
+    let eol = values.get("eol").map(String::as_str);
+    if text == Some("auto") {
+        return Ok(true);
+    }
+    if !matches!(text, Some("set") | Some("unset") | Some("unspecified"))
+        || !matches!(
+            eol,
+            Some("lf") | Some("crlf") | Some("unset") | Some("unspecified")
+        )
+    {
+        return Ok(true);
+    }
+    if text == Some("unspecified") && matches!(eol, Some("unspecified") | Some("unset")) {
+        return Ok(
+            git_config_value(cwd, "core.autocrlf")?.is_some_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "true" | "yes" | "on" | "1"
+                )
+            }),
+        );
+    }
+    Ok(false)
+}
+
+fn allows_expected_crlf(cwd: &Path, values: &BTreeMap<String, String>) -> Result<bool> {
+    if path_has_external_transform(values)
+        || attribute_is_active(values.get("ident"))
+        || attribute_is_active(values.get("crlf"))
+    {
+        return Ok(false);
+    }
+    let text = values.get("text").map(String::as_str);
+    let eol = values.get("eol").map(String::as_str);
+    if matches!(text, Some("unset") | Some("auto")) || eol == Some("lf") {
+        return Ok(false);
+    }
+    if eol == Some("crlf") {
+        return Ok(true);
+    }
+    if text != Some("set") {
+        return Ok(false);
+    }
+    if let Some(autocrlf) = git_config_value(cwd, "core.autocrlf")? {
+        match autocrlf.to_ascii_lowercase().as_str() {
+            "true" | "yes" | "on" | "1" => return Ok(true),
+            "input" => return Ok(false),
+            _ => {}
+        }
+    }
+    if git_config_value(cwd, "core.eol")?.is_some_and(|value| value.eq_ignore_ascii_case("crlf")) {
+        return Ok(true);
+    }
+    #[cfg(windows)]
+    if git_config_value(cwd, "core.eol")?.is_none_or(|value| value.eq_ignore_ascii_case("native")) {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn git_config_value(cwd: &Path, key: &str) -> Result<Option<String>> {
+    let argv = git_without_automation_argv(&["config", "--get", key]);
+    let output = proc::exec(
+        &argv,
+        &ExecOpts::new()
+            .cwd(cwd)
+            .timeout_secs(30)
+            .check(false)
+            .stop_descendants(true),
+    )?;
+    match output.code {
+        0 => Ok(Some(output.stdout.trim().to_string())),
+        1 => Ok(None),
+        _ => bail!(
+            "could not read Git configuration in {}: {}",
+            cwd.display(),
+            output.stderr.trim()
+        ),
+    }
+}
+
+fn git_config_bool(cwd: &Path, key: &str) -> Result<Option<bool>> {
+    let argv = git_without_automation_argv(&["config", "--type=bool", "--get", key]);
+    let output = proc::exec(
+        &argv,
+        &ExecOpts::new()
+            .cwd(cwd)
+            .timeout_secs(30)
+            .check(false)
+            .stop_descendants(true),
+    )?;
+    match output.code {
+        0 if output.stdout.trim() == "true" => Ok(Some(true)),
+        0 if output.stdout.trim() == "false" => Ok(Some(false)),
+        0 => bail!(
+            "git returned an invalid boolean for {key} in {}",
+            cwd.display()
+        ),
+        1 => Ok(None),
+        _ => bail!(
+            "could not read Git configuration in {}: {}",
+            cwd.display(),
+            output.stderr.trim()
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn tracked_file_mode(metadata: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    if metadata.permissions().mode() & 0o111 == 0 {
+        "100644".to_string()
+    } else {
+        "100755".to_string()
+    }
+}
+
+#[cfg(not(unix))]
+fn tracked_file_mode(_metadata: &std::fs::Metadata) -> String {
+    "100644".to_string()
+}
+
+fn tree_entries(cwd: &Path, treeish: &str) -> Result<Vec<IndexEntry>> {
+    let listed = run_git_bytes(cwd, &["ls-tree", "-r", "-z", treeish])?;
+    if !listed.is_empty() && !listed.ends_with(&[0]) {
+        bail!(
+            "git returned an unterminated tree listing for {}",
+            cwd.display()
+        );
+    }
+    let mut entries = Vec::new();
+    for record in listed
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+            bail!("git returned a malformed tree record for {}", cwd.display());
+        };
+        let fields = record[..tab]
+            .split(|byte| *byte == b' ')
+            .collect::<Vec<_>>();
+        if fields.len() != 3 {
+            bail!("git returned a malformed tree header for {}", cwd.display());
+        }
+        let mode = std::str::from_utf8(fields[0])
+            .map_err(|_| spar_err!("git returned a non-UTF-8 tree mode"))?
+            .to_string();
+        let oid = std::str::from_utf8(fields[2])
+            .map_err(|_| spar_err!("git returned a non-UTF-8 object id"))?
+            .to_string();
+        entries.push(IndexEntry {
+            path: safe_git_path(&record[tab + 1..], "tree")?,
+            mode,
+            oid,
+        });
+    }
+    Ok(entries)
+}
+
+fn head_gitlinks(cwd: &Path) -> Result<BTreeMap<PathBuf, String>> {
+    Ok(tree_entries(cwd, "HEAD")?
+        .into_iter()
+        .filter(|entry| entry.mode == "160000")
+        .map(|entry| (entry.path, entry.oid))
+        .collect())
+}
+
+fn changed_staged_gitlinks(cwd: &Path) -> Result<Vec<PathBuf>> {
+    let head = head_gitlinks(cwd)?;
+    let index: BTreeMap<PathBuf, String> = gitlinks(cwd)?
+        .into_iter()
+        .map(|link| (link.path, link.oid))
+        .collect();
+    let mut paths: BTreeSet<PathBuf> = head.keys().cloned().collect();
+    paths.extend(index.keys().cloned());
+    Ok(paths
+        .into_iter()
+        .filter(|path| head.get(path) != index.get(path))
+        .collect())
+}
+
+fn initialized_submodule(parent: &Path, relative: &Path) -> Result<Option<PathBuf>> {
+    let path = parent.join(relative);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(spar_err!("could not inspect {}: {e}", path.display())),
+    };
+    if !metadata.is_dir() {
+        bail!("the gitlink at {} is not a directory", path.display());
+    }
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|e| spar_err!("could not resolve {}: {e}", path.display()))?;
+    if canonical != path {
+        bail!(
+            "the gitlink at {} resolves through a symlink",
+            path.display()
+        );
+    }
+    if !path.join(".git").exists() {
+        let empty = std::fs::read_dir(&path)
+            .map_err(|e| spar_err!("could not inspect {}: {e}", path.display()))?
+            .next()
+            .is_none();
+        if empty {
+            return Ok(None);
+        }
+        bail!(
+            "the uninitialized gitlink at {} contains local files",
+            path.display()
+        );
+    }
+    let inside = run_git_text(&path, &["rev-parse", "--is-inside-work-tree"])?;
+    if inside.trim() != "true" {
+        bail!("the gitlink at {} is not a worktree", path.display());
+    }
+    let top = run_git_text(&path, &["rev-parse", "--show-toplevel"])?;
+    let top = std::fs::canonicalize(top.trim()).map_err(|e| {
+        spar_err!(
+            "could not resolve the gitlink top level at {}: {e}",
+            path.display()
+        )
+    })?;
+    if top != canonical {
+        bail!(
+            "the gitlink at {} belongs to a different worktree",
+            path.display()
+        );
+    }
+    Ok(Some(canonical))
+}
+
+fn unexpected_nested_git_entry(cwd: &Path) -> Result<Option<PathBuf>> {
+    let root = std::fs::canonicalize(cwd)
+        .map_err(|e| spar_err!("could not resolve {}: {e}", cwd.display()))?;
+    let mut allowed = BTreeSet::from([root.join(".git")]);
+    let mut repositories = vec![root.clone()];
+    let mut visited = BTreeSet::new();
+    while let Some(repository) = repositories.pop() {
+        let canonical = std::fs::canonicalize(&repository)
+            .map_err(|e| spar_err!("could not resolve {}: {e}", repository.display()))?;
+        if !visited.insert(canonical.clone()) {
+            bail!("submodule recursion revisited {}", canonical.display());
+        }
+        for link in gitlinks(&canonical)? {
+            let Some(submodule) = initialized_submodule(&canonical, &link.path)? else {
+                continue;
+            };
+            allowed.insert(submodule.join(".git"));
+            repositories.push(submodule);
+        }
+    }
+
+    let scan_root = root.clone();
+    let mut directories = vec![root];
+    while let Some(directory) = directories.pop() {
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|e| spar_err!("could not inspect {}: {e}", directory.display()))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| spar_err!("could not inspect {}: {e}", directory.display()))?;
+            let path = entry.path();
+            if directory == scan_root && entry.file_name() == OsStr::new(WORKTREE_DIR) {
+                continue;
+            }
+            if entry.file_name() == OsStr::new(".git") {
+                if !allowed.contains(&path) {
+                    return Ok(Some(path));
+                }
+                continue;
+            }
+            let kind = entry
+                .file_type()
+                .map_err(|e| spar_err!("could not inspect {}: {e}", path.display()))?;
+            if kind.is_dir() {
+                directories.push(path);
+            }
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn git_state(cwd: &Path) -> Result<GitState> {
+    if let Some(path) = unexpected_nested_git_entry(cwd)? {
+        bail!(
+            "the worktree contains an untracked Git entry at {}. It was kept because its \
+             repository objects are not represented by the outer index.",
+            path.display()
+        );
+    }
+    let root = std::fs::canonicalize(cwd)
+        .map_err(|e| spar_err!("could not resolve {}: {e}", cwd.display()))?;
+    let mut repositories = BTreeMap::new();
+    let mut visited = BTreeSet::new();
+    collect_git_state(&root, Path::new(""), &mut visited, &mut repositories)?;
+    Ok(GitState { repositories })
+}
+
+fn collect_git_state(
+    repository: &Path,
+    prefix: &Path,
+    visited: &mut BTreeSet<PathBuf>,
+    repositories: &mut BTreeMap<PathBuf, RepositoryState>,
+) -> Result<()> {
+    let canonical = std::fs::canonicalize(repository)
+        .map_err(|e| spar_err!("could not resolve {}: {e}", repository.display()))?;
+    if !visited.insert(canonical.clone()) {
+        bail!("submodule recursion revisited {}", canonical.display());
+    }
+    let head = run_git_text(repository, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    let head = head.trim().to_string();
+    if head.is_empty() {
+        bail!("git returned an empty head for {}", repository.display());
+    }
+    let unsafe_index_flags = unsafe_index_flags(repository)?;
+    let tracked = tracked_entries(repository)?;
+    let gitlinks = gitlinks(repository)?;
+    if repositories
+        .insert(
+            prefix.to_path_buf(),
+            RepositoryState {
+                head,
+                unsafe_index_flags,
+                tracked,
+                gitlinks: gitlinks
+                    .iter()
+                    .map(|link| (link.path.clone(), link.oid.clone()))
+                    .collect(),
+            },
+        )
+        .is_some()
+    {
+        bail!("Git state contains duplicate repository path {:?}", prefix);
+    }
+
+    for link in gitlinks {
+        let Some(submodule) = initialized_submodule(repository, &link.path)? else {
+            continue;
+        };
+        collect_git_state(&submodule, &prefix.join(&link.path), visited, repositories)?;
+    }
+    Ok(())
+}
+
+fn unsafe_index_flags(cwd: &Path) -> Result<Vec<u8>> {
+    let listed = run_git_bytes(cwd, &["ls-files", "-v", "-z"])?;
+    if !listed.is_empty() && !listed.ends_with(&[0]) {
+        bail!(
+            "git returned an unterminated index-flag listing for {}",
+            cwd.display()
+        );
+    }
+    let mut unsafe_records = Vec::new();
+    for record in listed
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        if record.len() < 3 || record[1] != b' ' {
+            bail!(
+                "git returned a malformed index-flag record for {}",
+                cwd.display()
+            );
+        }
+        if record[0] != b'H' {
+            unsafe_records.extend_from_slice(record);
+            unsafe_records.push(0);
+        }
+    }
+    Ok(unsafe_records)
+}
+
+pub(crate) fn refuse_unsafe_index_flags(cwd: &Path) -> Result<()> {
+    safe_git_state(cwd).map(|_| ())
+}
+
+pub(crate) fn safe_git_state(cwd: &Path) -> Result<GitState> {
+    let state = git_state(cwd)?;
+    if let Some((path, _repository)) = state
+        .repositories
+        .iter()
+        .find(|(_, repository)| !repository.unsafe_index_flags.is_empty())
+    {
+        let label = if path.as_os_str().is_empty() {
+            cwd.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+        bail!(
+            "the index at {} has assume-unchanged, skip-worktree, or another nonstandard flag. \
+             SPAR cannot prove the working files are unchanged, so it was kept.",
+            label.display()
+        );
+    }
+    Ok(state)
+}
+
+fn repository_has_recoverable_work(cwd: &Path, include_ignored: bool) -> Result<bool> {
+    if include_ignored && unexpected_nested_git_entry(cwd)?.is_some() {
+        return Ok(true);
+    }
+    let mut visited = BTreeSet::new();
+    repository_has_recoverable_work_inner(cwd, include_ignored, &mut visited)
+}
+
+fn has_recoverable_worktree_admin_state(cwd: &Path) -> Result<bool> {
+    let git_dir = run_git_text(cwd, &["rev-parse", "--git-dir"])?;
+    let git_dir = PathBuf::from(git_dir.trim());
+    let git_dir = if git_dir.is_absolute() {
+        git_dir
+    } else {
+        cwd.join(git_dir)
+    };
+    let git_dir = std::fs::canonicalize(&git_dir)
+        .map_err(|e| spar_err!("could not resolve {}: {e}", git_dir.display()))?;
+    match std::fs::symlink_metadata(git_dir.join("config.worktree")) {
+        Ok(_) => return Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(spar_err!(
+                "could not inspect per-worktree configuration in {}: {error}",
+                git_dir.display()
+            ))
+        }
+    }
+
+    let orig_head = git_dir.join("ORIG_HEAD");
+    match std::fs::symlink_metadata(&orig_head) {
+        Ok(metadata) if metadata.is_file() => {
+            let oid = std::fs::read_to_string(&orig_head)
+                .map_err(|e| spar_err!("could not read {}: {e}", orig_head.display()))?;
+            let Some(commit) = resolve_optional_commit(cwd, oid.trim())? else {
+                return Ok(true);
+            };
+            if !commit_has_shared_ref(cwd, &commit)? {
+                return Ok(true);
+            }
+        }
+        Ok(_) => return Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(spar_err!(
+                "could not inspect {}: {error}",
+                orig_head.display()
+            ))
+        }
+    }
+
+    let edit_message = git_dir.join("COMMIT_EDITMSG");
+    match std::fs::symlink_metadata(&edit_message) {
+        Ok(metadata) if metadata.is_file() => {
+            let draft = std::fs::read(&edit_message)
+                .map_err(|e| spar_err!("could not read {}: {e}", edit_message.display()))?;
+            if draft != head_commit_message(cwd)? {
+                return Ok(true);
+            }
+        }
+        Ok(_) => return Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(spar_err!(
+                "could not inspect {}: {error}",
+                edit_message.display()
+            ))
+        }
+    }
+
+    if reflogs_have_unpreserved_commits(cwd, &git_dir.join("logs"))? {
+        return Ok(true);
+    }
+
+    let local_refs = run_git_bytes(
+        cwd,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/worktree",
+            "refs/bisect",
+            "refs/rewritten",
+        ],
+    )?;
+    if !local_refs.is_empty() {
+        return Ok(true);
+    }
+
+    for entry in std::fs::read_dir(&git_dir)
+        .map_err(|e| spar_err!("could not inspect {}: {e}", git_dir.display()))?
+    {
+        let entry = entry.map_err(|e| spar_err!("could not inspect {}: {e}", git_dir.display()))?;
+        let known = matches!(
+            entry.file_name().to_str(),
+            Some(
+                "HEAD"
+                    | "ORIG_HEAD"
+                    | "COMMIT_EDITMSG"
+                    | "commondir"
+                    | "gitdir"
+                    | "index"
+                    | "logs"
+                    | "refs"
+            )
+        );
+        if !known {
+            return Ok(true);
+        }
+    }
+
+    let head = run_git_text(cwd, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    if !commit_has_shared_ref(cwd, head.trim())? {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn head_commit_message(cwd: &Path) -> Result<Vec<u8>> {
+    let commit = run_git_bytes(cwd, &["cat-file", "commit", "HEAD"])?;
+    let Some(split) = commit.windows(2).position(|bytes| bytes == b"\n\n") else {
+        bail!(
+            "git returned a commit without a message separator in {}",
+            cwd.display()
+        );
+    };
+    Ok(commit[split + 2..].to_vec())
+}
+
+fn reflogs_have_unpreserved_commits(cwd: &Path, logs: &Path) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(logs) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(spar_err!("could not inspect {}: {error}", logs.display())),
+    };
+    if !metadata.is_dir() {
+        return Ok(true);
+    }
+    let mut files = Vec::new();
+    let mut directories = vec![logs.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .map_err(|e| spar_err!("could not inspect {}: {e}", directory.display()))?
+        {
+            let entry =
+                entry.map_err(|e| spar_err!("could not inspect {}: {e}", directory.display()))?;
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|e| spar_err!("could not inspect {}: {e}", path.display()))?;
+            if kind.is_dir() {
+                directories.push(path);
+            } else if kind.is_file() {
+                files.push(path);
+            } else {
+                return Ok(true);
+            }
+        }
+    }
+
+    let mut commits = BTreeSet::new();
+    for path in files {
+        if !collect_reflog_commits(cwd, &path, &mut commits)? {
+            return Ok(true);
+        }
+    }
+    for commit in commits {
+        if !commit_has_shared_ref(cwd, &commit)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Every commit named by one ref's common reflog must survive deletion of that
+/// ref. Ancestors of a durable current tip survive with the tip; divergent
+/// entries need another shared ref of their own.
+fn ref_reflog_is_preserved(cwd: &Path, refname: &str, durable_tip: &str) -> Result<bool> {
+    let common = common_git_dir(cwd)?;
+    let reflog = common.join("logs").join(refname);
+    let metadata = match std::fs::symlink_metadata(&reflog) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(spar_err!("could not inspect {}: {error}", reflog.display())),
+    };
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+    let mut commits = BTreeSet::new();
+    if !collect_reflog_commits(cwd, &reflog, &mut commits)? {
+        return Ok(false);
+    }
+    for commit in commits {
+        if is_ancestor(cwd, &commit, durable_tip)?
+            || commit_has_shared_ref_except(cwd, &commit, Some(refname))?
+        {
+            continue;
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn collect_reflog_commits(cwd: &Path, path: &Path, commits: &mut BTreeSet<String>) -> Result<bool> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| spar_err!("could not read {}: {e}", path.display()))?;
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.map_err(|e| spar_err!("could not read {}: {e}", path.display()))?;
+        let mut fields = line.splitn(3, ' ');
+        let Some(old) = fields.next() else {
+            return Ok(false);
+        };
+        let Some(new) = fields.next() else {
+            return Ok(false);
+        };
+        if fields.next().is_none() {
+            return Ok(false);
+        }
+        for oid in [old, new] {
+            if oid.bytes().all(|byte| byte == b'0') {
+                continue;
+            }
+            let Some(commit) = resolve_optional_commit(cwd, oid)? else {
+                return Ok(false);
+            };
+            commits.insert(commit);
+        }
+    }
+    Ok(true)
+}
+
+fn common_git_dir(cwd: &Path) -> Result<PathBuf> {
+    let raw = run_git_text(cwd, &["rev-parse", "--git-common-dir"])?;
+    let path = PathBuf::from(raw.trim());
+    let path = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    std::fs::canonicalize(&path).map_err(|e| spar_err!("could not resolve {}: {e}", path.display()))
+}
+
+fn is_ancestor(cwd: &Path, older: &str, newer: &str) -> Result<bool> {
+    let argv = git_without_automation_argv(&["merge-base", "--is-ancestor", older, newer]);
+    let output = proc::exec(
+        &argv,
+        &ExecOpts::new()
+            .cwd(cwd)
+            .timeout_secs(30)
+            .check(false)
+            .stop_descendants(true),
+    )?;
+    match output.code {
+        0 => Ok(true),
+        1 => Ok(false),
+        _ => bail!("{}", proc::failure_message(&argv, &output)),
+    }
+}
+
+fn resolve_optional_commit(cwd: &Path, oid: &str) -> Result<Option<String>> {
+    let commit = format!("{oid}^{{commit}}");
+    let argv = git_without_automation_argv(&["rev-parse", "--quiet", "--verify", &commit]);
+    let output = proc::exec(
+        &argv,
+        &ExecOpts::new()
+            .cwd(cwd)
+            .timeout_secs(30)
+            .check(false)
+            .stop_descendants(true),
+    )?;
+    if output.code != 0 {
+        return Ok(None);
+    }
+    let oid = output.stdout.trim();
+    if oid.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(oid.to_string()))
+}
+
+fn commit_has_shared_ref(cwd: &Path, oid: &str) -> Result<bool> {
+    commit_has_shared_ref_except(cwd, oid, None)
+}
+
+fn commit_has_shared_ref_except(cwd: &Path, oid: &str, exclude: Option<&str>) -> Result<bool> {
+    let contains = format!("--contains={oid}");
+    let shared = run_git_bytes(cwd, &["for-each-ref", "--format=%(refname)", &contains])?;
+    Ok(shared.split(|byte| *byte == b'\n').any(|record| {
+        !record.is_empty()
+            && !record.starts_with(b"refs/worktree/")
+            && !record.starts_with(b"refs/bisect/")
+            && !record.starts_with(b"refs/rewritten/")
+            && exclude.is_none_or(|excluded| record != excluded.as_bytes())
+    }))
+}
+
+fn repository_has_recoverable_work_inner(
+    cwd: &Path,
+    include_ignored: bool,
+    visited: &mut BTreeSet<PathBuf>,
+) -> Result<bool> {
+    let canonical = std::fs::canonicalize(cwd)
+        .map_err(|e| spar_err!("could not resolve {}: {e}", cwd.display()))?;
+    if !visited.insert(canonical.clone()) {
+        bail!("submodule recursion revisited {}", canonical.display());
+    }
+    if include_ignored && !run_git_bytes(cwd, &["ls-files", "--others", "-z"])?.is_empty() {
+        return Ok(true);
+    }
+    if !unsafe_index_flags(cwd)?.is_empty() {
+        return Ok(true);
+    }
+    if attributes_may_be_modified(cwd)? {
+        return Ok(true);
+    }
+    if include_ignored && has_recoverable_worktree_admin_state(cwd)? {
+        return Ok(true);
+    }
+    if include_ignored {
+        let index = index_entries(cwd)?
+            .into_iter()
+            .map(|entry| (entry.path, (entry.mode, entry.oid)))
+            .collect::<BTreeMap<_, _>>();
+        let head = tree_entries(cwd, "HEAD")?
+            .into_iter()
+            .map(|entry| (entry.path, (entry.mode, entry.oid)))
+            .collect::<BTreeMap<_, _>>();
+        if index != head || !run_git_bytes(cwd, &["ls-files", "--unmerged", "-z"])?.is_empty() {
+            return Ok(true);
+        }
+        let tracked = tracked_entries(cwd)?;
+        let effective = check_attributes(cwd, tracked.keys().cloned())?;
+        for (path, entry) in tracked {
+            let Some(worktree) = entry.worktree else {
+                return Ok(true);
+            };
+            let attributes = effective.get(&path).ok_or_else(|| {
+                spar_err!("git omitted attributes for {}", cwd.join(&path).display())
+            })?;
+            if path_has_ambiguous_transform(cwd, attributes)? {
+                return Ok(true);
+            }
+            let symlink_file = entry.index_mode == "120000"
+                && worktree.mode == "100644"
+                && worktree.raw_oid == entry.index_oid
+                && git_config_bool(cwd, "core.symlinks")? == Some(false);
+            if worktree.mode != entry.index_mode && !symlink_file {
+                return Ok(true);
+            }
+            if entry.index_mode == "120000" {
+                if worktree.raw_oid != entry.index_oid {
+                    return Ok(true);
+                }
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                let expected = if entry.index_mode == "100755" {
+                    0o755
+                } else {
+                    0o644
+                };
+                if worktree.permissions != expected {
+                    return Ok(true);
+                }
+            }
+            if allows_expected_crlf(cwd, attributes)? {
+                let (normalized, every_lf_was_crlf) =
+                    normalized_git_blob_oid(&cwd.join(&path), entry.index_oid.len())?;
+                if !every_lf_was_crlf || normalized != entry.index_oid {
+                    return Ok(true);
+                }
+            } else if worktree.raw_oid != entry.index_oid {
+                return Ok(true);
+            }
+        }
+    } else {
+        let args = ["status", "--porcelain=v1", "-z", "--untracked-files=all"];
+        if !run_git_bytes(cwd, &args)?.is_empty() {
+            return Ok(true);
+        }
+    }
+    for link in gitlinks(cwd)? {
+        let Some(submodule) = initialized_submodule(cwd, &link.path)? else {
+            continue;
+        };
+        // Git stores a linked worktree's initialized submodule objects under
+        // that worktree's administrative directory. Ordinary removal cannot
+        // prove a local submodule commit exists anywhere else, even when both
+        // working trees look clean.
+        if include_ignored {
+            return Ok(true);
+        }
+        let head = run_git_text(&submodule, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+        if head.trim() != link.oid {
+            return Ok(true);
+        }
+        if repository_has_recoverable_work_inner(&submodule, include_ignored, visited)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn has_uncommitted_work(cwd: &Path) -> Result<bool> {
+    repository_has_recoverable_work(cwd, false)
+}
+
+fn has_tracked_or_staged_work(cwd: &Path) -> Result<bool> {
+    let args = ["status", "--porcelain=v1", "-z", "--untracked-files=no"];
+    Ok(!run_git_bytes(cwd, &args)?.is_empty())
+}
+
+#[cfg(unix)]
+fn path_from_git_bytes(raw: &[u8]) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(raw.to_vec())))
+}
+
+#[cfg(not(unix))]
+fn path_from_git_bytes(raw: &[u8]) -> Result<PathBuf> {
+    String::from_utf8(raw.to_vec())
+        .map(PathBuf::from)
+        .map_err(|_| spar_err!("git returned a non-UTF-8 ignored path"))
+}
+
+fn ignored_file_fingerprint(path: &Path) -> Result<UntrackedFile> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| spar_err!("could not inspect untracked file {}: {e}", path.display()))?;
+    let kind = if metadata.file_type().is_symlink() {
+        2
+    } else if metadata.is_file() {
+        1
+    } else {
+        bail!(
+            "untracked path {} is not a regular file or symlink",
+            path.display()
+        );
+    };
+    let symlink_target = if kind == 2 {
+        let target = std::fs::read_link(path)
+            .map_err(|e| spar_err!("could not read untracked symlink {}: {e}", path.display()))?;
+        Some(os_str_bytes(target.as_os_str())?)
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(UntrackedFile {
+            kind,
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            readonly: metadata.permissions().readonly(),
+            symlink_target,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            change_seconds: metadata.ctime(),
+            change_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(UntrackedFile {
+            kind,
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            readonly: metadata.permissions().readonly(),
+            symlink_target,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn os_str_bytes(value: &OsStr) -> Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(value.as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+fn os_str_bytes(value: &OsStr) -> Result<Vec<u8>> {
+    value
+        .to_str()
+        .map(|value| value.as_bytes().to_vec())
+        .ok_or_else(|| spar_err!("a filesystem path is not UTF-8"))
+}
+
+#[cfg(unix)]
+fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    right.is_file() && left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    right.is_file() && left.len() == right.len() && left.permissions() == right.permissions()
+}
 
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct BranchRecord {
@@ -2562,6 +6062,7 @@ mod tests {
     use super::*;
     use crate::config::StateStore;
     use crate::model::{Dispute, Finding, Ledger, Severity, Status};
+    use std::process::Command;
 
     fn repo_for_titles() -> Repo {
         Repo {
@@ -2577,8 +6078,643 @@ mod tests {
     }
 
     #[test]
+    fn only_known_build_and_cache_directories_are_generated_artifacts() {
+        assert!(is_generated_artifact(Path::new("target/debug/artifact")));
+        assert!(is_generated_artifact(Path::new(
+            "package/node_modules/dependency/file.js"
+        )));
+        assert!(!is_generated_artifact(Path::new(
+            "generated/required-fixture.txt"
+        )));
+        assert!(!is_generated_artifact(Path::new("local.env")));
+    }
+
+    struct ReviewFixture {
+        root: PathBuf,
+    }
+
+    impl Drop for ReviewFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn test_git(cwd: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn review_fixture(
+        tag: &str,
+        number: i64,
+    ) -> (ReviewFixture, Repo, PathBuf, WorktreeCheckpoint) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("spar-repo-test-{tag}-{}-{id}", std::process::id()));
+        let origin = root.join("origin.git");
+        let work = root.join("work");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        test_git(&origin, &["init", "--bare", "-b", "main"]);
+        test_git(&work, &["init", "-b", "main"]);
+        test_git(&work, &["config", "user.email", "spar@example.invalid"]);
+        test_git(&work, &["config", "user.name", "spar test"]);
+        test_git(&work, &["config", "commit.gpgsign", "false"]);
+        test_git(&work, &["config", "filter.drop.clean", "sed '/^secret:/d'"]);
+        test_git(&work, &["config", "filter.drop.smudge", "cat"]);
+        std::fs::write(work.join("README.md"), "seed\n").unwrap();
+        std::fs::write(work.join("data.txt"), "old\n").unwrap();
+        std::fs::write(work.join(".gitignore"), "generated/\n").unwrap();
+        std::fs::write(work.join(".gitattributes"), "* text\n").unwrap();
+        test_git(&work, &["add", "."]);
+        test_git(&work, &["commit", "-m", "seed"]);
+        test_git(
+            &work,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        test_git(&work, &["push", "-u", "origin", "main"]);
+        test_git(
+            &work,
+            &["push", "origin", &format!("HEAD:refs/pull/{number}/head")],
+        );
+        let cfg = crate::config::parse(
+            "[agents.a]\ncommand = [\"true\"]\n[agents.b]\ncommand = [\"true\"]\n",
+        )
+        .unwrap();
+        let repo = Repo::open(&work, &cfg).unwrap();
+        let path = repo.worktree_for_pr_head(number).unwrap();
+        let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+        (ReviewFixture { root }, repo, path, checkpoint)
+    }
+
+    #[test]
+    fn an_unchanged_review_worktree_is_released_after_a_checked_read() {
+        let (_fixture, repo, path, checkpoint) = review_fixture("checked-release", 901);
+
+        repo.release_review_worktree_checked(901, &checkpoint)
+            .unwrap();
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_branch_reflog_only_commit_prevents_ordinary_deletion() {
+        let (_fixture, repo, _review, _checkpoint) = review_fixture("branch-reflog", 920);
+        let (path, branch) = repo.worktree_for_split(45, 1, "main").unwrap();
+        std::fs::write(path.join("recovery.txt"), "keep me\n").unwrap();
+        test_git(&path, &["add", "recovery.txt"]);
+        test_git(&path, &["commit", "-m", "recovery commit"]);
+        let recovery = test_git(&path, &["rev-parse", "HEAD"]);
+        test_git(&path, &["reset", "--hard", "main"]);
+
+        assert!(!repo.branch_deletion_is_safe(&branch).unwrap());
+        test_git(
+            &path,
+            &["cat-file", "-e", &format!("{}^{{commit}}", recovery.trim())],
+        );
+    }
+
+    #[test]
+    fn a_review_ref_reflog_only_commit_prevents_deletion() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("review-ref-reflog", 921);
+        let local_ref = review_ref(921);
+        let original = test_git(&path, &["rev-parse", &local_ref]);
+        let tree = test_git(&path, &["rev-parse", "HEAD^{tree}"]);
+        let recovery = test_git(
+            &path,
+            &[
+                "commit-tree",
+                tree.trim(),
+                "-p",
+                original.trim(),
+                "-m",
+                "review ref recovery",
+            ],
+        );
+        test_git(
+            &path,
+            &["update-ref", "--create-reflog", &local_ref, recovery.trim()],
+        );
+        test_git(
+            &path,
+            &["update-ref", &local_ref, original.trim(), recovery.trim()],
+        );
+
+        assert!(!repo.review_ref_deletion_is_safe(921).unwrap());
+        assert_eq!(original, test_git(&path, &["rev-parse", &local_ref]));
+        test_git(
+            &path,
+            &["cat-file", "-e", &format!("{}^{{commit}}", recovery.trim())],
+        );
+    }
+
+    #[test]
+    fn an_unpublished_commit_message_draft_is_recoverable() {
+        let (_fixture, _repo, path, _checkpoint) = review_fixture("commit-draft", 922);
+        let raw = PathBuf::from(test_git(&path, &["rev-parse", "--git-dir"]).trim());
+        let git_dir = if raw.is_absolute() {
+            raw
+        } else {
+            path.join(raw)
+        };
+        std::fs::write(git_dir.join("COMMIT_EDITMSG"), "unique recovery draft\n").unwrap();
+
+        assert!(repository_has_recoverable_work(&path, true).unwrap());
+        assert_eq!(
+            "unique recovery draft\n",
+            std::fs::read_to_string(git_dir.join("COMMIT_EDITMSG")).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_changed_review_worktree_is_retained_after_a_checked_read() {
+        let (_fixture, repo, path, checkpoint) = review_fixture("checked-dirty", 902);
+        std::fs::write(path.join("README.md"), "recover me\n").unwrap();
+
+        let error = repo
+            .release_review_worktree_checked(902, &checkpoint)
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert!(error.to_string().contains("kept for recovery"), "{error}");
+        assert_eq!(
+            "recover me\n",
+            std::fs::read_to_string(path.join("README.md")).unwrap()
+        );
+        repo.release_review_worktree(902);
+    }
+
+    #[test]
+    fn a_review_commit_is_retained_after_a_checked_read() {
+        let (_fixture, repo, path, checkpoint) = review_fixture("checked-commit", 903);
+        std::fs::write(path.join("review-note.txt"), "recover me\n").unwrap();
+        test_git(&path, &["add", "review-note.txt"]);
+        test_git(&path, &["commit", "-m", "local review recovery"]);
+        let head = test_git(&path, &["rev-parse", "HEAD"]);
+
+        let error = repo
+            .release_review_worktree_checked(903, &checkpoint)
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert_eq!(head, test_git(&path, &["rev-parse", "HEAD"]));
+        assert_eq!(
+            "recover me\n",
+            std::fs::read_to_string(path.join("review-note.txt")).unwrap()
+        );
+        repo.release_review_worktree(903);
+    }
+
+    #[test]
+    fn an_ignored_review_file_is_retained_after_a_checked_read() {
+        let (_fixture, repo, path, checkpoint) = review_fixture("checked-ignored", 904);
+        std::fs::create_dir_all(path.join("generated")).unwrap();
+        std::fs::write(path.join("generated/recovery.txt"), "recover me\n").unwrap();
+
+        let error = repo
+            .release_review_worktree_checked(904, &checkpoint)
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert_eq!(
+            "recover me\n",
+            std::fs::read_to_string(path.join("generated/recovery.txt")).unwrap()
+        );
+        repo.release_review_worktree(904);
+    }
+
+    #[test]
+    fn a_preexisting_ignored_review_file_change_is_retained() {
+        let (_fixture, repo, path, _initial) = review_fixture("changed-existing-ignored", 905);
+        std::fs::create_dir_all(path.join("generated")).unwrap();
+        let ignored = path.join("generated/recovery.txt");
+        std::fs::write(&ignored, "before\n").unwrap();
+        let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+        std::fs::write(&ignored, "after!\n").unwrap();
+
+        let error = repo
+            .release_review_worktree_checked(905, &checkpoint)
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert_eq!("after!\n", std::fs::read_to_string(&ignored).unwrap());
+        repo.release_review_worktree(905);
+    }
+
+    #[test]
+    fn a_preexisting_ignored_review_file_prevents_checked_removal() {
+        let (_fixture, repo, path, _initial) = review_fixture("existing-ignored", 906);
+        std::fs::create_dir_all(path.join("generated")).unwrap();
+        let ignored = path.join("generated/recovery.txt");
+        std::fs::write(&ignored, "keep me\n").unwrap();
+        let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+
+        let error = repo
+            .release_review_worktree_checked(906, &checkpoint)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("recoverable"), "{error}");
+        assert_eq!("keep me\n", std::fs::read_to_string(&ignored).unwrap());
+    }
+
+    #[test]
+    fn overwriting_a_preexisting_untracked_file_is_detected() {
+        let (_fixture, repo, path, _initial) = review_fixture("changed-untracked", 907);
+        let untracked = path.join("notes.txt");
+        std::fs::write(&untracked, "before\n").unwrap();
+        let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+        std::fs::write(&untracked, "after!\n").unwrap();
+
+        let error = repo
+            .require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert_eq!("after!\n", std::fs::read_to_string(&untracked).unwrap());
+    }
+
+    #[test]
+    fn an_assume_unchanged_edit_is_detected() {
+        let (_fixture, repo, path, checkpoint) = review_fixture("assume-unchanged", 908);
+        test_git(&path, &["update-index", "--assume-unchanged", "README.md"]);
+        std::fs::write(path.join("README.md"), "hidden\n").unwrap();
+
+        let error = repo
+            .require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert_eq!(
+            "hidden\n",
+            std::fs::read_to_string(path.join("README.md")).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_normalized_text_edit_is_detected_even_when_status_is_clean() {
+        let (_fixture, repo, path, checkpoint) = review_fixture("normalized-text", 909);
+        std::fs::write(path.join("README.md"), b"seed\r\n").unwrap();
+        test_git(&path, &["add", "README.md"]);
+        assert!(test_git(&path, &["status", "--porcelain"]).is_empty());
+
+        let error = repo
+            .require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert_eq!(
+            b"seed\r\n",
+            std::fs::read(path.join("README.md")).unwrap().as_slice()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mode_edit_is_detected_when_filemode_is_disabled() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_fixture, repo, path, checkpoint) = review_fixture("hidden-mode", 910);
+        test_git(&path, &["config", "core.filemode", "false"]);
+        let readme = path.join("README.md");
+        let mut permissions = std::fs::metadata(&readme).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&readme, permissions).unwrap();
+        assert!(test_git(&path, &["status", "--porcelain"]).is_empty());
+
+        let error = repo
+            .require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert_eq!(
+            0o755,
+            std::fs::metadata(&readme).unwrap().permissions().mode() & 0o777
+        );
+    }
+
+    #[test]
+    fn a_lossy_filter_cannot_hide_raw_bytes_from_a_managed_commit() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("lossy-filter", 911);
+        std::fs::write(path.join(".gitattributes"), "* text\n*.txt filter=drop\n").unwrap();
+        test_git(&path, &["add", ".gitattributes"]);
+        test_git(&path, &["commit", "-m", "select data filter"]);
+        let baseline = repo.worktree_baseline(&path).unwrap();
+        std::fs::write(path.join("data.txt"), "secret: recover me\nnew\n").unwrap();
+
+        assert!(repo
+            .commit_pending_changes(&path, &baseline, "change data", "change data")
+            .unwrap());
+        let error = repo
+            .refuse_unrepresented_tracked_changes(&path, &baseline)
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert_eq!(
+            "secret: recover me\nnew\n",
+            std::fs::read_to_string(path.join("data.txt")).unwrap()
+        );
+        assert_eq!("new\n", test_git(&path, &["show", "HEAD:data.txt"]));
+    }
+
+    #[test]
+    fn a_baseline_ordinary_untracked_file_is_not_staged_by_a_managed_commit() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("baseline-untracked", 927);
+        std::fs::create_dir_all(path.join("target")).unwrap();
+        let untracked = path.join("target/user.yaml");
+        std::fs::write(&untracked, "user data\n").unwrap();
+        let baseline = repo.worktree_baseline(&path).unwrap();
+        std::fs::write(path.join("README.md"), "tracked change\n").unwrap();
+
+        assert!(repo
+            .commit_pending_changes(&path, &baseline, "change readme", "change readme")
+            .unwrap());
+
+        assert_eq!("user data\n", std::fs::read_to_string(&untracked).unwrap());
+        assert_eq!(
+            "?? target/user.yaml\n",
+            test_git(&path, &["status", "--short", "--untracked-files=all"])
+        );
+        assert!(test_git(
+            &path,
+            &[
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "HEAD",
+                "--",
+                "target/user.yaml"
+            ]
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn changing_a_baseline_ordinary_untracked_file_stops_a_managed_commit() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("changed-untracked", 929);
+        std::fs::create_dir_all(path.join("target")).unwrap();
+        let untracked = path.join("target/user.yaml");
+        std::fs::write(&untracked, "before\n").unwrap();
+        let baseline = repo.worktree_baseline(&path).unwrap();
+        let before = test_git(&path, &["rev-parse", "HEAD"]);
+        std::fs::write(&untracked, "after\n").unwrap();
+        std::fs::write(path.join("README.md"), "tracked change\n").unwrap();
+
+        let error = repo
+            .commit_pending_changes(&path, &baseline, "change readme", "change readme")
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert!(error.to_string().contains("target/user.yaml"), "{error}");
+        assert_eq!(before, test_git(&path, &["rev-parse", "HEAD"]));
+        assert!(test_git(&path, &["diff", "--cached", "--name-only"]).is_empty());
+        assert_eq!("after\n", std::fs::read_to_string(&untracked).unwrap());
+    }
+
+    #[test]
+    fn a_new_ordinary_untracked_file_is_staged_by_a_managed_commit() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("new-untracked", 928);
+        let baseline = repo.worktree_baseline(&path).unwrap();
+        std::fs::create_dir_all(path.join("target")).unwrap();
+        std::fs::write(path.join("target/new.txt"), "new file\n").unwrap();
+
+        assert!(repo
+            .commit_pending_changes(&path, &baseline, "add file", "add file")
+            .unwrap());
+
+        assert_eq!(
+            "new file\n",
+            test_git(&path, &["show", "HEAD:target/new.txt"])
+        );
+        assert!(test_git(&path, &["status", "--porcelain"]).is_empty());
+    }
+
+    #[test]
+    fn deleting_existing_ignored_work_stops_a_managed_commit() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("deleted-ignored", 912);
+        std::fs::create_dir_all(path.join("generated")).unwrap();
+        let ignored = path.join("generated/keep.txt");
+        std::fs::write(&ignored, "user data\n").unwrap();
+        let baseline = repo.worktree_baseline(&path).unwrap();
+        let before = test_git(&path, &["rev-parse", "HEAD"]);
+        std::fs::write(path.join("README.md"), "tracked change\n").unwrap();
+        std::fs::remove_file(&ignored).unwrap();
+
+        let error = repo
+            .commit_pending_changes(&path, &baseline, "change readme", "change readme")
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert!(error.to_string().contains("existing untracked"), "{error}");
+        assert_eq!(before, test_git(&path, &["rev-parse", "HEAD"]));
+        assert_eq!(
+            "tracked change\n",
+            std::fs::read_to_string(path.join("README.md")).unwrap()
+        );
+    }
+
+    #[test]
+    fn new_ignored_work_stops_a_managed_commit_with_tracked_changes() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("mixed-ignored", 926);
+        let baseline = repo.worktree_baseline(&path).unwrap();
+        let before = test_git(&path, &["rev-parse", "HEAD"]);
+        std::fs::write(path.join("README.md"), "tracked change\n").unwrap();
+        std::fs::create_dir_all(path.join("generated")).unwrap();
+        let ignored = path.join("generated/recovery.txt");
+        std::fs::write(&ignored, "keep me\n").unwrap();
+
+        let error = repo
+            .commit_pending_changes(&path, &baseline, "change readme", "change readme")
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert!(error.to_string().contains("recovery.txt"), "{error}");
+        assert_eq!(before, test_git(&path, &["rev-parse", "HEAD"]));
+        assert_eq!("keep me\n", std::fs::read_to_string(&ignored).unwrap());
+        assert!(test_git(&path, &["status", "--porcelain"])
+            .lines()
+            .any(|line| line == "M  README.md"));
+    }
+
+    #[test]
+    fn an_lf_override_of_an_expected_crlf_checkout_is_recoverable() {
+        let (_fixture, _repo, path, _checkpoint) = review_fixture("lf-override", 913);
+        test_git(&path, &["config", "core.autocrlf", "true"]);
+        std::fs::write(path.join("README.md"), "seed\n").unwrap();
+        assert_eq!(
+            test_git(&path, &["hash-object", "README.md"]).trim(),
+            test_git(&path, &["rev-parse", "HEAD:README.md"]).trim()
+        );
+
+        assert!(repository_has_recoverable_work(&path, true).unwrap());
+        assert_eq!(
+            "seed\n",
+            std::fs::read_to_string(path.join("README.md")).unwrap()
+        );
+    }
+
+    #[test]
+    fn autocrlf_input_overrides_a_crlf_core_eol() {
+        let (_fixture, _repo, path, _checkpoint) = review_fixture("autocrlf-input", 923);
+        test_git(&path, &["config", "core.autocrlf", "input"]);
+        test_git(&path, &["config", "core.eol", "crlf"]);
+        std::fs::write(path.join("README.md"), b"seed\r\n").unwrap();
+        assert_eq!(
+            test_git(&path, &["hash-object", "README.md"]).trim(),
+            test_git(&path, &["rev-parse", "HEAD:README.md"]).trim()
+        );
+
+        assert!(repository_has_recoverable_work(&path, true).unwrap());
+        assert_eq!(
+            b"seed\r\n",
+            std::fs::read(path.join("README.md")).unwrap().as_slice()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_permission_change_is_recoverable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_fixture, repo, path, checkpoint) = review_fixture("permission-change", 924);
+        let readme = path.join("README.md");
+        let mut permissions = std::fs::metadata(&readme).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&readme, permissions).unwrap();
+        assert!(test_git(&path, &["status", "--porcelain"]).is_empty());
+
+        let error = repo
+            .require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert!(repository_has_recoverable_work(&path, true).unwrap());
+        assert_eq!(
+            0o600,
+            std::fs::metadata(&readme).unwrap().permissions().mode() & 0o777
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_managed_commit_skips_signing_and_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (fixture, repo, path, _checkpoint) = review_fixture("managed-commit", 925);
+        let common = common_git_dir(&path).unwrap();
+        let hook = common.join("hooks/pre-commit");
+        let marker = fixture.root.join("hook-ran");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nprintf ran > {}\nexit 1\n",
+                sh_quote(marker.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).unwrap();
+        test_git(&path, &["config", "commit.gpgsign", "true"]);
+        test_git(&path, &["config", "gpg.program", "/usr/bin/false"]);
+        std::fs::write(path.join("managed.txt"), "managed\n").unwrap();
+        test_git(&path, &["add", "managed.txt"]);
+
+        repo.commit_staged_changes(&path, "record managed change")
+            .unwrap();
+
+        assert!(!marker.exists());
+        assert_eq!("managed\n", test_git(&path, &["show", "HEAD:managed.txt"]));
+    }
+
+    #[test]
+    fn an_auto_text_checkout_is_retained_when_representation_is_ambiguous() {
+        let (_fixture, _repo, path, _checkpoint) = review_fixture("auto-text", 914);
+        std::fs::write(
+            path.join(".gitattributes"),
+            ".gitattributes -text\n.gitignore -text\ndata.txt -text\nREADME.md text=auto\n",
+        )
+        .unwrap();
+        test_git(&path, &["add", ".gitattributes"]);
+        test_git(&path, &["commit", "-m", "select automatic text"]);
+        test_git(&path, &["config", "core.autocrlf", "true"]);
+
+        assert!(repository_has_recoverable_work(&path, true).unwrap());
+    }
+
+    #[test]
+    fn an_ident_checkout_is_retained_even_when_raw_bytes_match_the_index() {
+        let (_fixture, _repo, path, _checkpoint) = review_fixture("ident", 915);
+        std::fs::write(
+            path.join(".gitattributes"),
+            ".gitattributes -text\n.gitignore -text\ndata.txt -text\nREADME.md -text ident\n",
+        )
+        .unwrap();
+        test_git(&path, &["add", ".gitattributes"]);
+        test_git(&path, &["commit", "-m", "select ident expansion"]);
+        std::fs::write(path.join("README.md"), "seed\n").unwrap();
+
+        assert!(repository_has_recoverable_work(&path, true).unwrap());
+    }
+
+    #[test]
+    fn a_legacy_crlf_checkout_is_retained_conservatively() {
+        let (_fixture, _repo, path, _checkpoint) = review_fixture("legacy-crlf", 916);
+        std::fs::write(
+            path.join(".gitattributes"),
+            ".gitattributes -text\n.gitignore -text\ndata.txt -text\nREADME.md crlf\n",
+        )
+        .unwrap();
+        test_git(&path, &["add", ".gitattributes"]);
+        test_git(&path, &["commit", "-m", "select legacy line endings"]);
+
+        assert!(repository_has_recoverable_work(&path, true).unwrap());
+    }
+
+    #[test]
+    fn a_nested_git_entry_inside_a_tracked_directory_is_recoverable() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("nested-git", 917);
+        let nested = path.join("tracked");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("seed.txt"), "seed\n").unwrap();
+        test_git(&path, &["add", "tracked/seed.txt"]);
+        test_git(&path, &["commit", "-m", "add tracked directory"]);
+        let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+        test_git(&nested, &["init"]);
+
+        let error = repo
+            .require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert!(error.to_string().contains("Git entry"), "{error}");
+        assert!(nested.join(".git").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_git_path_is_preserved_without_loss() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = path_from_git_bytes(&[b'f', 0xff]).unwrap();
+
+        assert_eq!(&[b'f', 0xff], path.as_os_str().as_bytes());
+    }
+
+    #[test]
     fn guarded_merge_pins_the_reviewed_head() {
-        let args = merge_pr_args("36", Some("abc123"));
+        let args = merge_pr_args("36", Some("abc123"), true);
         assert_eq!(
             vec![
                 "pr",

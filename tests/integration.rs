@@ -1,9 +1,9 @@
 //! End to end against a real git repository.
 //!
-//! Everything here runs on git alone: no network, no gh, no model. These cover
-//! the mechanisms that unit tests cannot reach, in particular the commit
-//! message rewrite, which shells out to `git filter-branch` and calls back into
-//! this same binary.
+//! Most tests here run on git alone. A few use local command fakes to exercise
+//! remote-write boundaries without a network. Together they cover mechanisms
+//! that unit tests cannot reach, in particular the commit message rewrite,
+//! which shells out to `git filter-branch` and calls back into this same binary.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1447,11 +1447,16 @@ fn clearing_state_that_was_never_written_is_not_an_error() {
 // ---------------------------------------------------------------------------
 
 fn spar(args: &[&str], cwd: &Path) -> (bool, String, String) {
-    let out = Command::new(SPAR_BIN)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .unwrap();
+    spar_with_env(args, cwd, &[])
+}
+
+fn spar_with_env(args: &[&str], cwd: &Path, env: &[(&str, &str)]) -> (bool, String, String) {
+    let mut command = Command::new(SPAR_BIN);
+    command.args(args).current_dir(cwd);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let out = command.output().unwrap();
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1857,6 +1862,34 @@ esac
     assert_eq!(1, saved.open_findings.len());
 }
 
+#[cfg(unix)]
+fn fake_commands(fx: &Fixture, screen_answer: &str, gh_body: &str) -> (PathBuf, String) {
+    let bin = fx.dir.join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+
+    let screen = bin.join("screen");
+    executable(
+        &screen,
+        &format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", screen_answer),
+    );
+    executable(&bin.join("gh"), &format!("#!/bin/sh\n{gh_body}\n"));
+
+    let command = serde_json::to_string(screen.to_str().unwrap()).unwrap();
+    let config = fx.dir.join("spar.toml");
+    std::fs::write(
+        &config,
+        format!("[agents.a]\ncommand = [{command}]\n\n[agents.b]\ncommand = [\"true\"]\n"),
+    )
+    .unwrap();
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (config, path)
+}
+
 /// An empty queue is a local no-op, and it has to say which file it looked in.
 /// Reaching gh to find that out would make the common case cost a round trip.
 #[test]
@@ -1919,6 +1952,296 @@ fn followup_tells_an_empty_queue_from_one_it_could_not_read() {
         std::fs::read_to_string(&path).unwrap(),
         "a file it could not read must not be rewritten"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn followup_reports_an_all_failed_run_even_when_it_files_nothing() {
+    let fx = repo("followup-all-writes-fail");
+    let answer = r#"{"entries":[{"entry":1,"verdict":"still_relevant","title":"Write fails","reason":"Still present","duplicate_of":null}]}"#;
+    let gh = r#"
+set -eu
+printf '%s\n' "$*" >> "$SPAR_FAKE_GH_LOG"
+case "$1 $2" in
+  "issue list") printf '%s\n' '[]' ;;
+  "issue create") printf '%s\n' 'create failed' >&2; exit 1 ;;
+  *) printf 'unexpected gh call: %s\n' "$*" >&2; exit 1 ;;
+esac
+"#;
+    let (config, path) = fake_commands(&fx, answer, gh);
+    let notes = fx.work.join(".spar");
+    std::fs::create_dir_all(&notes).unwrap();
+    let queue = notes.join("followups.md");
+    let calls = fx.dir.join("gh-calls.log");
+    let original = "<!-- spar:followup -->\n## Write fails\n\nThe write still needs to happen.\n";
+    std::fs::write(&queue, original).unwrap();
+
+    let (ok, out, err) = spar_with_env(
+        &[
+            "followup",
+            "--config",
+            config.to_str().unwrap(),
+            "--repo",
+            fx.work.to_str().unwrap(),
+        ],
+        &fx.dir,
+        &[
+            ("PATH", path.as_str()),
+            ("SPAR_FAKE_GH_LOG", calls.to_str().unwrap()),
+        ],
+    );
+
+    assert!(
+        !ok,
+        "every write failed, but the command succeeded:\n{out}\n{err}"
+    );
+    assert!(out.contains("followups: 1 screened, 0 filed"), "{out}");
+    assert!(
+        out.contains("writes: 1 attempted, 0 succeeded, 1 failed"),
+        "{out}"
+    );
+    assert_eq!(original, std::fs::read_to_string(queue).unwrap());
+    assert!(!notes.join("followups.done.md").exists());
+    assert!(
+        std::fs::read_to_string(calls)
+            .unwrap()
+            .lines()
+            .any(|line| line.starts_with("issue create ")),
+        "the test must reach the write path"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn followup_reports_a_failure_after_an_issue_really_lands() {
+    let fx = repo("followup-partial-write-failure");
+    let answer = r#"{"entries":[{"entry":1,"verdict":"still_relevant","title":"First write","reason":"Still present","duplicate_of":null},{"entry":2,"verdict":"still_relevant","title":"Second write","reason":"Still present","duplicate_of":null}]}"#;
+    let gh = r#"
+set -eu
+printf '%s\n' "$*" >> "$SPAR_FAKE_GH_LOG"
+case "$1 $2" in
+  "issue list") printf '%s\n' '[]' ;;
+  "issue create")
+    case "$*" in
+      *"First write"*) printf '%s\n' 'https://github.com/example/project/issues/101' ;;
+      *) printf '%s\n' 'create failed' >&2; exit 1 ;;
+    esac
+    ;;
+  *) printf 'unexpected gh call: %s\n' "$*" >&2; exit 1 ;;
+esac
+"#;
+    let (config, path) = fake_commands(&fx, answer, gh);
+    let notes = fx.work.join(".spar");
+    std::fs::create_dir_all(&notes).unwrap();
+    let queue = notes.join("followups.md");
+    let calls = fx.dir.join("gh-calls.log");
+    std::fs::write(
+        &queue,
+        "<!-- spar:followup -->\n## First write\n\nThe first item.\n\n\
+         <!-- spar:followup -->\n## Second write\n\nThe second item.\n",
+    )
+    .unwrap();
+
+    let (ok, out, err) = spar_with_env(
+        &[
+            "followup",
+            "--file-only",
+            "--config",
+            config.to_str().unwrap(),
+            "--repo",
+            fx.work.to_str().unwrap(),
+        ],
+        &fx.dir,
+        &[
+            ("PATH", path.as_str()),
+            ("SPAR_FAKE_GH_LOG", calls.to_str().unwrap()),
+        ],
+    );
+
+    assert!(
+        !ok,
+        "a partial write failure must be non-zero:\n{out}\n{err}"
+    );
+    assert!(out.contains("followups: 2 screened, 1 filed"), "{out}");
+    assert!(
+        out.contains("writes: 2 attempted, 1 succeeded, 1 failed"),
+        "{out}"
+    );
+    let left = std::fs::read_to_string(queue).unwrap();
+    assert!(!left.contains("First write"), "{left}");
+    assert!(left.contains("Second write"), "{left}");
+    let done = std::fs::read_to_string(notes.join("followups.done.md")).unwrap();
+    assert!(done.contains("First write"), "{done}");
+    assert!(done.contains("Filed: #101"), "{done}");
+    assert_eq!(
+        2,
+        std::fs::read_to_string(calls)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("issue create "))
+            .count(),
+        "both issue writes must be exercised"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn tracker_reread_failure_is_counted_before_nothing_is_scheduled() {
+    let fx = repo("tracker-reread-failure");
+    let answer = r#"{"issues":[{"issue":42,"worth_doing":false,"tracker":true,"reason":"Tracks checklist work","complexity":"m","depends_on":[],"risk":"med"}]}"#;
+    let gh = r#"
+set -eu
+printf '%s\n' "$*" >> "$SPAR_FAKE_GH_LOG"
+if [ "$1" = api ] && [ "$2" = --paginate ]; then
+  printf '%s\n' '[{"body":"- Tracks checklist work"}]'
+  exit 0
+fi
+if [ "$1" = api ]; then
+  printf '%s\n' 'issue'
+  exit 0
+fi
+if [ "$1" = issue ] && [ "$2" = view ]; then
+  reads=0
+  if [ -f "$SPAR_FAKE_ISSUE_READS" ]; then
+    reads=$(sed -n '1p' "$SPAR_FAKE_ISSUE_READS")
+  fi
+  reads=$((reads + 1))
+  printf '%s\n' "$reads" > "$SPAR_FAKE_ISSUE_READS"
+  if [ "$reads" -eq 3 ]; then
+    printf '%s\n' 'tracker reread failed' >&2
+    exit 1
+  fi
+  printf '%s\n' '{"number":42,"title":"Tracker","body":"- [ ] Create child work","labels":[],"state":"OPEN","url":"https://github.com/example/project/issues/42"}'
+  exit 0
+fi
+if [ "$1" = issue ] && [ "$2" = list ]; then
+  printf '%s\n' '[]'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 64
+"#;
+    let (config, path) = fake_commands(&fx, answer, gh);
+    let screen = fx.dir.join("fake-bin").join("screen");
+    let command = serde_json::to_string(screen.to_str().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "[agents.a]\ncommand = [{command}]\n\n[agents.b]\ncommand = [{command}]\n\n\
+             [loop]\ndecompose_trackers = true\n"
+        ),
+    )
+    .unwrap();
+    let calls = fx.dir.join("gh-calls.log");
+    let reads = fx.dir.join("issue-reads");
+
+    let (ok, out, err) = spar_with_env(
+        &[
+            "run",
+            "42",
+            "--config",
+            config.to_str().unwrap(),
+            "--repo",
+            fx.work.to_str().unwrap(),
+        ],
+        &fx.dir,
+        &[
+            ("PATH", path.as_str()),
+            ("SPAR_FAKE_GH_LOG", calls.to_str().unwrap()),
+            ("SPAR_FAKE_ISSUE_READS", reads.to_str().unwrap()),
+        ],
+    );
+
+    assert!(
+        !ok,
+        "the required tracker reread failed, but the command succeeded:\n{out}\n{err}"
+    );
+    assert!(
+        out.contains("nothing scheduled") || err.contains("nothing scheduled"),
+        "{out}\n{err}"
+    );
+    assert!(
+        out.contains("writes: 1 attempted, 0 succeeded, 1 failed"),
+        "{out}"
+    );
+    assert!(err.contains("could not re-read #42"), "{err}");
+    assert_eq!("3", std::fs::read_to_string(reads).unwrap().trim());
+    let calls = std::fs::read_to_string(calls).unwrap();
+    assert!(!calls.contains("issue create"), "{calls}");
+    assert!(!calls.contains("issue comment"), "{calls}");
+    assert!(!calls.contains("issue edit"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn split_counts_each_child_title_that_cannot_reach_an_issue_write() {
+    let fx = repo("split-title-preflight-failure");
+    let proposal = r#"{"should_split":true,"reason":"Two separate tasks","stacked":false,"parts":[{"title":"\uD83E\uDD16","body":"First task","files":[]},{"title":"\uD83E\uDD16","body":"Second task","files":[]}]}"#;
+    let check = r#"{"accept":true,"stacked":false,"strike":[],"reasoning":"They are separate"}"#;
+    let gh = r#"
+set -eu
+printf '%s\n' "$*" >> "$SPAR_FAKE_GH_LOG"
+if [ "$1" = api ]; then
+  printf '%s\n' 'issue'
+  exit 0
+fi
+if [ "$1" = pr ] && [ "$2" = list ]; then
+  printf '%s\n' '[]'
+  exit 0
+fi
+if [ "$1" = issue ] && [ "$2" = view ]; then
+  printf '%s\n' '{"number":42,"title":"Large issue","body":"First task. Second task.","labels":[],"state":"OPEN","url":"https://github.com/example/project/issues/42"}'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 64
+"#;
+    let (config, path) = fake_commands(&fx, proposal, gh);
+    let check_command = fx.dir.join("fake-bin").join("check");
+    executable(
+        &check_command,
+        &format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", check),
+    );
+    let propose_command =
+        serde_json::to_string(fx.dir.join("fake-bin").join("screen").to_str().unwrap()).unwrap();
+    let check_command = serde_json::to_string(check_command.to_str().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "[agents.a]\ncommand = [{propose_command}]\n\n[agents.b]\ncommand = [{check_command}]\n"
+        ),
+    )
+    .unwrap();
+    let calls = fx.dir.join("gh-calls.log");
+
+    let (ok, out, err) = spar_with_env(
+        &[
+            "split",
+            "42",
+            "--config",
+            config.to_str().unwrap(),
+            "--repo",
+            fx.work.to_str().unwrap(),
+        ],
+        &fx.dir,
+        &[
+            ("PATH", path.as_str()),
+            ("SPAR_FAKE_GH_LOG", calls.to_str().unwrap()),
+        ],
+    );
+
+    assert!(
+        !ok,
+        "both required child title preflights failed, but the command succeeded:\n{out}\n{err}"
+    );
+    assert!(
+        out.contains("writes: 2 attempted, 0 succeeded, 2 failed"),
+        "{out}"
+    );
+    let calls = std::fs::read_to_string(calls).unwrap();
+    assert!(!calls.contains("issue create"), "{calls}");
+    assert!(!calls.contains("issue comment"), "{calls}");
+    assert!(!calls.contains("issue edit"), "{calls}");
 }
 
 /// The watermark is what makes the "leave a thread spar disagreed with open"
@@ -2099,6 +2422,74 @@ fn clean_on_a_repository_with_nothing_to_clean_says_so() {
     let (ok, out, _) = spar(&["clean", "--repo", fx.work.to_str().unwrap()], &fx.work);
     assert!(ok);
     assert!(out.contains("nothing to clean"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn clean_counts_a_failed_state_comment_delete() {
+    let fx = repo("clean-delete-failure");
+    let gh = r#"
+set -eu
+printf '%s\n' "$*" >> "$SPAR_FAKE_GH_LOG"
+if [ "$1" = pr ] && [ "$2" = list ]; then
+  printf '%s\n' '[{"number":7}]'
+  exit 0
+fi
+if [ "$1" = pr ] && [ "$2" = view ] && [ "$3" = 7 ]; then
+  printf '%s\n' '{"state":"MERGED"}'
+  exit 0
+fi
+if [ "$1" = api ] && [ "$2" = --paginate ]; then
+  printf '%s\n' '[{"id":77,"body":"<!-- spar:state\\n{}\\n-->"}]'
+  exit 0
+fi
+if [ "$1" = api ] && [ "$2" = -X ] && [ "$3" = DELETE ]; then
+  printf '%s\n' 'delete failed' >&2
+  exit 1
+fi
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 64
+"#;
+    let (config, path) = fake_commands(&fx, "{}", gh);
+    let calls = fx.dir.join("gh-calls.log");
+
+    let (ok, out, err) = spar_with_env(
+        &[
+            "clean",
+            "--repo",
+            fx.work.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--pr-state",
+        ],
+        &fx.work,
+        &[
+            ("PATH", path.as_str()),
+            ("SPAR_FAKE_GH_LOG", calls.to_str().unwrap()),
+        ],
+    );
+
+    assert!(!ok, "a failed deletion must fail cleanup:\n{out}\n{err}");
+    assert!(out.contains("nothing removed"), "{out}");
+    assert!(
+        !out.contains("removed state comment on PR #7"),
+        "a failed deletion was reported as removed: {out}"
+    );
+    assert!(
+        out.contains("writes: 1 attempted, 0 succeeded, 1 failed"),
+        "{out}"
+    );
+    assert!(
+        err.contains("could not remove state comment on PR #7"),
+        "{err}"
+    );
+    assert!(
+        std::fs::read_to_string(calls)
+            .unwrap()
+            .lines()
+            .any(|line| line.starts_with("api -X DELETE ")),
+        "the test must reach the DELETE path"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4392,6 +4783,106 @@ fn post_dry_run_prints_the_saved_review_without_touching_github() {
     );
     assert!(ok, "{out}");
     assert!(out.contains("A real defect."), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn post_counts_a_failed_duplicate_check_before_the_write() {
+    let fx = repo("post-preflight-failure");
+    let gh = r#"
+printf '%s\n' "$*" >> "$SPAR_FAKE_GH_LOG"
+printf '%s\n' 'comment lookup failed' >&2
+exit 1
+"#;
+    let (config, path) = fake_commands(&fx, "{}", gh);
+    let review = fx.dir.join("review.md");
+    let calls = fx.dir.join("gh-calls.log");
+    std::fs::write(&review, "review needs work").unwrap();
+
+    let (ok, out, err) = spar_with_env(
+        &[
+            "post",
+            "366",
+            "--repo",
+            fx.work.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--file",
+            review.to_str().unwrap(),
+        ],
+        &fx.work,
+        &[
+            ("PATH", path.as_str()),
+            ("SPAR_FAKE_GH_LOG", calls.to_str().unwrap()),
+        ],
+    );
+
+    assert!(
+        !ok,
+        "a failed safety check must fail the command:\n{out}\n{err}"
+    );
+    assert!(
+        out.contains("writes: 1 attempted, 0 succeeded, 1 failed"),
+        "{out}"
+    );
+    let calls = std::fs::read_to_string(calls).unwrap();
+    assert!(calls.contains("api --paginate"), "{calls}");
+    assert!(
+        !calls.contains("pr comment"),
+        "the write must not start after its duplicate check fails: {calls}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn post_counts_a_reported_failure_as_success_when_read_back_finds_it() {
+    let fx = repo("post-reconciled-success");
+    let gh = r#"
+case "$1 $2" in
+  "api --paginate")
+    if [ -f "$SPAR_FAKE_COMMENT_LANDED" ]; then
+      printf '%s\n' '[{"body":"review landed"}]'
+    else
+      printf '%s\n' '[]'
+    fi
+    ;;
+  "pr comment")
+    : > "$SPAR_FAKE_COMMENT_LANDED"
+    printf '%s\n' 'connection failed after write' >&2
+    exit 1
+    ;;
+  *) printf 'unexpected gh call: %s\n' "$*" >&2; exit 1 ;;
+esac
+"#;
+    let (config, path) = fake_commands(&fx, "{}", gh);
+    let review = fx.dir.join("review.md");
+    let landed = fx.dir.join("comment-landed");
+    std::fs::write(&review, "review landed").unwrap();
+
+    let (ok, out, err) = spar_with_env(
+        &[
+            "post",
+            "366",
+            "--repo",
+            fx.work.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--file",
+            review.to_str().unwrap(),
+        ],
+        &fx.work,
+        &[
+            ("PATH", path.as_str()),
+            ("SPAR_FAKE_COMMENT_LANDED", landed.to_str().unwrap()),
+        ],
+    );
+
+    assert!(ok, "the read-back proved the comment landed:\n{out}\n{err}");
+    assert!(
+        out.contains("writes: 1 attempted, 1 succeeded, 0 failed"),
+        "{out}"
+    );
+    assert!(landed.exists());
 }
 
 /// An edited file is still spar's output, so it goes through the same gate.

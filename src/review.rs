@@ -2577,7 +2577,7 @@ pub fn file_followup(
     //
     // A title the style gate cannot clean is a failure rather than a drop: the
     // next round words the point differently, and that wording may pass.
-    let title = match repo.clean_title(title) {
+    let title = match repo.clean_followup_title(title) {
         Ok(title) => title,
         Err(e) => {
             logdim!("could not clean a follow-up title: {e}");
@@ -2711,21 +2711,28 @@ pub fn file_as_issue_apart_from(
     body: &str,
     apart_from: Option<i64>,
 ) -> Result<Filed> {
-    let title = repo.clean_title(title)?;
+    let title = repo.record_failed_write(repo.clean_title(title))?;
     if title.trim().is_empty() {
-        return Err(spar_err!("nothing left of the title after cleaning it"));
+        return repo.record_failed_write(Err(spar_err!(
+            "nothing left of the title after cleaning it"
+        )));
     }
-    let issue_body = repo.clean_issue_body(body)?;
-    if let Some(existing) = repo.try_exact_issue_apart_from(&title, &issue_body, apart_from)? {
+    let issue_body = repo.record_failed_write(repo.clean_issue_body(body))?;
+    let exact =
+        repo.record_failed_write(repo.try_exact_issue_apart_from(&title, &issue_body, apart_from))?;
+    if let Some(existing) = exact {
         return Ok(if existing.open {
             Filed::Covered(existing.number, existing.url)
         } else {
             Filed::AlreadyClosed(existing.number, existing.url)
         });
     }
-    if let Some(existing) =
-        repo.try_find_similar_issue_apart_from(&title, &issue_body, apart_from)?
-    {
+    let similar = repo.record_failed_write(repo.try_find_similar_issue_apart_from(
+        &title,
+        &issue_body,
+        apart_from,
+    ))?;
+    if let Some(existing) = similar {
         let known = format!("{} {}", existing.title, existing.body);
         if !existing.open {
             return Ok(Filed::AlreadyClosed(existing.number, existing.url));

@@ -601,9 +601,9 @@ fn issue_inner(
         // Cleaned here rather than only inside `file_as_issue`, because the
         // same string also goes into the parent's checklist, and that write
         // deliberately does not run the body through the style gate.
-        let title = match repo.clean_title(&part.title) {
-            Ok(title) if !title.trim().is_empty() => title,
-            _ => {
+        let title = match repo.clean_nonempty_title_for_write(&part.title) {
+            Ok(title) => title,
+            Err(_) => {
                 logwarn!("nothing left of '{}' after cleaning it", label(part));
                 state.notes.push(format!(
                     "dropped {}: its title would not clean",
@@ -999,8 +999,10 @@ fn split_pr_inner(
 }
 
 fn ensure_parent_head(repo: &Repo, number: i64, expected: &str) -> Result<()> {
-    let live = repo.pr_head_oid(number)?;
-    same_parent_head(number, expected, &live)
+    let checked = repo
+        .pr_head_oid(number)
+        .and_then(|live| same_parent_head(number, expected, &live));
+    repo.record_failed_write(checked)
 }
 
 fn same_parent_head(number: i64, expected: &str, live: &str) -> Result<()> {
@@ -1219,19 +1221,19 @@ fn build_parts(
 
     for (i, part) in decision.parts.iter().enumerate() {
         let index = i + 1;
-        if let Err(e) = ensure_parent_head(repo, parent.number, parent.head_oid) {
-            return Ok(BuiltParts {
-                made,
-                worktrees,
-                failure: Some(e.to_string()),
-            });
-        }
         if part.files.is_empty() {
             log!("  part {index} carries no files, dropping it");
             state
                 .notes
                 .push(format!("dropped {}: it carried no files", label(part)));
             continue;
+        }
+        if let Err(e) = ensure_parent_head(repo, parent.number, parent.head_oid) {
+            return Ok(BuiltParts {
+                made,
+                worktrees,
+                failure: Some(e.to_string()),
+            });
         }
 
         let (dir, branch) = match repo.worktree_for_split(parent.number, index, &start) {

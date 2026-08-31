@@ -13,7 +13,7 @@ use crate::error::Result;
 use crate::followups;
 use crate::model::{Issue, IssueRun, ItemKind, Plan, Status};
 use crate::proc::{self, ExecOpts};
-use crate::repo::Repo;
+use crate::repo::{Repo, WriteSummary};
 use crate::review;
 use crate::review_only;
 use crate::split;
@@ -392,7 +392,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             if results.is_empty() {
                 return Ok(0);
             }
-            Ok(report(&results, &cfg))
+            Ok(report(&results, &cfg, &repo))
         }
 
         Command::Checkin {
@@ -465,7 +465,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             if results.is_empty() {
                 return Ok(0);
             }
-            Ok(report(&results, &cfg))
+            Ok(report(&results, &cfg, &repo))
         }
 
         Command::Split {
@@ -518,7 +518,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             if results.is_empty() {
                 return Ok(0);
             }
-            Ok(report(&results, &cfg))
+            Ok(report(&results, &cfg, &repo))
         }
 
         Command::Post {
@@ -612,9 +612,9 @@ fn dispatch(cli: Cli) -> Result<i32> {
 
             if results.is_empty() {
                 log!("nothing scheduled");
-                return Ok(0);
+                return Ok(report_writes(&repo));
             }
-            Ok(report(&results, &cfg))
+            Ok(report(&results, &cfg, &repo))
         }
         Command::Followup {
             common,
@@ -638,15 +638,15 @@ fn dispatch(cli: Cli) -> Result<i32> {
 
             let wave = followups::wave(&outcome);
             if mode != followups::Mode::Work || wave.is_empty() {
-                return Ok(outcome.exit_code());
+                return Ok(report_writes(&repo));
             }
             let mut results = Vec::new();
             work_issues(&agents, &cfg, &repo, wave, &plan_out, &mut results)?;
             if results.is_empty() {
                 log!("nothing scheduled");
-                return Ok(outcome.exit_code());
+                return Ok(report_writes(&repo));
             }
-            Ok(report(&results, &cfg).max(outcome.exit_code()))
+            Ok(report(&results, &cfg, &repo))
         }
 
         Command::Resume {
@@ -714,7 +714,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             if results.is_empty() {
                 return Ok(0);
             }
-            Ok(report(&results, &cfg))
+            Ok(report(&results, &cfg, &repo))
         }
     }
 }
@@ -1258,13 +1258,17 @@ fn cmd_clean(
         removed.extend(repo.prune_pr_state(None));
     }
     if removed.is_empty() {
-        println!("nothing to clean");
+        if repo.write_summary().failed > 0 {
+            println!("nothing removed");
+        } else {
+            println!("nothing to clean");
+        }
     } else {
         for item in removed {
             println!("removed {item}");
         }
     }
-    Ok(0)
+    Ok(report_writes(&repo))
 }
 
 /// Post a review that was produced earlier and not sent.
@@ -1319,7 +1323,7 @@ fn cmd_post(
             }
         }
     }
-    Ok(if failed { 1 } else { 0 })
+    Ok(i32::from(failed).max(report_writes(&repo)))
 }
 
 /// Append the settings a config does not mention, commented out.
@@ -1841,7 +1845,7 @@ fn first_line(text: &str) -> String {
 // Reporting
 // ---------------------------------------------------------------------------
 
-fn report(results: &[IssueRun], cfg: &Config) -> i32 {
+fn report(results: &[IssueRun], cfg: &Config, repo: &Repo) -> i32 {
     println!("\n{}", "=".repeat(60));
     for r in results {
         println!(
@@ -1882,11 +1886,35 @@ fn report(results: &[IssueRun], cfg: &Config) -> i32 {
              Set followups = \"issues\" to file them."
         );
     }
-    if results.iter().all(IssueRun::succeeded) {
-        0
-    } else {
-        1
+    let issue_exit = i32::from(!results.iter().all(IssueRun::succeeded));
+    issue_exit.max(report_writes(repo))
+}
+
+/// A failed write makes the final status non-zero, including a partial failure.
+/// Independent writes still finish first, so one failure does not discard work
+/// that another item can land. The non-zero status lets automation retry what
+/// was missed.
+fn report_writes(repo: &Repo) -> i32 {
+    let writes = repo.write_summary();
+    if let Some(line) = write_summary_line(writes) {
+        println!("\n{line}");
     }
+    write_exit_code(writes)
+}
+
+fn write_summary_line(writes: WriteSummary) -> Option<String> {
+    (writes.attempted > 0).then(|| {
+        format!(
+            "writes: {} attempted, {} succeeded, {} failed",
+            writes.attempted,
+            writes.succeeded(),
+            writes.failed
+        )
+    })
+}
+
+fn write_exit_code(writes: WriteSummary) -> i32 {
+    i32::from(writes.failed > 0)
 }
 
 fn report_item(title: &str, file: &str) -> String {
@@ -1908,6 +1936,31 @@ mod tests {
             report_item("Same title", "src/a.rs:10")
         );
         assert_eq!("General point", report_item("General point", ""));
+    }
+
+    #[test]
+    fn every_attempted_write_failing_is_a_failed_run() {
+        let writes = WriteSummary {
+            attempted: 3,
+            failed: 3,
+        };
+
+        assert_eq!(1, write_exit_code(writes));
+        assert_eq!(
+            Some("writes: 3 attempted, 0 succeeded, 3 failed".to_string()),
+            write_summary_line(writes)
+        );
+    }
+
+    #[test]
+    fn a_partial_write_failure_is_reported_after_the_run() {
+        let writes = WriteSummary {
+            attempted: 3,
+            failed: 1,
+        };
+
+        assert_eq!(1, write_exit_code(writes));
+        assert_eq!(2, writes.succeeded());
     }
 
     #[test]

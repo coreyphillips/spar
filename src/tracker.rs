@@ -883,7 +883,7 @@ fn child_body(text: &str, tracker: i64) -> String {
 /// safe. An item that is stale or already fixed is declined there rather than
 /// judged here.
 pub fn decompose(cfg: &Config, repo: &Repo, tracker: i64) -> Vec<i64> {
-    let Some((body, slug)) = read(repo, tracker) else {
+    let Some((body, slug)) = read_for_write(repo, tracker) else {
         return Vec::new();
     };
     let steps = plan(repo, cfg, tracker, &body, &slug);
@@ -933,7 +933,7 @@ fn apply(repo: &Repo, tracker: i64, steps: &[Step]) -> Vec<i64> {
                 }
             }
             Action::File => {
-                let Ok(title) = repo.clean_title(&step.item.text) else {
+                let Ok(title) = repo.clean_nonempty_title_for_write(&step.item.text) else {
                     logdim!("  could not clean a title out of '{what}'");
                     continue;
                 };
@@ -1007,7 +1007,7 @@ fn still_an_item(body: &str, raw: &str) -> bool {
 /// Unreadable counts as no: this gates filing, and an issue filed against a
 /// tracker that cannot be read is one nothing will link.
 fn still_asked_for(repo: &Repo, tracker: i64, raw: &str) -> bool {
-    match repo.read_issue(tracker) {
+    match repo.record_failed_write(repo.read_issue(tracker)) {
         Ok(issue) => still_an_item(issue.body_text(), raw),
         Err(e) => {
             logdim!("  could not re-read #{tracker}: {}", e.first_line());
@@ -1024,7 +1024,7 @@ fn still_asked_for(repo: &Repo, tracker: i64, raw: &str) -> bool {
 /// it has stopped making it an item, this is a skip with a log line, never a
 /// write.
 fn write(repo: &Repo, tracker: i64, raw: &str, change: &Change) -> bool {
-    let body = match repo.read_issue(tracker) {
+    let body = match repo.record_failed_write(repo.read_issue(tracker)) {
         Ok(issue) => issue.body_text().to_string(),
         Err(e) => {
             logdim!("  could not re-read #{tracker}: {}", e.first_line());
@@ -1075,6 +1075,16 @@ fn read(repo: &Repo, tracker: i64) -> Option<(String, String)> {
     // issue that trips it. Parsing a shortened body drops the last items and
     // looks identical to a tracker that had fewer.
     match repo.read_issue(tracker) {
+        Ok(issue) => Some((issue.body_text().to_string(), home_of(&issue.url))),
+        Err(e) => {
+            logdim!("could not read #{tracker}: {}", e.first_line());
+            None
+        }
+    }
+}
+
+fn read_for_write(repo: &Repo, tracker: i64) -> Option<(String, String)> {
+    match repo.record_failed_write(repo.read_issue(tracker)) {
         Ok(issue) => Some((issue.body_text().to_string(), home_of(&issue.url))),
         Err(e) => {
             logdim!("could not read #{tracker}: {}", e.first_line());

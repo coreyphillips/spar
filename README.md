@@ -91,6 +91,29 @@ other command, which is why its read-only half exists. There is no `--dry-run` o
 `run`, since `run` writes code: `triage` is its read-only half, and
 `followup --screen-only` is `followup`'s.
 
+### Write outcomes
+
+On normal completion, a command that attempted GitHub writes prints one summary
+for the whole command:
+
+```text
+writes: 3 attempted, 2 succeeded, 1 failed
+```
+
+One failed write does not stop independent work. Spar finishes the remaining
+items, reports every outcome together, and returns a non-zero status if any
+write failed. This includes partial failures and cleanup with
+`spar clean --pr-state`. `spar post` follows the same policy.
+
+The counts describe logical outcomes, not command invocations. If a GitHub
+command reports an error but a read-back proves the change landed, it counts as
+one success. Finding an exact duplicate is a no-op, so it counts as no attempt.
+If a required check fails before a write can safely start, it counts as one
+failed write.
+
+A hard command error can stop before this final summary. The error is printed
+directly and returns a non-zero status.
+
 For something persistent rather than per invocation, these live in `spar.toml`:
 
 ```toml

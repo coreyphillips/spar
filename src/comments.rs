@@ -337,41 +337,45 @@ impl Repo {
     /// on either path. So replying keeps working on a host where reading the
     /// threads did not.
     pub fn reply_in_thread(&self, pr: i64, root: i64, body: &str) -> Result<()> {
-        let body = self.clean(body)?;
+        let body = self.record_failed_write(self.clean(body))?;
         let path = format!("repos/{{owner}}/{{repo}}/pulls/{pr}/comments");
-        self.gh(&[
-            "api",
-            "-X",
-            "POST",
-            &path,
-            "-F",
-            &format!("in_reply_to={root}"),
-            "-f",
-            &format!("body={body}"),
-            "--silent",
-        ])
-        .map(|_| ())
+        let replied = self
+            .gh(&[
+                "api",
+                "-X",
+                "POST",
+                &path,
+                "-F",
+                &format!("in_reply_to={root}"),
+                "-f",
+                &format!("body={body}"),
+                "--silent",
+            ])
+            .map(|_| ());
+        self.record_write(replied)
     }
 
     /// Mark a review thread resolved.
     ///
-    /// GraphQL only: REST has never exposed it. A token that cannot write to
-    /// the repository cannot do this, which is not a reason to fail a run that
-    /// has already said its piece, so the caller logs and carries on.
+    /// GraphQL only: REST has never exposed it. A failure does not stop the
+    /// remaining replies, but it is included in the final write summary and
+    /// makes the command return non-zero after that work finishes.
     pub fn resolve_thread(&self, thread_id: &str) -> Result<()> {
         if thread_id.trim().is_empty() {
-            return Err(spar_err!("no thread id to resolve"));
+            return self.record_failed_write(Err(spar_err!("no thread id to resolve")));
         }
-        self.gh(&[
-            "api",
-            "graphql",
-            "-f",
-            &format!("query={RESOLVE_MUTATION}"),
-            "-f",
-            &format!("id={thread_id}"),
-            "--silent",
-        ])
-        .map(|_| ())
+        let resolved = self
+            .gh(&[
+                "api",
+                "graphql",
+                "-f",
+                &format!("query={RESOLVE_MUTATION}"),
+                "-f",
+                &format!("id={thread_id}"),
+                "--silent",
+            ])
+            .map(|_| ());
+        self.record_write(resolved)
     }
 }
 

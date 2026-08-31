@@ -6,6 +6,7 @@ use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde::Deserialize;
@@ -105,6 +106,25 @@ pub struct Repo {
     /// Kept in memory so a transient state read cannot reset the sequence
     /// after a resume already loaded a newer checkpoint.
     checkpoints: Mutex<BTreeMap<i64, u64>>,
+    writes: WriteStats,
+}
+
+#[derive(Debug, Default)]
+struct WriteStats {
+    attempted: AtomicUsize,
+    failed: AtomicUsize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WriteSummary {
+    pub(crate) attempted: usize,
+    pub(crate) failed: usize,
+}
+
+impl WriteSummary {
+    pub(crate) fn succeeded(self) -> usize {
+        self.attempted.saturating_sub(self.failed)
+    }
 }
 
 /// Ignored, untracked paths present before an editing call starts.
@@ -522,6 +542,7 @@ impl Repo {
             drafts: cfg.loop_cfg.drafts,
             viewer: OnceLock::new(),
             checkpoints: Mutex::new(BTreeMap::new()),
+            writes: WriteStats::default(),
         };
         repo.self_exclude();
         Ok(repo)
@@ -578,6 +599,38 @@ impl Repo {
         &self.root
     }
 
+    pub(crate) fn write_summary(&self) -> WriteSummary {
+        WriteSummary {
+            attempted: self.writes.attempted.load(Ordering::Relaxed),
+            failed: self.writes.failed.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn record_write<T, E>(
+        &self,
+        result: std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        self.record_write_outcome(result.is_err());
+        result
+    }
+
+    pub(crate) fn record_failed_write<T, E>(
+        &self,
+        result: std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        if result.is_err() {
+            self.record_write_outcome(true);
+        }
+        result
+    }
+
+    fn record_write_outcome(&self, failed: bool) {
+        self.writes.attempted.fetch_add(1, Ordering::Relaxed);
+        if failed {
+            self.writes.failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     // -- gates ------------------------------------------------------------
 
     /// Scrub, then verify. A leak here reaches GitHub, so it is a hard error
@@ -618,6 +671,24 @@ impl Repo {
     /// tests assert.
     pub fn clean_title(&self, text: &str) -> Result<String> {
         Ok(style::title(&self.clean(text)?, &self.style))
+    }
+
+    pub(crate) fn clean_nonempty_title_for_write(&self, text: &str) -> Result<String> {
+        let title = self.record_failed_write(self.clean_title(text))?;
+        if title.trim().is_empty() {
+            return self.record_failed_write(Err(spar_err!(
+                "nothing left of the title after cleaning it"
+            )));
+        }
+        Ok(title)
+    }
+
+    pub(crate) fn clean_followup_title(&self, text: &str) -> Result<String> {
+        if self.followups == Followups::Issues {
+            self.clean_nonempty_title_for_write(text)
+        } else {
+            self.clean_title(text)
+        }
     }
 
     // -- git --------------------------------------------------------------
@@ -2660,18 +2731,20 @@ impl Repo {
     /// wrong local ref or fail outright.
     pub fn push(&self, cwd: &Path, branch: &str) -> Result<()> {
         let refspec = format!("HEAD:{branch}");
-        self.git_at(
-            Some(cwd),
-            &["push", "--force-with-lease", "origin", &refspec],
-        )
-        .map(|_| ())
-        .map_err(|e| {
-            spar_err!(
-                "could not push to origin/{branch}. {}\nCheck push access and whether the \
-                     branch moved under you.",
-                e.last_line()
+        let pushed = self
+            .git_at(
+                Some(cwd),
+                &["push", "--force-with-lease", "origin", &refspec],
             )
-        })
+            .map(|_| ())
+            .map_err(|e| {
+                spar_err!(
+                    "could not push to origin/{branch}. {}\nCheck push access and whether the \
+                     branch moved under you.",
+                    e.last_line()
+                )
+            });
+        self.record_write(pushed)
     }
 
     /// Create one remote branch for a split without ever moving an existing ref.
@@ -2690,13 +2763,15 @@ impl Repo {
         let remote_ref = format!("refs/heads/{branch}");
         let lease = format!("--force-with-lease={remote_ref}:");
         let refspec = format!("HEAD:{remote_ref}");
-        let pushed = self.git_at(Some(cwd), &["push", &lease, "origin", &refspec]);
-        let Err(push_error) = pushed else {
-            return Ok(());
+        let result = match self.git_at(Some(cwd), &["push", &lease, "origin", &refspec]) {
+            Ok(_) => Ok(()),
+            Err(push_error) => {
+                let local = self.git_at(Some(cwd), &["rev-parse", "HEAD"]);
+                let remote = self.git(&["ls-remote", "--heads", "origin", &remote_ref]);
+                reconcile_failed_split_push(branch, push_error, local, remote)
+            }
         };
-        let local = self.git_at(Some(cwd), &["rev-parse", "HEAD"]);
-        let remote = self.git(&["ls-remote", "--heads", "origin", &remote_ref]);
-        reconcile_failed_split_push(branch, push_error, local, remote)
+        self.record_write(result)
     }
 
     // -- gh ---------------------------------------------------------------
@@ -2999,12 +3074,18 @@ impl Repo {
         serde_json::from_str(&text).map_err(|e| spar_err!("unexpected shape for PR #{number}: {e}"))
     }
 
-    pub fn pr_state(&self, number: i64) -> String {
-        let text = self.gh_try(&["pr", "view", &number.to_string(), "--json", "state"]);
+    fn try_pr_state(&self, number: i64) -> Result<String> {
+        let text = self.gh(&["pr", "view", &number.to_string(), "--json", "state"])?;
         serde_json::from_str::<Value>(text.trim())
-            .ok()
-            .and_then(|v| v.get("state").and_then(Value::as_str).map(str::to_string))
-            .unwrap_or_default()
+            .map_err(|e| spar_err!("unexpected shape for PR #{number}: {e}"))?
+            .get("state")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| spar_err!("PR #{number} did not include a state"))
+    }
+
+    pub fn pr_state(&self, number: i64) -> String {
+        self.try_pr_state(number).unwrap_or_default()
     }
 
     /// The commit currently exposed as a pull request's head.
@@ -3032,8 +3113,8 @@ impl Repo {
         title: &str,
         body: &str,
     ) -> Result<PrRef> {
-        let title = self.clean_title(title)?;
-        let body = self.clean(body)?;
+        let title = self.record_failed_write(self.clean_title(title))?;
+        let body = self.record_failed_write(self.clean(body))?;
         let mut argv = vec![
             "pr", "create", "--base", base, "--head", branch, "--title", &title, "--body", &body,
         ];
@@ -3042,31 +3123,39 @@ impl Repo {
         }
         let created = self.gh_at(Some(cwd), &argv);
         let found = self.try_pr_for_branch(branch, base);
-        reconcile_pr_creation(branch, created, found)
+        self.record_write(reconcile_pr_creation(branch, created, found))
     }
 
     pub fn comment_pr(&self, number: i64, body: &str) -> Result<()> {
-        let body = self.clean(body)?;
-        if has_exact_comment(&self.try_issue_comments(number)?, &body) {
+        let body = self.record_failed_write(self.clean(body))?;
+        let comments = self.record_failed_write(self.try_issue_comments(number))?;
+        if has_exact_comment(&comments, &body) {
             return Ok(());
         }
         let posted = self.gh(&["pr", "comment", &number.to_string(), "--body", &body]);
-        let Err(post_error) = posted else {
-            return Ok(());
+        let result = match posted {
+            Ok(_) => Ok(()),
+            Err(post_error) => {
+                reconcile_comment_post(number, &body, post_error, self.try_issue_comments(number))
+            }
         };
-        reconcile_comment_post(number, &body, post_error, self.try_issue_comments(number))
+        self.record_write(result)
     }
 
     pub fn comment_issue(&self, number: i64, body: &str) -> Result<()> {
-        let body = self.clean(body)?;
-        if has_exact_comment(&self.try_issue_comments(number)?, &body) {
+        let body = self.record_failed_write(self.clean(body))?;
+        let comments = self.record_failed_write(self.try_issue_comments(number))?;
+        if has_exact_comment(&comments, &body) {
             return Ok(());
         }
         let posted = self.gh(&["issue", "comment", &number.to_string(), "--body", &body]);
-        let Err(post_error) = posted else {
-            return Ok(());
+        let result = match posted {
+            Ok(_) => Ok(()),
+            Err(post_error) => {
+                reconcile_comment_post(number, &body, post_error, self.try_issue_comments(number))
+            }
         };
-        reconcile_comment_post(number, &body, post_error, self.try_issue_comments(number))
+        self.record_write(result)
     }
 
     /// Comment, then close as not planned.
@@ -3076,19 +3165,17 @@ impl Repo {
     pub fn close_issue(&self, number: i64, body: &str) -> Result<()> {
         self.comment_issue(number, body)?;
         let n = number.to_string();
-        if self
-            .gh(&["issue", "close", &n, "--reason", "not planned"])
-            .is_ok()
-        {
-            return Ok(());
-        }
-        // Older gh builds do not take --reason.
-        self.gh(&["issue", "close", &n]).map(|_| ()).map_err(|e| {
-            spar_err!(
-                "commented on #{number} but could not close it: {}",
-                e.last_line()
-            )
-        })
+        let closed = match self.gh(&["issue", "close", &n, "--reason", "not planned"]) {
+            Ok(_) => Ok(()),
+            // Older gh builds do not take --reason.
+            Err(_) => self.gh(&["issue", "close", &n]).map(|_| ()).map_err(|e| {
+                spar_err!(
+                    "commented on #{number} but could not close it: {}",
+                    e.last_line()
+                )
+            }),
+        };
+        self.record_write(closed)
     }
 
     /// Replace an issue body, refusing unless it is still byte for byte what
@@ -3112,27 +3199,30 @@ impl Repo {
         body: &str,
         inserted: &str,
     ) -> Result<()> {
-        let cleaned = self.clean(inserted)?;
+        let cleaned = self.record_failed_write(self.clean(inserted))?;
         if cleaned.trim() != inserted.trim() {
-            bail!(
+            return self.record_failed_write(Err(spar_err!(
                 "the style gate rewrote {inserted:?} to {cleaned:?}, so it is not being inserted"
-            );
+            )));
         }
-        let current = self.issue_body(number)?;
+        let current = self.record_failed_write(self.issue_body(number))?;
         if current != expected {
-            bail!(
+            return self.record_failed_write(Err(spar_err!(
                 "the body of #{number} changed since it was read, so it was left alone rather \
                  than written over."
-            );
+            )));
         }
         let edited = self.gh_stdin(
             &["issue", "edit", &number.to_string(), "--body-file", "-"],
             body,
         );
-        let Err(edit_error) = edited else {
-            return Ok(());
+        let result = match edited {
+            Ok(_) => Ok(()),
+            Err(edit_error) => {
+                reconcile_issue_edit(number, body, edit_error, self.issue_body(number))
+            }
         };
-        reconcile_issue_edit(number, body, edit_error, self.issue_body(number))
+        self.record_write(result)
     }
 
     /// One issue's body, exactly as GitHub holds it.
@@ -3191,14 +3281,17 @@ impl Repo {
         body: &str,
         apart_from: Option<i64>,
     ) -> Result<String> {
-        let title = self.clean_title(title)?;
-        let body = self.clean_issue_body(body)?;
+        let title = self.record_failed_write(self.clean_title(title))?;
+        let body = self.record_failed_write(self.clean_issue_body(body))?;
         let created = self.gh(&["issue", "create", "--title", &title, "--body", &body]);
-        if created.as_ref().is_ok_and(|url| issue_url_has_number(url)) {
-            return Ok(created.unwrap().trim().to_string());
-        }
-        let found = self.try_exact_issue_apart_from(&title, &body, apart_from);
-        reconcile_issue_creation(&title, created, found)
+        let result = match created {
+            Ok(url) if issue_url_has_number(&url) => Ok(url.trim().to_string()),
+            created => {
+                let found = self.try_exact_issue_apart_from(&title, &body, apart_from);
+                reconcile_issue_creation(&title, created, found)
+            }
+        };
+        self.record_write(result)
     }
 }
 
@@ -3388,11 +3481,11 @@ impl Repo {
     ///
     /// Take a pull request out of draft, once the review has converged.
     ///
-    /// Best effort. A draft that stayed a draft is a cosmetic problem, and
-    /// failing the run over it would throw away a review that has already
-    /// finished and been posted.
+    /// Best effort for the remaining workflow. A failure does not discard the
+    /// review or stop later independent work, but the final write summary
+    /// reports it and the command returns non-zero.
     pub fn mark_ready(&self, number: i64) -> bool {
-        match self.gh(&["pr", "ready", &number.to_string()]) {
+        match self.record_write(self.gh(&["pr", "ready", &number.to_string()])) {
             Ok(_) => true,
             Err(e) => {
                 logdim!(
@@ -3409,7 +3502,7 @@ impl Repo {
     /// Treating that as a failure reports work as lost when it is not.
     pub fn merge_pr(&self, number: i64) -> Result<()> {
         let n = number.to_string();
-        match self.gh(&merge_pr_args(&n, None, true)) {
+        let merged = match self.gh(&merge_pr_args(&n, None, true)) {
             Ok(_) => Ok(()),
             Err(e) => {
                 if self.pr_state(number) == "MERGED" {
@@ -3422,7 +3515,8 @@ impl Repo {
                     Err(spar_err!("could not merge PR #{number}. {}", e.last_line()))
                 }
             }
-        }
+        };
+        self.record_write(merged)
     }
 
     /// Squash merge only if the pull request still exposes the reviewed head.
@@ -3433,7 +3527,7 @@ impl Repo {
         delete_branch: bool,
     ) -> Result<()> {
         let n = number.to_string();
-        match self.gh(&merge_pr_args(&n, Some(expected_head), delete_branch)) {
+        let merged = match self.gh(&merge_pr_args(&n, Some(expected_head), delete_branch)) {
             Ok(_) => Ok(()),
             Err(e) => {
                 if self.pr_state(number) == "MERGED" {
@@ -3446,7 +3540,8 @@ impl Repo {
                     Err(spar_err!("could not merge PR #{number}. {}", e.last_line()))
                 }
             }
-        }
+        };
+        self.record_write(merged)
     }
 
     // -- follow-ups -------------------------------------------------------
@@ -3642,26 +3737,44 @@ impl Repo {
     }
 
     fn read_pr_state(&self, number: i64) -> Option<PersistedState> {
-        for body in self.state_comment_bodies(number).into_iter().rev() {
+        self.try_read_pr_state(number).ok().flatten()
+    }
+
+    fn try_read_pr_state(&self, number: i64) -> Result<Option<PersistedState>> {
+        for (_, body) in self.try_state_comments(number)?.into_iter().rev() {
             if let Some(state) = parse_state_comment(&body) {
-                return Some(state);
+                return Ok(Some(state));
             }
         }
-        None
+        Ok(None)
     }
 
     pub fn write_state(&self, number: i64, state: &PersistedState) -> Result<()> {
+        let remote_state = if self.state_store.writes_pr() {
+            self.try_read_pr_state(number)
+        } else {
+            Ok(None)
+        };
+        self.write_state_after_remote_read(number, state, remote_state)
+    }
+
+    fn write_state_after_remote_read(
+        &self,
+        number: i64,
+        state: &PersistedState,
+        remote_state: Result<Option<PersistedState>>,
+    ) -> Result<()> {
+        let remote_checkpoint = if self.state_store.writes_pr() {
+            self.record_failed_write(remote_state)?
+                .map(|saved| saved.checkpoint)
+                .unwrap_or_default()
+        } else {
+            0
+        };
         let local_checkpoint = self
             .state_store
             .writes_local()
             .then(|| self.read_local_state(number))
-            .flatten()
-            .map(|saved| saved.checkpoint)
-            .unwrap_or_default();
-        let remote_checkpoint = self
-            .state_store
-            .writes_pr()
-            .then(|| self.read_pr_state(number))
             .flatten()
             .map(|saved| saved.checkpoint)
             .unwrap_or_default();
@@ -3704,19 +3817,21 @@ impl Repo {
         // Not run through clean(): this is structured data, and scrubbing would
         // corrupt refutation text stored in the ledger. It sits inside an
         // unclosed HTML comment so GitHub renders it as nothing.
-        let body = format!(
-            "{STATE_MARKER}\n{}\n-->",
-            serde_json::to_string_pretty(state)?
-        );
-        if let Some(id) = self.state_comment_id(number) {
+        let serialized = self.record_failed_write(serde_json::to_string_pretty(state))?;
+        let body = format!("{STATE_MARKER}\n{}\n-->", serialized);
+        let comment_id = self.record_failed_write(self.try_state_comment_id(number))?;
+        if let Some(id) = comment_id {
             let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
             let field = format!("body={body}");
-            return self
+            let written = self
                 .gh(&["api", "-X", "PATCH", &path, "-f", &field, "--silent"])
                 .map(|_| ());
+            return self.record_write(written);
         }
-        self.gh(&["pr", "comment", &number.to_string(), "--body", &body])
-            .map(|_| ())
+        let written = self
+            .gh(&["pr", "comment", &number.to_string(), "--body", &body])
+            .map(|_| ());
+        self.record_write(written)
     }
 
     /// Top level comments. Works for issues and pull requests alike, because
@@ -3735,8 +3850,9 @@ impl Repo {
         try_parse_comment_pages(&self.gh(&["api", "--paginate", &path])?)
     }
 
-    fn state_comments(&self, number: i64) -> Vec<(i64, String)> {
-        self.issue_comments(number)
+    fn try_state_comments(&self, number: i64) -> Result<Vec<(i64, String)>> {
+        Ok(self
+            .try_issue_comments(number)?
             .into_iter()
             .filter_map(|c| {
                 let body = c.get("body").and_then(Value::as_str)?.to_string();
@@ -3746,18 +3862,11 @@ impl Repo {
                 let id = c.get("id").and_then(Value::as_i64)?;
                 Some((id, body))
             })
-            .collect()
+            .collect())
     }
 
-    fn state_comment_bodies(&self, number: i64) -> Vec<String> {
-        self.state_comments(number)
-            .into_iter()
-            .map(|(_, b)| b)
-            .collect()
-    }
-
-    fn state_comment_id(&self, number: i64) -> Option<i64> {
-        self.state_comments(number).last().map(|(id, _)| *id)
+    fn try_state_comment_id(&self, number: i64) -> Result<Option<i64>> {
+        Ok(self.try_state_comments(number)?.last().map(|(id, _)| *id))
     }
 
     /// Drop state once the PR is finished and there is nothing to resume.
@@ -3803,26 +3912,55 @@ impl Repo {
         struct Row {
             number: i64,
         }
-        let numbers = numbers.unwrap_or_else(|| {
-            let text = self.gh_try(&[
-                "pr", "list", "--state", "all", "--limit", "200", "--json", "number",
-            ]);
-            serde_json::from_str::<Vec<Row>>(text.trim())
-                .unwrap_or_default()
-                .into_iter()
-                .map(|r| r.number)
-                .collect()
-        });
+        let numbers = match numbers {
+            Some(numbers) => numbers,
+            None => {
+                let listed: Result<Vec<i64>> = (|| {
+                    let text = self.gh(&[
+                        "pr", "list", "--state", "all", "--limit", "200", "--json", "number",
+                    ])?;
+                    let rows = serde_json::from_str::<Vec<Row>>(text.trim())
+                        .map_err(|e| spar_err!("unexpected pull request list: {e}"))?;
+                    Ok(rows.into_iter().map(|row| row.number).collect())
+                })();
+                match self.record_failed_write(listed) {
+                    Ok(numbers) => numbers,
+                    Err(e) => {
+                        logdim!("could not inspect pull requests for state cleanup: {e}");
+                        return Vec::new();
+                    }
+                }
+            }
+        };
 
         let mut removed = Vec::new();
         for number in numbers {
-            if !is_finished(&self.pr_state(number)) {
+            let state = match self.record_failed_write(self.try_pr_state(number)) {
+                Ok(state) => state,
+                Err(e) => {
+                    logdim!("could not inspect PR #{number} for state cleanup: {e}");
+                    continue;
+                }
+            };
+            if !is_finished(&state) {
                 continue;
             }
-            for (id, _) in self.state_comments(number) {
+            let comments = match self.record_failed_write(self.try_state_comments(number)) {
+                Ok(comments) => comments,
+                Err(e) => {
+                    logdim!("could not inspect state comments on PR #{number}: {e}");
+                    continue;
+                }
+            };
+            for (id, _) in comments {
                 let path = format!("repos/{{owner}}/{{repo}}/issues/comments/{id}");
-                self.gh_try(&["api", "-X", "DELETE", &path, "--silent"]);
-                removed.push(format!("state comment on PR #{number}"));
+                let deleted = self
+                    .gh(&["api", "-X", "DELETE", &path, "--silent"])
+                    .map(|_| ());
+                match self.record_write(deleted) {
+                    Ok(()) => removed.push(format!("state comment on PR #{number}")),
+                    Err(e) => logdim!("could not remove state comment on PR #{number}: {e}"),
+                }
             }
         }
         removed
@@ -6117,7 +6255,7 @@ pub fn style_from_env() -> Style {
 mod tests {
     use super::*;
     use crate::config::StateStore;
-    use crate::model::{Dispute, Finding, Ledger, Severity, Status};
+    use crate::model::{Dispute, Finding, Ledger, PersistedState, Severity, Status};
     use std::process::Command;
 
     fn repo_for_titles() -> Repo {
@@ -6130,7 +6268,112 @@ mod tests {
             drafts: Drafts::Never,
             viewer: OnceLock::new(),
             checkpoints: Mutex::new(BTreeMap::new()),
+            writes: WriteStats::default(),
         }
+    }
+
+    #[test]
+    fn write_results_accumulate_for_the_run() {
+        let repo = repo_for_titles();
+
+        let _: std::result::Result<(), ()> = repo.record_write(Ok(()));
+        let _: std::result::Result<(), ()> = repo.record_write(Err(()));
+
+        assert_eq!(
+            WriteSummary {
+                attempted: 2,
+                failed: 1,
+            },
+            repo.write_summary()
+        );
+    }
+
+    #[test]
+    fn only_failed_write_preflights_join_the_summary() {
+        let repo = repo_for_titles();
+
+        let _: std::result::Result<(), ()> = repo.record_failed_write(Ok(()));
+        let _: std::result::Result<(), ()> = repo.record_failed_write(Err(()));
+
+        assert_eq!(
+            WriteSummary {
+                attempted: 1,
+                failed: 1,
+            },
+            repo.write_summary()
+        );
+    }
+
+    #[test]
+    fn a_nonempty_write_title_that_cleans_to_empty_is_one_failed_preflight() {
+        let repo = repo_for_titles();
+
+        assert!(repo.clean_nonempty_title_for_write("\u{1F916}").is_err());
+        assert_eq!(
+            WriteSummary {
+                attempted: 1,
+                failed: 1,
+            },
+            repo.write_summary()
+        );
+    }
+
+    #[test]
+    fn a_local_followup_title_failure_is_not_a_remote_write_failure() {
+        let mut repo = repo_for_titles();
+        repo.followups = Followups::Local;
+
+        assert_eq!("", repo.clean_followup_title("\u{1F916}").unwrap());
+        assert_eq!(WriteSummary::default(), repo.write_summary());
+    }
+
+    #[test]
+    fn a_failed_remote_state_read_stops_before_state_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "spar-state-preflight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let _fixture = ReviewFixture { root: root.clone() };
+        let mut repo = repo_for_titles();
+        repo.root = root;
+        repo.state_store = StateStore::Both;
+        let state = PersistedState {
+            version: 1,
+            checkpoint: 4,
+            round: 2,
+            next_actor: "a".into(),
+            status: Status::Pending,
+            pr_head: "abc123".into(),
+            ledger: Ledger::new(),
+            filed: Vec::new(),
+            open_findings: Vec::new(),
+            disputes: Vec::new(),
+            noted: Vec::new(),
+        };
+
+        let error = repo
+            .write_state_after_remote_read(
+                7,
+                &state,
+                Err(crate::error::SparError::new("state comments unavailable")),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("state comments unavailable"));
+        assert!(!repo.state_path(7).exists());
+        assert_eq!(0, repo.remembered_checkpoint(7));
+        assert_eq!(
+            WriteSummary {
+                attempted: 1,
+                failed: 1,
+            },
+            repo.write_summary()
+        );
     }
 
     #[test]

@@ -361,18 +361,6 @@ pub struct Outcome {
     pub issues: Vec<i64>,
     /// Left in the file: not reached, not screened, or could not be filed.
     pub held: usize,
-    /// Could not be filed. A non-zero exit even when the pipeline went fine.
-    pub failed: usize,
-}
-
-impl Outcome {
-    pub fn exit_code(&self) -> i32 {
-        if self.failed > 0 {
-            1
-        } else {
-            0
-        }
-    }
 }
 
 /// Read the queue, screen it, file what still holds, and take the filed entries
@@ -479,7 +467,6 @@ pub fn run(
                 Err(e) => {
                     logwarn!("could not file '{}': {e}", first_line(title));
                     outcome.held += 1;
-                    outcome.failed += 1;
                     continue;
                 }
             }

@@ -859,12 +859,15 @@ the worktree if files or `HEAD` change.
 
 Successful editing calls leave their files uncommitted, and spar stages and
 commits them only after accepting the structured report. A failed editing call
-that changed files is not retried or handed to a fallback. Unsafe Git state or
-uncommitted output stops the run and keeps the worktree and diagnostic for
-recovery. A failed initial implementation that already made durable commits can
-continue from those commits. With `--no-worktrees`, spar refuses to reset dirty
-or unpreserved work in the shared checkout, including an off-checkout target
-branch left by an earlier run.
+that changed files is not retried or handed to a fallback. If a custom editing
+command already left a clean commit that advances the prior tip, spar publishes
+and checkpoints it before returning the call failure. A reset or rewritten tip
+is kept for recovery instead. Unsafe Git state or uncommitted output stops the
+run and keeps the worktree and diagnostic for recovery. A failed initial
+implementation that already made durable commits can continue from those
+commits. With `--no-worktrees`, spar refuses to reset dirty or unpreserved work
+in the shared checkout, including an off-checkout target branch left by an
+earlier run.
 
 **Merge authority.** Two models agreeing is not the same as being right, and
 neither carries the consequences. `--auto-merge` is off by default; the terminal
@@ -977,11 +980,14 @@ finished writing. Spar refuses to stage a changed `.gitattributes` or gitlink,
 since attributes can select an external Git filter and nested repository
 objects may exist only in that worktree. If a call leaves uncommitted output or
 unsafe Git state, spar keeps the worktree and reports its path for recovery. A
-failed initial implementation that already made durable commits can continue
-from them. Ignored files outside known build and cache directories stop the
-commit because they may be required work. Recognized test and build artifacts,
-such as files under `target/`, are left in place with a warning and do not block
-the tracked change from reaching review.
+custom editing command that commits before its report fails has its clean,
+forward-moving commit published and review custody checkpointed before spar
+returns the error. A reset or rewritten tip is kept for recovery. A failed
+initial implementation that already made durable commits can continue from
+them. Ignored files outside known build and cache directories stop the commit
+because they may be required work. Recognized test and build artifacts, such as
+files under `target/`, are left in place with a warning and do not block the
+tracked change from reaching review.
 
 Include `{schema}` or `{schema_file}` and spar uses the CLI's native structured
 output. This is worth doing rather than optional: without it spar asks for JSON

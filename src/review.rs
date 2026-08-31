@@ -1062,6 +1062,8 @@ fn review_loop(
             &holder,
         )?;
 
+        let mut edit_error = None;
+
         if blocking.is_empty() {
             // Nothing blocking, but the branch it said that about is not the
             // branch that is there now. Falling through gives the next round
@@ -1081,15 +1083,25 @@ fn review_loop(
             let prompt = FIX_PROMPT.replace("{findings}", &findings_for_prompt(&blocking));
             let before_fix = repo.head_oid_checked(&ctx.work_dir)?;
             let worktree_baseline = repo.worktree_baseline(&ctx.work_dir)?;
-            let summary = reviewer.edit(&prompt, &ctx.work_dir, effort.as_deref())?;
-            commit_accepted_changes(
-                cfg,
-                repo,
-                &ctx.work_dir,
-                &worktree_baseline,
-                &summary,
-                "Address blocking review findings",
-            )?;
+            let fix_error = match reviewer.edit(&prompt, &ctx.work_dir, effort.as_deref()) {
+                Ok(summary) => {
+                    commit_accepted_changes(
+                        cfg,
+                        repo,
+                        &ctx.work_dir,
+                        &worktree_baseline,
+                        &summary,
+                        "Address blocking review findings",
+                    )?;
+                    None
+                }
+                Err(error) => Some(defer_clean_edit_error(
+                    repo,
+                    &ctx.work_dir,
+                    &worktree_baseline,
+                    error,
+                )?),
+            };
             match editor_after(repo, &ctx.work_dir, &before_fix, &ctx.label, &holder)? {
                 Some(who) => {
                     // Recorded like an author's fix, and for the same reason.
@@ -1103,7 +1115,7 @@ fn review_loop(
                     remove_findings(&mut open_findings, &blocking);
                     editor = Some(who);
                 }
-                None => {
+                None if fix_error.is_none() => {
                     repo.refuse_new_ignored_files(&ctx.work_dir, &worktree_baseline)?;
                     // Handing over here is what the bug was: the head is still
                     // the author's, so the author would be reading its own work.
@@ -1117,7 +1129,9 @@ fn review_loop(
                          nothing"
                     ));
                 }
+                None => {}
             }
+            edit_error = fix_error;
         } else {
             let author_name = cfg.other(&holder);
             let author = agent::find(agents, &author_name)?;
@@ -1131,20 +1145,34 @@ fn review_loop(
                 .replace("{findings}", &findings_for_prompt(&blocking));
             let before_response = repo.head_oid_checked(&ctx.work_dir)?;
             let worktree_baseline = repo.worktree_baseline(&ctx.work_dir)?;
-            let response: ResponseDoc = author.edit_json(
+            let response: Result<ResponseDoc> = author.edit_json(
                 &prompt,
                 &schema::response(),
                 &ctx.work_dir,
                 cfg.effort_for_round(&author.spec, round).as_deref(),
-            )?;
-            commit_accepted_changes(
-                cfg,
-                repo,
-                &ctx.work_dir,
-                &worktree_baseline,
-                &response.summary,
-                "Address blocking review findings",
-            )?;
+            );
+            let response = match response {
+                Ok(response) => {
+                    commit_accepted_changes(
+                        cfg,
+                        repo,
+                        &ctx.work_dir,
+                        &worktree_baseline,
+                        &response.summary,
+                        "Address blocking review findings",
+                    )?;
+                    Some(response)
+                }
+                Err(error) => {
+                    edit_error = Some(defer_clean_edit_error(
+                        repo,
+                        &ctx.work_dir,
+                        &worktree_baseline,
+                        error,
+                    )?);
+                    None
+                }
+            };
             if let Some(who) = editor_after(
                 repo,
                 &ctx.work_dir,
@@ -1153,7 +1181,7 @@ fn review_loop(
                 &author_name,
             )? {
                 editor = Some(who);
-            } else {
+            } else if let Some(response) = &response {
                 repo.refuse_new_ignored_files(&ctx.work_dir, &worktree_baseline)?;
                 if response
                     .dispositions
@@ -1167,21 +1195,23 @@ fn review_loop(
                     );
                 }
             }
-            let unresolved = apply_dispositions(
-                repo,
-                cfg,
-                &response,
-                &blocking,
-                ledger,
-                state,
-                round,
-                ctx.subject,
-                ctx.pr_number,
-                &author_name,
-                editor.is_some(),
-            );
-            remove_findings(&mut open_findings, &blocking);
-            extend_findings(&mut open_findings, &unresolved);
+            if let Some(response) = response {
+                let unresolved = apply_dispositions(
+                    repo,
+                    cfg,
+                    &response,
+                    &blocking,
+                    ledger,
+                    state,
+                    round,
+                    ctx.subject,
+                    ctx.pr_number,
+                    &author_name,
+                    editor.is_some(),
+                );
+                remove_findings(&mut open_findings, &blocking);
+                extend_findings(&mut open_findings, &unresolved);
+            }
         }
 
         if editor.is_some() {
@@ -1200,6 +1230,9 @@ fn review_loop(
             round,
             &holder,
         )?;
+        if let Some(error) = edit_error {
+            return Err(error);
+        }
     }
 
     // Falling out of the budget is not an outcome. Every path above returns
@@ -1583,6 +1616,24 @@ fn next_reviewer(cfg: &Config, reviewer: &str, editor: Option<&str>) -> String {
     }
 }
 
+fn defer_clean_edit_error(
+    repo: &Repo,
+    work_dir: &Path,
+    baseline: &crate::repo::WorktreeBaseline,
+    error: SparError,
+) -> Result<SparError> {
+    if error.kind() == ErrorKind::UncertainWrite {
+        return Err(error);
+    }
+    repo.refuse_changed_attributes(work_dir, baseline)?;
+    if repo.has_uncommitted_changes(work_dir)? {
+        return Err(error);
+    }
+    repo.refuse_new_ignored_files(work_dir, baseline)?;
+    repo.refuse_unrepresented_tracked_changes(work_dir, baseline)?;
+    Ok(error)
+}
+
 /// Who wrote the head after a call that was asked to commit, if anybody did.
 ///
 /// A call that returns successfully is not evidence of a commit, and custody is
@@ -1605,6 +1656,14 @@ fn editor_after(
         );
     }
     let after_head = repo.head_oid_checked(work_dir)?;
+    if after_head != before_head && !repo.is_ancestor_checked(work_dir, before_head, &after_head)? {
+        bail!(
+            "{label}: {who} moved HEAD to {after_head}, but it does not contain the previous \
+             branch tip {before_head}. The worktree was kept for recovery and nothing was \
+             published. Restore {before_head} or reapply the intended commits on top of it before \
+             resuming."
+        );
+    }
     Ok((after_head != before_head).then(|| who.to_string()))
 }
 

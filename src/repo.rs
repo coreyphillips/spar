@@ -806,19 +806,26 @@ impl Repo {
     /// replacing recovery commits left by an earlier run.
     pub(crate) fn refuse_issue_branch_rebuild(&self, issue: i64, base: &str) -> Result<()> {
         let branch = self.branch_for_issue(issue);
-        self.git_try(&["fetch", "origin", base]);
-        self.git_try(&["fetch", "origin", &branch]);
+        let base_remote_ref = format!("refs/heads/{base}");
+        let base_tracking_ref = format!("refs/remotes/origin/{base}");
+        let base_refspec = format!("+{base_remote_ref}:{base_tracking_ref}");
+        self.git(&["fetch", "--no-tags", "origin", &base_refspec])
+            .map_err(|e| {
+                spar_err!(
+                    "could not refresh origin/{base} before checking issue #{issue}: {}",
+                    e.last_line()
+                )
+            })?;
 
-        let remote_ref = format!("refs/remotes/origin/{branch}");
-        if self.exact_ref_exists_checked(&self.root, &remote_ref)? {
+        if let Some(remote_ref) = self.refresh_issue_remote_ref(&branch)? {
             let ahead = self.commit_count_checked(&self.root, &remote_ref, base)?;
-            if ahead > 0 {
+            if ahead > 0 && !self.pull_request_holds(&branch, &remote_ref, base) {
                 bail!(
                     "origin/{branch} already has {ahead} commit(s) that are not on {base}, and no \
-                     open pull request accounts for them. Rebuilding it would force push over \
-                     that work.\nOpen a pull request for the branch and run `spar resume <pr>` to \
-                     continue it, or delete it with `git push origin --delete {branch}` if it is \
-                     stale."
+                     pull request accounts for them. Rebuilding it would force push over that \
+                     work.\nOpen a pull request for the branch and run `spar resume <pr>` to continue \
+                     it, or delete it with `git push origin --delete {branch}` if the remote \
+                     branch is no longer needed."
                 );
             }
         }
@@ -834,7 +841,7 @@ impl Repo {
                 || if recorded_pr {
                     self.local_branch_is_preserved(&branch)?
                 } else {
-                    self.pull_request_holds(&branch, base)
+                    self.pull_request_holds(&branch, &local_ref, base)
                 };
             if !preserved {
                 let listed = self
@@ -854,28 +861,77 @@ impl Repo {
         Ok(())
     }
 
-    /// Whether a pull request already holds every commit `branch` has beyond
-    /// `base`.
+    fn refresh_issue_remote_ref(&self, branch: &str) -> Result<Option<String>> {
+        let live_ref = format!("refs/heads/{branch}");
+        let tracking_ref = format!("refs/remotes/origin/{branch}");
+        let listed = self
+            .git(&["ls-remote", "--heads", "origin", &live_ref])
+            .map_err(|e| {
+                spar_err!(
+                    "could not verify whether origin/{branch} still exists: {}",
+                    e.last_line()
+                )
+            })?;
+
+        if remote_head_oid(&listed, &live_ref)?.is_some() {
+            let refspec = format!("+{live_ref}:{tracking_ref}");
+            self.git(&["fetch", "--no-tags", "origin", &refspec])
+                .map_err(|e| {
+                    spar_err!(
+                        "origin/{branch} exists but its tracking ref could not be refreshed: {}",
+                        e.last_line()
+                    )
+                })?;
+            if !self.exact_ref_exists_checked(&self.root, &tracking_ref)? {
+                bail!("origin/{branch} was fetched but its tracking ref is missing");
+            }
+            return Ok(Some(tracking_ref));
+        }
+
+        if !self.exact_ref_exists_checked(&self.root, &tracking_ref)? {
+            return Ok(None);
+        }
+        let expected = self
+            .git_at(Some(&self.root), &["rev-parse", "--verify", &tracking_ref])?
+            .trim()
+            .to_string();
+        self.git_at_without_automation(&self.root, &["update-ref", "-d", &tracking_ref, &expected])
+            .map_err(|e| {
+                spar_err!(
+                    "could not discard stale origin/{branch} tracking ref safely: {}",
+                    e.last_line()
+                )
+            })?;
+        if self.exact_ref_exists_checked(&self.root, &tracking_ref)? {
+            bail!(
+                "origin/{branch} changed while its stale tracking ref was being removed. It was \
+                 kept."
+            );
+        }
+        Ok(None)
+    }
+
+    /// Whether a pull request from `branch` already holds every commit `refname`
+    /// has beyond `base`.
     ///
     /// GitHub serves `refs/pull/N/head` for as long as the repository lives, so
     /// commits that reached a pull request outlive the branch they were pushed
     /// from. A matching branch name does not establish that on its own: an
     /// issue worked twice reuses the name, and the merged pull request from the
     /// first round says nothing about where the second round's commits are.
-    fn pull_request_holds(&self, branch: &str, base: &str) -> bool {
+    fn pull_request_holds(&self, branch: &str, refname: &str, base: &str) -> bool {
         self.prs_for_branch(branch)
             .iter()
-            .any(|pr| self.pr_head_holds(pr.number, branch, base))
+            .any(|pr| self.pr_head_holds(pr.number, refname, base))
     }
 
-    fn pr_head_holds(&self, number: i64, branch: &str, base: &str) -> bool {
+    fn pr_head_holds(&self, number: i64, refname: &str, base: &str) -> bool {
         let head = format!("refs/spar/pr-head/{number}");
         let refspec = format!("+refs/pull/{number}/head:{head}");
         if self.git(&["fetch", "origin", &refspec]).is_err() {
             return false;
         }
-        let branch_ref = format!("refs/heads/{branch}");
-        let held = self.commits_held_by(&branch_ref, base, &head);
+        let held = self.commits_held_by(refname, base, &head);
         self.git_try(&["update-ref", "-d", &head]);
         held
     }

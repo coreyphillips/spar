@@ -1903,6 +1903,10 @@ fn a_remote_branch_with_unaccounted_work_is_not_rebuilt() {
         err.contains("spar resume"),
         "the remedy has to be in the message: {err}"
     );
+    assert!(
+        err.contains("git push origin --delete issue-42"),
+        "a confirmed remote branch may name the remote remedy: {err}"
+    );
     assert_eq!(
         before,
         git(&fx.work, &["rev-parse", "origin/issue-42"]),
@@ -2029,6 +2033,99 @@ fn a_pushed_commit_with_no_message_is_still_work() {
         git(&fx.work, &["rev-parse", "origin/issue-48"]),
         "the previous work must still be on origin"
     );
+}
+
+#[test]
+fn a_squash_merged_branch_deleted_on_origin_is_rebuilt() {
+    let fx = repo("noclobber-squash-merged");
+    let origin = fx.dir.join("origin.git");
+
+    git(&fx.work, &["checkout", "-q", "-b", "issue-50"]);
+    commit(
+        &fx.work,
+        "feature.txt",
+        "round one\n",
+        "Implement the feature",
+    );
+    git(&fx.work, &["push", "-q", "-u", "origin", "issue-50"]);
+
+    git(&fx.work, &["checkout", "-q", "main"]);
+    git(&fx.work, &["merge", "--squash", "issue-50"]);
+    git(&fx.work, &["commit", "-m", "Squash the feature"]);
+    git(&fx.work, &["push", "-q", "origin", "main"]);
+    git(&origin, &["update-ref", "-d", "refs/heads/issue-50"]);
+    git(&fx.work, &["branch", "-D", "issue-50"]);
+    git(
+        &fx.work,
+        &[
+            "config",
+            "--replace-all",
+            "remote.origin.fetch",
+            "+refs/heads/main:refs/remotes/origin/main",
+        ],
+    );
+    git(&fx.work, &["fetch", "--prune", "origin"]);
+
+    assert_eq!(
+        "1",
+        git(
+            &fx.work,
+            &["rev-list", "--count", "origin/main..origin/issue-50"]
+        )
+        .trim(),
+        "the stale tracking ref must still look ahead of the squash merge"
+    );
+
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, branch) = repo.worktree_add(50, "main").unwrap();
+
+    assert_eq!("issue-50", branch);
+    assert!(path.is_dir());
+    assert!(
+        repo.git_try(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/remotes/origin/issue-50",
+        ])
+        .trim()
+        .is_empty(),
+        "the deleted remote branch must be pruned"
+    );
+    repo.worktree_remove(50);
+}
+
+#[test]
+fn a_remote_refresh_failure_keeps_the_existing_issue_branch() {
+    let fx = repo("noclobber-remote-failure");
+    let missing_origin = fx.dir.join("missing-origin.git");
+
+    git(&fx.work, &["checkout", "-q", "-b", "issue-51"]);
+    commit(
+        &fx.work,
+        "feature.txt",
+        "round one\n",
+        "Implement the feature",
+    );
+    git(&fx.work, &["push", "-q", "-u", "origin", "issue-51"]);
+    git(&fx.work, &["checkout", "-q", "main"]);
+    let before = git(&fx.work, &["rev-parse", "issue-51"]);
+    git(
+        &fx.work,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            missing_origin.to_str().unwrap(),
+        ],
+    );
+
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let err = repo.worktree_add(51, "main").unwrap_err().to_string();
+
+    assert!(err.contains("could not refresh origin/main"), "{err}");
+    assert!(!err.contains("git push origin --delete"), "{err}");
+    assert_eq!(before, git(&fx.work, &["rev-parse", "issue-51"]));
 }
 
 /// What lets the local guard rebuild a branch: a pull request already holds its

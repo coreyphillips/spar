@@ -1586,6 +1586,84 @@ fn review_worktree(fx: &Fixture) -> PathBuf {
 }
 
 #[cfg(unix)]
+#[test]
+fn a_legacy_resume_migrates_before_the_saved_reviewer_starts() {
+    let author = r#"#!/bin/sh
+common=$(git rev-parse --git-common-dir)
+printf 'called\n' > "$common/../.spar/state/legacy-author-called"
+exit 1
+"#;
+    let reviewer = r#"#!/bin/sh
+common=$(git rev-parse --git-common-dir)
+state="$common/../.spar/state/pr-42.json"
+head=$(git rev-parse HEAD)
+grep -q '"version": 2' "$state" || exit 20
+grep -q "\"pr_head\": \"$head\"" "$state" || exit 21
+case "$1" in
+*"Legacy point"*"the caller already handles it"*) ;;
+*) exit 22 ;;
+esac
+printf 'observed\n' > "$common/../.spar/state/legacy-review-observed"
+exit 1
+"#;
+    let (fx, bin, config, head) = failed_edit_fixture("legacy-state-migration", author, reviewer);
+    let state_path = fx.work.join(".spar/state/pr-42.json");
+    std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    let legacy = serde_json::json!({
+        "version": 1,
+        "round": 1,
+        "next_actor": "b",
+        "status": "pending",
+        "ledger": {
+            "legacy-key": {
+                "title": "Legacy point",
+                "file": "feature.txt",
+                "reasoning": "the caller already handles it",
+                "round": 1,
+                "reraised": 0,
+                "outcome": "refuted"
+            }
+        },
+        "filed": []
+    });
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+    let (ok, out, err) = spar_with_path(
+        &[
+            "resume",
+            "42",
+            "--config",
+            config.to_str().unwrap(),
+            "--repo",
+            fx.work.to_str().unwrap(),
+        ],
+        &fx.dir,
+        &bin,
+    );
+
+    assert!(!ok, "the reviewer exits deliberately:\n{out}\n{err}");
+    assert!(
+        fx.work.join(".spar/state/legacy-review-observed").exists(),
+        "the saved reviewer did not observe migrated state:\n{out}\n{err}"
+    );
+    assert!(
+        !fx.work.join(".spar/state/legacy-author-called").exists(),
+        "the wrong reviewer was invoked:\n{out}\n{err}"
+    );
+    assert!(err.contains("round 2, b reviewing"), "{out}\n{err}");
+
+    let migrated = saved_state(&fx);
+    assert_eq!(2, migrated.version);
+    assert_eq!(1, migrated.round);
+    assert_eq!("b", migrated.next_actor);
+    assert_eq!(head, migrated.pr_head);
+    assert!(migrated
+        .ledger
+        .values()
+        .any(|entry| entry.title == "Legacy point"));
+}
+
+#[cfg(unix)]
 fn assert_failed_reset_was_not_published(fx: &Fixture, before: &str, error: &str) {
     assert_eq!(before, pushed_head(fx));
     assert_ne!(

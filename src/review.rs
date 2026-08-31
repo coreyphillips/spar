@@ -239,12 +239,16 @@ fn checked_head(repo: &Repo, work_dir: &Path) -> Result<String> {
 
 /// Whether branch-dependent review state can be applied to the checked-out PR.
 ///
-/// A missing checkpoint is a fresh run. A saved checkpoint must name this exact
-/// published head; otherwise automatic custody would let the previous reviewer
-/// read a commit it may have written. An explicit override supplies the human
-/// decision and starts branch-dependent state fresh.
+/// A version 1 checkpoint has no head field, but it already records the
+/// intended next reviewer. Its first resume preserves that handoff and binds it
+/// to the checked-out head. A current checkpoint must name this exact published
+/// head; otherwise automatic custody would let the previous reviewer read a
+/// commit it may have written. An explicit override supplies the human decision
+/// and starts branch-dependent state fresh.
 fn reconcile_saved_head(
     recorded_head: Option<&str>,
+    state_version: Option<u32>,
+    saved_actor_known: bool,
     actual_head: &str,
     holder_override: Option<&str>,
     pr_number: i64,
@@ -258,13 +262,21 @@ fn reconcile_saved_head(
     if holder_override.is_some() {
         return Ok(false);
     }
+    if recorded_head.is_empty() && state_version == Some(1) && saved_actor_known {
+        return Ok(true);
+    }
     let recorded = if recorded_head.is_empty() {
-        "legacy or unknown"
+        format!(
+            "state version {} without a recorded head",
+            state_version
+                .map(|version| version.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        )
     } else {
-        recorded_head
+        format!("head {recorded_head}")
     };
     Err(spar_err!(
-        "saved review state applies to head {recorded}, but PR #{pr_number} is at {actual_head}; \
+        "saved review state applies to {recorded}, but PR #{pr_number} is at {actual_head}; \
          resume with --next <agent> to choose who reviews this head"
     ))
 }
@@ -767,12 +779,27 @@ fn resume_inner(
     let (work_dir, branch) = repo.worktree_for_pr(&pr)?;
     let actual_head = checked_head(repo, &work_dir)?;
     let saved = repo.read_state_for_head(&pr, &actual_head);
+    let saved_actor_known = saved
+        .as_ref()
+        .map(|state| cfg.has_agent(&state.next_actor))
+        .unwrap_or(false);
     let state_matches_head = reconcile_saved_head(
         saved.as_ref().map(|state| state.pr_head.as_str()),
+        saved.as_ref().map(|state| state.version),
+        saved_actor_known,
         &actual_head,
         holder_override,
         pr_number,
     )?;
+    let migrates_legacy_state = saved.as_ref().is_some_and(|state| {
+        state.version == 1
+            && state.pr_head.is_empty()
+            && saved_actor_known
+            && holder_override.is_none()
+    });
+    if migrates_legacy_state {
+        log!("PR #{pr_number}: migrating legacy review state to head {actual_head}");
+    }
 
     let mut ledger: Ledger = saved
         .as_ref()
@@ -4402,13 +4429,14 @@ mod tests {
 
     #[test]
     fn a_matching_head_keeps_saved_custody() {
-        assert!(reconcile_saved_head(Some("abc123"), "abc123", None, 42).unwrap());
-        assert!(reconcile_saved_head(None, "abc123", None, 42).unwrap());
+        assert!(reconcile_saved_head(Some("abc123"), Some(2), true, "abc123", None, 42).unwrap());
+        assert!(reconcile_saved_head(None, None, false, "abc123", None, 42).unwrap());
     }
 
     #[test]
     fn a_changed_head_refuses_automatic_custody() {
-        let error = reconcile_saved_head(Some("abc123"), "def456", None, 42).unwrap_err();
+        let error =
+            reconcile_saved_head(Some("abc123"), Some(2), true, "def456", None, 42).unwrap_err();
         let text = error.to_string();
         assert!(text.contains("abc123"), "{text}");
         assert!(text.contains("def456"), "{text}");
@@ -4416,10 +4444,30 @@ mod tests {
     }
 
     #[test]
+    fn legacy_state_keeps_its_saved_custody_for_migration() {
+        assert!(reconcile_saved_head(Some(""), Some(1), true, "def456", None, 42).unwrap());
+    }
+
+    #[test]
     fn an_explicit_holder_resets_state_for_a_changed_or_legacy_head() {
-        assert!(!reconcile_saved_head(Some("abc123"), "def456", Some("b"), 42).unwrap());
-        assert!(!reconcile_saved_head(Some(""), "def456", Some("b"), 42).unwrap());
-        assert!(reconcile_saved_head(Some(""), "def456", None, 42).is_err());
+        assert!(
+            !reconcile_saved_head(Some("abc123"), Some(2), true, "def456", Some("b"), 42).unwrap()
+        );
+        assert!(!reconcile_saved_head(Some(""), Some(1), true, "def456", Some("b"), 42).unwrap());
+    }
+
+    #[test]
+    fn a_headless_current_or_future_state_is_not_legacy() {
+        for version in [2, STATE_VERSION + 1] {
+            assert!(
+                reconcile_saved_head(Some(""), Some(version), true, "def456", None, 42).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_state_with_an_unknown_actor_refuses_to_guess() {
+        assert!(reconcile_saved_head(Some(""), Some(1), false, "def456", None, 42).is_err());
     }
 
     #[test]

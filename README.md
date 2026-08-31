@@ -419,7 +419,8 @@ without a matching checkpoint, `resume` refuses to guess who may safely review
 it. Choose the reviewer explicitly with `--next <agent>`; spar then keeps filed
 follow-ups but clears branch-dependent findings and ledger entries before the
 new review. State written by an older release has no head binding, so its first
-resume also requires that explicit choice.
+resume preserves the recorded handoff and review state, then binds the migrated
+checkpoint to the current head.
 
 A PR with no spar state starts fresh, with the agent that did not implement
 taking the first review.

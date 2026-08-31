@@ -2270,9 +2270,6 @@ fn normalise(text: &str) -> String {
         .join(" ")
 }
 
-/// Match a disposition back to the finding it answers, so the ledger key it
-/// records is the same key the next round's finding will hash to. Without this
-/// the re-litigation guard is dead code for any finding that names a file.
 /// Whether two titles name the same point, ignoring wording noise.
 pub(crate) fn same_point(a: &str, b: &str) -> bool {
     normalise(a) == normalise(b)
@@ -2290,19 +2287,47 @@ fn disposition_matches(finding: &Finding, disposition: &Disposition) -> bool {
     same_point(&finding.title, &disposition.title) && finding.file.trim() == disposition.file.trim()
 }
 
-fn matching_disposition<'a>(
+fn stable_disposition_matches(finding: &Finding, disposition: &Disposition) -> bool {
+    stable_finding_key(&finding.title, &finding.file)
+        == stable_finding_key(&disposition.title, &disposition.file)
+}
+
+fn sole_disposition_match<'a>(
     finding: &Finding,
     dispositions: &'a [Disposition],
-) -> std::result::Result<(usize, &'a Disposition), &'static str> {
-    let mut matches = dispositions
+    matches: impl Fn(&Finding, &Disposition) -> bool,
+) -> std::result::Result<Option<(usize, &'a Disposition)>, &'static str> {
+    let mut matched = dispositions
         .iter()
         .enumerate()
-        .filter(|(_, disposition)| disposition_matches(finding, disposition));
-    let first = matches.next().ok_or("no matching disposition")?;
-    if matches.next().is_some() {
+        .filter(|(_, disposition)| matches(finding, disposition));
+    let first = matched.next();
+    if matched.next().is_some() {
         return Err("more than one matching disposition");
     }
     Ok(first)
+}
+
+/// Match a disposition back to the finding it answers, so the ledger key it
+/// records is the same key the next round's finding will hash to. Exact
+/// locations lead. A line-tolerant match is safe only when the finding and its
+/// disposition are each unique at that stable repository path.
+fn matching_disposition<'a>(
+    finding: &Finding,
+    findings: &[Finding],
+    dispositions: &'a [Disposition],
+) -> std::result::Result<(usize, &'a Disposition), &'static str> {
+    if let Some(exact) = sole_disposition_match(finding, dispositions, disposition_matches)? {
+        return Ok(exact);
+    }
+    if unique_stable_finding(findings, finding) {
+        if let Some(stable) =
+            sole_disposition_match(finding, dispositions, stable_disposition_matches)?
+        {
+            return Ok(stable);
+        }
+    }
+    Err("no matching disposition")
 }
 
 fn fixed_disposition_resolves(committed: bool) -> bool {
@@ -2330,7 +2355,7 @@ fn apply_dispositions(
     let mut used = vec![false; response.dispositions.len()];
 
     for source in blocking {
-        let (index, d) = match matching_disposition(source, &response.dispositions) {
+        let (index, d) = match matching_disposition(source, blocking, &response.dispositions) {
             Ok((index, disposition)) if !used[index] => (index, disposition),
             Ok(_) => {
                 logwarn!(
@@ -4165,7 +4190,7 @@ mod tests {
     fn an_omitted_disposition_leaves_the_blocker_unmatched() {
         let blocker = finding("blocking", "Unbounded loop", "d", "src/x.rs", true);
         assert!(matches!(
-            matching_disposition(&blocker, &[]),
+            matching_disposition(&blocker, std::slice::from_ref(&blocker), &[]),
             Err("no matching disposition")
         ));
     }
@@ -4178,28 +4203,90 @@ mod tests {
             disposition("Unbounded loop", "src/x.rs", Action::Refuted),
         ];
         assert!(matches!(
-            matching_disposition(&blocker, &answers),
+            matching_disposition(&blocker, std::slice::from_ref(&blocker), &answers),
             Err("more than one matching disposition")
         ));
     }
 
     #[test]
+    fn an_unambiguous_disposition_may_omit_the_line_number() {
+        let blocker = finding(
+            "blocking",
+            "Replayed offers persist the wrong lane key",
+            "d",
+            "src/engine.rs:1166",
+            true,
+        );
+        let answers = [disposition(
+            "replayed offers persist the wrong lane key!",
+            "src/engine.rs",
+            Action::Fixed,
+        )];
+
+        assert_eq!(
+            0,
+            matching_disposition(&blocker, std::slice::from_ref(&blocker), &answers)
+                .expect("stable answer")
+                .0
+        );
+    }
+
+    #[test]
+    fn a_line_free_disposition_does_not_choose_between_two_sites() {
+        let first = finding("blocking", "Unchecked error", "d", "src/engine.rs:10", true);
+        let second = finding(
+            "blocking",
+            "Unchecked error",
+            "d",
+            "src/engine.rs:200",
+            true,
+        );
+        let findings = [first.clone(), second];
+        let answers = [disposition(
+            "Unchecked error",
+            "src/engine.rs",
+            Action::Fixed,
+        )];
+
+        assert!(matches!(
+            matching_disposition(&first, &findings, &answers),
+            Err("no matching disposition")
+        ));
+    }
+
+    #[test]
+    fn an_exact_location_wins_over_an_ambiguous_fallback() {
+        let blocker = finding("blocking", "Unchecked error", "d", "src/engine.rs:10", true);
+        let answers = [
+            disposition("Unchecked error", "src/engine.rs", Action::Refuted),
+            disposition("Unchecked error", "src/engine.rs:10", Action::Fixed),
+        ];
+
+        let matched = matching_disposition(&blocker, std::slice::from_ref(&blocker), &answers)
+            .expect("exact answer");
+        assert_eq!(1, matched.0);
+        assert_eq!(Action::Fixed, matched.1.action);
+    }
+
+    #[test]
     fn same_titled_findings_in_different_files_need_separate_dispositions() {
-        let left = finding("blocking", "Unchecked error", "d", "src/a.rs", true);
-        let right = finding("blocking", "Unchecked error", "d", "src/b.rs", true);
+        let findings = [
+            finding("blocking", "Unchecked error", "d", "src/a.rs", true),
+            finding("blocking", "Unchecked error", "d", "src/b.rs", true),
+        ];
         let answers = vec![
             disposition("Unchecked error", "src/a.rs", Action::Fixed),
             disposition("Unchecked error", "src/b.rs", Action::Refuted),
         ];
         assert_eq!(
             0,
-            matching_disposition(&left, &answers)
+            matching_disposition(&findings[0], &findings, &answers)
                 .expect("left answer")
                 .0
         );
         assert_eq!(
             1,
-            matching_disposition(&right, &answers)
+            matching_disposition(&findings[1], &findings, &answers)
                 .expect("right answer")
                 .0
         );

@@ -1751,6 +1751,50 @@ esac
 
 #[cfg(unix)]
 #[test]
+fn a_line_free_disposition_records_the_committed_fix() {
+    let author = r#"#!/bin/sh
+case "$1" in
+*"choose exactly one disposition"*)
+    printf 'fixed\n' > feature.txt
+    git add feature.txt
+    git commit -q -m 'Address the review finding'
+    printf '%s\n' '{"summary":"Fixed the finding.","dispositions":[{"title":"Fix the branch","file":"feature.txt","action":"fixed","reasoning":"Updated the feature and committed the result.","new_issue_title":null,"new_issue_body":null}]}'
+    ;;
+*)
+    exit 1
+    ;;
+esac
+"#;
+    let review = r#"{"verdict":"changes_requested","next_action":"hand_back","summary":"One blocker.","findings":[{"severity":"blocking","title":"Fix the branch","detail":"Confirmed in the fixture.","file":"feature.txt:1","in_scope":true}]}"#;
+    let reviewer = format!(
+        r#"#!/bin/sh
+case "$1" in
+*"This closes the review"*) exit 1 ;;
+*) printf '%s\n' '{}' ;;
+esac
+"#,
+        review
+    );
+    let (fx, bin, config, before) = failed_edit_fixture("line-free-disposition", author, &reviewer);
+
+    run_failed_edit(&fx, &bin, &config);
+
+    let pushed = pushed_head(&fx);
+    let saved = saved_state(&fx);
+    assert_ne!(before, pushed);
+    assert_eq!(pushed, saved.pr_head);
+    assert!(saved.open_findings.is_empty());
+    let fixed = saved
+        .ledger
+        .values()
+        .find(|entry| entry.title == "Fix the branch")
+        .expect("fixed ledger entry");
+    assert_eq!("feature.txt:1", fixed.file);
+    assert_eq!(spar::model::Settled::Fixed, fixed.outcome);
+}
+
+#[cfg(unix)]
+#[test]
 fn a_failed_self_fix_keeps_uncommitted_files_local() {
     let reviewer = format!(
         r#"#!/bin/sh

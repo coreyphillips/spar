@@ -1459,6 +1459,404 @@ fn spar(args: &[&str], cwd: &Path) -> (bool, String, String) {
     )
 }
 
+#[cfg(unix)]
+fn executable(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(path, body).unwrap();
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(unix)]
+fn spar_with_path(args: &[&str], cwd: &Path, first: &Path) -> (bool, String, String) {
+    let mut paths = vec![first.to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let out = Command::new(SPAR_BIN)
+        .args(args)
+        .current_dir(cwd)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[cfg(unix)]
+fn failed_edit_fixture(
+    tag: &str,
+    author_script: &str,
+    reviewer_script: &str,
+) -> (Fixture, PathBuf, PathBuf, String) {
+    let fx = repo(tag);
+    git(&fx.work, &["checkout", "-q", "-b", "feature"]);
+    commit(
+        &fx.work,
+        "feature.txt",
+        "needs review\n",
+        "Add the initial change",
+    );
+    git(&fx.work, &["push", "-q", "-u", "origin", "feature"]);
+    git(&fx.work, &["checkout", "-q", "main"]);
+    let before = pushed_head(&fx);
+
+    let bin = fx.dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    executable(
+        &bin.join("gh"),
+        r#"#!/bin/sh
+if [ "$1" = "api" ]; then
+    printf 'pr\n'
+    exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+    printf '%s\n' '{"number":42,"url":"https://example.invalid/pr/42","title":"Test PR","headRefName":"feature","baseRefName":"main","state":"OPEN","closingIssuesReferences":[],"isCrossRepository":false}'
+    exit 0
+fi
+printf '[]\n'
+"#,
+    );
+    let author = bin.join("author");
+    let reviewer = bin.join("reviewer");
+    executable(&author, author_script);
+    executable(&reviewer, reviewer_script);
+
+    let config = fx.dir.join("spar.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[agents.a]\ncommand = [{:?}, \"{{prompt}}\"]\n\
+             [agents.b]\ncommand = [{:?}, \"{{prompt}}\"]\n\
+             [loop]\nmax_rounds = 1\nkeep_worktrees = true\n\
+             [style]\npr_comments = \"none\"\n",
+            author.display().to_string(),
+            reviewer.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    (fx, bin, config, before)
+}
+
+#[cfg(unix)]
+fn run_failed_edit(fx: &Fixture, bin: &Path, config: &Path) -> String {
+    let (ok, out, err) = spar_with_path(
+        &[
+            "resume",
+            "42",
+            "--config",
+            config.to_str().unwrap(),
+            "--repo",
+            fx.work.to_str().unwrap(),
+        ],
+        &fx.dir,
+        bin,
+    );
+    assert!(!ok, "the edit call should fail:\n{out}\n{err}");
+    err
+}
+
+#[cfg(unix)]
+fn saved_state(fx: &Fixture) -> spar::model::PersistedState {
+    let path = fx.work.join(".spar/state/pr-42.json");
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[cfg(unix)]
+fn pushed_head(fx: &Fixture) -> String {
+    git(&fx.dir.join("origin.git"), &["rev-parse", "feature"])
+        .trim()
+        .to_string()
+}
+
+#[cfg(unix)]
+fn review_worktree(fx: &Fixture) -> PathBuf {
+    fx.work.join(".spar-worktrees/pr-42")
+}
+
+#[cfg(unix)]
+fn assert_failed_reset_was_not_published(fx: &Fixture, before: &str, error: &str) {
+    assert_eq!(before, pushed_head(fx));
+    assert_ne!(
+        before,
+        git(&review_worktree(fx), &["rev-parse", "HEAD"]).trim()
+    );
+    assert!(
+        error.contains("does not contain the previous branch tip"),
+        "{error}"
+    );
+    assert!(error.contains("kept for recovery"), "{error}");
+    let saved = saved_state(fx);
+    assert_eq!(before, saved.pr_head);
+    assert_eq!(1, saved.open_findings.len());
+}
+
+#[cfg(unix)]
+const BLOCKING_REVIEW: &str = r#"{"verdict":"changes_requested","next_action":"fix_myself","summary":"One blocker.","findings":[{"severity":"blocking","title":"Fix the branch","detail":"Confirmed in the fixture.","file":"feature.txt","in_scope":true}]}"#;
+
+#[cfg(unix)]
+#[test]
+fn a_failed_self_fix_publishes_its_clean_commit() {
+    let reviewer = format!(
+        r#"#!/bin/sh
+case "$1" in
+*"chose to fix the blocking findings yourself"*)
+    printf 'fixed\n' > feature.txt
+    git add feature.txt
+    git commit -q -m 'Fix the review finding'
+    exit 1
+    ;;
+*)
+    printf '%s\n' '{}'
+    ;;
+esac
+"#,
+        BLOCKING_REVIEW
+    );
+    let (fx, bin, config, before) =
+        failed_edit_fixture("failed-self-fix", "#!/bin/sh\nprintf '{}\n'\n", &reviewer);
+
+    run_failed_edit(&fx, &bin, &config);
+
+    let pushed = pushed_head(&fx);
+    let saved = saved_state(&fx);
+    assert_ne!(before, pushed);
+    assert_eq!(pushed, saved.pr_head);
+    assert_eq!("a", saved.next_actor);
+    assert!(saved.open_findings.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_author_response_preserves_findings_on_the_published_head() {
+    let author = r#"#!/bin/sh
+case "$1" in
+*"choose exactly one disposition"*)
+    if [ ! -f response.txt ]; then
+        printf 'fixed\n' > response.txt
+        git add response.txt
+        git commit -q -m 'Address the review finding'
+    fi
+    printf 'not json\n'
+    ;;
+*)
+    printf '{}\n'
+    ;;
+esac
+"#;
+    let review = BLOCKING_REVIEW.replace("fix_myself", "hand_back");
+    let reviewer = format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", review);
+    let (fx, bin, config, before) =
+        failed_edit_fixture("failed-author-response", author, &reviewer);
+
+    run_failed_edit(&fx, &bin, &config);
+
+    let pushed = pushed_head(&fx);
+    let saved = saved_state(&fx);
+    assert_ne!(before, pushed);
+    assert_eq!(pushed, saved.pr_head);
+    assert_eq!("b", saved.next_actor);
+    assert_eq!(1, saved.open_findings.len());
+    assert_eq!("Fix the branch", saved.open_findings[0].title);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_self_fix_keeps_uncommitted_files_local() {
+    let reviewer = format!(
+        r#"#!/bin/sh
+case "$1" in
+*"chose to fix the blocking findings yourself"*)
+    printf 'uncommitted\n' > feature.txt
+    exit 1
+    ;;
+*)
+    printf '%s\n' '{}'
+    ;;
+esac
+"#,
+        BLOCKING_REVIEW
+    );
+    let (fx, bin, config, before) = failed_edit_fixture(
+        "failed-self-fix-uncommitted",
+        "#!/bin/sh\nprintf '{}\n'\n",
+        &reviewer,
+    );
+
+    run_failed_edit(&fx, &bin, &config);
+
+    assert_eq!(before, pushed_head(&fx));
+    assert_eq!(
+        "uncommitted\n",
+        std::fs::read_to_string(review_worktree(&fx).join("feature.txt")).unwrap()
+    );
+    assert!(!git(&review_worktree(&fx), &["status", "--porcelain"]).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_self_fix_refuses_unsafe_ignored_output() {
+    let reviewer = format!(
+        r#"#!/bin/sh
+case "$1" in
+*"chose to fix the blocking findings yourself"*)
+    printf 'fixed\n' > feature.txt
+    git add feature.txt
+    git commit -q -m 'Fix the review finding'
+    mkdir -p generated
+    printf 'keep me\n' > generated/fixture.txt
+    exit 1
+    ;;
+*)
+    printf '%s\n' '{}'
+    ;;
+esac
+"#,
+        BLOCKING_REVIEW
+    );
+    let (fx, bin, config, _) = failed_edit_fixture(
+        "failed-self-fix-ignored",
+        "#!/bin/sh\nprintf '{}\n'\n",
+        &reviewer,
+    );
+    git(&fx.work, &["checkout", "-q", "feature"]);
+    commit(
+        &fx.work,
+        ".gitignore",
+        "generated/\n",
+        "Ignore generated output",
+    );
+    git(&fx.work, &["push", "-q", "origin", "feature"]);
+    git(&fx.work, &["checkout", "-q", "main"]);
+    let before = pushed_head(&fx);
+
+    let error = run_failed_edit(&fx, &bin, &config);
+
+    let worktree = review_worktree(&fx);
+    assert_eq!(before, pushed_head(&fx));
+    assert_ne!(before, git(&worktree, &["rev-parse", "HEAD"]).trim());
+    assert!(error.contains("ignored file"), "{error}");
+    assert_eq!(
+        "keep me\n",
+        std::fs::read_to_string(worktree.join("generated/fixture.txt")).unwrap()
+    );
+    let saved = saved_state(&fx);
+    assert_eq!(before, saved.pr_head);
+    assert_eq!(1, saved.open_findings.len());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_self_fix_cannot_publish_a_backward_reset() {
+    let reviewer = format!(
+        r#"#!/bin/sh
+case "$1" in
+*"chose to fix the blocking findings yourself"*)
+    git reset -q --hard HEAD^
+    exit 1
+    ;;
+*)
+    printf '%s\n' '{}'
+    ;;
+esac
+"#,
+        BLOCKING_REVIEW
+    );
+    let (fx, bin, config, before) = failed_edit_fixture(
+        "failed-self-fix-reset",
+        "#!/bin/sh\nprintf '{}\n'\n",
+        &reviewer,
+    );
+
+    let error = run_failed_edit(&fx, &bin, &config);
+
+    assert_failed_reset_was_not_published(&fx, &before, &error);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_author_response_cannot_publish_a_backward_reset() {
+    let author = r#"#!/bin/sh
+case "$1" in
+*"choose exactly one disposition"*)
+    git reset -q --hard HEAD^
+    exit 1
+    ;;
+*)
+    printf '{}\n'
+    ;;
+esac
+"#;
+    let review = BLOCKING_REVIEW.replace("fix_myself", "hand_back");
+    let reviewer = format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", review);
+    let (fx, bin, config, before) = failed_edit_fixture("failed-author-reset", author, &reviewer);
+
+    let error = run_failed_edit(&fx, &bin, &config);
+
+    assert_failed_reset_was_not_published(&fx, &before, &error);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_edit_checks_attributes_before_git_status() {
+    let reviewer = format!(
+        r#"#!/bin/sh
+case "$1" in
+*"chose to fix the blocking findings yourself"*)
+    printf '*.txt filter=trip\n' > .gitattributes
+    printf 'changed\n' > feature.txt
+    exit 1
+    ;;
+*)
+    printf '%s\n' '{}'
+    ;;
+esac
+"#,
+        BLOCKING_REVIEW
+    );
+    let (fx, bin, config, before) = failed_edit_fixture(
+        "failed-edit-attributes",
+        "#!/bin/sh\nprintf '{}\n'\n",
+        &reviewer,
+    );
+    let marker = fx.dir.join("filter-ran");
+    let filter = bin.join("trip-filter");
+    executable(
+        &filter,
+        &format!(
+            "#!/bin/sh\nprintf 'ran\\n' > {:?}\ncat\n",
+            marker.display().to_string()
+        ),
+    );
+    git(
+        &fx.work,
+        &["config", "filter.trip.clean", filter.to_str().unwrap()],
+    );
+    assert!(!marker.exists());
+
+    let error = run_failed_edit(&fx, &bin, &config);
+
+    assert!(
+        !marker.exists(),
+        "the changed attributes selected a Git filter"
+    );
+    assert_eq!(before, pushed_head(&fx));
+    assert!(error.contains("attribute file changed"), "{error}");
+    assert_eq!(
+        "*.txt filter=trip\n",
+        std::fs::read_to_string(review_worktree(&fx).join(".gitattributes")).unwrap()
+    );
+    let saved = saved_state(&fx);
+    assert_eq!(before, saved.pr_head);
+    assert_eq!(1, saved.open_findings.len());
+}
+
 /// An empty queue is a local no-op, and it has to say which file it looked in.
 /// Reaching gh to find that out would make the common case cost a round trip.
 #[test]

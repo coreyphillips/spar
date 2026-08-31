@@ -936,7 +936,7 @@ impl Repo {
         held
     }
 
-    fn is_ancestor_checked(&self, cwd: &Path, older: &str, newer: &str) -> Result<bool> {
+    pub(crate) fn is_ancestor_checked(&self, cwd: &Path, older: &str, newer: &str) -> Result<bool> {
         let argv = vec![
             "git".to_string(),
             "merge-base".to_string(),

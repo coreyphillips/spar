@@ -139,7 +139,7 @@ pub fn implementation() -> Value {
         "properties": {
             "not_worth_doing": {
                 "type": "boolean",
-                "description": "True if, having read the code, this should not be implemented: a duplicate, already fixed, too vague to act on, or a change that would make the codebase worse. Make no commits when this is true."
+                "description": "True if, having read the code, this should not be implemented: a duplicate, already fixed, too vague to act on, or a change that would make the codebase worse. Make no changes when this is true."
             },
             "reason": {
                 "type": "string",

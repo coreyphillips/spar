@@ -37,6 +37,10 @@ pub struct ExecOpts {
     pub check: bool,
     pub env: Vec<(String, String)>,
     pub stdin: Option<String>,
+    /// On Unix, put the command in its own process group and stop descendants
+    /// when the direct child exits. Agent calls use this to establish a quiet
+    /// point before their working tree is inspected or committed.
+    pub stop_descendants: bool,
 }
 
 impl Default for ExecOpts {
@@ -47,6 +51,7 @@ impl Default for ExecOpts {
             check: true,
             env: Vec::new(),
             stdin: None,
+            stop_descendants: false,
         }
     }
 }
@@ -85,11 +90,18 @@ impl ExecOpts {
         self.stdin = Some(text.into());
         self
     }
+
+    pub fn stop_descendants(mut self, value: bool) -> Self {
+        self.stop_descendants = value;
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Output {
     pub stdout: String,
+    /// Exact stdout bytes for commands whose output carries filesystem paths.
+    pub stdout_bytes: Vec<u8>,
     pub stderr: String,
     pub code: i32,
 }
@@ -105,6 +117,11 @@ impl Output {
 /// Only spawn failures and timeouts are errors here; a non-zero exit is a
 /// normal result that the caller decides how to treat.
 pub fn exec(argv: &[String], opts: &ExecOpts) -> Result<Output> {
+    let input = opts.stdin.as_deref().map(str::as_bytes);
+    exec_with_input(argv, opts, input)
+}
+
+fn exec_with_input(argv: &[String], opts: &ExecOpts, input: Option<&[u8]>) -> Result<Output> {
     let program = argv
         .first()
         .ok_or_else(|| SparError::new("cannot run an empty command"))?;
@@ -115,7 +132,7 @@ pub fn exec(argv: &[String], opts: &ExecOpts) -> Result<Output> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    if opts.stdin.is_some() {
+    if input.is_some() {
         command.stdin(Stdio::piped());
     } else {
         // Agent CLIs happily block forever waiting on an inherited terminal.
@@ -129,13 +146,19 @@ pub fn exec(argv: &[String], opts: &ExecOpts) -> Result<Output> {
         command.env(key, value);
     }
 
+    #[cfg(unix)]
+    if opts.stop_descendants {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
     let mut child = command
         .spawn()
         .map_err(|e| SparError::new(format!("could not run `{}`: {e}", abbreviate(argv))))?;
 
-    if let Some(text) = &opts.stdin {
+    if let Some(bytes) = input {
         if let Some(mut pipe) = child.stdin.take() {
-            let _ = pipe.write_all(text.as_bytes());
+            let _ = pipe.write_all(bytes);
         }
         // Dropping the handle closes the pipe, which the child needs in order
         // to see EOF and exit.
@@ -147,13 +170,15 @@ pub fn exec(argv: &[String], opts: &ExecOpts) -> Result<Output> {
     let deadline = Instant::now() + opts.timeout;
     let mut poll = Duration::from_millis(5);
     let mut timed_out = false;
+    let mut quiet_error = None;
     let status = loop {
-        match child.try_wait()? {
-            Some(status) => break Some(status),
-            None => {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    if let Err(error) = stop_and_reap(&mut child, opts.stop_descendants) {
+                        quiet_error = Some(error);
+                    }
                     timed_out = true;
                     break None;
                 }
@@ -162,8 +187,20 @@ pub fn exec(argv: &[String], opts: &ExecOpts) -> Result<Output> {
                 // responsive for the many fast git and gh calls.
                 poll = (poll * 2).min(Duration::from_millis(100));
             }
+            Err(error) => {
+                return Err(poll_failure(error, argv, || {
+                    stop_and_reap(&mut child, opts.stop_descendants)
+                }));
+            }
         }
     };
+
+    #[cfg(unix)]
+    if !timed_out && opts.stop_descendants {
+        if let Err(error) = stop_process_group(child.id()) {
+            quiet_error = Some(error);
+        }
+    }
 
     // Never join the readers.
     //
@@ -175,7 +212,21 @@ pub fn exec(argv: &[String], opts: &ExecOpts) -> Result<Output> {
     let stdout = out_reader.collect(DRAIN_GRACE);
     let stderr = err_reader.collect(DRAIN_GRACE);
 
+    if let Some(error) = quiet_error {
+        return Err(quiet_point_failure(error, argv));
+    }
+
     if timed_out {
+        #[cfg(not(unix))]
+        if opts.stop_descendants {
+            return Err(SparError::uncertain_write(format!(
+                "timed out after {}s: {}\nThe direct process was stopped, but remaining child \
+                 processes could not be stopped on this platform. The worktree must be inspected \
+                 before retrying.",
+                opts.timeout.as_secs(),
+                abbreviate(argv)
+            )));
+        }
         return Err(SparError::timed_out(format!(
             "timed out after {}s: {}\nRaise `timeout` on this agent in spar.toml if the model \
              legitimately needs longer. Not retried: asking again would wait exactly as long a \
@@ -187,9 +238,84 @@ pub fn exec(argv: &[String], opts: &ExecOpts) -> Result<Output> {
 
     Ok(Output {
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stdout_bytes: stdout,
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         code: status.and_then(|s| s.code()).unwrap_or(-1),
     })
+}
+
+fn stop_and_reap(child: &mut std::process::Child, stop_descendants: bool) -> std::io::Result<()> {
+    #[cfg(not(unix))]
+    let _ = stop_descendants;
+
+    #[cfg(unix)]
+    if stop_descendants {
+        if let Err(group_error) = stop_process_group(child.id()) {
+            if child.kill().is_ok() {
+                let _ = child.wait();
+            }
+            return Err(group_error);
+        }
+        return child.wait().map(|_| ());
+    }
+
+    match child.kill() {
+        Ok(()) => child.wait().map(|_| ()),
+        Err(kill_error) => match child.try_wait() {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(kill_error),
+            Err(poll_error) => Err(std::io::Error::new(
+                poll_error.kind(),
+                format!("could not stop the direct process: {kill_error}; {poll_error}"),
+            )),
+        },
+    }
+}
+
+fn poll_failure(
+    error: std::io::Error,
+    argv: &[String],
+    stop_and_reap: impl FnOnce() -> std::io::Result<()>,
+) -> SparError {
+    let cleanup = stop_and_reap()
+        .err()
+        .map(|cleanup| format!(" Cleanup also failed: {cleanup}."))
+        .unwrap_or_default();
+    SparError::uncertain_write(format!(
+        "could not confirm whether `{}` stopped: {error}. SPAR attempted to stop and reap the \
+         direct process and its descendants.{cleanup} The worktree must be inspected before \
+         retrying.",
+        abbreviate(argv),
+    ))
+}
+
+fn quiet_point_failure(error: std::io::Error, argv: &[String]) -> SparError {
+    SparError::uncertain_write(format!(
+        "could not establish a quiet point after `{}`: {error}. The worktree must be inspected \
+         before retrying.",
+        abbreviate(argv)
+    ))
+}
+
+#[cfg(unix)]
+fn stop_process_group(id: u32) -> std::io::Result<()> {
+    let id = i32::try_from(id).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the child process id does not fit a platform process-group id",
+        )
+    })?;
+    // The child was placed in a new process group whose id is its pid. A
+    // negative pid sends the signal to that group, including descendants that
+    // kept running after the direct command exited.
+    if unsafe { libc::kill(-id, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error)
 }
 
 /// How long to keep waiting for output after the child has exited, when a
@@ -265,6 +391,27 @@ pub fn run(argv: &[String], opts: &ExecOpts) -> Result<String> {
         return Err(SparError::call_failed(failure_message(argv, &out)));
     }
     Ok(out.stdout)
+}
+
+pub(crate) fn run_with_input_bytes(
+    argv: &[String],
+    opts: &ExecOpts,
+    input: &[u8],
+) -> Result<String> {
+    let out = exec_with_input(argv, opts, Some(input))?;
+    if opts.check && !out.ok() {
+        return Err(SparError::call_failed(failure_message(argv, &out)));
+    }
+    Ok(out.stdout)
+}
+
+/// Run a command and return stdout without changing non-UTF-8 bytes.
+pub fn run_bytes(argv: &[String], opts: &ExecOpts) -> Result<Vec<u8>> {
+    let out = exec(argv, opts)?;
+    if opts.check && !out.ok() {
+        return Err(SparError::call_failed(failure_message(argv, &out)));
+    }
+    Ok(out.stdout_bytes)
 }
 
 /// Convenience for the many `run(&["git".into(), ...])` call sites.
@@ -380,6 +527,7 @@ mod tests {
     fn proc(out: &str, err: &str, code: i32) -> Output {
         Output {
             stdout: out.into(),
+            stdout_bytes: out.as_bytes().to_vec(),
             stderr: err.into(),
             code,
         }
@@ -390,11 +538,47 @@ mod tests {
     }
 
     #[test]
+    fn a_poll_failure_attempts_cleanup_and_is_uncertain() {
+        let stopped = std::cell::Cell::new(false);
+        let error = poll_failure(
+            std::io::Error::other("poll failed"),
+            &argv(&["editor"]),
+            || {
+                stopped.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(stopped.get());
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert!(error.to_string().contains("poll failed"), "{error}");
+    }
+
+    #[test]
+    fn a_stop_or_reap_failure_is_uncertain() {
+        let error =
+            quiet_point_failure(std::io::Error::other("could not reap"), &argv(&["editor"]));
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert!(error.to_string().contains("could not reap"), "{error}");
+    }
+
+    #[test]
     fn stdin_reaches_the_child_byte_for_byte() {
         let body = "line one  \n\nline three\n";
         let out = run_str(&["/bin/sh", "-c", "cat"], &ExecOpts::new().stdin(body))
             .expect("the child reads stdin");
         assert_eq!(body, out);
+    }
+
+    #[test]
+    fn byte_input_reaches_the_child_without_text_conversion() {
+        let input = [b'f', 0xff, 0];
+        let command = argv(&["/bin/sh", "-c", "cat"]);
+        let out = exec_with_input(&command, &ExecOpts::new(), Some(&input))
+            .expect("the child reads byte input");
+
+        assert_eq!(input, out.stdout_bytes.as_slice());
     }
 
     #[test]
@@ -526,6 +710,32 @@ mod tests {
             start.elapsed() < Duration::from_secs(20),
             "waited on a grandchild that will never exit"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_process_group_cannot_edit_after_the_parent_exits() {
+        let late = std::env::temp_dir().join(format!(
+            "spar-late-child-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_file(&late);
+        let out = run(
+            &argv(&[
+                "/bin/sh",
+                "-c",
+                "(sleep 1; touch \"$1\") & echo done",
+                "sh",
+                late.to_str().unwrap(),
+            ]),
+            &ExecOpts::new().stop_descendants(true),
+        )
+        .unwrap();
+
+        assert!(out.contains("done"), "{out:?}");
+        std::thread::sleep(Duration::from_millis(1_200));
+        assert!(!late.exists(), "a descendant edited after the quiet point");
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! it.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -15,6 +16,10 @@ use crate::config::{AgentSpec, CommandPart, OutputMode, SystemVia};
 use crate::error::{ErrorKind, Result, SparError};
 use crate::jsonx;
 use crate::proc::{self, ExecOpts};
+use crate::repo::{
+    attribute_state, git_state, ignored_untracked_state, safe_git_state, uncertain_worktree_change,
+    AttributeState, GitState, IgnoredState,
+};
 use crate::{bail, log, logdim, logwarn, spar_err};
 
 /// Injected into every request.
@@ -57,6 +62,12 @@ produced the work.";
 
 const JSON_INSTRUCTION: &str = "Respond with ONLY a JSON object matching this \
 schema. No prose, no markdown fences, no commentary before or after:";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Read,
+    Edit,
+}
 
 /// What a run's own instructions arrive under.
 ///
@@ -389,11 +400,37 @@ impl Agent {
     // -- the two operations everything else is built from -------------------
 
     pub fn ask(&self, prompt: &str, cwd: &Path, effort: Option<&str>) -> Result<String> {
+        let baseline = EditBaseline::capture(cwd)?;
+        self.ask_with_access(prompt, cwd, effort, Access::Read, Some(&baseline))
+    }
+
+    /// Ask for a call that may modify the working tree.
+    ///
+    /// The caller commits accepted edits after validating the response.
+    pub fn edit(&self, prompt: &str, cwd: &Path, effort: Option<&str>) -> Result<String> {
+        let baseline = EditBaseline::capture(cwd)?;
+        self.ask_with_access(prompt, cwd, effort, Access::Edit, Some(&baseline))
+    }
+
+    fn ask_with_access(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        effort: Option<&str>,
+        access: Access,
+        baseline: Option<&EditBaseline>,
+    ) -> Result<String> {
         let prompt = &self.instructed(prompt);
-        match self.ask_inner(prompt, cwd, effort, None, None) {
+        let result = match self.ask_inner(prompt, cwd, effort, None, None, access) {
             Ok(text) => Ok(text),
-            Err(e) => self.hand_over(e, |backup| backup.ask(prompt, cwd, None)),
-        }
+            Err(e) => match recovery_error(&e, baseline, cwd, access) {
+                Some(recovery) => Err(recovery),
+                None => self.hand_over(e, |backup| {
+                    backup.ask_with_access(prompt, cwd, None, access, baseline)
+                }),
+            },
+        };
+        finish_call(result, access, baseline, cwd)
     }
 
     /// Give a failed call to the fallback, if there is one.
@@ -423,14 +460,17 @@ impl Agent {
             // Both messages, primary first. The fallback's failure is usually
             // the less interesting of the two, and is often just "not
             // installed", which explains nothing about why the run stopped.
-            Err(second) => Err(spar_err!(
-                "agent '{}' failed and its fallback '{}' could not stand in.\n{}\n\n{}: {}",
-                self.name(),
-                backup.name(),
-                primary.message(),
-                backup.name(),
-                second.message()
-            )),
+            Err(second) => {
+                let message = format!(
+                    "agent '{}' failed and its fallback '{}' could not stand in.\n{}\n\n{}: {}",
+                    self.name(),
+                    backup.name(),
+                    primary.message(),
+                    backup.name(),
+                    second.message()
+                );
+                Err(second.with_message(message))
+            }
         }
     }
 
@@ -441,6 +481,7 @@ impl Agent {
         effort: Option<&str>,
         schema_file: Option<&Path>,
         schema: Option<&str>,
+        access: Access,
     ) -> Result<String> {
         let body = match self.spec.system_via {
             SystemVia::Placeholder => prompt.to_string(),
@@ -464,8 +505,21 @@ impl Agent {
         let opts = ExecOpts::new()
             .cwd(cwd)
             .timeout_secs(self.spec.timeout)
+            .stop_descendants(true)
             .check(false);
-        let out = proc::exec(&argv, &opts)?;
+        // Supported review commands can still write despite being asked not
+        // to, so linked-worktree marker recovery applies to every agent call.
+        let git_file = match access {
+            Access::Read | Access::Edit => GitFile::capture(cwd)?,
+        };
+        let called = proc::exec(&argv, &opts);
+        after_call_is_quiet(&called, || {
+            if let Some(git_file) = git_file {
+                git_file.restore_if_changed(cwd)?;
+            }
+            Ok(())
+        })?;
+        let out = called?;
         if !out.ok() {
             return Err(self.call_failure(&argv, &out));
         }
@@ -482,15 +536,46 @@ impl Agent {
         cwd: &Path,
         effort: Option<&str>,
     ) -> Result<T> {
+        let baseline = EditBaseline::capture(cwd)?;
+        self.ask_json_with_access(prompt, schema, cwd, effort, Access::Read, Some(&baseline))
+    }
+
+    /// Ask for a structured call that may modify the working tree.
+    ///
+    /// The caller commits accepted edits after validating the response.
+    pub fn edit_json<T: serde::de::DeserializeOwned>(
+        &self,
+        prompt: &str,
+        schema: &Value,
+        cwd: &Path,
+        effort: Option<&str>,
+    ) -> Result<T> {
+        let baseline = EditBaseline::capture(cwd)?;
+        self.ask_json_with_access(prompt, schema, cwd, effort, Access::Edit, Some(&baseline))
+    }
+
+    fn ask_json_with_access<T: serde::de::DeserializeOwned>(
+        &self,
+        prompt: &str,
+        schema: &Value,
+        cwd: &Path,
+        effort: Option<&str>,
+        access: Access,
+        baseline: Option<&EditBaseline>,
+    ) -> Result<T> {
         // Once here, not inside the retry, so the second ask carries the same
         // instructions as the first alongside the parser's complaint.
         let prompt = &self.instructed(prompt);
-        match self.ask_json_retrying(prompt, schema, cwd, effort) {
+        let result = match self.ask_json_retrying(prompt, schema, cwd, effort, access, baseline) {
             Ok(parsed) => Ok(parsed),
-            Err(e) => self.hand_over(e, |backup| {
-                backup.ask_json_retrying::<T>(prompt, schema, cwd, None)
-            }),
-        }
+            Err(e) => match recovery_error(&e, baseline, cwd, access) {
+                Some(recovery) => Err(recovery),
+                None => self.hand_over(e, |backup| {
+                    backup.ask_json_retrying::<T>(prompt, schema, cwd, None, access, baseline)
+                }),
+            },
+        };
+        finish_call(result, access, baseline, cwd)
     }
 
     /// Whether to spend a second call on this same agent.
@@ -521,6 +606,8 @@ impl Agent {
         schema: &Value,
         cwd: &Path,
         effort: Option<&str>,
+        access: Access,
+        baseline: Option<&EditBaseline>,
     ) -> Result<T> {
         // One retry, with the parser's own complaint handed back.
         //
@@ -539,7 +626,7 @@ impl Agent {
                     e.first_line()
                 ),
             };
-            match self.ask_json_once::<T>(&asked, schema, cwd, effort) {
+            match self.ask_json_once::<T>(&asked, schema, cwd, effort, access) {
                 Ok(parsed) => {
                     if attempt > 1 {
                         logdim!("{} answered on the retry", self.spec.name);
@@ -549,8 +636,13 @@ impl Agent {
                 // A deadline is not a bad answer. Asking again buys another
                 // wait of exactly the same length, which on a long review is
                 // the most expensive way to learn nothing.
-                Err(e) if !self.worth_asking_again(&e) => return Err(e),
                 Err(e) => {
+                    if let Some(recovery) = recovery_error(&e, baseline, cwd, access) {
+                        return Err(recovery);
+                    }
+                    if !self.worth_asking_again(&e) {
+                        return Err(e);
+                    }
                     if attempt < ATTEMPTS {
                         // The whole error, not its first line. The first line is
                         // the command; the reason is in the stderr underneath
@@ -575,17 +667,25 @@ impl Agent {
         schema: &Value,
         cwd: &Path,
         effort: Option<&str>,
+        access: Access,
     ) -> Result<T> {
         let text = if self.supports_schema() {
             let inline = serde_json::to_string(schema).unwrap_or_default();
             let file = TempJson::write(schema)?;
-            self.ask_inner(prompt, cwd, effort, Some(file.path()), Some(&inline))?
+            self.ask_inner(
+                prompt,
+                cwd,
+                effort,
+                Some(file.path()),
+                Some(&inline),
+                access,
+            )?
         } else {
             let full = format!(
                 "{prompt}\n\n{JSON_INSTRUCTION}\n{}",
                 serde_json::to_string_pretty(schema).unwrap_or_default()
             );
-            self.ask_inner(&full, cwd, effort, None, None)?
+            self.ask_inner(&full, cwd, effort, None, None, access)?
         };
         jsonx::extract_into(&text)
     }
@@ -616,11 +716,405 @@ impl Agent {
              working directory. Inspect them with git, then read the surrounding code before \
              judging. Do not review only the diff.\n\nThis call is a review and nothing else. Do \
              not edit the code under review, do not commit, and do not push: somebody else acts \
-             on what you find, and a reviewer that writes ends up reviewing its own work. Writing \
-             a scratch file to check a claim is fine, and anything else you leave behind is rolled \
-             back."
+             on what you find, and a reviewer that writes ends up reviewing its own work. Put any \
+             scratch file under the system temporary directory, not in the working tree."
         );
         self.ask_json(&scoped, schema, cwd, effort)
+    }
+}
+
+const GIT_MARKER_RECOVERY: &str = ".spar-edited-git-marker";
+
+/// The repository state before a logical editing operation begins.
+///
+/// This is recovery tracking, not an operating-system security boundary. It
+/// prevents a failed call, retry, or fallback from silently building on work
+/// the same operation already left behind.
+struct EditBaseline {
+    attributes: AttributeState,
+    git_state: GitState,
+    git_entry: GitEntry,
+    ignored_untracked: IgnoredState,
+}
+
+impl EditBaseline {
+    fn capture(cwd: &Path) -> Result<Self> {
+        let git_entry = GitEntry::capture(cwd)?;
+        if matches!(&git_entry, GitEntry::File) {
+            ensure_recovery_path_clear(cwd)?;
+        }
+        let attributes = attribute_state(cwd).map_err(|e| {
+            e.with_message(format!(
+                "could not record attribute files before a call in {}: {}",
+                cwd.display(),
+                e.last_line()
+            ))
+        })?;
+        let git_state = safe_git_state(cwd).map_err(|e| {
+            e.with_message(format!(
+                "could not record a safe Git state before editing {}: {}",
+                cwd.display(),
+                e.last_line()
+            ))
+        })?;
+        let ignored_untracked = ignored_untracked_state(cwd).map_err(|e| {
+            e.with_message(format!(
+                "could not record ignored files before editing {}: {}",
+                cwd.display(),
+                e.last_line()
+            ))
+        })?;
+        Ok(Self {
+            attributes,
+            git_state,
+            git_entry,
+            ignored_untracked,
+        })
+    }
+
+    fn recovery_needed(&self, cwd: &Path) -> Result<bool> {
+        if !self.git_entry.still_matches(cwd)? {
+            return Err(uncertain_worktree_change(
+                cwd,
+                format!(
+                    "the Git entry at {} changed type during the editing call. No Git recovery \
+                     probe was run. Inspect the worktree before retrying.",
+                    cwd.join(".git").display()
+                ),
+            ));
+        }
+        let attributes = attribute_state(cwd).map_err(|e| {
+            uncertain_worktree_change(
+                cwd,
+                format!(
+                    "could not check attribute files after a call in {}: {}. Inspect the \
+                     worktree before retrying.",
+                    cwd.display(),
+                    e.last_line()
+                ),
+            )
+        })?;
+        if attributes != self.attributes {
+            return Err(uncertain_worktree_change(
+                cwd,
+                format!(
+                    "an attribute file changed during a call in {}. The worktree was kept before \
+                     running any Git operation that could select a new filter.",
+                    cwd.display()
+                ),
+            ));
+        }
+        let current = git_state(cwd).map_err(|e| recovery_probe_error(cwd, "state", &e))?;
+        let ignored = ignored_untracked_state(cwd)
+            .map_err(|e| recovery_probe_error(cwd, "ignored files", &e))?;
+        Ok(current != self.git_state || ignored != self.ignored_untracked)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum GitEntry {
+    Directory(GitDirectory),
+    File,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct GitDirectory {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    created: Option<std::time::SystemTime>,
+}
+
+impl GitEntry {
+    fn capture(cwd: &Path) -> Result<Self> {
+        let path = cwd.join(".git");
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    Ok(Self::Directory(GitDirectory {
+                        device: meta.dev(),
+                        inode: meta.ino(),
+                    }))
+                }
+                #[cfg(not(unix))]
+                {
+                    Ok(Self::Directory(GitDirectory {
+                        created: meta.created().ok(),
+                    }))
+                }
+            }
+            Ok(meta) if meta.is_file() => Ok(Self::File),
+            Ok(_) => bail!(
+                "{} is not a regular Git directory or marker",
+                path.display()
+            ),
+            Err(e) => Err(spar_err!("could not inspect {}: {e}", path.display())),
+        }
+    }
+
+    fn still_matches(&self, cwd: &Path) -> Result<bool> {
+        let path = cwd.join(".git");
+        match (self, std::fs::symlink_metadata(path)) {
+            (Self::Directory(before), Ok(meta)) if meta.is_dir() => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    Ok(before.device == meta.dev() && before.inode == meta.ino())
+                }
+                #[cfg(not(unix))]
+                {
+                    Ok(before.created == meta.created().ok())
+                }
+            }
+            (Self::Directory(_), Ok(_)) => Ok(false),
+            (Self::File, Ok(meta)) => Ok(meta.is_file()),
+            (_, Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            (_, Err(e)) => Err(SparError::uncertain_write(format!(
+                "could not inspect the Git entry at {} after the editing call: {e}",
+                cwd.join(".git").display()
+            ))),
+        }
+    }
+}
+
+fn recovery_probe_error(cwd: &Path, probe: &str, error: &SparError) -> SparError {
+    uncertain_worktree_change(
+        cwd,
+        format!(
+            "could not check the Git {probe} after an editing call in {}: {}. Inspect the \
+             worktree before retrying.",
+            cwd.display(),
+            error.last_line()
+        ),
+    )
+}
+
+fn recovery_error(
+    error: &SparError,
+    baseline: Option<&EditBaseline>,
+    cwd: &Path,
+    access: Access,
+) -> Option<SparError> {
+    // A marker restoration failure must not be followed by a Git command. The
+    // marker is exactly what Git would use to choose its metadata and config.
+    if error.kind() == ErrorKind::UncertainWrite {
+        return Some(error.clone());
+    }
+    let baseline = baseline?;
+    match baseline.recovery_needed(cwd) {
+        Ok(false) => None,
+        Ok(true) if access == Access::Edit => Some(changed_edit_failure(error)),
+        Ok(true) => Some(uncertain_worktree_change(
+            cwd,
+            format!(
+                "{}\nA read-only call changed the worktree before it failed. Its answer was \
+                 discarded and the worktree was kept for recovery.",
+                error.message()
+            ),
+        )),
+        Err(recovery) => Some(SparError::uncertain_write(format!(
+            "{}\n{}",
+            error.message(),
+            recovery.message()
+        ))),
+    }
+}
+
+fn changed_edit_failure(error: &SparError) -> SparError {
+    const NOTE: &str =
+        "The call changed the worktree before it failed. It was not retried or handed to a fallback.";
+    if error.message().contains(NOTE) {
+        return error.clone();
+    }
+    error.with_message(format!("{}\n{NOTE}", error.message()))
+}
+
+fn finish_call<T>(
+    result: Result<T>,
+    access: Access,
+    baseline: Option<&EditBaseline>,
+    cwd: &Path,
+) -> Result<T> {
+    let value = result?;
+    let Some(baseline) = baseline else {
+        return Ok(value);
+    };
+    if access == Access::Edit {
+        if baseline.git_entry.still_matches(cwd)? {
+            return Ok(value);
+        }
+        return Err(uncertain_worktree_change(
+            cwd,
+            format!(
+                "the Git entry at {} was replaced during an editing call. The result was \
+                 discarded before any Git operation ran.",
+                cwd.join(".git").display()
+            ),
+        ));
+    }
+    match baseline.recovery_needed(cwd) {
+        Ok(false) => Ok(value),
+        Ok(true) => Err(uncertain_worktree_change(
+            cwd,
+            "a read-only call changed the worktree. Its answer was discarded and the worktree \
+             was kept for recovery.",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+/// The original linked-worktree marker for one editing attempt.
+///
+/// Restoring this file makes an accidental marker edit recoverable. It does not
+/// confine the child or remove any Git metadata authority the child already has.
+struct GitFile {
+    bytes: Vec<u8>,
+}
+
+impl GitFile {
+    fn capture(cwd: &Path) -> Result<Option<Self>> {
+        let path = cwd.join(".git");
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() => Ok(None),
+            Ok(meta) if meta.is_file() => {
+                ensure_recovery_path_clear(cwd)?;
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| spar_err!("could not read {}: {e}", path.display()))?;
+                Ok(Some(Self { bytes }))
+            }
+            Ok(_) => bail!(
+                "{} is not a regular Git marker. Refusing to run an editing call.",
+                path.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(spar_err!("could not inspect {}: {e}", path.display())),
+        }
+    }
+
+    fn restore_if_changed(self, cwd: &Path) -> Result<()> {
+        let path = cwd.join(".git");
+        let unchanged = std::fs::symlink_metadata(&path)
+            .ok()
+            .filter(|meta| meta.is_file())
+            .and_then(|_| std::fs::read(&path).ok())
+            .is_some_and(|bytes| bytes == self.bytes);
+        let recovery = cwd.join(GIT_MARKER_RECOVERY);
+        if unchanged {
+            return match std::fs::symlink_metadata(&recovery) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Ok(_) => Err(SparError::uncertain_write(format!(
+                    "the agent call created the reserved recovery path at {}. The Git marker was \
+                     unchanged. Inspect or remove the recovery path before retrying.",
+                    recovery.display()
+                ))),
+                Err(e) => Err(SparError::uncertain_write(format!(
+                    "could not inspect {} after the agent call: {e}",
+                    recovery.display()
+                ))),
+            };
+        }
+
+        let retained = match std::fs::symlink_metadata(&path) {
+            Ok(_) => match std::fs::symlink_metadata(&recovery) {
+                Ok(_) => {
+                    return Err(SparError::uncertain_write(format!(
+                        "the agent call changed the linked worktree Git marker at {}, but the \
+                         changed entry could not be retained because {} already exists. The \
+                         original marker was not restored, so no changed entry was deleted. \
+                         Inspect the worktree before retrying.",
+                        path.display(),
+                        recovery.display()
+                    )));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    match std::fs::rename(&path, &recovery) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            return Err(SparError::uncertain_write(format!(
+                                "the agent call changed the linked worktree Git marker at {}, but \
+                                 the changed entry could not be moved to {}: {e}. The original \
+                                 marker was not restored, so no changed entry was deleted. Inspect \
+                                 the worktree before retrying.",
+                                path.display(),
+                                recovery.display()
+                            )));
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(SparError::uncertain_write(format!(
+                        "the agent call changed the linked worktree Git marker at {}, but {} could \
+                         not be inspected: {e}. The original marker was not restored, so no changed \
+                         entry was deleted. Inspect the worktree before retrying.",
+                        path.display(),
+                        recovery.display()
+                    )));
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                return Err(SparError::uncertain_write(format!(
+                    "the agent call changed the linked worktree Git marker at {}, but the changed \
+                     entry could not be inspected: {e}. The original marker was not restored. \
+                     Inspect the worktree before retrying.",
+                    path.display()
+                )));
+            }
+        };
+
+        let restored = replace_git_marker(&path, &self.bytes);
+        let restore_note = match &restored {
+            Ok(()) => "The original marker was restored.".to_string(),
+            Err(e) => format!("The original marker could not be restored: {e}."),
+        };
+        let retain_note = if retained {
+            format!("The changed marker was kept at {}.", recovery.display())
+        } else {
+            "The agent call deleted the changed marker, so there was nothing to retain.".to_string()
+        };
+        Err(SparError::uncertain_write(format!(
+            "the agent call changed the linked worktree Git marker at {}. {restore_note} \
+             {retain_note} Inspect the worktree before retrying.",
+            path.display()
+        )))
+    }
+}
+
+/// Run post-call filesystem recovery only after the process runner confirms
+/// that no descendant may still be writing.
+fn after_call_is_quiet<T>(called: &Result<T>, recover: impl FnOnce() -> Result<()>) -> Result<()> {
+    if let Err(error) = called {
+        if error.kind() == ErrorKind::UncertainWrite {
+            return Err(error.clone());
+        }
+    }
+    recover()
+}
+
+fn replace_git_marker(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut marker = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    marker.write_all(bytes)
+}
+
+fn ensure_recovery_path_clear(cwd: &Path) -> Result<()> {
+    let recovery = cwd.join(GIT_MARKER_RECOVERY);
+    match std::fs::symlink_metadata(&recovery) {
+        Ok(_) => Err(SparError::uncertain_write(format!(
+            "{} already exists. Recover or remove it before another agent call.",
+            recovery.display()
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(SparError::uncertain_write(format!(
+            "could not inspect {} before the agent call: {e}",
+            recovery.display()
+        ))),
     }
 }
 
@@ -897,6 +1391,21 @@ mod tests {
 
     fn group(parts: &[&str]) -> CommandPart {
         CommandPart::Group(parts.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn an_uncertain_process_result_skips_post_call_recovery() {
+        let called: Result<()> = Err(SparError::uncertain_write("descendants may still write"));
+        let recovered = std::cell::Cell::new(false);
+
+        let error = after_call_is_quiet(&called, || {
+            recovered.set(true);
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(ErrorKind::UncertainWrite, error.kind());
+        assert!(!recovered.get());
     }
 
     fn agent(command: Vec<CommandPart>) -> Agent {
@@ -1259,6 +1768,7 @@ mod tests {
     fn failed(stdout: &str, stderr: &str) -> proc::Output {
         proc::Output {
             stdout: stdout.to_string(),
+            stdout_bytes: stdout.as_bytes().to_vec(),
             stderr: stderr.to_string(),
             code: 1,
         }
@@ -1421,6 +1931,70 @@ mod tests {
         Agent::with_bin(primary, "/bin/sh")
     }
 
+    fn git_at(cwd: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn committed_repo(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "spar-agent-{name}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_at(&dir, &["init", "-q", "-b", "main"]);
+        git_at(&dir, &["config", "user.email", "spar@example.invalid"]);
+        git_at(&dir, &["config", "user.name", "spar test"]);
+        git_at(&dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("README.md"), "seed\n").unwrap();
+        git_at(&dir, &["add", "README.md"]);
+        git_at(&dir, &["commit", "-q", "-m", "seed"]);
+        dir
+    }
+
+    fn linked_worktree(name: &str) -> (PathBuf, PathBuf, PathBuf, Vec<u8>) {
+        let root = std::env::temp_dir().join(format!(
+            "spar-agent-{name}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let main = root.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git_at(&main, &["init", "-q", "-b", "main"]);
+        git_at(&main, &["config", "user.email", "spar@example.invalid"]);
+        git_at(&main, &["config", "user.name", "spar test"]);
+        git_at(&main, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(main.join("README.md"), "seed\n").unwrap();
+        git_at(&main, &["add", "README.md"]);
+        git_at(&main, &["commit", "-q", "-m", "seed"]);
+        let linked = root.join("linked");
+        git_at(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "issue-test",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let marker = std::fs::read(linked.join(".git")).unwrap();
+        (root, main, linked, marker)
+    }
+
     #[test]
     fn a_failed_call_is_answered_by_the_fallback() {
         let agent = with_fallback(
@@ -1429,6 +2003,330 @@ mod tests {
         );
         let answer = agent.ask("hi", Path::new("."), None).expect("fallback");
         assert_eq!("stood in", answer);
+    }
+
+    #[test]
+    fn a_failed_edit_with_files_left_does_not_run_the_fallback() {
+        let dir = committed_repo("dirty-edit-recovery");
+
+        let agent = with_fallback(
+            shell(
+                "primary",
+                "printf 'recover me\\n' > README.md; printf refused >&2; exit 1",
+            ),
+            shell("backup", "printf 'fallback ran\\n' > fallback.txt"),
+        );
+        let err = agent.edit("change it", &dir, None).unwrap_err();
+
+        assert!(err.message().contains("refused"), "{err}");
+        assert_eq!(
+            1,
+            err.message()
+                .matches("The call changed the worktree before it failed")
+                .count(),
+            "{err}"
+        );
+        assert_eq!(
+            "recover me\n",
+            std::fs::read_to_string(dir.join("README.md")).unwrap()
+        );
+        assert!(!dir.join("fallback.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_edit_with_a_new_ignored_file_does_not_run_the_fallback() {
+        let dir = committed_repo("ignored-edit-recovery");
+        std::fs::write(dir.join(".gitignore"), "ignored.txt\n").unwrap();
+        git_at(&dir, &["add", ".gitignore"]);
+        git_at(&dir, &["commit", "-q", "-m", "ignore fixture"]);
+        let agent = with_fallback(
+            shell(
+                "primary",
+                "printf 'recover me\n' > ignored.txt; printf refused >&2; exit 1",
+            ),
+            shell("backup", "printf 'fallback ran\n' > fallback.txt"),
+        );
+
+        let err = agent.edit("change it", &dir, None).unwrap_err();
+
+        assert!(err.message().contains("refused"), "{err}");
+        assert_eq!(
+            "recover me\n",
+            std::fs::read_to_string(dir.join("ignored.txt")).unwrap()
+        );
+        assert!(!dir.join("fallback.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_edit_that_overwrites_an_ignored_file_does_not_run_the_fallback() {
+        let dir = committed_repo("changed-ignored-edit-recovery");
+        std::fs::write(dir.join(".gitignore"), "ignored.txt\n").unwrap();
+        git_at(&dir, &["add", ".gitignore"]);
+        git_at(&dir, &["commit", "-q", "-m", "ignore fixture"]);
+        std::fs::write(dir.join("ignored.txt"), "before\n").unwrap();
+        let agent = with_fallback(
+            shell(
+                "primary",
+                "printf 'after!\\n' > ignored.txt; printf refused >&2; exit 1",
+            ),
+            shell("backup", "printf 'fallback ran\n' > fallback.txt"),
+        );
+
+        let err = agent.edit("change it", &dir, None).unwrap_err();
+
+        assert!(err.message().contains("refused"), "{err}");
+        assert_eq!(
+            "after!\n",
+            std::fs::read_to_string(dir.join("ignored.txt")).unwrap()
+        );
+        assert!(!dir.join("fallback.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_edit_with_a_commit_does_not_run_the_fallback() {
+        let dir = committed_repo("committed-edit-recovery");
+        let agent = with_fallback(
+            shell(
+                "primary",
+                "printf 'recover me\n' > README.md; git add README.md; \
+                 git commit -q -m preserved; printf refused >&2; exit 1",
+            ),
+            shell("backup", "printf 'fallback ran\n' > fallback.txt"),
+        );
+
+        let err = agent.edit("change it", &dir, None).unwrap_err();
+
+        assert!(err.message().contains("refused"), "{err}");
+        assert_eq!("preserved", git_at(&dir, &["log", "-1", "--pretty=%s"]));
+        assert_eq!(
+            "recover me\n",
+            std::fs::read_to_string(dir.join("README.md")).unwrap()
+        );
+        assert!(!dir.join("fallback.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_committed_edit_with_malformed_json_is_not_retried_or_handed_over() {
+        let dir = committed_repo("committed-malformed-edit");
+        let agent = with_fallback(
+            shell(
+                "primary",
+                "printf 'once\n' >> attempts.txt; printf 'recover me\n' > README.md; \
+                 git add -A; git commit -q -m preserved; printf 'not json\n'",
+            ),
+            shell(
+                "backup",
+                "printf 'fallback ran\n' > fallback.txt; printf '{}\n'",
+            ),
+        );
+
+        let err = agent
+            .edit_json::<Value>(
+                "change it",
+                &serde_json::json!({"type": "object"}),
+                &dir,
+                None,
+            )
+            .unwrap_err();
+
+        assert!(err.message().contains("JSON"), "{err}");
+        assert_eq!("preserved", git_at(&dir, &["log", "-1", "--pretty=%s"]));
+        assert_eq!(
+            1,
+            std::fs::read_to_string(dir.join("attempts.txt"))
+                .unwrap()
+                .lines()
+                .count()
+        );
+        assert!(!dir.join("fallback.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_edit_recovery_probe_does_not_retry_or_run_the_fallback() {
+        let dir = committed_repo("failed-edit-probe");
+        let agent = with_fallback(
+            shell(
+                "primary",
+                "printf 'once\n' >> attempts.txt; mv .git .git-away; printf 'not json\n'",
+            ),
+            shell(
+                "backup",
+                "printf 'fallback ran\n' > fallback.txt; printf '{}\n'",
+            ),
+        );
+
+        let err = agent
+            .edit_json::<Value>(
+                "change it",
+                &serde_json::json!({"type": "object"}),
+                &dir,
+                None,
+            )
+            .unwrap_err();
+
+        std::fs::rename(dir.join(".git-away"), dir.join(".git")).unwrap();
+        assert_eq!(ErrorKind::UncertainWrite, err.kind());
+        assert!(err.message().contains("JSON"), "{err}");
+        assert_eq!(
+            1,
+            std::fs::read_to_string(dir.join("attempts.txt"))
+                .unwrap()
+                .lines()
+                .count()
+        );
+        assert!(!dir.join("fallback.txt").exists());
+        assert!(dir.join(".git").is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_linked_worktree_git_marker_is_restored_after_an_edit() {
+        let (root, main, linked, marker) = linked_worktree("changed-git-marker");
+        let agent = Agent::with_bin(
+            shell(
+                "editor",
+                "printf 'gitdir: /tmp/not-the-repo\\n' > .git; echo done",
+            ),
+            "/bin/sh",
+        );
+
+        let err = agent.edit("change it", &linked, None).unwrap_err();
+
+        assert_eq!(ErrorKind::UncertainWrite, err.kind());
+        assert!(err.message().contains("Git marker"), "{err}");
+        assert_eq!(marker, std::fs::read(linked.join(".git")).unwrap());
+        assert_eq!(
+            b"gitdir: /tmp/not-the-repo\n",
+            std::fs::read(linked.join(GIT_MARKER_RECOVERY))
+                .unwrap()
+                .as_slice()
+        );
+        git_at(
+            &main,
+            &["worktree", "remove", "--force", linked.to_str().unwrap()],
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_read_call_also_restores_a_linked_worktree_git_marker() {
+        let (root, main, linked, marker) = linked_worktree("read-call-git-marker");
+        let agent = with_fallback(
+            shell(
+                "reader",
+                "printf 'gitdir: /tmp/not-the-repo\n' > .git; echo done",
+            ),
+            shell("backup", "printf 'fallback ran\n' > fallback.txt"),
+        );
+
+        let err = agent.ask("read it", &linked, None).unwrap_err();
+
+        assert_eq!(ErrorKind::UncertainWrite, err.kind());
+        assert_eq!(marker, std::fs::read(linked.join(".git")).unwrap());
+        assert!(!linked.join("fallback.txt").exists());
+        git_at(
+            &main,
+            &["worktree", "remove", "--force", linked.to_str().unwrap()],
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_successful_read_that_writes_is_discarded() {
+        let dir = committed_repo("successful-read-write");
+        let agent = Agent::with_bin(
+            shell("reader", "printf 'recover me\n' > README.md; echo reviewed"),
+            "/bin/sh",
+        );
+
+        let err = agent.ask("read it", &dir, None).unwrap_err();
+
+        assert_eq!(ErrorKind::UncertainWrite, err.kind());
+        assert!(err.message().contains("read-only call"), "{err}");
+        assert_eq!(
+            "recover me\n",
+            std::fs::read_to_string(dir.join("README.md")).unwrap()
+        );
+        assert!(std::fs::read_dir(&dir).unwrap().flatten().any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".spar-recovery-needed-")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_successful_edit_cannot_replace_the_git_directory() {
+        let dir = committed_repo("replaced-git-directory");
+        let agent = Agent::with_bin(
+            shell("editor", "mv .git .git-original; mkdir .git; echo done"),
+            "/bin/sh",
+        );
+
+        let err = agent.edit("change it", &dir, None).unwrap_err();
+
+        assert_eq!(ErrorKind::UncertainWrite, err.kind());
+        assert!(err.message().contains("Git entry"), "{err}");
+        assert!(dir.join(".git-original").is_dir());
+        std::fs::remove_dir(dir.join(".git")).unwrap();
+        std::fs::rename(dir.join(".git-original"), dir.join(".git")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deleted_linked_worktree_git_marker_is_restored_without_a_fallback() {
+        let (root, main, linked, marker) = linked_worktree("deleted-git-marker");
+        let agent = with_fallback(
+            shell("editor", "rm .git; echo done"),
+            shell("backup", "printf 'fallback ran\n' > fallback.txt"),
+        );
+
+        let err = agent.edit("change it", &linked, None).unwrap_err();
+
+        assert_eq!(ErrorKind::UncertainWrite, err.kind());
+        assert!(err.message().contains("deleted"), "{err}");
+        assert_eq!(marker, std::fs::read(linked.join(".git")).unwrap());
+        assert!(!linked.join(GIT_MARKER_RECOVERY).exists());
+        assert!(!linked.join("fallback.txt").exists());
+        git_at(
+            &main,
+            &["worktree", "remove", "--force", linked.to_str().unwrap()],
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_occupied_marker_recovery_path_keeps_the_changed_marker() {
+        let (root, main, linked, marker) = linked_worktree("occupied-marker-recovery");
+        let agent = with_fallback(
+            shell(
+                "editor",
+                "mkdir .spar-edited-git-marker; \
+                 printf 'gitdir: /tmp/not-the-repo\n' > .git; echo done",
+            ),
+            shell("backup", "printf 'fallback ran\n' > fallback.txt"),
+        );
+
+        let err = agent.edit("change it", &linked, None).unwrap_err();
+
+        assert_eq!(ErrorKind::UncertainWrite, err.kind());
+        assert!(err.message().contains("already exists"), "{err}");
+        assert_eq!(
+            b"gitdir: /tmp/not-the-repo\n",
+            std::fs::read(linked.join(".git")).unwrap().as_slice()
+        );
+        assert!(linked.join(GIT_MARKER_RECOVERY).is_dir());
+        assert!(!linked.join("fallback.txt").exists());
+        std::fs::write(linked.join(".git"), marker).unwrap();
+        git_at(
+            &main,
+            &["worktree", "remove", "--force", linked.to_str().unwrap()],
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

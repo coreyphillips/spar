@@ -26,12 +26,12 @@ use std::path::Path;
 
 use crate::agent::Agent;
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{ErrorKind, Result};
 use crate::jsonx::exact_finding_key as finding_key;
 use crate::model::{
     AdjudicationDoc, Finding, IssueRun, Judged, PrView, Review, Severity, Standing, Status,
 };
-use crate::repo::Repo;
+use crate::repo::{Repo, WorktreeCheckpoint};
 use crate::style::{self, Style};
 use crate::{log, logdim, schema, spar_err};
 
@@ -142,11 +142,20 @@ fn review_inner(
     state.pr = Some(pr.url.clone());
 
     let work_dir = repo.worktree_for_pr_head(pr_number)?;
+    let checkpoint = repo.worktree_checkpoint(&work_dir)?;
     let outcome = run_phases(
-        agents, cfg, repo, &pr, &base, &work_dir, &mut state, dry_run,
+        agents,
+        cfg,
+        repo,
+        &pr,
+        &base,
+        &work_dir,
+        &checkpoint,
+        &mut state,
+        dry_run,
     );
-    repo.release_review_worktree(pr_number);
     outcome?;
+    repo.release_review_worktree_checked(pr_number, &checkpoint)?;
     Ok(state)
 }
 
@@ -158,6 +167,7 @@ fn run_phases(
     pr: &PrView,
     base: &str,
     work_dir: &Path,
+    checkpoint: &WorktreeCheckpoint,
     state: &mut IssueRun,
     dry_run: bool,
 ) -> Result<()> {
@@ -193,6 +203,7 @@ fn run_phases(
     for (name, result) in reviews {
         match result {
             Ok(review) => by_agent.push((name, review.findings)),
+            Err(e) if e.kind() == ErrorKind::UncertainWrite => return Err(e),
             Err(e) => {
                 // One reviewer failing is a degraded review, not a dead one,
                 // but the report has to say so rather than quietly halving the
@@ -204,6 +215,11 @@ fn run_phases(
             }
         }
     }
+    repo.require_unchanged_worktree(
+        work_dir,
+        checkpoint,
+        &format!("review worktree for PR #{}", pr.number),
+    )?;
     if by_agent.is_empty() {
         return Err(spar_err!("neither reviewer returned a usable review"));
     }
@@ -225,7 +241,7 @@ fn run_phases(
 
     // -- phase 2: each rules on what only the other raised ----------------
     if budget >= 2 && by_agent.len() == 2 {
-        adjudicate(agents, cfg, repo, work_dir, &mut judged, 2)?;
+        adjudicate(agents, cfg, repo, work_dir, checkpoint, &mut judged, 2)?;
     } else if budget < 2 {
         for j in judged.iter_mut() {
             if j.standing == Standing::Unverified {
@@ -236,10 +252,15 @@ fn run_phases(
 
     // -- phase 3: whoever raised a rejected point defends it or drops it --
     if budget >= 3 && judged.iter().any(|j| j.standing == Standing::Disputed) {
-        rebut(agents, cfg, repo, work_dir, &mut judged, 3)?;
+        rebut(agents, cfg, repo, work_dir, checkpoint, &mut judged, 3)?;
     }
 
     state.rounds = budget.min(3);
+    repo.require_unchanged_worktree(
+        work_dir,
+        checkpoint,
+        &format!("review worktree for PR #{}", pr.number),
+    )?;
     finish(repo, pr, state, &judged, dry_run)
 }
 
@@ -305,6 +326,7 @@ fn adjudicate(
     cfg: &Config,
     repo: &Repo,
     work_dir: &Path,
+    checkpoint: &WorktreeCheckpoint,
     judged: &mut [Judged],
     round: u32,
 ) -> Result<()> {
@@ -347,6 +369,7 @@ fn adjudicate(
     for (name, result) in answers {
         let doc = match result {
             Ok(doc) => doc,
+            Err(e) if e.kind() == ErrorKind::UncertainWrite => return Err(e),
             Err(e) => {
                 logdim!("{name} could not adjudicate: {e}");
                 continue;
@@ -381,6 +404,7 @@ fn adjudicate(
             }
         }
     }
+    repo.require_unchanged_worktree(work_dir, checkpoint, "read-only review worktree")?;
     Ok(())
 }
 
@@ -389,6 +413,7 @@ fn rebut(
     cfg: &Config,
     repo: &Repo,
     work_dir: &Path,
+    checkpoint: &WorktreeCheckpoint,
     judged: &mut [Judged],
     round: u32,
 ) -> Result<()> {
@@ -439,6 +464,7 @@ fn rebut(
     for (name, result) in answers {
         let doc = match result {
             Ok(doc) => doc,
+            Err(e) if e.kind() == ErrorKind::UncertainWrite => return Err(e),
             Err(e) => {
                 logdim!("{name} could not answer the objections: {e}");
                 continue;
@@ -468,6 +494,7 @@ fn rebut(
             }
         }
     }
+    repo.require_unchanged_worktree(work_dir, checkpoint, "read-only review worktree")?;
     Ok(())
 }
 

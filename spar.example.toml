@@ -71,6 +71,16 @@ effort = "ultra"        # ultra | max | xhigh | high | medium | low | minimal |
 #
 # Placeholders: {prompt} {system} {model} {effort} {cwd} {schema} {schema_file}
 #
+# Editing calls leave working tree changes uncommitted. Spar stages and commits
+# them after accepting the structured report, so a linked worktree does not
+# need additional writable access to Git metadata. A changed .gitattributes is
+# kept for recovery instead of staged, because it can select an external filter.
+# Changed gitlinks are kept too, since their objects may exist only in a nested
+# repository. On Unix, remaining child processes are stopped before inspection.
+# Elsewhere, the configured command must wait for its children before returning.
+# Ignored files outside known build and cache directories stop a managed commit.
+# Recognized build artifacts are kept with a warning but do not block it.
+#
 # Include {schema} or {schema_file} and spar uses the CLI's native structured
 # output, which is worth doing: without it spar asks for JSON in the prompt and
 # parses whatever comes back, and a long answer that hits the model's output

@@ -754,7 +754,7 @@ pub enum Standing {
 /// narrating.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Implementation {
-    /// The issue should not be implemented. No commits, and `reason` says why.
+    /// The issue should not be implemented. No changes, and `reason` says why.
     #[serde(default, deserialize_with = "de_bool")]
     pub not_worth_doing: bool,
     /// Only when declining. Posted on the issue, so it is written for whoever

@@ -60,6 +60,17 @@ impl SparError {
         }
     }
 
+    /// Replace the explanation without changing how callers classify the
+    /// failure. Recovery checks use this after safely observing changed work:
+    /// the call must not be retried, but its original failure kind still tells
+    /// the workflow whether committed work can continue.
+    pub fn with_message(&self, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: self.kind,
+        }
+    }
+
     pub fn kind(&self) -> ErrorKind {
         self.kind
     }

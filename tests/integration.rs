@@ -8,10 +8,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use spar::agent::Agent;
+use spar::config::CommandPart;
 use spar::config::{self, Config, Followups};
-use spar::model::{Followup, IssueRun};
+use spar::model::{Complexity, Followup, Issue, IssueRun, PlanItem, PrView, Risk, Status};
 use spar::repo::Repo;
-use spar::review::{drop_uncommitted, file_followup, park, snapshot, undo_edits};
+use spar::review::{drop_uncommitted, file_followup, park, run_issue, snapshot, undo_edits};
 
 const SPAR_BIN: &str = env!("CARGO_BIN_EXE_spar");
 
@@ -93,6 +95,46 @@ fn commit(work: &Path, file: &str, body: &str, message: &str) {
     std::fs::write(work.join(file), body).unwrap();
     git(work, &["add", "."]);
     git(work, &["commit", "-m", message]);
+}
+
+fn add_submodule(fx: &Fixture, name: &str) -> PathBuf {
+    let source = fx.dir.join(format!("{name}-source"));
+    std::fs::create_dir_all(&source).unwrap();
+    git(&source, &["init", "-b", "main"]);
+    git(&source, &["config", "user.email", "spar@example.invalid"]);
+    git(&source, &["config", "user.name", "spar test"]);
+    git(&source, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(source.join("seed.txt"), "seed\n").unwrap();
+    std::fs::write(source.join(".gitignore"), "generated/\n").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-m", "seed submodule"]);
+    git(
+        &fx.work,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            source.to_str().unwrap(),
+            name,
+        ],
+    );
+    git(&fx.work, &["commit", "-m", "add submodule"]);
+    git(&fx.work, &["push", "-q", "origin", "main"]);
+    source
+}
+
+fn pr(number: i64, head: &str) -> PrView {
+    PrView {
+        number,
+        url: format!("https://example.invalid/pull/{number}"),
+        title: format!("PR {number}"),
+        head_ref_name: head.to_string(),
+        base_ref_name: "main".into(),
+        state: "OPEN".into(),
+        closing_issues_references: Vec::new(),
+        is_cross_repository: false,
+    }
 }
 
 fn messages(work: &Path) -> String {
@@ -440,6 +482,41 @@ fn a_worktree_is_created_on_the_base_branch_and_recorded() {
 }
 
 #[test]
+fn ordinary_release_does_not_prune_a_missing_personal_worktree() {
+    let fx = repo("personal-worktree-admin");
+    let personal = fx.dir.join("personal");
+    git(
+        &fx.work,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            personal.to_str().unwrap(),
+            "main",
+        ],
+    );
+    commit(&personal, "personal.txt", "keep me\n", "personal recovery");
+    let recovery = git(&personal, &["rev-parse", "HEAD"]);
+    let admin = std::fs::canonicalize(git(&personal, &["rev-parse", "--git-dir"]).trim()).unwrap();
+    std::fs::remove_dir_all(&personal).unwrap();
+    git(&fx.work, &["config", "gc.worktreePruneExpire", "now"]);
+
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, _) = repo.worktree_add(42, "main").unwrap();
+    assert!(repo.worktree_remove(42));
+
+    assert!(!path.exists());
+    assert!(
+        admin.exists(),
+        "the personal worktree registration was pruned"
+    );
+    assert_eq!(
+        recovery.trim(),
+        std::fs::read_to_string(admin.join("HEAD")).unwrap().trim()
+    );
+}
+
+#[test]
 fn a_branch_prefix_namespaces_the_branch() {
     let fx = repo("prefix");
     let mut c = cfg();
@@ -647,6 +724,77 @@ fn a_dropped_part_takes_its_branch_and_its_record_with_it() {
     assert!(!repo.known_branches().contains_key(&branch));
 }
 
+#[test]
+fn an_exact_mechanical_slice_can_be_discarded() {
+    let fx = repo("split-disposable-slice");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, branch) = repo.worktree_for_split(12, 1, "main").unwrap();
+    commit(&path, "part.rs", "slice\n", "mechanical slice");
+    let disposable = git(&path, &["rev-parse", "HEAD"]);
+
+    assert!(repo.discard_split_worktree(&path, &branch, disposable.trim()));
+
+    assert!(!path.exists());
+    assert!(git(&fx.work, &["branch", "--list", &branch]).is_empty());
+    assert!(!repo.known_branches().contains_key(&branch));
+}
+
+#[test]
+fn a_disposable_slice_with_a_reflog_only_commit_is_retained() {
+    let fx = repo("split-disposable-reflog");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, branch) = repo.worktree_for_split(12, 1, "main").unwrap();
+    commit(&path, "part.rs", "slice\n", "mechanical slice");
+    let disposable = git(&path, &["rev-parse", "HEAD"]);
+    commit(&path, "recovery.rs", "keep me\n", "recovery commit");
+    let recovery = git(&path, &["rev-parse", "HEAD"]);
+    git(&path, &["reset", "--hard", disposable.trim()]);
+
+    assert!(!repo.discard_split_worktree(&path, &branch, disposable.trim()));
+
+    assert!(path.exists());
+    assert_eq!(disposable, git(&path, &["rev-parse", "HEAD"]));
+    git(
+        &path,
+        &["cat-file", "-e", &format!("{}^{{commit}}", recovery.trim())],
+    );
+    assert!(repo.known_branches().contains_key(&branch));
+}
+
+#[test]
+fn a_dirty_disposable_slice_is_retained() {
+    let fx = repo("split-disposable-dirty");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, branch) = repo.worktree_for_split(12, 1, "main").unwrap();
+    commit(&path, "part.rs", "slice\n", "mechanical slice");
+    let disposable = git(&path, &["rev-parse", "HEAD"]);
+    std::fs::write(path.join("recovery.txt"), "keep me\n").unwrap();
+
+    assert!(!repo.discard_split_worktree(&path, &branch, disposable.trim()));
+
+    assert!(path.exists());
+    assert_eq!(
+        "keep me\n",
+        std::fs::read_to_string(path.join("recovery.txt")).unwrap()
+    );
+    assert!(repo.known_branches().contains_key(&branch));
+}
+
+#[test]
+fn an_unpushed_split_commit_survives_release() {
+    let fx = repo("split-release-recovery");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, branch) = repo.worktree_for_split(12, 1, "main").unwrap();
+    commit(&path, "recovery.rs", "keep me\n", "local split recovery");
+    let before = git(&path, &["rev-parse", "HEAD"]);
+
+    repo.release_split_worktree(&path, &branch);
+
+    assert!(path.is_dir());
+    assert_eq!(before, git(&path, &["rev-parse", "HEAD"]));
+    assert!(repo.known_branches().contains_key(&branch));
+}
+
 /// Successful stacked parts have to remain available until every child pull
 /// request is opened, then all of their local worktrees and branches can go.
 #[test]
@@ -657,6 +805,8 @@ fn two_stacked_part_worktrees_are_released_together() {
     commit(&first_dir, "one.rs", "one\n", "part one");
     let (second_dir, second) = repo.worktree_for_split(12, 2, &first).unwrap();
     commit(&second_dir, "two.rs", "two\n", "part two");
+    repo.push_split_branch(&first_dir, &first).unwrap();
+    repo.push_split_branch(&second_dir, &second).unwrap();
 
     for (dir, branch) in [(&first_dir, &first), (&second_dir, &second)] {
         repo.release_split_worktree(dir, branch);
@@ -1933,6 +2083,1361 @@ fn a_fresh_issue_is_unaffected_by_the_guard() {
     repo.worktree_remove(44);
 }
 
+#[test]
+fn a_dirty_issue_worktree_is_not_rebuilt() {
+    let fx = repo("noclobber-dirty");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, _) = repo.worktree_add(50, "main").unwrap();
+    std::fs::write(path.join("README.md"), "recover me\n").unwrap();
+
+    let err = repo.worktree_add(50, "main").unwrap_err().to_string();
+
+    assert!(err.contains("uncommitted changes"), "{err}");
+    assert!(err.contains(&path.display().to_string()), "{err}");
+    assert_eq!(
+        "recover me\n",
+        std::fs::read_to_string(path.join("README.md")).unwrap()
+    );
+    repo.worktree_remove(50);
+}
+
+#[test]
+fn an_untracked_issue_file_is_not_deleted_by_a_retry() {
+    let fx = repo("noclobber-untracked");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, _) = repo.worktree_add(51, "main").unwrap();
+    std::fs::write(path.join("new-source.rs"), "recover me\n").unwrap();
+
+    let err = repo.worktree_add(51, "main").unwrap_err().to_string();
+
+    assert!(err.contains("uncommitted changes"), "{err}");
+    assert_eq!(
+        "recover me\n",
+        std::fs::read_to_string(path.join("new-source.rs")).unwrap()
+    );
+    repo.worktree_remove(51);
+}
+
+#[test]
+fn an_unreadable_issue_worktree_is_kept() {
+    let fx = repo("noclobber-unreadable");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, _) = repo.worktree_add(53, "main").unwrap();
+    let marker = path.join("recover.txt");
+    std::fs::write(&marker, "recover me\n").unwrap();
+    let git_file = path.join(".git");
+    let metadata = std::fs::read_to_string(&git_file).unwrap();
+    std::fs::write(&git_file, "broken\n").unwrap();
+
+    let err = repo.worktree_add(53, "main").unwrap_err().to_string();
+
+    assert!(err.contains("could not verify"), "{err}");
+    assert_eq!("recover me\n", std::fs::read_to_string(&marker).unwrap());
+    std::fs::write(&git_file, metadata).unwrap();
+    repo.worktree_remove(53);
+}
+
+#[test]
+fn staged_files_are_still_uncommitted_work() {
+    let fx = repo("uncommitted-staged");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, _) = repo.worktree_add(52, "main").unwrap();
+    std::fs::write(path.join("README.md"), "staged\n").unwrap();
+    git(&path, &["add", "README.md"]);
+
+    let err = repo.worktree_add(52, "main").unwrap_err().to_string();
+    assert!(err.contains("uncommitted changes"), "{err}");
+    assert_eq!(
+        "staged\n",
+        std::fs::read_to_string(path.join("README.md")).unwrap()
+    );
+    repo.worktree_remove(52);
+}
+
+#[test]
+fn a_clean_foreign_repository_at_an_issue_path_is_not_removed() {
+    let fx = repo("noclobber-foreign");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let path = fx.work.join(".spar-worktrees").join("issue-54");
+    std::fs::create_dir_all(&path).unwrap();
+    git(&path, &["init", "-b", "main"]);
+    git(&path, &["config", "user.email", "spar@example.invalid"]);
+    git(&path, &["config", "user.name", "spar test"]);
+    git(&path, &["config", "commit.gpgsign", "false"]);
+    commit(&path, "recovery.txt", "foreign history\n", "foreign commit");
+    let before = git(&path, &["rev-parse", "HEAD"]);
+
+    let err = repo.worktree_add(54, "main").unwrap_err().to_string();
+
+    assert!(err.contains("not a worktree owned"), "{err}");
+    assert_eq!(before, git(&path, &["rev-parse", "HEAD"]));
+    assert_eq!(
+        "foreign history\n",
+        std::fs::read_to_string(path.join("recovery.txt")).unwrap()
+    );
+}
+
+#[test]
+fn a_foreign_repository_at_a_stale_registered_path_is_not_removed() {
+    let fx = repo("noclobber-stale-foreign");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, _) = repo.worktree_add(56, "main").unwrap();
+    let displaced = fx.work.join("displaced-issue-56");
+    std::fs::rename(&path, &displaced).unwrap();
+
+    std::fs::create_dir_all(&path).unwrap();
+    git(&path, &["init", "-b", "main"]);
+    git(&path, &["config", "user.email", "spar@example.invalid"]);
+    git(&path, &["config", "user.name", "spar test"]);
+    git(&path, &["config", "commit.gpgsign", "false"]);
+    commit(&path, "recovery.txt", "foreign history\n", "foreign commit");
+    let before = git(&path, &["rev-parse", "HEAD"]);
+
+    let err = repo.worktree_add(56, "main").unwrap_err().to_string();
+
+    assert!(err.contains("not a worktree owned"), "{err}");
+    assert_eq!(before, git(&path, &["rev-parse", "HEAD"]));
+    assert_eq!(
+        "foreign history\n",
+        std::fs::read_to_string(path.join("recovery.txt")).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_issue_path_cannot_delete_a_personal_worktree() {
+    use std::os::unix::fs::symlink;
+
+    let fx = repo("noclobber-symlinked-worktree");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let personal = fx.dir.join("personal-worktree");
+    git(
+        &fx.work,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "personal-57",
+            personal.to_str().unwrap(),
+            "main",
+        ],
+    );
+    commit(
+        &personal,
+        "personal.txt",
+        "keep me\n",
+        "personal worktree commit",
+    );
+    let path = fx.work.join(".spar-worktrees").join("issue-57");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    symlink(&personal, &path).unwrap();
+
+    repo.worktree_remove(57);
+    assert_eq!(
+        "keep me\n",
+        std::fs::read_to_string(personal.join("personal.txt")).unwrap()
+    );
+    assert!(std::fs::symlink_metadata(&path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+
+    let err = repo.worktree_add(57, "main").unwrap_err().to_string();
+    assert!(err.contains("not a worktree owned"), "{err}");
+    assert!(personal.exists());
+}
+
+#[test]
+fn a_clean_autocrlf_worktree_can_be_rebuilt() {
+    let fx = repo("clean-autocrlf-worktree");
+    commit(
+        &fx.work,
+        ".gitattributes",
+        "* text\n",
+        "set text attributes",
+    );
+    git(&fx.work, &["push", "-q", "origin", "main"]);
+    git(&fx.work, &["config", "core.autocrlf", "true"]);
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, _) = repo.worktree_add(58, "main").unwrap();
+    assert!(std::fs::read(path.join("README.md"))
+        .unwrap()
+        .windows(2)
+        .any(|pair| pair == b"\r\n"));
+
+    let (rebuilt, _) = repo.worktree_add(58, "main").unwrap();
+
+    assert!(rebuilt.is_dir());
+    repo.worktree_remove(58);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_clean_filemode_false_worktree_can_be_rebuilt() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = repo("clean-filemode-worktree");
+    let script = fx.work.join("script.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+    git(&fx.work, &["add", "script.sh"]);
+    git(&fx.work, &["commit", "-m", "add script"]);
+    git(&fx.work, &["push", "-q", "origin", "main"]);
+    git(&fx.work, &["config", "core.filemode", "false"]);
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (_path, _) = repo.worktree_add(59, "main").unwrap();
+
+    let (rebuilt, _) = repo.worktree_add(59, "main").unwrap();
+
+    assert!(rebuilt.is_dir());
+    repo.worktree_remove(59);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_mode_only_change_is_retained_when_filemode_is_false() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = repo("changed-filemode-worktree");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, _) = repo.worktree_add(61, "main").unwrap();
+    let linked_script = path.join("README.md");
+    let mut permissions = std::fs::metadata(&linked_script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&linked_script, permissions).unwrap();
+    git(&path, &["config", "core.filemode", "false"]);
+    assert!(git(&path, &["status", "--porcelain"]).is_empty());
+
+    let error = repo.worktree_add(61, "main").unwrap_err().to_string();
+
+    assert!(error.contains("uncommitted changes"), "{error}");
+    assert!(path.exists());
+    assert_eq!(
+        0o755,
+        std::fs::metadata(&linked_script)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_clean_symlinks_false_worktree_can_be_rebuilt() {
+    use std::os::unix::fs::symlink;
+
+    let fx = repo("clean-symlinks-worktree");
+    std::fs::write(fx.work.join("target.txt"), "target\n").unwrap();
+    symlink("target.txt", fx.work.join("link.txt")).unwrap();
+    git(&fx.work, &["add", "target.txt", "link.txt"]);
+    git(&fx.work, &["commit", "-m", "add link"]);
+    git(&fx.work, &["push", "-q", "origin", "main"]);
+    git(&fx.work, &["config", "core.symlinks", "false"]);
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, _) = repo.worktree_add(60, "main").unwrap();
+    assert!(std::fs::symlink_metadata(path.join("link.txt"))
+        .unwrap()
+        .is_file());
+
+    let (rebuilt, _) = repo.worktree_add(60, "main").unwrap();
+
+    assert!(rebuilt.is_dir());
+    repo.worktree_remove(60);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_mode_change_to_a_symlink_surrogate_is_retained() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let fx = repo("changed-symlink-surrogate");
+    std::fs::write(fx.work.join("target.txt"), "target\n").unwrap();
+    symlink("target.txt", fx.work.join("link.txt")).unwrap();
+    git(&fx.work, &["add", "target.txt", "link.txt"]);
+    git(&fx.work, &["commit", "-m", "add link"]);
+    git(&fx.work, &["push", "-q", "origin", "main"]);
+    git(&fx.work, &["config", "core.symlinks", "false"]);
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, _) = repo.worktree_add(64, "main").unwrap();
+    let surrogate = path.join("link.txt");
+    let mut permissions = std::fs::metadata(&surrogate).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&surrogate, permissions).unwrap();
+    assert!(git(&path, &["status", "--porcelain"]).is_empty());
+
+    let error = repo.worktree_add(64, "main").unwrap_err().to_string();
+
+    assert!(error.contains("uncommitted changes"), "{error}");
+    assert_eq!(
+        0o755,
+        std::fs::metadata(surrogate).unwrap().permissions().mode() & 0o777
+    );
+}
+
+#[test]
+fn an_initialized_submodule_with_ignored_work_is_retained() {
+    let fx = repo("submodule-recovery-worktree");
+    add_submodule(&fx, "nested");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, _) = repo.worktree_add(62, "main").unwrap();
+    git(
+        &path,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "nested",
+        ],
+    );
+    let recovery = path.join("nested/generated/keep.txt");
+    std::fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+    std::fs::write(&recovery, "keep me\n").unwrap();
+
+    let error = repo.worktree_add(62, "main").unwrap_err().to_string();
+
+    assert!(error.contains("uncommitted changes"), "{error}");
+    assert_eq!("keep me\n", std::fs::read_to_string(recovery).unwrap());
+}
+
+#[test]
+fn a_detached_recovery_commit_is_retained() {
+    let fx = repo("detached-recovery-commit");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, _) = repo.worktree_add(65, "main").unwrap();
+    git(&path, &["checkout", "--detach"]);
+    commit(&path, "recovery.txt", "keep me\n", "detached recovery");
+    let recovery_head = git(&path, &["rev-parse", "HEAD"]);
+
+    let error = repo.worktree_add(65, "main").unwrap_err().to_string();
+
+    assert!(error.contains("uncommitted changes"), "{error}");
+    assert_eq!(recovery_head, git(&path, &["rev-parse", "HEAD"]));
+    assert_eq!(
+        "keep me\n",
+        std::fs::read_to_string(path.join("recovery.txt")).unwrap()
+    );
+}
+
+#[test]
+fn an_unreferenced_head_reflog_commit_is_retained() {
+    let fx = repo("head-reflog-recovery");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, branch) = repo.worktree_add(66, "main").unwrap();
+    git(&path, &["checkout", "--detach"]);
+    commit(&path, "recovery.txt", "keep me\n", "reflog recovery");
+    let recovery_head = git(&path, &["rev-parse", "HEAD"]);
+    git(&path, &["checkout", &branch]);
+    assert!(git(&path, &["status", "--porcelain"]).is_empty());
+
+    let error = repo.worktree_add(66, "main").unwrap_err().to_string();
+
+    assert!(error.contains("uncommitted changes"), "{error}");
+    assert!(path.exists());
+    git(
+        &path,
+        &[
+            "cat-file",
+            "-e",
+            &format!("{}^{{commit}}", recovery_head.trim()),
+        ],
+    );
+}
+
+#[test]
+fn a_per_worktree_ref_is_retained() {
+    let fx = repo("per-worktree-ref");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, _) = repo.worktree_add(67, "main").unwrap();
+    let tree = git(&path, &["rev-parse", "HEAD^{tree}"]);
+    let recovery_head = git(
+        &path,
+        &[
+            "commit-tree",
+            tree.trim(),
+            "-p",
+            "HEAD",
+            "-m",
+            "per-worktree recovery",
+        ],
+    );
+    git(
+        &path,
+        &["update-ref", "refs/worktree/recovery", recovery_head.trim()],
+    );
+
+    let error = repo.worktree_add(67, "main").unwrap_err().to_string();
+
+    assert!(error.contains("uncommitted changes"), "{error}");
+    assert_eq!(
+        recovery_head.trim(),
+        git(&path, &["rev-parse", "refs/worktree/recovery"]).trim()
+    );
+}
+
+#[test]
+fn per_worktree_configuration_is_retained() {
+    let fx = repo("per-worktree-config");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, _) = repo.worktree_add(68, "main").unwrap();
+    git(&path, &["config", "extensions.worktreeConfig", "true"]);
+    git(&path, &["config", "--worktree", "recovery.value", "keep"]);
+
+    let error = repo.worktree_add(68, "main").unwrap_err().to_string();
+
+    assert!(error.contains("uncommitted changes"), "{error}");
+    assert_eq!(
+        "keep",
+        git(&path, &["config", "--worktree", "--get", "recovery.value"]).trim()
+    );
+}
+
+#[test]
+fn an_unreferenced_orig_head_commit_is_retained() {
+    let fx = repo("orig-head-recovery");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, _) = repo.worktree_add(69, "main").unwrap();
+    let tree = git(&path, &["rev-parse", "HEAD^{tree}"]);
+    let recovery_head = git(
+        &path,
+        &[
+            "commit-tree",
+            tree.trim(),
+            "-p",
+            "HEAD",
+            "-m",
+            "original head recovery",
+        ],
+    );
+    git(&path, &["update-ref", "ORIG_HEAD", recovery_head.trim()]);
+
+    let error = repo.worktree_add(69, "main").unwrap_err().to_string();
+
+    assert!(error.contains("uncommitted changes"), "{error}");
+    assert_eq!(
+        recovery_head.trim(),
+        git(&path, &["rev-parse", "ORIG_HEAD"]).trim()
+    );
+}
+
+#[test]
+fn full_clean_keeps_an_unrecorded_issue_shaped_worktree() {
+    let fx = repo("clean-all-unrecorded-issue");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let path = fx.work.join(".spar-worktrees/issue-63");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    git(
+        &fx.work,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "issue-63",
+            path.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let before = git(&path, &["rev-parse", "HEAD"]);
+
+    let removed = repo.prune_worktrees(true);
+
+    assert!(removed.is_empty(), "{removed:?}");
+    assert!(path.is_dir());
+    assert_eq!(before, git(&path, &["rev-parse", "HEAD"]));
+}
+
+#[test]
+fn full_clean_keeps_an_unrecorded_review_shaped_worktree() {
+    let fx = repo("clean-all-unrecorded-review");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let path = fx.work.join(".spar-worktrees/review-64");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    git(
+        &fx.work,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            path.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let before = git(&path, &["rev-parse", "HEAD"]);
+
+    let removed = repo.prune_worktrees(true);
+
+    assert!(removed.is_empty(), "{removed:?}");
+    assert!(path.is_dir());
+    assert_eq!(before, git(&path, &["rev-parse", "HEAD"]));
+}
+
+#[test]
+fn a_same_named_tag_cannot_hide_an_unpushed_issue_commit() {
+    let fx = repo("noclobber-tagged-issue");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (path, _) = repo.worktree_add(55, "main").unwrap();
+    commit(&path, "feature.txt", "unique\n", "unique issue work");
+    let before = git(&path, &["rev-parse", "HEAD"]);
+    git(&fx.work, &["tag", "issue-55", "refs/heads/main"]);
+
+    let err = repo.worktree_add(55, "main").unwrap_err().to_string();
+
+    assert!(err.contains("local branch issue-55"), "{err}");
+    assert_eq!(before, git(&path, &["rev-parse", "HEAD"]));
+    repo.worktree_remove(55);
+}
+
+#[test]
+fn a_dirty_pr_worktree_is_not_rebuilt() {
+    let fx = repo("noclobber-pr-dirty");
+    git(&fx.work, &["checkout", "-q", "-b", "feature-60"]);
+    commit(&fx.work, "feature.txt", "remote\n", "remote head");
+    git(&fx.work, &["push", "-q", "-u", "origin", "feature-60"]);
+    git(&fx.work, &["checkout", "-q", "main"]);
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let view = pr(60, "feature-60");
+    let (path, _) = repo.worktree_for_pr(&view).unwrap();
+    std::fs::write(path.join("README.md"), "recover me\n").unwrap();
+
+    let err = repo.worktree_for_pr(&view).unwrap_err().to_string();
+
+    assert!(err.contains("uncommitted changes"), "{err}");
+    assert_eq!(
+        "recover me\n",
+        std::fs::read_to_string(path.join("README.md")).unwrap()
+    );
+    repo.release_pr_worktree(60);
+}
+
+#[test]
+fn an_unpushed_pr_worktree_commit_is_not_rebuilt() {
+    let fx = repo("noclobber-pr-commit");
+    git(&fx.work, &["checkout", "-q", "-b", "feature-61"]);
+    commit(&fx.work, "feature.txt", "remote\n", "remote head");
+    git(&fx.work, &["push", "-q", "-u", "origin", "feature-61"]);
+    git(&fx.work, &["checkout", "-q", "main"]);
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let view = pr(61, "feature-61");
+    let (path, _) = repo.worktree_for_pr(&view).unwrap();
+    commit(&path, "feature.txt", "local\n", "local repair");
+    let before = git(&path, &["rev-parse", "HEAD"]);
+
+    let err = repo.worktree_for_pr(&view).unwrap_err().to_string();
+
+    assert!(err.contains("local commit"), "{err}");
+    assert!(err.contains(&path.display().to_string()), "{err}");
+    assert_eq!(before, git(&path, &["rev-parse", "HEAD"]));
+    assert!(!repo.release_pr_worktree(61));
+    assert_eq!(before, git(&path, &["rev-parse", "HEAD"]));
+}
+
+#[test]
+fn a_same_named_tag_cannot_hide_an_unpushed_pr_commit() {
+    let fx = repo("noclobber-tagged-pr");
+    git(&fx.work, &["checkout", "-q", "-b", "feature-62"]);
+    commit(&fx.work, "feature.txt", "remote\n", "remote head");
+    git(&fx.work, &["push", "-q", "-u", "origin", "feature-62"]);
+    git(&fx.work, &["checkout", "-q", "main"]);
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let view = pr(62, "feature-62");
+    let (path, _) = repo.worktree_for_pr(&view).unwrap();
+    commit(&path, "feature.txt", "local\n", "local repair");
+    let before = git(&path, &["rev-parse", "HEAD"]);
+    git(
+        &fx.work,
+        &["tag", "pr-62", "refs/remotes/origin/feature-62"],
+    );
+
+    let err = repo.worktree_for_pr(&view).unwrap_err().to_string();
+
+    assert!(err.contains("local commit"), "{err}");
+    assert_eq!(before, git(&path, &["rev-parse", "HEAD"]));
+    repo.release_pr_worktree(62);
+}
+
+#[test]
+fn a_structured_implementation_is_committed_before_review() {
+    let fx = repo("dirty-implementation");
+    git(&fx.work, &["config", "commit.gpgsign", "true"]);
+    git(&fx.work, &["config", "gpg.program", "/usr/bin/false"]);
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let mut config = cfg();
+    let answer = r#"{"summary":"changed it","problem":"broken","changes":[],"testing":[],"notes":"git add could not create index.lock"}"#;
+    let script = format!("printf 'changed\\n' > README.md; printf '%s\\n' '{answer}'");
+    config.agents[0].command = vec![
+        CommandPart::One("/bin/sh".into()),
+        CommandPart::One("-c".into()),
+        CommandPart::One(script),
+    ];
+    let agents: Vec<Agent> = config.agents.iter().cloned().map(Agent::new).collect();
+    let item = PlanItem {
+        issue: 70,
+        title: "Preserve failed edits".into(),
+        complexity: Complexity::S,
+        risk: Risk::Low,
+        depends_on: Vec::new(),
+        reason: "reproduces the failure".into(),
+    };
+    let issue = Issue {
+        number: 70,
+        title: item.title.clone(),
+        body: Some("Make the change".into()),
+        state: "OPEN".into(),
+        url: "https://example.invalid/issues/70".into(),
+        labels: Vec::new(),
+    };
+
+    let state = run_issue(&agents, &config, &repo, &item, &issue);
+    let path = fx.work.join(".spar-worktrees").join("issue-70");
+
+    assert_eq!(Status::Error, state.status);
+    assert_eq!(
+        "changed\n",
+        std::fs::read_to_string(path.join("README.md")).unwrap()
+    );
+    assert_eq!("changed it\n", git(&path, &["log", "-1", "--format=%s"]));
+    assert_eq!("N\n", git(&path, &["log", "-1", "--format=%G?"]));
+    assert!(git(&path, &["status", "--porcelain"]).is_empty());
+    assert_ne!(
+        git(&path, &["rev-parse", "HEAD"]),
+        git(&path, &["rev-parse", "origin/main"])
+    );
+    repo.worktree_remove(70);
+}
+
+#[test]
+fn an_editing_call_cannot_select_a_new_parent_side_git_filter() {
+    let fx = repo("changed-gitattributes");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let mut config = cfg();
+    let answer =
+        r#"{"summary":"changed attributes","problem":"","changes":[],"testing":[],"notes":""}"#;
+    let script = format!(
+        "printf '*.md filter=outside\\n' > .gitattributes; \
+         printf 'changed\\n' > README.md; printf '%s\\n' '{answer}'"
+    );
+    config.agents[0].command = vec![
+        CommandPart::One("/bin/sh".into()),
+        CommandPart::One("-c".into()),
+        CommandPart::One(script),
+    ];
+    let agents: Vec<Agent> = config.agents.iter().cloned().map(Agent::new).collect();
+    let item = PlanItem {
+        issue: 74,
+        title: "Keep changed attributes out of parent staging".into(),
+        complexity: Complexity::S,
+        risk: Risk::Low,
+        depends_on: Vec::new(),
+        reason: "protect the staging boundary".into(),
+    };
+    let issue = Issue {
+        number: 74,
+        title: item.title.clone(),
+        body: Some("Change the attributes".into()),
+        state: "OPEN".into(),
+        url: "https://example.invalid/issues/74".into(),
+        labels: Vec::new(),
+    };
+
+    let state = run_issue(&agents, &config, &repo, &item, &issue);
+    let path = fx.work.join(".spar-worktrees").join("issue-74");
+
+    assert_eq!(Status::Error, state.status);
+    assert!(
+        state
+            .notes
+            .iter()
+            .any(|note| note.contains(".gitattributes")),
+        "{:?}",
+        state.notes
+    );
+    assert_eq!(
+        "*.md filter=outside\n",
+        std::fs::read_to_string(path.join(".gitattributes")).unwrap()
+    );
+    assert_eq!(
+        git(&path, &["rev-parse", "HEAD"]),
+        git(&path, &["rev-parse", "origin/main"])
+    );
+    assert!(!git(&path, &["status", "--porcelain"]).is_empty());
+    repo.worktree_remove(74);
+}
+
+#[test]
+fn an_ignored_only_success_is_kept_instead_of_treated_as_no_work() {
+    let fx = repo("ignored-only-edit");
+    commit(
+        &fx.work,
+        ".gitignore",
+        "generated/\n",
+        "ignore generated files",
+    );
+    git(&fx.work, &["push", "-q", "origin", "main"]);
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let mut config = cfg();
+    let answer = r#"{"summary":"added fixture","problem":"","changes":[],"testing":[],"notes":""}"#;
+    let script = format!(
+        "mkdir -p generated; printf 'keep me\\n' > generated/fixture.txt; \
+         printf '%s\\n' '{answer}'"
+    );
+    config.agents[0].command = vec![
+        CommandPart::One("/bin/sh".into()),
+        CommandPart::One("-c".into()),
+        CommandPart::One(script),
+    ];
+    let agents: Vec<Agent> = config.agents.iter().cloned().map(Agent::new).collect();
+    let item = PlanItem {
+        issue: 75,
+        title: "Keep an ignored fixture".into(),
+        complexity: Complexity::S,
+        risk: Risk::Low,
+        depends_on: Vec::new(),
+        reason: "protect ignored work".into(),
+    };
+    let issue = Issue {
+        number: 75,
+        title: item.title.clone(),
+        body: Some("Add the ignored fixture".into()),
+        state: "OPEN".into(),
+        url: "https://example.invalid/issues/75".into(),
+        labels: Vec::new(),
+    };
+
+    let state = run_issue(&agents, &config, &repo, &item, &issue);
+    let path = fx.work.join(".spar-worktrees").join("issue-75");
+
+    assert_eq!(Status::Error, state.status);
+    assert!(
+        state.notes.iter().any(|note| note.contains("ignored file")),
+        "{:?}",
+        state.notes
+    );
+    assert_eq!(
+        "keep me\n",
+        std::fs::read_to_string(path.join("generated/fixture.txt")).unwrap()
+    );
+    assert_eq!(
+        git(&path, &["rev-parse", "HEAD"]),
+        git(&path, &["rev-parse", "origin/main"])
+    );
+    let retry = repo.worktree_add(75, "main").unwrap_err().to_string();
+    assert!(retry.contains("ignored files"), "{retry}");
+    assert_eq!(
+        "keep me\n",
+        std::fs::read_to_string(path.join("generated/fixture.txt")).unwrap()
+    );
+    repo.worktree_remove(75);
+}
+
+#[test]
+fn tracked_and_ignored_edits_stop_before_a_managed_commit() {
+    let fx = repo("tracked-and-ignored-edit");
+    commit(
+        &fx.work,
+        ".gitignore",
+        "generated/\n",
+        "ignore generated files",
+    );
+    git(&fx.work, &["push", "-q", "origin", "main"]);
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let mut config = cfg();
+    let answer = r#"{"summary":"changed it","problem":"","changes":[],"testing":[],"notes":""}"#;
+    let script = format!(
+        "printf 'tracked change\\n' > README.md; mkdir -p generated; \
+         printf 'keep me\\n' > generated/fixture.txt; printf '%s\\n' '{answer}'"
+    );
+    config.agents[0].command = vec![
+        CommandPart::One("/bin/sh".into()),
+        CommandPart::One("-c".into()),
+        CommandPart::One(script),
+    ];
+    let agents: Vec<Agent> = config.agents.iter().cloned().map(Agent::new).collect();
+    let item = PlanItem {
+        issue: 81,
+        title: "Retain mixed ignored output".into(),
+        complexity: Complexity::S,
+        risk: Risk::Low,
+        depends_on: Vec::new(),
+        reason: "protect incomplete work".into(),
+    };
+    let issue = Issue {
+        number: 81,
+        title: item.title.clone(),
+        body: Some("Make the change".into()),
+        state: "OPEN".into(),
+        url: "https://example.invalid/issues/81".into(),
+        labels: Vec::new(),
+    };
+
+    let state = run_issue(&agents, &config, &repo, &item, &issue);
+    let path = fx.work.join(".spar-worktrees").join("issue-81");
+
+    assert_eq!(Status::Error, state.status);
+    assert!(
+        state
+            .notes
+            .iter()
+            .any(|note| note.contains("generated/fixture.txt")),
+        "{:?}",
+        state.notes
+    );
+    assert_eq!(
+        git(&path, &["rev-parse", "HEAD"]),
+        git(&path, &["rev-parse", "origin/main"])
+    );
+    assert_eq!(
+        "tracked change\n",
+        std::fs::read_to_string(path.join("README.md")).unwrap()
+    );
+    assert_eq!(
+        "keep me\n",
+        std::fs::read_to_string(path.join("generated/fixture.txt")).unwrap()
+    );
+    assert!(!git(&path, &["status", "--porcelain"]).is_empty());
+    let retry = repo.worktree_add(81, "main").unwrap_err().to_string();
+    assert!(retry.contains("ignored files"), "{retry}");
+    repo.worktree_remove(81);
+}
+
+#[test]
+fn a_direct_commit_with_ignored_output_stops_before_push() {
+    let fx = repo("direct-commit-and-ignored-edit");
+    commit(
+        &fx.work,
+        ".gitignore",
+        "generated/\n",
+        "ignore generated files",
+    );
+    git(&fx.work, &["push", "-q", "origin", "main"]);
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let mut config = cfg();
+    let answer = r#"{"summary":"changed it","problem":"","changes":[],"testing":[],"notes":""}"#;
+    let script = format!(
+        "printf 'tracked change\\n' > README.md; git add README.md; \
+         git commit -q -m 'direct change'; mkdir -p generated; \
+         printf 'keep me\\n' > generated/fixture.txt; printf '%s\\n' '{answer}'"
+    );
+    config.agents[0].command = vec![
+        CommandPart::One("/bin/sh".into()),
+        CommandPart::One("-c".into()),
+        CommandPart::One(script),
+    ];
+    let agents: Vec<Agent> = config.agents.iter().cloned().map(Agent::new).collect();
+    let item = PlanItem {
+        issue: 82,
+        title: "Retain ignored output beside a direct commit".into(),
+        complexity: Complexity::S,
+        risk: Risk::Low,
+        depends_on: Vec::new(),
+        reason: "protect incomplete work".into(),
+    };
+    let issue = Issue {
+        number: 82,
+        title: item.title.clone(),
+        body: Some("Make the change".into()),
+        state: "OPEN".into(),
+        url: "https://example.invalid/issues/82".into(),
+        labels: Vec::new(),
+    };
+
+    let state = run_issue(&agents, &config, &repo, &item, &issue);
+    let path = fx.work.join(".spar-worktrees").join("issue-82");
+
+    assert_eq!(Status::Error, state.status);
+    assert!(
+        state
+            .notes
+            .iter()
+            .any(|note| note.contains("generated/fixture.txt")),
+        "{:?}",
+        state.notes
+    );
+    assert_eq!("direct change\n", git(&path, &["log", "-1", "--format=%s"]));
+    assert_eq!(
+        "keep me\n",
+        std::fs::read_to_string(path.join("generated/fixture.txt")).unwrap()
+    );
+    assert!(git(&fx.work, &["ls-remote", "--heads", "origin", "issue-82"]).is_empty());
+    let retry = repo.worktree_add(82, "main").unwrap_err().to_string();
+    assert!(retry.contains("local branch issue-82"), "{retry}");
+    assert_eq!(
+        "keep me\n",
+        std::fs::read_to_string(path.join("generated/fixture.txt")).unwrap()
+    );
+    repo.worktree_remove(82);
+}
+
+#[test]
+fn ignored_rust_build_artifacts_do_not_stop_a_managed_commit_or_push() {
+    let fx = repo("managed-commit-with-build-artifacts");
+    commit(&fx.work, ".gitignore", "target/\n", "ignore build output");
+    git(&fx.work, &["push", "-q", "origin", "main"]);
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let mut config = cfg();
+    let answer = r#"{"summary":"changed it","problem":"","changes":[],"testing":["tests passed"],"notes":""}"#;
+    let script = format!(
+        "printf 'tracked change\\n' > README.md; mkdir -p target/debug; \
+         printf 'compiler output\\n' > target/debug/artifact; printf '%s\\n' '{answer}'"
+    );
+    config.agents[0].command = vec![
+        CommandPart::One("/bin/sh".into()),
+        CommandPart::One("-c".into()),
+        CommandPart::One(script),
+    ];
+    let agents: Vec<Agent> = config.agents.iter().cloned().map(Agent::new).collect();
+    let item = PlanItem {
+        issue: 83,
+        title: "Allow ordinary build output".into(),
+        complexity: Complexity::S,
+        risk: Risk::Low,
+        depends_on: Vec::new(),
+        reason: "testing must not block publication".into(),
+    };
+    let issue = Issue {
+        number: 83,
+        title: item.title.clone(),
+        body: Some("Make and test the change".into()),
+        state: "OPEN".into(),
+        url: "https://example.invalid/issues/83".into(),
+        labels: Vec::new(),
+    };
+
+    let state = run_issue(&agents, &config, &repo, &item, &issue);
+    let path = fx.work.join(".spar-worktrees").join("issue-83");
+
+    assert_eq!(Status::Error, state.status);
+    assert_eq!("changed it\n", git(&path, &["log", "-1", "--format=%s"]));
+    assert_eq!(
+        "compiler output\n",
+        std::fs::read_to_string(path.join("target/debug/artifact")).unwrap()
+    );
+    assert!(!git(&fx.work, &["ls-remote", "--heads", "origin", "issue-83"]).is_empty());
+    assert!(git(&path, &["status", "--porcelain"]).is_empty());
+    repo.worktree_remove(83);
+}
+
+#[test]
+fn a_decline_that_created_an_ignored_file_keeps_the_worktree() {
+    let fx = repo("ignored-decline");
+    commit(
+        &fx.work,
+        ".gitignore",
+        "generated/\n",
+        "ignore generated files",
+    );
+    git(&fx.work, &["push", "-q", "origin", "main"]);
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let mut config = cfg();
+    let answer = r#"{"not_worth_doing":true,"reason":"already handled","summary":"","problem":"","changes":[],"testing":[],"notes":null}"#;
+    let script = format!(
+        "mkdir -p generated; printf 'keep me\\n' > generated/fixture.txt; \
+         printf '%s\\n' '{answer}'"
+    );
+    config.agents[0].command = vec![
+        CommandPart::One("/bin/sh".into()),
+        CommandPart::One("-c".into()),
+        CommandPart::One(script),
+    ];
+    let agents: Vec<Agent> = config.agents.iter().cloned().map(Agent::new).collect();
+    let item = PlanItem {
+        issue: 77,
+        title: "Keep ignored work on decline".into(),
+        complexity: Complexity::S,
+        risk: Risk::Low,
+        depends_on: Vec::new(),
+        reason: "a decline must not erase files".into(),
+    };
+    let issue = Issue {
+        number: 77,
+        title: item.title.clone(),
+        body: Some("Inspect before declining".into()),
+        state: "OPEN".into(),
+        url: "https://example.invalid/issues/77".into(),
+        labels: Vec::new(),
+    };
+
+    let state = run_issue(&agents, &config, &repo, &item, &issue);
+    let path = fx.work.join(".spar-worktrees").join("issue-77");
+
+    assert_eq!(Status::Error, state.status);
+    assert!(
+        state.notes.iter().any(|note| note.contains("ignored file")),
+        "{:?}",
+        state.notes
+    );
+    assert_eq!(
+        "keep me\n",
+        std::fs::read_to_string(path.join("generated/fixture.txt")).unwrap()
+    );
+    repo.worktree_remove(77);
+}
+
+#[test]
+fn a_failed_implementation_keeps_its_files_and_diagnostic() {
+    let fx = repo("failed-implementation-files");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let mut config = cfg();
+    config.agents[0].command = vec![
+        CommandPart::One("/bin/sh".into()),
+        CommandPart::One("-c".into()),
+        CommandPart::One(
+            "printf 'recover me\\n' > README.md; printf 'refused after editing\\n' >&2; exit 1"
+                .into(),
+        ),
+    ];
+    let agents: Vec<Agent> = config.agents.iter().cloned().map(Agent::new).collect();
+    let item = PlanItem {
+        issue: 73,
+        title: "Keep failed implementation files".into(),
+        complexity: Complexity::S,
+        risk: Risk::Low,
+        depends_on: Vec::new(),
+        reason: "protect local work".into(),
+    };
+    let issue = Issue {
+        number: 73,
+        title: item.title.clone(),
+        body: Some("Make a change".into()),
+        state: "OPEN".into(),
+        url: "https://example.invalid/issues/73".into(),
+        labels: Vec::new(),
+    };
+
+    let state = run_issue(&agents, &config, &repo, &item, &issue);
+    let path = fx.work.join(".spar-worktrees").join("issue-73");
+
+    assert_eq!(Status::Error, state.status);
+    assert!(
+        state
+            .notes
+            .iter()
+            .any(|note| note.contains("refused after editing")),
+        "{:?}",
+        state.notes
+    );
+    assert_eq!(
+        "recover me\n",
+        std::fs::read_to_string(path.join("README.md")).unwrap()
+    );
+    assert!(!git(&path, &["status", "--porcelain"]).is_empty());
+    repo.worktree_remove(73);
+}
+
+#[test]
+fn a_failed_implementation_with_a_clean_commit_continues_to_review() {
+    let fx = repo("failed-implementation-commit");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let mut config = cfg();
+    config.agents[0].command = vec![
+        CommandPart::One("/bin/sh".into()),
+        CommandPart::One("-c".into()),
+        CommandPart::One(
+            "printf 'committed recovery\\n' > README.md; git add README.md; \
+             git commit -q -m 'durable implementation'; printf 'report failed\\n' >&2; exit 1"
+                .into(),
+        ),
+    ];
+    let agents: Vec<Agent> = config.agents.iter().cloned().map(Agent::new).collect();
+    let item = PlanItem {
+        issue: 80,
+        title: "Continue from a durable implementation".into(),
+        complexity: Complexity::S,
+        risk: Risk::Low,
+        depends_on: Vec::new(),
+        reason: "recover a committed edit".into(),
+    };
+    let issue = Issue {
+        number: 80,
+        title: item.title.clone(),
+        body: Some("Make the change".into()),
+        state: "OPEN".into(),
+        url: "https://example.invalid/issues/80".into(),
+        labels: Vec::new(),
+    };
+
+    let state = run_issue(&agents, &config, &repo, &item, &issue);
+    let path = fx.work.join(".spar-worktrees").join("issue-80");
+
+    assert_eq!(Status::Error, state.status);
+    assert!(
+        state
+            .notes
+            .iter()
+            .any(|note| note.contains("failed after committing")),
+        "{:?}",
+        state.notes
+    );
+    assert_eq!(
+        "durable implementation\n",
+        git(&path, &["log", "-1", "--format=%s"])
+    );
+    assert!(git(&path, &["status", "--porcelain"]).is_empty());
+    assert!(!path.read_dir().unwrap().flatten().any(|entry| entry
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".spar-recovery-needed-")));
+}
+
+#[test]
+fn a_recovery_commit_in_the_shared_checkout_is_not_reset() {
+    let fx = repo("shared-recovery");
+    git(&fx.work, &["checkout", "-q", "-b", "issue-71"]);
+    commit(&fx.work, "README.md", "recovered\n", "recover failed work");
+    let before = git(&fx.work, &["rev-parse", "HEAD"]);
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let mut config = cfg();
+    config.loop_cfg.worktrees = false;
+    let agents: Vec<Agent> = config.agents.iter().cloned().map(Agent::new).collect();
+    let item = PlanItem {
+        issue: 71,
+        title: "Keep the recovery commit".into(),
+        complexity: Complexity::S,
+        risk: Risk::Low,
+        depends_on: Vec::new(),
+        reason: "protect local work".into(),
+    };
+    let issue = Issue {
+        number: 71,
+        title: item.title.clone(),
+        body: Some("Do not reset the branch".into()),
+        state: "OPEN".into(),
+        url: "https://example.invalid/issues/71".into(),
+        labels: Vec::new(),
+    };
+
+    let state = run_issue(&agents, &config, &repo, &item, &issue);
+
+    assert_eq!(Status::Error, state.status);
+    assert!(
+        state
+            .notes
+            .iter()
+            .any(|note| note.contains("Refusing to reset")),
+        "{:?}",
+        state.notes
+    );
+    assert_eq!(before, git(&fx.work, &["rev-parse", "HEAD"]));
+    assert_eq!(
+        "recovered\n",
+        std::fs::read_to_string(fx.work.join("README.md")).unwrap()
+    );
+}
+
+#[test]
+fn an_off_checkout_issue_branch_with_recovery_commits_is_not_reset() {
+    let fx = repo("shared-target-recovery");
+    git(&fx.work, &["checkout", "-q", "-b", "issue-78"]);
+    commit(&fx.work, "recovery.txt", "keep me\n", "recover issue 78");
+    let before = git(&fx.work, &["rev-parse", "refs/heads/issue-78"]);
+    git(&fx.work, &["checkout", "-q", "main"]);
+
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let mut config = cfg();
+    config.loop_cfg.worktrees = false;
+    let agents: Vec<Agent> = config.agents.iter().cloned().map(Agent::new).collect();
+    let item = PlanItem {
+        issue: 78,
+        title: "Keep the target branch".into(),
+        complexity: Complexity::S,
+        risk: Risk::Low,
+        depends_on: Vec::new(),
+        reason: "protect off-checkout work".into(),
+    };
+    let issue = Issue {
+        number: 78,
+        title: item.title.clone(),
+        body: Some("Do not reset the existing target branch".into()),
+        state: "OPEN".into(),
+        url: "https://example.invalid/issues/78".into(),
+        labels: Vec::new(),
+    };
+
+    let state = run_issue(&agents, &config, &repo, &item, &issue);
+
+    assert_eq!(Status::Error, state.status);
+    assert!(
+        state
+            .notes
+            .iter()
+            .any(|note| note.contains("local branch issue-78")),
+        "{:?}",
+        state.notes
+    );
+    assert_eq!(before, git(&fx.work, &["rev-parse", "refs/heads/issue-78"]));
+    assert_eq!("main\n", git(&fx.work, &["branch", "--show-current"]));
+}
+
+#[test]
+fn a_pull_request_head_allows_an_off_checkout_issue_branch_to_reset() {
+    let fx = repo("shared-target-preserved");
+    git(&fx.work, &["checkout", "-q", "-b", "issue-79"]);
+    commit(&fx.work, "published.txt", "preserved\n", "publish issue 79");
+    let published = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    git(
+        &fx.work,
+        &["push", "-q", "origin", "HEAD:refs/pull/790/head"],
+    );
+    git(&fx.work, &["checkout", "-q", "main"]);
+
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    repo.record_branch("issue-79", "pr", 790);
+    let mut config = cfg();
+    config.loop_cfg.worktrees = false;
+    let agents: Vec<Agent> = config.agents.iter().cloned().map(Agent::new).collect();
+    let item = PlanItem {
+        issue: 79,
+        title: "Reuse a preserved target branch".into(),
+        complexity: Complexity::S,
+        risk: Risk::Low,
+        depends_on: Vec::new(),
+        reason: "the old tip remains on its pull request".into(),
+    };
+    let issue = Issue {
+        number: 79,
+        title: item.title.clone(),
+        body: Some("Start a new round from the base".into()),
+        state: "OPEN".into(),
+        url: "https://example.invalid/issues/79".into(),
+        labels: Vec::new(),
+    };
+
+    let state = run_issue(&agents, &config, &repo, &item, &issue);
+
+    assert_eq!(Status::Error, state.status);
+    assert!(
+        state
+            .notes
+            .iter()
+            .all(|note| !note.contains("local branch issue-79")),
+        "{:?}",
+        state.notes
+    );
+    assert_eq!("issue-79\n", git(&fx.work, &["branch", "--show-current"]));
+    assert_eq!(
+        git(&fx.work, &["rev-parse", "origin/main"]),
+        git(&fx.work, &["rev-parse", "refs/heads/issue-79"])
+    );
+    assert_eq!(
+        published,
+        git(&fx.work, &["ls-remote", "origin", "refs/pull/790/head"])
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+    );
+}
+
+#[test]
+fn a_pr_head_lets_the_shared_checkout_advance_after_the_pr_closes() {
+    let fx = repo("shared-preserved-pr");
+    git(&fx.work, &["checkout", "-q", "-b", "issue-74"]);
+    commit(&fx.work, "README.md", "published\n", "publish issue 74");
+    git(
+        &fx.work,
+        &["push", "-q", "origin", "HEAD:refs/pull/740/head"],
+    );
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    repo.record_branch("issue-74", "pr", 740);
+    let mut config = cfg();
+    config.loop_cfg.worktrees = false;
+    let agents: Vec<Agent> = config.agents.iter().cloned().map(Agent::new).collect();
+    let item = PlanItem {
+        issue: 75,
+        title: "Start the next shared issue".into(),
+        complexity: Complexity::S,
+        risk: Risk::Low,
+        depends_on: Vec::new(),
+        reason: "the prior tip is preserved".into(),
+    };
+    let issue = Issue {
+        number: 75,
+        title: item.title.clone(),
+        body: Some("Start from the base".into()),
+        state: "OPEN".into(),
+        url: "https://example.invalid/issues/75".into(),
+        labels: Vec::new(),
+    };
+
+    let state = run_issue(&agents, &config, &repo, &item, &issue);
+
+    assert_eq!(Status::Error, state.status);
+    assert!(
+        state
+            .notes
+            .iter()
+            .all(|note| !note.contains("Refusing to reset")),
+        "{:?}",
+        state.notes
+    );
+    assert_eq!(
+        "issue-75\n",
+        git(&fx.work, &["branch", "--show-current"]),
+        "the next issue never reached its implementation branch"
+    );
+    assert_eq!(
+        git(&fx.work, &["rev-parse", "origin/main"]),
+        git(&fx.work, &["rev-parse", "HEAD"])
+    );
+}
+
+#[test]
+fn a_managed_edit_in_the_shared_checkout_is_kept_uncommitted() {
+    let fx = repo("shared-managed-edit");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let mut config = cfg();
+    config.loop_cfg.worktrees = false;
+    let answer =
+        r#"{"summary":"changed it","problem":"broken","changes":[],"testing":[],"notes":null}"#;
+    let script = format!("printf 'recover me\\n' > README.md; printf '%s\\n' '{answer}'");
+    config.agents[0].command = vec![
+        CommandPart::One("/bin/sh".into()),
+        CommandPart::One("-c".into()),
+        CommandPart::One(script),
+    ];
+    let agents: Vec<Agent> = config.agents.iter().cloned().map(Agent::new).collect();
+    let item = PlanItem {
+        issue: 76,
+        title: "Keep a shared checkout edit".into(),
+        complexity: Complexity::S,
+        risk: Risk::Low,
+        depends_on: Vec::new(),
+        reason: "do not sweep concurrent files into a commit".into(),
+    };
+    let issue = Issue {
+        number: 76,
+        title: item.title.clone(),
+        body: Some("Make a change".into()),
+        state: "OPEN".into(),
+        url: "https://example.invalid/issues/76".into(),
+        labels: Vec::new(),
+    };
+
+    let state = run_issue(&agents, &config, &repo, &item, &issue);
+
+    assert_eq!(Status::Error, state.status);
+    assert!(
+        state
+            .notes
+            .iter()
+            .any(|note| note.contains("cannot distinguish")),
+        "{:?}",
+        state.notes
+    );
+    assert_eq!(
+        git(&fx.work, &["rev-parse", "origin/main"]),
+        git(&fx.work, &["rev-parse", "HEAD"]),
+        "the shared edit was committed"
+    );
+    assert_eq!(
+        "recover me\n",
+        std::fs::read_to_string(fx.work.join("README.md")).unwrap()
+    );
+    assert!(!git(&fx.work, &["status", "--porcelain"]).is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // Reviewing what cannot be pushed to
 // ---------------------------------------------------------------------------
@@ -2019,6 +3524,31 @@ fn a_missing_pull_request_head_says_what_went_wrong() {
         err.contains("refs/pull"),
         "the message should explain the mechanism: {err}"
     );
+}
+
+#[test]
+fn a_local_commit_in_a_review_worktree_is_not_rebuilt() {
+    let fx = repo("prhead-local-commit");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/8/head"]);
+    let path = repo.worktree_for_pr_head(8).unwrap();
+    commit(
+        &path,
+        "review-note.txt",
+        "recover me\n",
+        "local review recovery",
+    );
+    let before = git(&path, &["rev-parse", "HEAD"]);
+
+    let error = repo.worktree_for_pr_head(8).unwrap_err().to_string();
+
+    assert!(error.contains("local commit"), "{error}");
+    assert_eq!(before, git(&path, &["rev-parse", "HEAD"]));
+    assert_eq!(
+        "recover me\n",
+        std::fs::read_to_string(path.join("review-note.txt")).unwrap()
+    );
+    repo.release_review_worktree(8);
 }
 
 #[test]

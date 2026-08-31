@@ -31,7 +31,7 @@ use crate::model::{
 };
 use crate::repo::Repo;
 use crate::style::{self, Style};
-use crate::{log, logdim, logwarn, schema, spar_err};
+use crate::{bail, log, logdim, logwarn, schema, spar_err};
 
 // ---------------------------------------------------------------------------
 // Prompts
@@ -49,9 +49,9 @@ That is the issue body as filed. The discussion since is not included, so read
 the thread at the URL above if the body leaves anything open. If you cannot
 reach the network, work from what is here.
 
-Do the work, then commit it on the current branch. Make focused commits with
-clear messages. Do not push, do not open a PR, and do not merge; the harness
-handles that.
+Do the work and run the relevant tests. Leave the changes uncommitted. Do not
+commit, push, open a PR, or merge; the harness validates and commits the working
+tree after your report is accepted.
 
 Then report it. Your answer becomes the pull request description, and the
 reviewer reads that cold, with nothing but the diff and a link to the issue:
@@ -59,7 +59,7 @@ say what you found wrong, what the change does about it, and how they confirm
 it for themselves. Say what you actually ran, not what could be run.
 
 If after reading the code you conclude this issue should not be implemented,
-make no commits and set not_worth_doing, with the reason.";
+make no changes and set not_worth_doing, with the reason.";
 
 const REVIEW_PROMPT: &str = "\
 Review the changes on this branch against `{base}`. They implement issue
@@ -82,9 +82,10 @@ is not enough to block. It has to be wrong in a way that would cost somebody.
 Confirm anything you label blocking before you label it. Run the code,
 reproduce the failure, or point at the exact line that breaks, and say in the
 detail what you did to confirm it. When you need to run something to check a
-claim, write a scratch file and run that, rather than passing a long program on
-the command line: it is easier to read back, easier to rerun, and less likely to
-be refused by a sandbox or a safety filter part way through your work. An unverified blocking finding is worse than
+claim, write a scratch file under the system temporary directory and run that,
+rather than passing a long program on the command line: it is easier to read
+back, easier to rerun, and less likely to be refused by a sandbox or a safety
+filter part way through your work. An unverified blocking finding is worse than
 one you never raised: it stalls a good PR and teaches the author to stop
 believing you. If you suspect a problem but could not confirm it, say so and
 label it non-blocking.
@@ -139,11 +140,13 @@ do. Nothing acts on it here, and the findings are what decide.
 This call reads and nothing else. Do not edit the code, do not commit, and do
 not push. A pass that writes has judged a branch the rollback then takes away,
 so anything you leave behind is rolled back and the sign off does not stand.
-Writing a scratch file to check a claim is fine.";
+Put any scratch file under the system temporary directory, not in the working
+tree.";
 
 const FIX_PROMPT: &str = "\
 You reviewed this branch and chose to fix the blocking findings yourself.
-Implement those fixes now and commit them.
+Implement those fixes now. Leave the changes uncommitted so the harness can
+validate and commit them.
 
 Your findings:
 {findings}
@@ -155,7 +158,7 @@ reviews, so a fix that grows the branch buys another round of findings about the
 fix. If a point cannot be answered without a change bigger than the point, say so
 rather than making the change.
 
-Commit your changes. Do not push, do not merge.";
+Do not commit, push, or merge.";
 
 const RESPOND_PROMPT: &str = "\
 Here is a review of your PR for issue #{number}.
@@ -163,7 +166,8 @@ Here is a review of your PR for issue #{number}.
 {findings}
 
 For each point, choose exactly one disposition:
-- fixed: the point is valid and in scope. Fix it and commit.
+- fixed: the point is valid and in scope. Fix it and leave the change
+  uncommitted for the harness.
 - refuted: the point is wrong, or the change it asks for is bigger than the
   problem it names. Explain why. Refuting is a legitimate outcome; do not accept
   a review comment you believe is incorrect just to get the PR approved.
@@ -182,7 +186,7 @@ reviews, so a fix that grows the branch buys another round of findings about the
 fix. If a point cannot be answered without a change bigger than the point, say so
 rather than making the change.
 
-Commit any fixes. Do not push, do not merge.";
+Leave any fixes uncommitted. Do not commit, push, or merge.";
 
 // ---------------------------------------------------------------------------
 // Evidence
@@ -373,6 +377,43 @@ fn should_release(cfg: &Config, status: Status) -> bool {
     !matches!(status, Status::Escalated | Status::Error)
 }
 
+fn uncommitted_implementation_error(work_dir: &Path, detail: Option<&str>) -> SparError {
+    let detail = detail.unwrap_or_default().trim();
+    let prefix = if detail.is_empty() {
+        String::new()
+    } else {
+        format!("{detail}\n")
+    };
+    spar_err!(
+        "{prefix}The implementation left uncommitted changes in {}. Commit or recover them \
+         before running this issue again.",
+        work_dir.display()
+    )
+}
+
+fn commit_accepted_changes(
+    cfg: &Config,
+    repo: &Repo,
+    work_dir: &Path,
+    baseline: &crate::repo::WorktreeBaseline,
+    preferred_subject: &str,
+    fallback_subject: &str,
+) -> Result<bool> {
+    repo.refuse_changed_attributes(work_dir, baseline)?;
+    if !cfg.loop_cfg.worktrees && repo.has_uncommitted_changes(work_dir)? {
+        bail!(
+            "the implementation changed the shared checkout at {}, but spar cannot distinguish \
+             those files from edits made concurrently by its owner. The files were kept. Commit \
+             or recover them, then use the default worktree mode for managed commits.",
+            work_dir.display()
+        );
+    }
+    let committed =
+        repo.commit_pending_changes(work_dir, baseline, preferred_subject, fallback_subject)?;
+    repo.refuse_unrepresented_tracked_changes(work_dir, baseline)?;
+    Ok(committed)
+}
+
 // ---------------------------------------------------------------------------
 // One issue, start to finish
 // ---------------------------------------------------------------------------
@@ -413,10 +454,49 @@ pub fn run_issue(
     let prepared = if cfg.loop_cfg.worktrees {
         repo.worktree_add(item.issue, &base)
     } else {
-        let branch = repo.branch_for_issue(item.issue);
-        let start = format!("origin/{base}");
-        repo.git(&["checkout", "-B", &branch, &start])
-            .map(|_| (repo.root().to_path_buf(), branch))
+        (|| {
+            if repo.has_uncommitted_changes(repo.root())? {
+                bail!(
+                    "the shared checkout at {} has uncommitted changes. Refusing to reset it for \
+                     issue #{}.",
+                    repo.root().display(),
+                    item.issue
+                );
+            }
+            if repo.has_changes_checked(repo.root(), &base)? {
+                let preserved = repo.current_branch_is_preserved(repo.root()).map_err(|e| {
+                    spar_err!(
+                        "could not verify whether a pull request preserves the shared checkout \
+                             at {}: {}. Refusing to reset it for issue #{}.",
+                        repo.root().display(),
+                        e.last_line(),
+                        item.issue
+                    )
+                })?;
+                if !preserved {
+                    bail!(
+                        "the shared checkout at {} has commits that are not on {base}. Refusing \
+                         to reset them for issue #{}.",
+                        repo.root().display(),
+                        item.issue
+                    );
+                }
+            }
+            let branch = repo.branch_for_issue(item.issue);
+            let start = format!("origin/{base}");
+            repo.refuse_issue_branch_rebuild(item.issue, &base)?;
+            if repo.has_uncommitted_changes(repo.root())? {
+                bail!(
+                    "the shared checkout at {} changed while issue #{} was being prepared. \
+                     Refusing to reset it.",
+                    repo.root().display(),
+                    item.issue
+                );
+            }
+            repo.git(&["checkout", "-B", &branch, &start])?;
+            repo.record_branch(&branch, "issue", item.issue);
+            Ok((repo.root().to_path_buf(), branch))
+        })()
     };
 
     let (work_dir, branch) = match prepared {
@@ -482,22 +562,39 @@ fn implement_and_review(
         );
     }
     let prompt = implement_prompt(number, &item.title, &issue.url, &body);
-    let answer: Result<Implementation> = implementor.ask_json(
+    let worktree_baseline = repo.worktree_baseline(work_dir)?;
+    let answer: Result<Implementation> = implementor.edit_json(
         &prompt,
         &schema::implementation(),
         work_dir,
         cfg.effort_for_round(&implementor.spec, 1).as_deref(),
     );
 
+    if answer.is_ok() {
+        repo.refuse_changed_attributes(work_dir, &worktree_baseline)?;
+    }
+
+    if let Err(e) = &answer {
+        if e.kind() == crate::error::ErrorKind::UncertainWrite {
+            return Err(e.clone());
+        }
+    }
+
     // A call that fails with commits on the branch is not the same as one that
-    // fails with nothing to show. The agent commits as it goes and reports at
-    // the end, so the usual failure here is the report, not the work, and
-    // returning the error would leave the commits unpushed on a local branch
-    // that the next `spar run` deletes. The review loop is what the round is
-    // for and it needs the diff, not the summary.
+    // fails with nothing to show. Custom editing commands can still commit
+    // directly before their report fails. The review loop needs that retained
+    // diff, not the missing summary.
+    let has_commits = repo.has_changes_checked(work_dir, &base)?;
+    let has_uncommitted = repo.has_uncommitted_changes(work_dir)?;
     let mut work = match answer {
+        Err(e) if has_uncommitted => {
+            return Err(uncommitted_implementation_error(
+                work_dir,
+                Some(e.message()),
+            ));
+        }
         Ok(work) => work,
-        Err(e) if repo.has_changes(work_dir, &base) => {
+        Err(e) if has_commits => {
             logwarn!(
                 "#{number}: {holder} failed after committing: {e}\nContinuing from the commits, \
                  with a pull request body written from their messages."
@@ -510,7 +607,42 @@ fn implement_and_review(
         Err(e) => return Err(e),
     };
 
-    if work.not_worth_doing || !repo.has_changes(work_dir, &base) {
+    if work.not_worth_doing {
+        repo.refuse_unrepresented_tracked_changes(work_dir, &worktree_baseline)?;
+        repo.refuse_changed_existing_untracked(work_dir, &worktree_baseline)?;
+        if has_uncommitted || has_commits {
+            bail!(
+                "{holder} declined issue #{number} after changing {}. The worktree was kept for \
+                 recovery.",
+                work_dir.display()
+            );
+        }
+        repo.refuse_new_ignored_files(work_dir, &worktree_baseline)?;
+        state.status = Status::Abandoned;
+        let reason = no_pr_note(&work, &repo.style);
+        state.notes.push(reason.clone());
+        if let Err(e) = repo.comment_issue(number, &reason) {
+            logdim!("could not comment on #{number}: {e}");
+        }
+        return Ok(());
+    }
+
+    commit_accepted_changes(
+        cfg,
+        repo,
+        work_dir,
+        &worktree_baseline,
+        &work.summary,
+        &item.title,
+    )?;
+    if repo.has_uncommitted_changes(work_dir)? {
+        return Err(uncommitted_implementation_error(
+            work_dir,
+            work.notes.as_deref(),
+        ));
+    }
+    if !repo.has_changes_checked(work_dir, &base)? {
+        repo.refuse_new_ignored_files(work_dir, &worktree_baseline)?;
         state.status = Status::Abandoned;
         let reason = no_pr_note(&work, &repo.style);
         state.notes.push(reason.clone());
@@ -543,6 +675,7 @@ fn implement_and_review(
             )?
         }
     };
+    repo.record_branch(branch, "pr", pr.number);
     state.pr = Some(pr.url.clone());
     log!("#{number}: PR {}", pr.url);
 
@@ -747,7 +880,7 @@ struct LoopCtx {
 }
 
 impl LoopCtx {
-    fn release(&self, repo: &Repo) {
+    fn release(&self, repo: &Repo) -> bool {
         match self.release {
             Release::Issue(n) => repo.worktree_remove(n),
             Release::Pr(n) => repo.release_pr_worktree(n),
@@ -814,16 +947,33 @@ fn review_loop(
             last_allowed,
         );
         let before_review = snapshot(repo, &ctx.work_dir);
+        let review_baseline = repo.worktree_baseline(&ctx.work_dir)?;
         // The commit this round is judging, kept for the closing pass, which
         // reads what landed after the last one of these.
         audited_head = before_review.head.clone();
-        let review: Review = reviewer.review(
+        let review = reviewer.review::<Review>(
             &base,
             &prompt,
             &schema::review(),
             &ctx.work_dir,
             effort.as_deref(),
-        )?;
+        );
+        if let Err(error) = &review {
+            if error.kind() == crate::error::ErrorKind::UncertainWrite {
+                return Err(error.clone());
+            }
+        }
+        repo.refuse_unrepresented_tracked_changes(&ctx.work_dir, &review_baseline)?;
+        repo.refuse_new_ignored_files(&ctx.work_dir, &review_baseline)?;
+        let review = review?;
+        if repo.has_uncommitted_changes(&ctx.work_dir)? {
+            bail!(
+                "{}: {holder} left uncommitted files while reviewing. They were kept at {} and \
+                 the review did not continue.",
+                ctx.label,
+                ctx.work_dir.display()
+            );
+        }
 
         // Who actually wrote the head this round, which is the only thing that
         // decides who reviews it next. None so far: a review is not supposed to
@@ -929,9 +1079,18 @@ fn review_loop(
         } else if review.next_action == NextAction::FixMyself {
             log!("{}: {holder} fixing its own findings", ctx.label);
             let prompt = FIX_PROMPT.replace("{findings}", &findings_for_prompt(&blocking));
-            let before_fix = snapshot(repo, &ctx.work_dir);
-            reviewer.ask(&prompt, &ctx.work_dir, effort.as_deref())?;
-            match editor_after(repo, &ctx.work_dir, &before_fix, &ctx.label, &holder) {
+            let before_fix = repo.head_oid_checked(&ctx.work_dir)?;
+            let worktree_baseline = repo.worktree_baseline(&ctx.work_dir)?;
+            let summary = reviewer.edit(&prompt, &ctx.work_dir, effort.as_deref())?;
+            commit_accepted_changes(
+                cfg,
+                repo,
+                &ctx.work_dir,
+                &worktree_baseline,
+                &summary,
+                "Address blocking review findings",
+            )?;
+            match editor_after(repo, &ctx.work_dir, &before_fix, &ctx.label, &holder)? {
                 Some(who) => {
                     // Recorded like an author's fix, and for the same reason.
                     // These points were answered in code too, and leaving them
@@ -945,6 +1104,7 @@ fn review_loop(
                     editor = Some(who);
                 }
                 None => {
+                    repo.refuse_new_ignored_files(&ctx.work_dir, &worktree_baseline)?;
                     // Handing over here is what the bug was: the head is still
                     // the author's, so the author would be reading its own work.
                     logwarn!(
@@ -969,12 +1129,21 @@ fn review_loop(
             let prompt = RESPOND_PROMPT
                 .replace("{number}", &ctx.subject.to_string())
                 .replace("{findings}", &findings_for_prompt(&blocking));
-            let before_response = snapshot(repo, &ctx.work_dir);
-            let response: ResponseDoc = author.ask_json(
+            let before_response = repo.head_oid_checked(&ctx.work_dir)?;
+            let worktree_baseline = repo.worktree_baseline(&ctx.work_dir)?;
+            let response: ResponseDoc = author.edit_json(
                 &prompt,
                 &schema::response(),
                 &ctx.work_dir,
                 cfg.effort_for_round(&author.spec, round).as_deref(),
+            )?;
+            commit_accepted_changes(
+                cfg,
+                repo,
+                &ctx.work_dir,
+                &worktree_baseline,
+                &response.summary,
+                "Address blocking review findings",
             )?;
             if let Some(who) = editor_after(
                 repo,
@@ -982,18 +1151,21 @@ fn review_loop(
                 &before_response,
                 &ctx.label,
                 &author_name,
-            ) {
+            )? {
                 editor = Some(who);
-            } else if response
-                .dispositions
-                .iter()
-                .any(|d| d.action == Action::Fixed)
-            {
-                logwarn!(
-                    "{}: {author_name} reported fixes but committed nothing, so the diff does not \
-                     have them.",
-                    ctx.label
-                );
+            } else {
+                repo.refuse_new_ignored_files(&ctx.work_dir, &worktree_baseline)?;
+                if response
+                    .dispositions
+                    .iter()
+                    .any(|d| d.action == Action::Fixed)
+                {
+                    logwarn!(
+                        "{}: {author_name} reported fixes but committed nothing, so the diff does \
+                         not have them.",
+                        ctx.label
+                    );
+                }
             }
             let unresolved = apply_dispositions(
                 repo,
@@ -1139,10 +1311,26 @@ fn close_out(
         round,
     );
     let before = snapshot(repo, &ctx.work_dir);
+    let closing_baseline = repo.worktree_baseline(&ctx.work_dir)?;
     // `ask_json` rather than `Agent::review`: this prompt already defines the
     // full merge-safety scope and calls out the unread delta and carried points.
     // Appending a second scope would make the closing instructions compete.
     let pass = closer.ask_json(&prompt, &schema::review(), &ctx.work_dir, effort.as_deref());
+    if let Err(e) = &pass {
+        if e.kind() == crate::error::ErrorKind::UncertainWrite {
+            return Err(e.clone());
+        }
+    }
+    repo.refuse_unrepresented_tracked_changes(&ctx.work_dir, &closing_baseline)?;
+    repo.refuse_new_ignored_files(&ctx.work_dir, &closing_baseline)?;
+    if repo.has_uncommitted_changes(&ctx.work_dir)? {
+        bail!(
+            "{}: {holder} left uncommitted files during the closing pass. They were kept at {} \
+             and the pass did not continue.",
+            ctx.label,
+            ctx.work_dir.display()
+        );
+    }
 
     // Held to the same rule as a review, for the same reason: a pass that judged
     // a tree the rollback then takes away judged code that is not there.
@@ -1347,8 +1535,15 @@ fn approve(
         // Release the worktree first. `gh pr merge --delete-branch` fails if
         // anything still has the branch checked out, and it fails *after*
         // merging, so the merge lands while the command reports failure.
-        ctx.release(repo);
-        repo.merge_pr_at_head(ctx.pr_number, published_head)?;
+        let released = ctx.release(repo);
+        if !released {
+            log!(
+                "{}: kept the worktree at {} and will leave its branch in place",
+                ctx.label,
+                ctx.work_dir.display()
+            );
+        }
+        repo.merge_pr_at_head(ctx.pr_number, published_head, released)?;
         state.status = Status::Merged;
         repo.clear_state(ctx.pr_number); // nothing left to resume
         log!("{}: merged", ctx.label);
@@ -1398,19 +1593,19 @@ fn next_reviewer(cfg: &Config, reviewer: &str, editor: Option<&str>) -> String {
 fn editor_after(
     repo: &Repo,
     work_dir: &Path,
-    before: &Snapshot,
+    before_head: &str,
     label: &str,
     who: &str,
-) -> Option<String> {
-    let after = snapshot(repo, work_dir);
-    if after.dirty {
-        logwarn!(
-            "{label}: {who} left tracked files uncommitted. Only commits are pushed and the next \
-             review reads the tree, so they are discarded."
+) -> Result<Option<String>> {
+    if repo.has_uncommitted_changes(work_dir)? {
+        bail!(
+            "{label}: {who} left uncommitted files at {}. They were kept and the review did not \
+             continue.",
+            work_dir.display()
         );
-        drop_uncommitted(repo, work_dir);
     }
-    after.landed_over(before).then(|| who.to_string())
+    let after_head = repo.head_oid_checked(work_dir)?;
+    Ok((after_head != before_head).then(|| who.to_string()))
 }
 
 /// The inclusive range of round numbers this invocation will work through.
@@ -3331,6 +3526,18 @@ mod tests {
         let cfg = cfg_with(true, false);
         assert!(!should_release(&cfg, Status::Escalated));
         assert!(!should_release(&cfg, Status::Error));
+    }
+
+    #[test]
+    fn an_uncommitted_implementation_names_its_diagnostic_and_recovery_path() {
+        let path = Path::new("/tmp/issue worktree");
+        let err =
+            uncommitted_implementation_error(path, Some("git add could not create index.lock"))
+                .to_string();
+        assert!(err.contains("could not create index.lock"), "{err}");
+        assert!(err.contains("/tmp/issue worktree"), "{err}");
+        assert!(err.contains("Commit or recover"), "{err}");
+        assert!(!should_release(&cfg_with(true, false), Status::Error));
     }
 
     #[test]

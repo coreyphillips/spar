@@ -4048,7 +4048,10 @@ fn ignored_build_artifacts_do_not_stop_a_managed_commit_or_push() {
     .is_empty());
     assert!(!git(&fx.work, &["ls-remote", "--heads", "origin", "issue-83"]).is_empty());
     assert!(git(&path, &["status", "--porcelain"]).is_empty());
-    repo.worktree_remove(83);
+    // Build output is not work to recover, so it does not leave the checkout
+    // behind once the run is finished with it.
+    assert!(repo.worktree_remove(83));
+    assert!(!path.exists());
 }
 
 #[test]

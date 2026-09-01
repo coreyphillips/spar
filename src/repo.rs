@@ -20,7 +20,7 @@ use crate::model::{Followup, Issue, IssueRef, ItemKind, PersistedState, PrRef, P
 use crate::proc::{self, ExecOpts};
 use crate::style::{self, Style};
 use crate::textsim;
-use crate::{bail, logdim, logwarn, spar_err};
+use crate::{bail, logdim, spar_err};
 
 /// gh returns newest first, so its `--limit` cannot be used to take the lowest
 /// numbered items: it would slice the newest N and then sorting that slice
@@ -266,11 +266,55 @@ impl IgnoredState {
     }
 }
 
+/// Build output one commit attempt let through, gathered for a single report.
+///
+/// The checks that allow it run more than once per attempt, before staging,
+/// after staging, and again after the commit, because the tree could have moved
+/// under any of them. Reporting from inside each check said the same thing
+/// about the same files two and three times over.
+#[derive(Default)]
+struct GeneratedArtifacts {
+    new_paths: BTreeSet<PathBuf>,
+    changed_paths: BTreeSet<PathBuf>,
+}
+
+impl GeneratedArtifacts {
+    fn left(&mut self, paths: Vec<PathBuf>) {
+        self.new_paths.extend(paths);
+    }
+
+    fn changed(&mut self, paths: Vec<PathBuf>) {
+        self.changed_paths.extend(paths);
+    }
+
+    /// Said once, and not as a warning. The files stay out of the commit,
+    /// whatever wrote them writes them again, and they no longer keep the
+    /// worktree from being removed.
+    fn report(&self, cwd: &Path) {
+        if !self.new_paths.is_empty() {
+            logdim!(
+                "the editing call left {} generated artifact(s) under a known build or cache \
+                 directory in {}. They are not part of the commit.",
+                self.new_paths.len(),
+                cwd.display()
+            );
+        }
+        if !self.changed_paths.is_empty() {
+            logdim!(
+                "the editing call changed {} existing generated artifact(s) under a known build \
+                 or cache directory in {}. They are not part of the commit.",
+                self.changed_paths.len(),
+                cwd.display()
+            );
+        }
+    }
+}
+
 /// Generated directories that test and build commands routinely create.
 ///
-/// Files under these directories are never deleted or committed. They may
-/// remain beside an accepted edit, with a warning, so running the requested
-/// tests does not prevent the tracked change from reaching review.
+/// Files under these directories are never committed, and they do not keep a
+/// worktree that is otherwise finished, so running the requested tests neither
+/// stops the tracked change reaching review nor leaves a checkout behind.
 fn is_generated_artifact(path: &Path) -> bool {
     const DIRECTORIES: &[&str] = &[
         "target",
@@ -2106,10 +2150,16 @@ impl Repo {
         cwd: &Path,
         baseline: &WorktreeBaseline,
     ) -> Result<()> {
-        self.check_new_ignored_files(cwd, baseline, false)
+        self.check_new_ignored_files(cwd, baseline, false).map(drop)
     }
 
-    fn allow_generated_ignored_files(&self, cwd: &Path, baseline: &WorktreeBaseline) -> Result<()> {
+    /// The generated paths this call let through, for one report per attempt
+    /// rather than one per check.
+    fn allow_generated_ignored_files(
+        &self,
+        cwd: &Path,
+        baseline: &WorktreeBaseline,
+    ) -> Result<Vec<PathBuf>> {
         self.check_new_ignored_files(cwd, baseline, true)
     }
 
@@ -2118,7 +2168,7 @@ impl Repo {
         cwd: &Path,
         baseline: &WorktreeBaseline,
         allow_generated: bool,
-    ) -> Result<()> {
+    ) -> Result<Vec<PathBuf>> {
         self.refuse_changed_attributes(cwd, baseline)?;
         let after = ignored_untracked_state(cwd).map_err(|e| {
             uncertain_worktree_change(
@@ -2133,22 +2183,13 @@ impl Repo {
         })?;
         let changed = baseline.ignored_untracked.changed_paths(&after);
         if changed.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let (generated, changed): (Vec<_>, Vec<_>) = changed.into_iter().partition(|path| {
             allow_generated && after.is_ignored(path) && is_generated_artifact(path)
         });
-        if !generated.is_empty() {
-            logwarn!(
-                "the editing call left {} generated artifact(s) under a known build or cache \
-                 directory in {}. They are not part of the commit and will keep the worktree \
-                 available for inspection.",
-                generated.len(),
-                cwd.display()
-            );
-        }
         if changed.is_empty() {
-            return Ok(());
+            return Ok(generated);
         }
         let mut listed = changed
             .iter()
@@ -2180,13 +2221,14 @@ impl Repo {
         baseline: &WorktreeBaseline,
     ) -> Result<()> {
         self.check_changed_existing_untracked(cwd, baseline, false)
+            .map(drop)
     }
 
     fn allow_changed_generated_artifacts(
         &self,
         cwd: &Path,
         baseline: &WorktreeBaseline,
-    ) -> Result<()> {
+    ) -> Result<Vec<PathBuf>> {
         self.check_changed_existing_untracked(cwd, baseline, true)
     }
 
@@ -2195,7 +2237,7 @@ impl Repo {
         cwd: &Path,
         baseline: &WorktreeBaseline,
         allow_generated: bool,
-    ) -> Result<()> {
+    ) -> Result<Vec<PathBuf>> {
         self.refuse_changed_attributes(cwd, baseline)?;
         let after = ignored_untracked_state(cwd).map_err(|e| {
             uncertain_worktree_change(
@@ -2210,7 +2252,7 @@ impl Repo {
         })?;
         let changed = baseline.ignored_untracked.changed_existing_paths(&after);
         if changed.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let (generated, changed): (Vec<_>, Vec<_>) = changed.into_iter().partition(|path| {
             allow_generated
@@ -2218,17 +2260,8 @@ impl Repo {
                 && after.is_ignored(path)
                 && is_generated_artifact(path)
         });
-        if !generated.is_empty() {
-            logwarn!(
-                "the editing call changed {} existing generated artifact(s) under a known build \
-                 or cache directory in {}. They are not part of the commit and will keep the \
-                 worktree available for inspection.",
-                generated.len(),
-                cwd.display()
-            );
-        }
         if changed.is_empty() {
-            return Ok(());
+            return Ok(generated);
         }
         let mut listed = changed
             .iter()
@@ -2465,11 +2498,13 @@ impl Repo {
         preferred_subject: &str,
         fallback_subject: &str,
     ) -> Result<bool> {
+        let mut artifacts = GeneratedArtifacts::default();
         self.refuse_changed_attributes(cwd, baseline)?;
-        self.allow_changed_generated_artifacts(cwd, baseline)?;
+        artifacts.changed(self.allow_changed_generated_artifacts(cwd, baseline)?);
         refuse_unsafe_index_flags(cwd)?;
         if !self.has_uncommitted_changes(cwd)? {
-            self.allow_generated_ignored_files(cwd, baseline)?;
+            artifacts.left(self.allow_generated_ignored_files(cwd, baseline)?);
+            artifacts.report(cwd);
             return Ok(false);
         }
         self.stage_managed_changes(cwd, baseline).map_err(|e| {
@@ -2481,7 +2516,7 @@ impl Repo {
         })?;
         // Ignored paths remain untracked after staging. Only known generated
         // output may remain beside an otherwise complete managed commit.
-        self.allow_generated_ignored_files(cwd, baseline)?;
+        artifacts.left(self.allow_generated_ignored_files(cwd, baseline)?);
         let changed_gitlinks = changed_staged_gitlinks(cwd)?;
         if !changed_gitlinks.is_empty() {
             let listed = changed_gitlinks
@@ -2514,8 +2549,9 @@ impl Repo {
                 cwd.display()
             );
         }
-        self.allow_changed_generated_artifacts(cwd, baseline)?;
-        self.allow_generated_ignored_files(cwd, baseline)?;
+        artifacts.changed(self.allow_changed_generated_artifacts(cwd, baseline)?);
+        artifacts.left(self.allow_generated_ignored_files(cwd, baseline)?);
+        artifacts.report(cwd);
         Ok(true)
     }
 
@@ -5866,6 +5902,59 @@ fn commit_has_shared_ref_except(cwd: &Path, oid: &str, exclude: Option<&str>) ->
     }))
 }
 
+/// Whether removing the worktree would take away an untracked file somebody
+/// might want back.
+///
+/// Ordinary untracked files always count. So does an ignored file outside the
+/// known build and cache directories, because an ignored path is only a path
+/// Git was told not to track, which is where a local `.env` lives as readily as
+/// compiler output.
+///
+/// Recognized build and cache output does not. A managed commit already leaves
+/// it out rather than treating it as work, and the command that wrote it writes
+/// it again. Counting it kept every worktree whose tests or build had run,
+/// which is nearly all of them, so a merged pull request still left its
+/// checkout behind. A repository nested in that output is somebody else's
+/// history and counts whatever it sits under.
+fn has_untracked_work_worth_keeping(cwd: &Path) -> Result<bool> {
+    let ordinary = untracked_listing(cwd, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    if !ordinary.is_empty() {
+        return Ok(true);
+    }
+    let listed = untracked_listing(
+        cwd,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ],
+    )?;
+    for raw in listed {
+        let (path, nested) = untracked_record(&raw, "ignored")?;
+        if nested || !is_generated_artifact(&path) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn untracked_listing(cwd: &Path, args: &[&str]) -> Result<Vec<Vec<u8>>> {
+    let listed = run_git_bytes(cwd, args)?;
+    if !listed.is_empty() && !listed.ends_with(&[0]) {
+        bail!(
+            "git returned an unterminated untracked-file list for {}",
+            cwd.display()
+        );
+    }
+    Ok(listed
+        .split(|byte| *byte == 0)
+        .filter(|raw| !raw.is_empty())
+        .map(|raw| raw.to_vec())
+        .collect())
+}
+
 fn repository_has_recoverable_work_inner(
     cwd: &Path,
     include_ignored: bool,
@@ -5876,7 +5965,7 @@ fn repository_has_recoverable_work_inner(
     if !visited.insert(canonical.clone()) {
         bail!("submodule recursion revisited {}", canonical.display());
     }
-    if include_ignored && !run_git_bytes(cwd, &["ls-files", "--others", "-z"])?.is_empty() {
+    if include_ignored && has_untracked_work_worth_keeping(cwd)? {
         return Ok(true);
     }
     if !unsafe_index_flags(cwd)?.is_empty() {
@@ -7049,6 +7138,82 @@ mod tests {
         std::fs::write(path.join("README.md"), "seed\n").unwrap();
 
         assert!(repository_has_recoverable_work(&path, true).unwrap());
+    }
+
+    /// Add ignore rules the way SPAR does, without a tracked change the
+    /// worktree would then be kept for.
+    fn exclude_paths(repo: &Repo, lines: &[&str]) {
+        use std::io::Write;
+        let path = repo.root().join(".git").join("info").join("exclude");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+    }
+
+    #[test]
+    fn build_output_alone_does_not_keep_a_worktree() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("build-output", 933);
+        exclude_paths(&repo, &["target/", "dist/"]);
+        std::fs::create_dir_all(path.join("target/debug")).unwrap();
+        std::fs::write(path.join("target/debug/artifact"), "compiler output\n").unwrap();
+        std::fs::create_dir_all(path.join("dist/cli")).unwrap();
+        std::fs::write(path.join("dist/cli/index.js"), "typescript output\n").unwrap();
+
+        assert!(!repository_has_recoverable_work(&path, true).unwrap());
+        repo.release_review_worktree(933);
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_ignored_file_outside_build_output_keeps_a_worktree() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("ignored-local", 934);
+        exclude_paths(&repo, &["target/", ".env.local"]);
+        std::fs::create_dir_all(path.join("target/debug")).unwrap();
+        std::fs::write(path.join("target/debug/artifact"), "compiler output\n").unwrap();
+        std::fs::write(path.join(".env.local"), "TOKEN=keep me\n").unwrap();
+
+        assert!(repository_has_recoverable_work(&path, true).unwrap());
+        repo.release_review_worktree(934);
+
+        assert_eq!(
+            "TOKEN=keep me\n",
+            std::fs::read_to_string(path.join(".env.local")).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_repository_nested_in_build_output_keeps_a_worktree() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("nested-in-build", 935);
+        exclude_paths(&repo, &["node_modules/"]);
+        let nested = path.join("node_modules/local-dep");
+        std::fs::create_dir_all(&nested).unwrap();
+        test_git(&nested, &["init"]);
+        std::fs::write(nested.join("work.txt"), "uncommitted\n").unwrap();
+
+        assert!(repository_has_recoverable_work(&path, true).unwrap());
+        repo.release_review_worktree(935);
+
+        assert!(nested.join(".git").exists());
+    }
+
+    #[test]
+    fn an_ordinary_untracked_file_keeps_a_worktree() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("ordinary-untracked", 936);
+        std::fs::write(path.join("notes.md"), "somebody's notes\n").unwrap();
+
+        assert!(repository_has_recoverable_work(&path, true).unwrap());
+        repo.release_review_worktree(936);
+
+        assert_eq!(
+            "somebody's notes\n",
+            std::fs::read_to_string(path.join("notes.md")).unwrap()
+        );
     }
 
     #[test]

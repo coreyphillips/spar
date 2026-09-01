@@ -212,9 +212,35 @@ pub(crate) fn stable_finding_key(title: &str, file: &str) -> String {
     identity_key(title, &finding_file(file))
 }
 
+/// A title with a leading severity tag removed, such as `[blocking] `.
+///
+/// Reviewers and authors are told to copy a finding's title across exactly so
+/// the two can be matched up, and they mostly do, but one side decorating it
+/// with the severity it already reports in its own field is common enough to
+/// cost a round: the disposition matches nothing, the finding it answered stays
+/// open, and both are reported as unresolved. Only a bracketed tag whose word
+/// is a severity is dropped, so a title that genuinely opens with a bracketed
+/// subject keeps it and two findings that differ only there stay distinct.
+pub(crate) fn untagged_title(title: &str) -> &str {
+    let trimmed = title.trim();
+    let Some(rest) = trimmed.strip_prefix('[') else {
+        return trimmed;
+    };
+    let Some((tag, rest)) = rest.split_once(']') else {
+        return trimmed;
+    };
+    if crate::model::Severity::parse_lenient(tag.trim()).is_none() {
+        return trimmed;
+    }
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return trimmed;
+    }
+    rest
+}
+
 fn identity_key(title: &str, file: &str) -> String {
-    let title: String = title
-        .trim()
+    let title: String = untagged_title(title)
         .to_lowercase()
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || c.is_whitespace())
@@ -351,6 +377,30 @@ mod tests {
     #[test]
     fn key_is_stable_across_whitespace() {
         assert_eq!(finding_key("a  b", "x.rs"), finding_key(" a b ", "x.rs"));
+    }
+
+    #[test]
+    fn a_severity_tag_does_not_change_a_title() {
+        assert_eq!(
+            "Unbounded loop",
+            untagged_title("[blocking] Unbounded loop")
+        );
+        assert_eq!("Unbounded loop", untagged_title("  [ NIT ]Unbounded loop "));
+        assert_eq!(
+            exact_finding_key("Unbounded loop", "x.rs"),
+            exact_finding_key("[non-blocking] Unbounded loop", "x.rs")
+        );
+    }
+
+    #[test]
+    fn a_bracketed_subject_is_part_of_the_title() {
+        assert_eq!("[iOS] Startup crash", untagged_title("[iOS] Startup crash"));
+        assert_eq!("[blocking]", untagged_title("[blocking]"));
+        assert_eq!("[blocking Unbounded", untagged_title("[blocking Unbounded"));
+        assert_ne!(
+            exact_finding_key("[iOS] Startup crash", "x.rs"),
+            exact_finding_key("[Android] Startup crash", "x.rs")
+        );
     }
 
     #[test]

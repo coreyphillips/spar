@@ -4457,9 +4457,14 @@ fn collect_untracked_files(
         .split(|byte| *byte == 0)
         .filter(|raw| !raw.is_empty())
     {
-        let relative = safe_git_path(raw, "untracked")?;
+        let (relative, nested) = untracked_record(raw, "untracked")?;
         let from_root = prefix.join(&relative);
-        let fingerprint = ignored_file_fingerprint(&root.join(&from_root))?;
+        let absolute = root.join(&from_root);
+        let fingerprint = if nested {
+            nested_repository_fingerprint(&absolute)?
+        } else {
+            ignored_file_fingerprint(&absolute)?
+        };
         if files.insert(from_root.clone(), fingerprint).is_some() {
             bail!(
                 "git returned the untracked path more than once: {:?}",
@@ -4488,7 +4493,7 @@ fn collect_untracked_files(
         .split(|byte| *byte == 0)
         .filter(|raw| !raw.is_empty())
     {
-        let relative = safe_git_path(raw, "ignored")?;
+        let (relative, _) = untracked_record(raw, "ignored")?;
         let from_root = prefix.join(relative);
         if !files.contains_key(&from_root) {
             bail!(
@@ -4569,6 +4574,23 @@ fn safe_git_path(raw: &[u8], kind: &str) -> Result<PathBuf> {
         bail!("git returned an unsafe {kind} path: {:?}", relative);
     }
     Ok(relative)
+}
+
+/// Split one `ls-files --others` record into its path and whether Git reported
+/// a nested repository rather than a single file.
+///
+/// Git never lists the contents of a repository inside the working tree, so a
+/// checkout parked there, such as another of SPAR's own worktrees, arrives as
+/// one record for the directory itself ending in a separator. Git writes that
+/// separator on every platform. Trimming it keeps the recorded path equal to
+/// the same path seen any other way.
+fn untracked_record(raw: &[u8], kind: &str) -> Result<(PathBuf, bool)> {
+    let nested = raw.last() == Some(&b'/');
+    let trimmed = if nested { &raw[..raw.len() - 1] } else { raw };
+    if trimmed.is_empty() {
+        bail!("git returned an empty {kind} path");
+    }
+    Ok((safe_git_path(trimmed, kind)?, nested))
 }
 
 fn index_entries(cwd: &Path) -> Result<Vec<IndexEntry>> {
@@ -5974,6 +5996,63 @@ fn path_from_git_bytes(raw: &[u8]) -> Result<PathBuf> {
         .map_err(|_| spar_err!("git returned a non-UTF-8 ignored path"))
 }
 
+/// Fingerprint the directory of a nested repository without reading inside it.
+///
+/// The files under it are that repository's, not this one's. They are recorded
+/// against its own baseline whenever SPAR works there, and a run of its own may
+/// legitimately add or remove entries while this call is in flight, so the
+/// volatile directory fields stay out of the fingerprint. Identity and type
+/// remain, which is what makes deleting the checkout, or replacing it with a
+/// file, observable from the outer worktree.
+fn nested_repository_fingerprint(path: &Path) -> Result<UntrackedFile> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| {
+        spar_err!(
+            "could not inspect the nested repository at {}: {e}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_dir() {
+        bail!(
+            "git reported {} as a nested repository, but it is not a directory",
+            path.display()
+        );
+    }
+    if std::fs::symlink_metadata(path.join(".git")).is_err() {
+        bail!(
+            "git reported {} as a nested repository, but it has no Git entry",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(UntrackedFile {
+            kind: 3,
+            len: 0,
+            modified: None,
+            created: metadata.created().ok(),
+            readonly: metadata.permissions().readonly(),
+            symlink_target: None,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            change_seconds: 0,
+            change_nanoseconds: 0,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(UntrackedFile {
+            kind: 3,
+            len: 0,
+            modified: None,
+            created: metadata.created().ok(),
+            readonly: metadata.permissions().readonly(),
+            symlink_target: None,
+        })
+    }
+}
+
 fn ignored_file_fingerprint(path: &Path) -> Result<UntrackedFile> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|e| spar_err!("could not inspect untracked file {}: {e}", path.display()))?;
@@ -7004,6 +7083,61 @@ mod tests {
         assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
         assert!(error.to_string().contains("Git entry"), "{error}");
         assert!(nested.join(".git").exists());
+    }
+
+    #[test]
+    fn a_resident_worktree_is_snapshotted_as_one_ignored_entry() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("resident-snapshot", 930);
+
+        let state = ignored_untracked_state(repo.root()).unwrap();
+
+        let relative = path.strip_prefix(repo.root()).unwrap();
+        assert!(
+            state.files.contains_key(relative),
+            "{:?}",
+            state.files.keys().collect::<Vec<_>>()
+        );
+        assert!(state.is_ignored(relative));
+    }
+
+    #[test]
+    fn work_inside_a_resident_worktree_leaves_the_outer_baseline_alone() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("resident-churn", 931);
+        let baseline = repo.worktree_baseline(repo.root()).unwrap();
+        std::fs::write(path.join("scratch.txt"), "another run's work\n").unwrap();
+        std::fs::write(path.join("README.md"), "another run's edit\n").unwrap();
+
+        repo.refuse_new_ignored_files(repo.root(), &baseline)
+            .unwrap();
+        repo.refuse_changed_existing_untracked(repo.root(), &baseline)
+            .unwrap();
+    }
+
+    #[test]
+    fn deleting_a_resident_worktree_during_a_call_is_refused() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("resident-deleted", 932);
+        let baseline = repo.worktree_baseline(repo.root()).unwrap();
+        std::fs::remove_dir_all(&path).unwrap();
+
+        let error = repo
+            .refuse_new_ignored_files(repo.root(), &baseline)
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert!(error.to_string().contains("review-932"), "{error}");
+    }
+
+    #[test]
+    fn a_nested_repository_record_is_read_as_a_plain_path() {
+        let (path, nested) = untracked_record(b"vendor/checkout/", "untracked").unwrap();
+        assert_eq!(Path::new("vendor/checkout"), path);
+        assert!(nested);
+
+        let (path, nested) = untracked_record(b"vendor/notes.txt", "untracked").unwrap();
+        assert_eq!(Path::new("vendor/notes.txt"), path);
+        assert!(!nested);
+
+        assert!(untracked_record(b"/", "untracked").is_err());
     }
 
     #[cfg(unix)]

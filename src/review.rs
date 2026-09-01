@@ -2261,7 +2261,8 @@ fn why_escalated(outcome: Settled) -> &'static str {
 }
 
 fn normalise(text: &str) -> String {
-    text.to_lowercase()
+    crate::jsonx::untagged_title(text)
+        .to_lowercase()
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || c.is_whitespace())
         .collect::<String>()
@@ -4183,6 +4184,52 @@ mod tests {
         assert!(!disposition_matches(
             &findings[0],
             &disposition("unbounded loop", "src/y.rs", Action::Refuted)
+        ));
+    }
+
+    #[test]
+    fn a_disposition_matches_its_finding_despite_a_severity_tag() {
+        let blocker = finding(
+            "blocking",
+            "Refused requests can corrupt the active splice",
+            "d",
+            "src/lightning/channel/channel.ts",
+            true,
+        );
+        let answers = [disposition(
+            "[blocking] Refused requests can corrupt the active splice",
+            "src/lightning/channel/channel.ts",
+            Action::Fixed,
+        )];
+
+        assert_eq!(
+            0,
+            matching_disposition(&blocker, std::slice::from_ref(&blocker), &answers)
+                .expect("tagged answer")
+                .0
+        );
+    }
+
+    #[test]
+    fn a_bracketed_subject_still_separates_two_findings() {
+        let ios = finding("blocking", "[iOS] Startup crash", "d", "src/app.ts", true);
+        let android = finding(
+            "blocking",
+            "[Android] Startup crash",
+            "d",
+            "src/app.ts",
+            true,
+        );
+        let findings = [ios.clone(), android];
+        let answers = [disposition(
+            "[Android] Startup crash",
+            "src/app.ts",
+            Action::Fixed,
+        )];
+
+        assert!(matches!(
+            matching_disposition(&ios, &findings, &answers),
+            Err("no matching disposition")
         ));
     }
 

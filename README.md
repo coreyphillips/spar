@@ -879,7 +879,12 @@ than from what landed. Custody now follows checked `HEAD` values on both sides
 of every call. Spar commits an accepted fix before choosing the next reviewer.
 The custody loop rolls back a review pass that writes before it can count as
 approval. Detached review, split, and check-in inspections instead stop and keep
-the worktree if files or `HEAD` change.
+the worktree if files or `HEAD` change. Rebuilding recognized build and cache
+output is not such a change: verifying a finding usually means building the
+project and running its tests, and a reviewer held to a byte-identical `dist/`
+loses the review it just did. What it was asked to judge is the tracked tree,
+and that is compared as strictly as ever, along with every other untracked
+file.
 
 Successful editing calls leave their files uncommitted, and spar stages and
 commits them only after accepting the structured report. A failed editing call

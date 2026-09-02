@@ -2172,34 +2172,35 @@ impl Repo {
         Ok(())
     }
 
-    /// Refuse to discard ignored files that appeared during an editing call.
+    /// Refuse to discard ignored files that appeared during a call.
     ///
-    /// Call this when the edit reported success but produced no commit-worthy
-    /// status. Existing ignored build output is harmless because it is present
-    /// in `baseline`; only newly created paths stop cleanup.
+    /// Call this when the call reported success but produced no commit-worthy
+    /// status. Existing ignored files are harmless because they are present in
+    /// `baseline`; only new paths stop cleanup, and recognized build and cache
+    /// output is not one of them. Running the project's tests is what a call is
+    /// asked to do, and whatever wrote that output writes it again.
     pub(crate) fn refuse_new_ignored_files(
         &self,
         cwd: &Path,
         baseline: &WorktreeBaseline,
     ) -> Result<()> {
-        self.check_new_ignored_files(cwd, baseline, false).map(drop)
+        self.check_new_ignored_files(cwd, baseline).map(drop)
     }
 
-    /// The generated paths this call let through, for one report per attempt
+    /// The generated paths the check let through, for one report per attempt
     /// rather than one per check.
     fn allow_generated_ignored_files(
         &self,
         cwd: &Path,
         baseline: &WorktreeBaseline,
     ) -> Result<Vec<PathBuf>> {
-        self.check_new_ignored_files(cwd, baseline, true)
+        self.check_new_ignored_files(cwd, baseline)
     }
 
     fn check_new_ignored_files(
         &self,
         cwd: &Path,
         baseline: &WorktreeBaseline,
-        allow_generated: bool,
     ) -> Result<Vec<PathBuf>> {
         self.refuse_changed_attributes(cwd, baseline)?;
         let after = ignored_untracked_state(cwd).map_err(|e| {
@@ -2217,9 +2218,9 @@ impl Repo {
         if changed.is_empty() {
             return Ok(Vec::new());
         }
-        let (generated, changed): (Vec<_>, Vec<_>) = changed.into_iter().partition(|path| {
-            allow_generated && after.is_ignored(path) && is_generated_artifact(path)
-        });
+        let (generated, changed): (Vec<_>, Vec<_>) = changed
+            .into_iter()
+            .partition(|path| after.is_ignored(path) && is_generated_artifact(path));
         if changed.is_empty() {
             return Ok(generated);
         }
@@ -2243,16 +2244,17 @@ impl Repo {
         ))
     }
 
-    /// Existing untracked files belong to the checkout owner, even when an
-    /// editing call also produces a valid tracked change. Refuse their
-    /// modification or deletion before accepting the tracked result. Newly
-    /// created build output is handled by ordinary removal preflight instead.
+    /// Existing untracked files belong to the checkout owner, even when a call
+    /// also produces a valid tracked change. Refuse their modification or
+    /// deletion before accepting the tracked result. Rebuilt output is not that:
+    /// it is ignored on both sides and under a known build or cache directory,
+    /// which is where the command the call was asked to run puts it.
     pub(crate) fn refuse_changed_existing_untracked(
         &self,
         cwd: &Path,
         baseline: &WorktreeBaseline,
     ) -> Result<()> {
-        self.check_changed_existing_untracked(cwd, baseline, false)
+        self.check_changed_existing_untracked(cwd, baseline)
             .map(drop)
     }
 
@@ -2261,14 +2263,13 @@ impl Repo {
         cwd: &Path,
         baseline: &WorktreeBaseline,
     ) -> Result<Vec<PathBuf>> {
-        self.check_changed_existing_untracked(cwd, baseline, true)
+        self.check_changed_existing_untracked(cwd, baseline)
     }
 
     fn check_changed_existing_untracked(
         &self,
         cwd: &Path,
         baseline: &WorktreeBaseline,
-        allow_generated: bool,
     ) -> Result<Vec<PathBuf>> {
         self.refuse_changed_attributes(cwd, baseline)?;
         let after = ignored_untracked_state(cwd).map_err(|e| {
@@ -2287,8 +2288,7 @@ impl Repo {
             return Ok(Vec::new());
         }
         let (generated, changed): (Vec<_>, Vec<_>) = changed.into_iter().partition(|path| {
-            allow_generated
-                && baseline.ignored_untracked.is_ignored(path)
+            baseline.ignored_untracked.is_ignored(path)
                 && after.is_ignored(path)
                 && is_generated_artifact(path)
         });
@@ -2453,7 +2453,9 @@ impl Repo {
                     ),
                 )
             })?;
-            if verified != after || verified_untracked != before_filter_untracked {
+            if verified != after
+                || before_filter_untracked.changed_beyond_generated(&verified_untracked)
+            {
                 return Err(uncertain_worktree_change(
                     cwd,
                     "a content filter changed the worktree while SPAR verified the managed \
@@ -7225,6 +7227,36 @@ mod tests {
         for line in lines {
             writeln!(file, "{line}").unwrap();
         }
+    }
+
+    #[test]
+    fn rebuilt_output_does_not_stop_a_call_that_committed_nothing() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("rebuilt-output", 939);
+        exclude_paths(&repo, &["dist/"]);
+        std::fs::create_dir_all(path.join("dist")).unwrap();
+        std::fs::write(path.join("dist/index.js"), "first build\n").unwrap();
+        let baseline = repo.worktree_baseline(&path).unwrap();
+        std::fs::write(path.join("dist/index.js"), "second build\n").unwrap();
+        std::fs::write(path.join("dist/extra.js"), "more output\n").unwrap();
+
+        repo.refuse_new_ignored_files(&path, &baseline).unwrap();
+        repo.refuse_changed_existing_untracked(&path, &baseline)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_new_ignored_file_outside_build_output_still_stops_a_call() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("new-ignored-local", 940);
+        exclude_paths(&repo, &["dist/", ".env.local"]);
+        std::fs::create_dir_all(path.join("dist")).unwrap();
+        let baseline = repo.worktree_baseline(&path).unwrap();
+        std::fs::write(path.join("dist/index.js"), "a build\n").unwrap();
+        std::fs::write(path.join(".env.local"), "TOKEN=x\n").unwrap();
+
+        let error = repo.refuse_new_ignored_files(&path, &baseline).unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert!(error.to_string().contains(".env.local"), "{error}");
     }
 
     #[test]

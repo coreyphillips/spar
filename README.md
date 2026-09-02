@@ -1015,11 +1015,12 @@ returns the error. A reset or rewritten tip is kept for recovery. A failed
 initial implementation that already made durable commits can continue from
 them. Ignored files outside known build and cache directories stop the commit
 because they may be required work. Recognized test and build artifacts, such as
-files under `target/` or `dist/`, are left in place, do not block the tracked
-change from reaching review, and do not keep a finished worktree from being
-removed, since whatever wrote them writes them again. An ignored file anywhere
-else, an ordinary untracked file, or a repository nested in the output still
-keeps the worktree.
+files under `target/` or `dist/`, are treated the same way everywhere: writing
+or rewriting them never fails a call, whether it was asked to edit or only to
+read, they are left out of the commit, and they do not keep a finished worktree
+from being removed, since whatever wrote them writes them again. An ignored file
+anywhere else, an ordinary untracked file, or a repository nested in the output
+still stops the call and keeps the worktree.
 
 Include `{schema}` or `{schema_file}` and spar uses the CLI's native structured
 output. This is worth doing rather than optional: without it spar asks for JSON

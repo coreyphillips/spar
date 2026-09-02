@@ -4737,6 +4737,7 @@ fn attributes_may_be_modified(cwd: &Path) -> Result<bool> {
     }
 
     let effective = check_attributes(cwd, index.keys().cloned())?;
+    let config = CheckoutConfig::read(cwd)?;
     for (path, (_mode, oid)) in index {
         let Some(worktree) = tracked_worktree_file(&cwd.join(&path), oid.len())? else {
             return Ok(true);
@@ -4744,7 +4745,7 @@ fn attributes_may_be_modified(cwd: &Path) -> Result<bool> {
         let attributes = effective
             .get(&path)
             .ok_or_else(|| spar_err!("git omitted attributes for {}", cwd.join(&path).display()))?;
-        if allows_expected_crlf(cwd, attributes)? {
+        if allows_expected_crlf(&config, attributes)? {
             if worktree.mode == "120000" {
                 return Ok(true);
             }
@@ -5235,7 +5236,49 @@ fn path_has_external_transform(values: &BTreeMap<String, String>) -> bool {
         || attribute_is_active(values.get("working-tree-encoding"))
 }
 
-fn path_has_ambiguous_transform(cwd: &Path, values: &BTreeMap<String, String>) -> Result<bool> {
+/// The checkout settings a per-file line-ending decision depends on.
+///
+/// These are constant for a worktree, but the checks that read them run once
+/// per tracked file, and each read was its own `git config` process. A
+/// thousand-file repository with no `.gitattributes` takes every one of those
+/// branches, which is half a minute of process spawning per scan, and the sweep
+/// before a run scans every finished worktree more than once. Read them here,
+/// once, and hand them down.
+struct CheckoutConfig {
+    autocrlf: Option<String>,
+    eol: Option<String>,
+    symlinks: Option<bool>,
+}
+
+impl CheckoutConfig {
+    fn read(cwd: &Path) -> Result<Self> {
+        Ok(Self {
+            autocrlf: git_config_value(cwd, "core.autocrlf")?,
+            eol: git_config_value(cwd, "core.eol")?,
+            symlinks: git_config_bool(cwd, "core.symlinks")?,
+        })
+    }
+
+    fn autocrlf_is_true(&self) -> bool {
+        self.autocrlf.as_ref().is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "true" | "yes" | "on" | "1"
+            )
+        })
+    }
+
+    fn eol_is(&self, wanted: &str) -> bool {
+        self.eol
+            .as_ref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(wanted))
+    }
+}
+
+fn path_has_ambiguous_transform(
+    config: &CheckoutConfig,
+    values: &BTreeMap<String, String>,
+) -> Result<bool> {
     if path_has_external_transform(values)
         || attribute_is_active(values.get("ident"))
         || attribute_is_active(values.get("crlf"))
@@ -5256,19 +5299,15 @@ fn path_has_ambiguous_transform(cwd: &Path, values: &BTreeMap<String, String>) -
         return Ok(true);
     }
     if text == Some("unspecified") && matches!(eol, Some("unspecified") | Some("unset")) {
-        return Ok(
-            git_config_value(cwd, "core.autocrlf")?.is_some_and(|value| {
-                matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "true" | "yes" | "on" | "1"
-                )
-            }),
-        );
+        return Ok(config.autocrlf_is_true());
     }
     Ok(false)
 }
 
-fn allows_expected_crlf(cwd: &Path, values: &BTreeMap<String, String>) -> Result<bool> {
+fn allows_expected_crlf(
+    config: &CheckoutConfig,
+    values: &BTreeMap<String, String>,
+) -> Result<bool> {
     if path_has_external_transform(values)
         || attribute_is_active(values.get("ident"))
         || attribute_is_active(values.get("crlf"))
@@ -5286,18 +5325,18 @@ fn allows_expected_crlf(cwd: &Path, values: &BTreeMap<String, String>) -> Result
     if text != Some("set") {
         return Ok(false);
     }
-    if let Some(autocrlf) = git_config_value(cwd, "core.autocrlf")? {
+    if let Some(autocrlf) = config.autocrlf.as_deref() {
         match autocrlf.to_ascii_lowercase().as_str() {
             "true" | "yes" | "on" | "1" => return Ok(true),
             "input" => return Ok(false),
             _ => {}
         }
     }
-    if git_config_value(cwd, "core.eol")?.is_some_and(|value| value.eq_ignore_ascii_case("crlf")) {
+    if config.eol_is("crlf") {
         return Ok(true);
     }
     #[cfg(windows)]
-    if git_config_value(cwd, "core.eol")?.is_none_or(|value| value.eq_ignore_ascii_case("native")) {
+    if config.eol.is_none() || config.eol_is("native") {
         return Ok(true);
     }
     Ok(false)
@@ -6023,6 +6062,7 @@ fn repository_has_recoverable_work_inner(
         }
         let tracked = tracked_entries(cwd)?;
         let effective = check_attributes(cwd, tracked.keys().cloned())?;
+        let config = CheckoutConfig::read(cwd)?;
         for (path, entry) in tracked {
             let Some(worktree) = entry.worktree else {
                 return Ok(true);
@@ -6030,13 +6070,13 @@ fn repository_has_recoverable_work_inner(
             let attributes = effective.get(&path).ok_or_else(|| {
                 spar_err!("git omitted attributes for {}", cwd.join(&path).display())
             })?;
-            if path_has_ambiguous_transform(cwd, attributes)? {
+            if path_has_ambiguous_transform(&config, attributes)? {
                 return Ok(true);
             }
             let symlink_file = entry.index_mode == "120000"
                 && worktree.mode == "100644"
                 && worktree.raw_oid == entry.index_oid
-                && git_config_bool(cwd, "core.symlinks")? == Some(false);
+                && config.symlinks == Some(false);
             if worktree.mode != entry.index_mode && !symlink_file {
                 return Ok(true);
             }
@@ -6057,7 +6097,7 @@ fn repository_has_recoverable_work_inner(
                     return Ok(true);
                 }
             }
-            if allows_expected_crlf(cwd, attributes)? {
+            if allows_expected_crlf(&config, attributes)? {
                 let (normalized, every_lf_was_crlf) =
                     normalized_git_blob_oid(&cwd.join(&path), entry.index_oid.len())?;
                 if !every_lf_was_crlf || normalized != entry.index_oid {

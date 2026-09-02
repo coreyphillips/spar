@@ -24,14 +24,23 @@ search_paths = [
 
 # Hints for `spar init`. Never validated against, only written as comments.
 #
-# Codex enumerates neither set in its help, so these were read out of the
-# binary: the effort list is its own enum, in its own order, and the models are
-# the current generation of those it names. Which models an account may
-# actually call is a separate question from which ones exist, so treat the list
-# as a starting point rather than a promise.
-models = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-pro", "gpt-5.5"]
+# Codex enumerates neither set in its help. The effort list is its own enum, in
+# its own order, read out of the binary. The models were read out of the binary
+# too, and that is what made this list incomplete: gpt-5.3-codex-spark is not a
+# string in the binary at all. It arrives in the model list the server hands the
+# CLI, cached at ~/.codex/models_cache.json, which is the better place to look.
+# Which models an account may actually call is a separate question again from
+# which ones exist, so treat the list as a starting point rather than a promise.
+#
+# Spark is last because it is not a peer of the rest. It is a generation older,
+# ultra-fast, 128k of context against 272k, text only, and no priority tier. It
+# is here because it bills against its own quota allowance rather than the
+# general one, which makes it the one entry on this list worth naming under
+# [agents.codex.fallback]: a stand in for a weekly limit has to draw on a
+# different pool than the model that just hit it.
+models = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-pro", "gpt-5.5", "gpt-5.3-codex-spark"]
 efforts = ["ultra", "max", "xhigh", "high", "medium", "low", "minimal", "none"]
-options_note = "Codex lists neither set in its help. Your ~/.codex/config.toml is the source of truth for what your account has, and effort is passed through as -c model_reasoning_effort=..."
+options_note = "Codex lists neither set in its help. ~/.codex/models_cache.json is what your account is currently offered, and effort is passed through as -c model_reasoning_effort=..."
 
 [message_match]
 type = "item.completed"

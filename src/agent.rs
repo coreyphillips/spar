@@ -807,7 +807,7 @@ impl EditBaseline {
         let current = git_state(cwd).map_err(|e| recovery_probe_error(cwd, "state", &e))?;
         let ignored = ignored_untracked_state(cwd)
             .map_err(|e| recovery_probe_error(cwd, "ignored files", &e))?;
-        Ok(current != self.git_state || ignored != self.ignored_untracked)
+        Ok(current != self.git_state || self.ignored_untracked.changed_beyond_generated(&ignored))
     }
 }
 
@@ -2256,6 +2256,91 @@ mod tests {
             .file_name()
             .to_string_lossy()
             .starts_with(".spar-recovery-needed-")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repository that ignores build output, with one build already in it.
+    fn built_repo(name: &str) -> PathBuf {
+        let dir = committed_repo(name);
+        std::fs::write(dir.join(".gitignore"), "dist/\nlocal.env\n").unwrap();
+        git_at(&dir, &["add", ".gitignore"]);
+        git_at(&dir, &["commit", "-q", "-m", "ignore build output"]);
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        std::fs::write(dir.join("dist/index.js"), "first build\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_read_that_only_rebuilds_generated_output_keeps_its_answer() {
+        let dir = built_repo("successful-read-build");
+        let agent = Agent::with_bin(
+            shell(
+                "reader",
+                "printf 'second build\n' > dist/index.js; printf 'more\n' > dist/extra.js; \
+                 echo reviewed",
+            ),
+            "/bin/sh",
+        );
+
+        let answer = agent.ask("read it", &dir, None).expect("answer kept");
+
+        assert_eq!("reviewed", answer.trim());
+        assert_eq!(
+            "second build\n",
+            std::fs::read_to_string(dir.join("dist/index.js")).unwrap()
+        );
+        assert!(
+            !std::fs::read_dir(&dir).unwrap().flatten().any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".spar-recovery-needed-"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_that_writes_an_ignored_file_elsewhere_is_still_discarded() {
+        let dir = built_repo("successful-read-ignored");
+        let agent = Agent::with_bin(
+            shell(
+                "reader",
+                "printf 'second build\n' > dist/index.js; printf 'TOKEN=x\n' > local.env; \
+                 echo reviewed",
+            ),
+            "/bin/sh",
+        );
+
+        let err = agent.ask("read it", &dir, None).unwrap_err();
+
+        assert_eq!(ErrorKind::UncertainWrite, err.kind());
+        assert!(err.message().contains("read-only call"), "{err}");
+        assert_eq!(
+            "TOKEN=x\n",
+            std::fs::read_to_string(dir.join("local.env")).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_that_changes_a_tracked_file_is_still_discarded() {
+        let dir = built_repo("successful-read-tracked");
+        let agent = Agent::with_bin(
+            shell(
+                "reader",
+                "printf 'second build\n' > dist/index.js; printf 'recover me\n' > README.md; \
+                 echo reviewed",
+            ),
+            "/bin/sh",
+        );
+
+        let err = agent.ask("read it", &dir, None).unwrap_err();
+
+        assert_eq!(ErrorKind::UncertainWrite, err.kind());
+        assert!(err.message().contains("read-only call"), "{err}");
+        assert_eq!(
+            "recover me\n",
+            std::fs::read_to_string(dir.join("README.md")).unwrap()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

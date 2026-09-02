@@ -264,6 +264,34 @@ impl IgnoredState {
             .cloned()
             .collect()
     }
+
+    /// Whether anything moved here that is not recognized build or cache
+    /// output.
+    ///
+    /// A read-only call is held to its word by comparing the worktree before
+    /// and after. Verifying a finding usually means building the project and
+    /// running its tests, which rewrites that output, and holding a reviewer to
+    /// a byte-identical `dist/` threw away the review it had just done. What
+    /// the call was asked to judge is the tracked tree, and that is compared as
+    /// strictly as ever, along with every other untracked file.
+    pub(crate) fn changed_beyond_generated(&self, after: &Self) -> bool {
+        let mut paths: BTreeSet<&PathBuf> = self.files.keys().collect();
+        paths.extend(after.files.keys());
+        paths.into_iter().any(|path| {
+            if self.files.get(path) == after.files.get(path)
+                && self.is_ignored(path) == after.is_ignored(path)
+            {
+                return false;
+            }
+            !(is_generated_artifact(path) && self.disposable(path) && after.disposable(path))
+        })
+    }
+
+    /// Whether this state has nothing at `path` worth keeping: either the path
+    /// is not there at all, or it is there as an ignored file.
+    fn disposable(&self, path: &Path) -> bool {
+        !self.files.contains_key(path) || self.is_ignored(path)
+    }
 }
 
 /// Build output one commit attempt let through, gathered for a single report.
@@ -2127,7 +2155,11 @@ impl Repo {
                 ),
             )
         })?;
-        if git_state != checkpoint.git_state || ignored != checkpoint.ignored_untracked {
+        if git_state != checkpoint.git_state
+            || checkpoint
+                .ignored_untracked
+                .changed_beyond_generated(&ignored)
+        {
             return Err(uncertain_worktree_change(
                 cwd,
                 format!(
@@ -7153,6 +7185,35 @@ mod tests {
         for line in lines {
             writeln!(file, "{line}").unwrap();
         }
+    }
+
+    #[test]
+    fn a_read_only_inspection_may_rebuild_generated_output() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("inspect-build", 937);
+        exclude_paths(&repo, &["dist/"]);
+        std::fs::create_dir_all(path.join("dist")).unwrap();
+        std::fs::write(path.join("dist/index.js"), "first build\n").unwrap();
+        let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+        std::fs::write(path.join("dist/index.js"), "second build\n").unwrap();
+        std::fs::write(path.join("dist/extra.js"), "more output\n").unwrap();
+
+        repo.require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .unwrap();
+    }
+
+    #[test]
+    fn a_read_only_inspection_may_not_change_an_ignored_file_elsewhere() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("inspect-local", 938);
+        exclude_paths(&repo, &["dist/", ".env.local"]);
+        std::fs::write(path.join(".env.local"), "TOKEN=before\n").unwrap();
+        let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+        std::fs::write(path.join(".env.local"), "TOKEN=after\n").unwrap();
+
+        let error = repo
+            .require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
     }
 
     #[test]

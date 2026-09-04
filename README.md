@@ -264,7 +264,12 @@ instruction rather than a setting.
 ## How a run goes
 
 **Triage.** Both agents independently judge every issue: is it worth doing, how
-complex, what does it depend on, how risky. They run at the same time, and
+complex, what does it depend on, how risky. Complexity and risk are defined in
+the prompt in terms an agent can check, files touched and whether a test exists
+for the first, blast radius and reversibility for the second, and the agents are
+told what the answers are used for and that the larger of the two wins. Where
+they land two steps apart on a three point scale, the run says so: that is the
+scale not being shared rather than a rounding difference. They run at the same time, and
 neither sees the other's answer. Then reconcile mechanically:
 
 - Both say do, it is scheduled.

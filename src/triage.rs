@@ -16,7 +16,7 @@ use crate::model::{
     TriageVerdict,
 };
 use crate::repo::Repo;
-use crate::{log, logwarn, schema, spar_err};
+use crate::{log, logdim, logwarn, schema, spar_err};
 
 const TRIAGE_PROMPT: &str = "\
 You are triaging GitHub issues for the repository in your working directory.
@@ -32,9 +32,27 @@ For each issue decide:
 - worth_doing: is this a real, valid, actionable issue worth a PR? Say false for
   duplicates, stale requests, things already fixed, vague reports with nothing
   reproducible, or changes that would make the codebase worse.
-- complexity: s, m, or l.
+- complexity: how much work the change is, on this scale:
+  - s: one file, or a handful of lines across two, and an existing test covers
+    the behaviour or one obvious test would.
+  - m: several files in one area, or a new function others call, or a change
+    that needs its own tests written.
+  - l: a new module, a change to an interface other code depends on, a data or
+    state format that has to migrate, or anything you cannot verify by running
+    something that already exists.
 - depends_on: issue numbers from this same list that should land first.
-- risk: how likely a change here is to break something.
+- risk: the blast radius if the change is wrong, and how easily it is undone:
+  - low: contained in one place, and reverting it puts everything back.
+  - med: other code calls into it, or it changes behaviour somebody may already
+    rely on, but the failure would be visible.
+  - high: it touches data that persists, a security or permission boundary, or
+    a path whose failure is silent.
+
+Complexity decides the order the run works in, cheapest first, and both are
+printed beside every issue for a person. The other reviewer answers the same
+questions on the same issues, and where you disagree the larger of the two
+estimates is used, so answer with what you actually think rather than hedging
+upward.
 
 Judge independently. Be willing to say an issue is not worth doing. Your reason
 is posted on the issue when the other reviewer agrees with you, so write one
@@ -270,6 +288,20 @@ fn reconcile(issues: &[Issue], verdicts: &[(String, BTreeMap<i64, TriageVerdict>
                 .map(|(_, v)| v.risk)
                 .max_by_key(|r| r.rank())
                 .unwrap_or(Risk::Med);
+            // Two agents on the same scale land next to each other. Two steps
+            // apart is not a rounding difference, it is the scale not being
+            // shared, and since the maximum wins the order is then set by
+            // whichever agent read the issue most pessimistically.
+            report_spread(
+                number,
+                "complexity",
+                all.iter().map(|(n, v)| (n.as_str(), v.complexity.rank())),
+            );
+            report_spread(
+                number,
+                "risk",
+                all.iter().map(|(n, v)| (n.as_str(), v.risk.rank())),
+            );
             let mut depends: Vec<i64> =
                 all.iter().flat_map(|(_, v)| v.depends_on.clone()).collect();
             depends.sort_unstable();
@@ -380,6 +412,28 @@ pub fn order(
         );
     }
     ordered
+}
+
+/// Name a disagreement wider than one step on a three point scale.
+///
+/// The values are only worth what the two agents' calibration is worth, and
+/// nothing else says when they are not calibrated at all.
+fn report_spread<'a>(issue: i64, what: &str, answers: impl Iterator<Item = (&'a str, u8)>) {
+    let seen: Vec<(&str, u8)> = answers.collect();
+    let (Some(low), Some(high)) = (
+        seen.iter().min_by_key(|(_, rank)| *rank),
+        seen.iter().max_by_key(|(_, rank)| *rank),
+    ) else {
+        return;
+    };
+    if high.1.saturating_sub(low.1) < 2 {
+        return;
+    }
+    logdim!(
+        "#{issue}: {} and {} are two steps apart on {what}, and the larger is used",
+        low.0,
+        high.0
+    );
 }
 
 /// Say what each item depends on, and what became of a dependency that is not
@@ -740,6 +794,45 @@ mod tests {
         );
         assert_eq!(Complexity::L, plan.order[0].complexity);
         assert_eq!(Risk::High, plan.order[0].risk);
+    }
+
+    /// Ordering by a number two models assign on no shared scale is ordering
+    /// by noise, and the max-of-two rule then biases every item upward.
+    ///
+    /// The scale is defined in the prompt now. This is the other half: when the
+    /// two answers are two steps apart on a three point scale, the scale was
+    /// not shared for that issue and a person should be able to see where.
+    #[test]
+    fn a_two_step_disagreement_about_size_is_said_out_loud() {
+        let spread = |a: u8, b: u8| {
+            let seen = [("claude", a), ("codex", b)];
+            let low = seen.iter().min_by_key(|(_, r)| *r).unwrap().1;
+            let high = seen.iter().max_by_key(|(_, r)| *r).unwrap().1;
+            high.saturating_sub(low) >= 2
+        };
+        assert!(spread(Complexity::S.rank(), Complexity::L.rank()));
+        assert!(!spread(Complexity::S.rank(), Complexity::M.rank()));
+        assert!(!spread(Complexity::M.rank(), Complexity::M.rank()));
+        assert!(spread(Risk::Low.rank(), Risk::High.rank()));
+    }
+
+    /// The values decide the order and are printed beside every issue, and an
+    /// agent told what they are used for gives a different answer from one
+    /// told nothing.
+    #[test]
+    fn the_triage_prompt_defines_the_scales_it_asks_for() {
+        for phrase in [
+            "one file",
+            "a new module",
+            "blast radius",
+            "cheapest first",
+            "the larger of the two",
+        ] {
+            assert!(
+                TRIAGE_PROMPT.contains(phrase),
+                "the prompt does not say {phrase:?}"
+            );
+        }
     }
 
     #[test]

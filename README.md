@@ -478,7 +478,12 @@ changes what gets filed, which is the point.
 
 An entry is only removed after its issue exists, so a run that dies halfway
 files one thing twice rather than losing one. The duplicate is caught by the
-same search that catches every other one.
+same search that catches every other one. An entry the screen retitles is
+archived under both wordings, so a later run that rediscovers the defect in the
+original words still recognises it, and an entry the screen calls a duplicate of
+another entry is resolved after the batch: if the one it points at was not
+filed, this one stays in the queue rather than being archived as covered by an
+issue that has nothing to do with it.
 
 That search reads open issues, and weighs the title separately from the body, so
 a long umbrella issue cannot absorb every short finding about the module it

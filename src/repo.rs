@@ -3869,7 +3869,7 @@ impl Repo {
         let heading = format!("## {}", title.trim());
         for seen in [&path, &self.worked_followups_path()] {
             if let Ok(existing) = std::fs::read_to_string(seen) {
-                if existing.contains(&heading) {
+                if has_heading(&existing, title) {
                     logdim!("follow-up already noted: {title}");
                     return Followup::Covered(format!("note: {}", title.trim()));
                 }
@@ -6584,6 +6584,22 @@ pub fn write_text_atomic(path: &Path, text: &str) -> Result<()> {
     std::fs::rename(&tmp, path)
         .map_err(|e| spar_err!("could not replace {}: {e}", path.display()))?;
     Ok(())
+}
+
+/// Whether a follow-up file already has an entry under this exact title.
+///
+/// Whole heading lines, case insensitively. A substring check answered yes
+/// for "Retry loop" against "## Retry loop never terminates", which is a
+/// different defect, and the new one was dropped with a line saying it was
+/// already noted.
+pub fn has_heading(text: &str, title: &str) -> bool {
+    let wanted = title.trim().to_lowercase();
+    if wanted.is_empty() {
+        return false;
+    }
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("## "))
+        .any(|heading| heading.trim().to_lowercase() == wanted)
 }
 
 /// Write JSON through a temporary file and rename, so a kill cannot leave a

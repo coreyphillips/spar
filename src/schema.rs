@@ -302,12 +302,16 @@ pub fn screen() -> Value {
                             "type": "string",
                             "description": "One sentence. For already_fixed, name the function or the change that fixed it, so somebody can check you. For anything but still_relevant this is the only record of why the entry was dropped, so give the reason rather than the verdict again."
                         },
-                        "duplicate_of": {
+                        "duplicate_of_issue": {
                             "type": ["integer", "null"],
-                            "description": "Only when the verdict is duplicate, null otherwise. An open issue number, or the number of an earlier entry in this same list."
+                            "description": "Only when the verdict is duplicate and an open issue already covers it. The issue number, null otherwise."
+                        },
+                        "duplicate_of_entry": {
+                            "type": ["integer", "null"],
+                            "description": "Only when the verdict is duplicate and another entry in this same list covers it. That entry's number from the list above, null otherwise. Kept apart from duplicate_of_issue because an entry is not an issue: it may itself be dropped, and then this one is kept rather than lost."
                         }
                     },
-                    "required": ["entry", "verdict", "title", "reason", "duplicate_of"]
+                    "required": ["entry", "verdict", "title", "reason", "duplicate_of_issue", "duplicate_of_entry"]
                 }
             }
         },

@@ -4007,6 +4007,66 @@ fn a_same_named_tag_cannot_hide_an_unpushed_pr_commit() {
     repo.release_pr_worktree(62);
 }
 
+/// The one claim in a report that nothing checked.
+///
+/// The design's rule is that a prompt is not a permission and every claim an
+/// agent makes is checked mechanically where it can be. "I ran the tests" was
+/// the exception: the schema records it and spar pushed on the agent's word.
+/// Every round after a broken push is a round spent on a branch that should not
+/// have been pushed.
+#[test]
+fn a_failing_check_stops_the_push_and_keeps_the_worktree() {
+    let fx = repo("check-gate");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let mut config = cfg();
+    // The check fails, and so does the one fix the agent is given.
+    config.loop_cfg.check = spar::config::CheckCommand::Line("false".into());
+    let answer = r#"{"summary":"changed it","problem":"broken","changes":[],"testing":["ran the tests"],"notes":null}"#;
+    let script = format!("printf 'changed\\n' > README.md; printf '%s\\n' '{answer}'");
+    config.agents[0].command = vec![
+        CommandPart::One("/bin/sh".into()),
+        CommandPart::One("-c".into()),
+        CommandPart::One(script),
+    ];
+    let agents: Vec<Agent> = config.agents.iter().cloned().map(Agent::new).collect();
+    let item = PlanItem {
+        issue: 71,
+        title: "Bound the retry loop".into(),
+        complexity: Complexity::S,
+        risk: Risk::Low,
+        depends_on: Vec::new(),
+        reason: "worth doing".into(),
+    };
+    let issue = Issue {
+        number: 71,
+        title: item.title.clone(),
+        body: Some("Make the change".into()),
+        state: "OPEN".into(),
+        state_reason: None,
+        url: "https://example.invalid/issues/71".into(),
+        labels: Vec::new(),
+    };
+
+    let state = run_issue(&agents, &config, &repo, &item, &issue);
+    let path = fx.work.join(".spar-worktrees").join("issue-71");
+
+    assert_eq!(Status::Error, state.status);
+    assert!(
+        state.notes.iter().any(|n| n.contains("still fails")),
+        "the report has to carry the failure: {:?}",
+        state.notes
+    );
+    assert!(path.is_dir(), "the worktree was not kept for recovery");
+    // The work is committed and nothing reached origin.
+    assert_eq!("changed it\n", git(&path, &["log", "-1", "--format=%s"]));
+    let remote = git(&fx.work, &["ls-remote", "--heads", "origin"]);
+    assert!(
+        !remote.contains("issue-71"),
+        "a branch that does not pass was pushed: {remote}"
+    );
+    repo.worktree_remove(71);
+}
+
 #[test]
 fn a_structured_implementation_is_committed_before_review() {
     let fx = repo("dirty-implementation");
@@ -5551,7 +5611,7 @@ fn a_pr_body_is_assembled_from_the_commits_when_the_report_never_came() {
         "oldest first, as the branch reads"
     );
 
-    let body = spar::review::pr_body(42, &work, &repo.style);
+    let body = spar::review::pr_body(42, &work, None, &repo.style);
     assert!(body.contains("Closes #42"), "{body}");
     assert!(body.contains("- Add the parser"), "{body}");
     assert!(body.contains("- Cover the empty input case"), "{body}");

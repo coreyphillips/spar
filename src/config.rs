@@ -427,6 +427,49 @@ impl EffortSchedule {
     }
 }
 
+/// A command spar runs itself, before it pushes.
+///
+/// A string is split on whitespace, which covers `cargo test` and `npm test`.
+/// A list is taken as it is, for anything that needs an argument with a space
+/// in it. No shell either way: spar runs the program, so nothing here is
+/// interpreted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CheckCommand {
+    Line(String),
+    Argv(Vec<String>),
+}
+
+impl Default for CheckCommand {
+    /// An empty list, which is both "nothing to run" and a value that survives
+    /// a round trip through TOML, unlike a unit variant.
+    fn default() -> Self {
+        CheckCommand::Argv(Vec::new())
+    }
+}
+
+impl CheckCommand {
+    pub fn argv(&self) -> Vec<String> {
+        match self {
+            CheckCommand::Line(line) => line.split_whitespace().map(str::to_string).collect(),
+            CheckCommand::Argv(argv) => argv
+                .iter()
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+                .collect(),
+        }
+    }
+
+    pub fn is_set(&self) -> bool {
+        !self.argv().is_empty()
+    }
+
+    /// How the command reads in a log line or a pull request body.
+    pub fn describe(&self) -> String {
+        self.argv().join(" ")
+    }
+}
+
 /// Every field takes its value from `LoopCfg::default()` when a config does not
 /// mention it, rather than from a per-field function saying the same thing in a
 /// second place. Two places is how a default goes stale.
@@ -545,6 +588,16 @@ pub struct LoopCfg {
     /// A backstop against a long argument being read back to somebody, not a
     /// target. What it held back is said out loud.
     pub max_checkin_comments: usize,
+    /// A command spar runs in the worktree after an editing call committed and
+    /// before the branch is pushed. Unset means nothing is run.
+    ///
+    /// The design's rule is that a prompt is not a permission and every claim
+    /// an agent makes is checked mechanically where it can be. "I ran the
+    /// tests" was the one claim nothing checked: the schema records it, and
+    /// spar pushed and opened the pull request on the agent's word. This is not
+    /// waiting on CI, which is expensive and somebody else's machine. It is one
+    /// command, before the push, that fails closed.
+    pub check: CheckCommand,
     pub effort_schedule: EffortSchedule,
 }
 
@@ -577,6 +630,7 @@ impl Default for LoopCfg {
             checkin_trust: Trust::Write,
             checkin_resolve: true,
             max_checkin_comments: 20,
+            check: CheckCommand::default(),
             effort_schedule: EffortSchedule::default(),
         }
     }
@@ -1316,6 +1370,30 @@ model = "gpt-5.6-sol"
     /// One agent wrote every first draft, so half the pair's diversity went
     /// unused: a model's blind spots as an author are systematic, and the ones
     /// the two share go through every time.
+    /// The one claim a report makes that nothing else checks.
+    #[test]
+    fn a_check_is_read_as_an_argv_either_way_it_is_written() {
+        let line = format!("{TWO_AGENTS}\n[loop]\ncheck = \"cargo test --all\"\n");
+        let cfg = parse(&line).unwrap();
+        assert!(cfg.loop_cfg.check.is_set());
+        assert_eq!(vec!["cargo", "test", "--all"], cfg.loop_cfg.check.argv());
+        assert_eq!("cargo test --all", cfg.loop_cfg.check.describe());
+
+        let listed =
+            format!("{TWO_AGENTS}\n[loop]\ncheck = [\"npm\", \"run\", \"test -- --ci\"]\n");
+        let cfg = parse(&listed).unwrap();
+        assert_eq!(
+            vec!["npm", "run", "test -- --ci"],
+            cfg.loop_cfg.check.argv(),
+            "a list is taken as it is, spaces and all"
+        );
+
+        // Unset is the default, and runs nothing.
+        let bare = parse(TWO_AGENTS).unwrap();
+        assert!(!bare.loop_cfg.check.is_set());
+        assert!(bare.loop_cfg.check.argv().is_empty());
+    }
+
     #[test]
     fn alternating_swaps_the_author_from_issue_to_issue() {
         let text = format!("{TWO_AGENTS}\n[loop]\nfirst_implementor = \"alternate\"\n");

@@ -1737,6 +1737,7 @@ const LOOP_OPTIONS: &[Setting] = &[
     (true, "file_non_blocking", "File a non-blocking finding as a follow-up. Off, because not gating a merge is not the same as deserving somebody's triage queue."),
     (true, "max_followups", "Most follow-ups one run may record before it stops and says what it dropped. A backstop, not a target. `spar followup` is bounded by --limit instead."),
     (true, "max_split_parts", "Most parts `spar split` will make out of one issue or pull request. A backstop against a queue nobody asked for, not a target, and what it holds back is said out loud. A part is never itself split, so if one is still too big, `spar split <part>` is one command away."),
+    (true, "check", "A command spar runs in the worktree after an editing call committed and before the branch is pushed, as an argv list or a string split on whitespace. Unset runs nothing. \"I ran the tests\" is the one claim in a report that nothing else checks, and a broken push costs the reviewer's round on a tree that does not build. On failure the output goes back to the same agent once; a second failure ends the round with the worktree kept and nothing pushed."),
     (true, "keep_worktrees", "Keep worktrees after a run, for inspection."),
     (true, "min_number", "Ignore issues and pull requests numbered below this when spar picks for itself. 0 is no floor, and a number you name explicitly is always honoured."),
     (true, "parallel_triage", "Ask both agents to triage at once. They only read during triage, so there is nothing to serialise."),

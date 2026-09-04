@@ -2443,6 +2443,86 @@ exit 64
     );
 }
 
+/// A triage failure must not throw away the run's report.
+///
+/// `make_plan` failing was propagated out of `work_issues`, so `results` was
+/// dropped and `report()` never ran: no pull request urls, no approved or
+/// escalated list, no write summary. The pull requests named on the command
+/// line after the issues were never reached either, and they do not depend on
+/// triage at all.
+#[cfg(unix)]
+#[test]
+fn a_triage_failure_still_reports_and_still_reaches_the_named_pull_requests() {
+    let fx = repo("triage-failure-report");
+    let gh = r#"
+set -eu
+printf '%s\n' "$*" >> "$SPAR_FAKE_GH_LOG"
+case "$*" in
+  *"/issues/7"*) printf '%s\n' 'pr'; exit 0 ;;
+  *"/issues/42"*) printf '%s\n' 'issue'; exit 0 ;;
+esac
+if [ "$1" = issue ] && [ "$2" = view ]; then
+  printf '%s\n' '{"number":42,"title":"Retry on 429","body":"Honour Retry-After","labels":[],"state":"OPEN","url":"https://github.com/example/project/issues/42"}'
+  exit 0
+fi
+if [ "$1" = pr ] && [ "$2" = view ]; then
+  printf '%s\n' '{"number":7,"url":"https://github.com/example/project/pull/7","title":"PR 7","headRefName":"feature-7","baseRefName":"main","state":"OPEN","closingIssuesReferences":[],"isCrossRepository":false}'
+  exit 0
+fi
+if [ "$1" = pr ] && [ "$2" = list ]; then
+  printf '%s\n' '[]'
+  exit 0
+fi
+if [ "$1" = issue ] && [ "$2" = list ]; then
+  printf '%s\n' '[]'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 64
+"#;
+    // The agents answer nothing usable, so triage fails on its first wave.
+    let (config, path) = fake_commands(&fx, "not json", gh);
+    let screen = fx.dir.join("fake-bin").join("screen");
+    let command = serde_json::to_string(screen.to_str().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        format!("[agents.a]\ncommand = [{command}]\n\n[agents.b]\ncommand = [{command}]\n"),
+    )
+    .unwrap();
+    let calls = fx.dir.join("gh-calls.log");
+
+    let (ok, out, err) = spar_with_env(
+        &[
+            "run",
+            "42",
+            "7",
+            "--config",
+            config.to_str().unwrap(),
+            "--repo",
+            fx.work.to_str().unwrap(),
+        ],
+        &fx.dir,
+        &[
+            ("PATH", path.as_str()),
+            ("SPAR_FAKE_GH_LOG", calls.to_str().unwrap()),
+        ],
+    );
+
+    assert!(!ok, "a failed wave must not report success:\n{out}\n{err}");
+    assert!(
+        out.contains("triage failed for #42"),
+        "the report does not say what stopped:\n{out}"
+    );
+    assert!(
+        out.contains("========"),
+        "the report itself never printed:\n{out}"
+    );
+    assert!(
+        out.contains("#7"),
+        "the pull request named on the command line was never reached:\n{out}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn tracker_reread_failure_is_counted_before_nothing_is_scheduled() {

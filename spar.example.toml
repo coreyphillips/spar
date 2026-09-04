@@ -147,9 +147,11 @@ decompose_trackers = false   # read the checklist in a tracking issue as work:
                              # and `spar triage` prints the whole decomposition
                              # without writing any of it. spar checks a box and
                              # never unchecks one.
-max_tracker_children = 5     # most unchecked items from one tracker's
-                             # checklist one run will act on. A cap, not a
-                             # target. What it left is named out loud.
+max_tracker_children = 5     # most issues one run will file from one tracker's
+                             # checklist. A cap, not a target, and it counts
+                             # only new issues: an item that already links one
+                             # needs a tick or an adoption, never a filing, so
+                             # it is free. What the cap left is named out loud.
 followups         = "local"  # issues | local | none. Where a follow-up goes.
                              # local writes .spar/followups.md and leaves the
                              # tracker alone, which is the default because a

@@ -490,6 +490,10 @@ For each unchecked `- [ ]` item, in order:
 - It names none, but an issue already covers it: link it, file nothing.
 - Neither: file one, then link it.
 
+`max_tracker_children` caps the issues one run files from a checklist. An item
+that already links an issue costs nothing against it, since it needs a tick or
+an adoption rather than a filing.
+
 The number is written back beside the item, so the tracker body is the record.
 There is no state file to go stale, and you can correct a wrong link by editing
 one token in your own issue. An item whose issue is closed gets its box ticked,

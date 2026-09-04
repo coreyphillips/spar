@@ -848,6 +848,10 @@ fn work_issues(
     // the default, means a dependent waits for a person.
     let mut landed: BTreeSet<i64> = BTreeSet::new();
     let mut leftover: BTreeSet<i64> = BTreeSet::new();
+    // How many issues this run has actually implemented, which is what the
+    // alternating first implementor policy counts. Across waves, so a
+    // follow-up wave keeps swapping rather than restarting on the same agent.
+    let mut worked = 0usize;
     let mut queue: VecDeque<Wave> = VecDeque::from([Wave::first(first_wave)]);
     let mut plans_written = 0usize;
 
@@ -985,7 +989,8 @@ fn work_issues(
                 results.push(held);
                 continue;
             }
-            let run = review::run_issue(agents, cfg, repo, item, issue);
+            let run = review::run_nth_issue(agents, cfg, repo, item, issue, worked);
+            worked += 1;
             if run.status == Status::Merged {
                 landed.insert(item.issue);
             }
@@ -1200,12 +1205,13 @@ fn prepare(common: &Common, overrides: Option<Overrides>) -> Result<(Config, Rep
 
     log!("repo {} base {}", repo.root().display(), cfg.base_branch());
     log!(
-        "agents: {}",
+        "agents: {}, first {}",
         agents
             .iter()
             .map(|a| format!("{}={}", a.name(), a.spec.describe()))
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(", "),
+        cfg.first_implementor_policy()
     );
     Ok((cfg, repo, agents))
 }
@@ -2032,7 +2038,8 @@ fn cmd_doctor(config_path: Option<&Path>) -> Result<i32> {
     }
 
     println!(
-        "\n  settings: max_rounds={} auto_merge={} worktrees={} followups={} terse={}",
+        "\n  settings: first={} max_rounds={} auto_merge={} worktrees={} followups={} terse={}",
+        cfg.first_implementor_policy(),
         cfg.loop_cfg.max_rounds,
         cfg.loop_cfg.auto_merge,
         cfg.loop_cfg.worktrees,
@@ -2169,6 +2176,13 @@ fn report_with(
     }
     println!("{}", "=".repeat(60));
 
+    if cfg.alternate_first && results.len() > 1 {
+        println!(
+            "\nfirst implementor alternated, starting with {}. Who wrote each first draft is in \
+             .spar/state/implementors.json.",
+            cfg.first_implementor
+        );
+    }
     if !cfg.loop_cfg.auto_merge && results.iter().any(|r| r.status == Status::Approved) {
         println!("\nApproved PRs are waiting on you to merge.");
     }

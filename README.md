@@ -291,7 +291,12 @@ the log and holds nothing, since it may well be merged already. The plan is
 written to `plan.json`, and the preview names what each item waits on.
 
 **Per issue.** An isolated git worktree, so a failed issue cannot poison the
-next one's base. The first agent implements and opens a PR. Custody passes to
+next one's base. The first agent implements and opens a PR. With
+`first_implementor = "alternate"` that agent swaps from issue to issue, so both
+models write first drafts and both review them: roles alternate inside a pull
+request either way, and without this one model authors every one of them, blind
+spots and all. Who wrote each first draft is recorded in
+`.spar/state/implementors.json`, and `--first` still pins one agent for a run. Custody passes to
 the other, which reviews with full repo context rather than a bare diff. Each
 finding is labelled `blocking`, `non-blocking`, or `nit`.
 
@@ -1028,7 +1033,7 @@ effort = "ultra"
 [loop]
 max_rounds        = 3       # custody rounds, or review-only phases
 auto_merge        = false
-first_implementor = "claude"
+first_implementor = "claude"  # or "alternate"
 close_skipped     = true
 worktrees         = true
 

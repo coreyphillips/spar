@@ -3846,6 +3846,38 @@ impl Repo {
     }
 
     /// What `spar checkin` has already answered on one pull request or issue.
+    /// Who wrote the first draft of each issue, by number.
+    ///
+    /// Custody alternates within a pull request and the record of it lives in
+    /// that pull request's state. This is the other question, which nothing
+    /// answered: over a queue, which model authored what.
+    pub fn implementors_path(&self) -> PathBuf {
+        self.root
+            .join(STATE_DIR)
+            .join("state")
+            .join("implementors.json")
+    }
+
+    pub fn read_implementors(&self) -> BTreeMap<i64, String> {
+        std::fs::read_to_string(self.implementors_path())
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    /// Best effort: this is a record for a person, not something the loop reads
+    /// back, so a failure to write it is not a reason to stop.
+    pub fn remember_implementor(&self, issue: i64, agent: &str) {
+        let mut known = self.read_implementors();
+        known.insert(issue, agent.to_string());
+        if let Some(parent) = self.implementors_path().parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = write_json_atomic(&self.implementors_path(), &known) {
+            logdim!("could not record who implemented #{issue}: {e}");
+        }
+    }
+
     /// Where the issues triage disagreed about are remembered.
     ///
     /// One file rather than one per issue: it is read once per run, before any

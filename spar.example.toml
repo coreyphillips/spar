@@ -108,7 +108,12 @@ max_rounds        = 3        # in the custody loop, review rounds ONE invocation
 auto_merge        = false    # off on purpose: two models agreeing is not the
                              # same as being right, and neither carries the
                              # consequences of a bad merge
-first_implementor = "claude"
+first_implementor = "claude" # who writes the first draft. "alternate" swaps it
+                             # from issue to issue, so both models author and
+                             # both review first over a queue: a model's blind
+                             # spots as an author are systematic, and the ones
+                             # the pair shares go through every time. --first
+                             # still pins one agent for a run.
 base_branch       = "main"   # only a fallback; origin/HEAD wins when it exists
 worktrees         = true     # isolate each issue in its own git worktree
 keep_worktrees    = false    # keep them after a run, for inspection

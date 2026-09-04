@@ -651,8 +651,11 @@ pub struct Config {
     pub agents: Vec<AgentSpec>,
     pub loop_cfg: LoopCfg,
     pub style: Style,
-    /// Resolved: never empty, always one of the configured agents.
+    /// Resolved: never empty, always one of the configured agents. Under the
+    /// alternating policy this is who goes first on the first issue.
     pub first_implementor: String,
+    /// Whether the first implementor swaps from issue to issue.
+    pub alternate_first: bool,
     /// Where this config was read from, for error messages.
     pub source: Option<PathBuf>,
 }
@@ -705,6 +708,26 @@ impl Config {
     /// full ultra review of a three line delta is money on fire.
     pub fn effort_for_round(&self, spec: &AgentSpec, round: u32) -> Option<String> {
         self.effort_for(spec, Call::Review(round))
+    }
+
+    /// Who writes the first draft of the nth issue this run works.
+    ///
+    /// Fixed unless the policy is to alternate, in which case it swaps every
+    /// issue, so both models author and both models review first over a queue.
+    pub fn first_implementor_for(&self, nth: usize) -> String {
+        if !self.alternate_first || nth % 2 == 0 {
+            return self.first_implementor.clone();
+        }
+        self.other(&self.first_implementor)
+    }
+
+    /// What to print when somebody asks who goes first.
+    pub fn first_implementor_policy(&self) -> String {
+        if self.alternate_first {
+            format!("alternating, {} first", self.first_implementor)
+        } else {
+            self.first_implementor.clone()
+        }
     }
 
     pub fn base_branch(&self) -> &str {
@@ -1023,8 +1046,18 @@ pub fn parse(text: &str) -> Result<Config> {
         );
     }
 
+    // "alternate" is not an agent name, it is a policy: whoever is not the
+    // agent that wrote the last first draft. Roles alternate within a pull
+    // request and never between them, so over a queue of twenty issues one
+    // model writes every first draft and the other reviews every one of them.
+    // A model's blind spots as an author are systematic, and the ones the pair
+    // shares go through every time.
+    let alternate = loop_cfg
+        .first_implementor
+        .as_deref()
+        .is_some_and(|name| name.trim().eq_ignore_ascii_case("alternate"));
     let first = match &loop_cfg.first_implementor {
-        Some(name) if !name.trim().is_empty() => name.trim().to_string(),
+        Some(name) if !name.trim().is_empty() && !alternate => name.trim().to_string(),
         _ => agents[0].name.clone(),
     };
     if !agents.iter().any(|a| a.name == first) {
@@ -1043,6 +1076,7 @@ pub fn parse(text: &str) -> Result<Config> {
         loop_cfg,
         style,
         first_implementor: first,
+        alternate_first: alternate,
         source: None,
     })
 }
@@ -1277,6 +1311,37 @@ model = "gpt-5.6-sol"
             "[agents.a]\ncommand = [\"x\"]\noutput = \"jsonl\"\n[agents.b]\ncommand = [\"y\"]\n";
         let err = parse(text).unwrap_err().to_string();
         assert!(err.contains("message_path"), "{err}");
+    }
+
+    /// One agent wrote every first draft, so half the pair's diversity went
+    /// unused: a model's blind spots as an author are systematic, and the ones
+    /// the two share go through every time.
+    #[test]
+    fn alternating_swaps_the_author_from_issue_to_issue() {
+        let text = format!("{TWO_AGENTS}\n[loop]\nfirst_implementor = \"alternate\"\n");
+        let cfg = parse(&text).unwrap();
+
+        assert!(cfg.alternate_first);
+        assert_eq!(
+            "claude", cfg.first_implementor,
+            "declaration order still leads"
+        );
+        assert_eq!("claude", cfg.first_implementor_for(0));
+        assert_eq!("codex", cfg.first_implementor_for(1));
+        assert_eq!("claude", cfg.first_implementor_for(2));
+        assert!(cfg.first_implementor_policy().contains("alternating"));
+    }
+
+    /// Naming an agent still pins it, which is what --first does for a run.
+    #[test]
+    fn a_named_first_implementor_never_swaps() {
+        let text = format!("{TWO_AGENTS}\n[loop]\nfirst_implementor = \"codex\"\n");
+        let cfg = parse(&text).unwrap();
+        assert!(!cfg.alternate_first);
+        for nth in 0..4 {
+            assert_eq!("codex", cfg.first_implementor_for(nth));
+        }
+        assert_eq!("codex", cfg.first_implementor_policy());
     }
 
     #[test]

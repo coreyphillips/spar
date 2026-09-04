@@ -473,6 +473,21 @@ pub fn run_issue(
     item: &PlanItem,
     issue: &Issue,
 ) -> IssueRun {
+    run_nth_issue(agents, cfg, repo, item, issue, 0)
+}
+
+/// The same, told where in the plan this issue sits.
+///
+/// The position is what the alternating first implementor policy reads: it
+/// swaps every issue, so both models write first drafts and both review them.
+pub fn run_nth_issue(
+    agents: &[Agent],
+    cfg: &Config,
+    repo: &Repo,
+    item: &PlanItem,
+    issue: &Issue,
+    nth: usize,
+) -> IssueRun {
     // Continue an existing PR rather than implementing over the top of it.
     //
     // Without this, a second `spar run 42` deletes the local branch, rebuilds
@@ -575,6 +590,7 @@ pub fn run_issue(
         repo,
         item,
         issue,
+        nth,
         &mut ledger,
         &mut state,
         &work_dir,
@@ -599,17 +615,19 @@ fn implement_and_review(
     repo: &Repo,
     item: &PlanItem,
     issue: &Issue,
+    nth: usize,
     ledger: &mut Ledger,
     state: &mut IssueRun,
     work_dir: &Path,
     branch: &str,
 ) -> Result<()> {
     let number = item.issue;
-    let holder = cfg.first_implementor.clone();
+    let holder = cfg.first_implementor_for(nth);
     let implementor = agent::find(agents, &holder)?;
     let base = cfg.base_branch().to_string();
 
     log!("#{number}: {holder} implementing");
+    repo.remember_implementor(number, &holder);
     // Fixing triage alone would have been worse than fixing neither: an issue
     // correctly judged worth doing on its whole text, then built from the first
     // few thousand characters of it, raises confidence without raising

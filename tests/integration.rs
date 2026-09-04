@@ -1869,7 +1869,10 @@ esac
     assert_ne!(before, pushed);
     assert_eq!(pushed, saved.pr_head);
     assert_eq!("a", saved.next_actor);
-    assert!(saved.open_findings.is_empty());
+    // The commit is published, and the finding stays open: the call failed
+    // before reporting, so nothing claims this point was answered. A commit
+    // landing says one thing was done, not which.
+    assert_eq!(1, saved.open_findings.len());
 }
 
 #[cfg(unix)]

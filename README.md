@@ -6,7 +6,9 @@ converges. Neither agent reviews its own most recent edit.
 Roles are not fixed. Whoever holds the PR may implement, review, fix, or file
 follow-ups, and then hands custody to the other. A reviewer that finds a problem
 can either fix it directly and hand back for review of its own fix, or return
-notes for the author to address.
+notes for the author to address. A reviewer that fixes its own findings reports
+on each one, so a point it decided against stays open and reaches the author
+with its reason rather than being recorded as fixed.
 
 It also reviews without touching: `spar review <pr>` puts two independent
 reviewers on a pull request you cannot push to, including one from a fork, and

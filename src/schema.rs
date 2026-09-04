@@ -570,12 +570,59 @@ pub fn checkin_fix() -> Value {
     })
 }
 
+/// A reviewer's report on fixing its own findings.
+///
+/// Same shape as a response, minus the parts that only make sense from the
+/// author's side: a reviewer fixing its own point cannot refute it, and filing
+/// it as somebody else's issue is a decision for the round rather than for this
+/// call.
+pub fn own_fix() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "One sentence naming what changed, at most 200 characters. This becomes the commit subject, so write it as one."
+            },
+            "fixes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Copy your own finding title exactly, so the two can be matched up."
+                        },
+                        "file": {
+                            "type": "string",
+                            "description": "Copy the file from that finding exactly. Empty string if it had none."
+                        },
+                        "fixed": {
+                            "type": "boolean",
+                            "description": "True only if this point is answered by a change in the working tree. False if you left it, whatever the reason."
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "For a fix, what you changed and how it answers the point. For one you left, why, in a sentence the author will read: it stays open and goes to them."
+                        }
+                    },
+                    "required": ["title", "file", "fixed", "reason"]
+                }
+            }
+        },
+        "required": ["summary", "fixes"]
+    })
+}
+
 pub fn all() -> Vec<(&'static str, Value)> {
     vec![
         ("triage", triage()),
         ("implementation", implementation()),
         ("review", review()),
         ("response", response()),
+        ("own_fix", own_fix()),
         ("screen", screen()),
         ("checkin", checkin()),
         ("checkin_check", checkin_check()),

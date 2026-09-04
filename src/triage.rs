@@ -556,6 +556,7 @@ mod tests {
             title: format!("issue {n}"),
             body: Some("body".into()),
             state: "OPEN".into(),
+            state_reason: None,
             url: String::new(),
             labels: vec![],
         }

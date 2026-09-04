@@ -671,7 +671,10 @@ fn implement_and_review(
         work.summary = item.title.clone();
     }
 
-    repo.rewrite_commits_if_needed(work_dir, &base)?;
+    // Nothing on this branch predates spar: the worktree was created from
+    // `origin/<base>` in this invocation, and `refuse_issue_branch_rebuild`
+    // has already refused to build over a branch that carried commits.
+    repo.rewrite_commits_if_needed(work_dir, &base, None)?;
     repo.push(work_dir, branch)?;
 
     let pr = match repo.pr_for_branch(branch) {
@@ -1242,7 +1245,7 @@ fn review_loop(
         }
 
         if editor.is_some() {
-            repo.rewrite_commits_if_needed(&ctx.work_dir, &base)?;
+            repo.rewrite_commits_if_needed(&ctx.work_dir, &base, Some(&published_head))?;
             repo.push(&ctx.work_dir, &ctx.branch)?;
             published_head = checked_head(repo, &ctx.work_dir)?;
         }

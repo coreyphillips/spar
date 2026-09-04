@@ -905,7 +905,10 @@ repo should be considered required, not optional, if you turn it on.
 
 **Style rules models forget.** Prompting alone is unreliable over a long run.
 Every commit message, PR body, and comment is scrubbed deterministically and
-then re-verified. A leak is a hard error, not a warning.
+then re-verified. A leak is a hard error, not a warning. The scrub is bounded to
+the commits spar itself made: on a resumed pull request, or a check-in on
+somebody's branch, a message that was already there is reported and left alone,
+because rewriting it would change a published sha under the person who wrote it.
 
 **An issue read in part.** An agent handed half an issue judges and builds the
 half it saw, and reports it with the confidence of having read all of it.

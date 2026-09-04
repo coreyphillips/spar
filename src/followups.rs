@@ -23,7 +23,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::agent::Agent;
-use crate::config::{Config, Followups};
+use crate::config::{Call, Config, Followups};
 use crate::error::Result;
 use crate::model::{Finding, ScreenResponse, ScreenVerdict, Screened};
 use crate::repo::{Repo, FOLLOWUP_MARKER};
@@ -337,9 +337,9 @@ pub fn screen(
         );
     }
     let prompt = format!("{SCREEN_PROMPT}{}", rendered.text);
-    let effort = cfg.effort_for_round(&agent.spec, 1);
+    let effort = agent.effort(cfg, Call::Screen);
     let answer: ScreenResponse =
-        agent.ask_json(&prompt, &schema::screen(), repo.root(), effort.as_deref())?;
+        agent.ask_json(&prompt, &schema::screen(), repo.root(), &effort)?;
     Ok(answer.entries)
 }
 

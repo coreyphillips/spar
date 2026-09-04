@@ -1782,11 +1782,23 @@ fn settings_block(first_implementor: &str) -> String {
     out.push_str(&option_lines(LOOP_OPTIONS, &value));
     out.push_str(concat!(
         "\n[loop.effort_schedule]\n",
-        "# Values are whatever each agent's own CLI accepts, listed above, so\n",
-        "# these are examples rather than defaults. Left out, each agent uses\n",
-        "# the effort its own block asked for.\n",
-        "# round_1 = \"high\"   # the deep first review\n",
-        "# rest    = \"low\"    # later rounds and the closing pass\n\n",
+        "# One key per kind of call, so a value means what its name says. Values\n",
+        "# are whatever each agent's own CLI accepts, listed above, so these are\n",
+        "# examples rather than defaults. Left out, a call falls back to\n",
+        "# round_1 or rest, and then to the effort the agent's own block asked\n",
+        "# for. Where the two CLIs do not share a vocabulary, put the schedule\n",
+        "# under [agents.NAME.effort_schedule] instead, with the same keys.\n",
+        "# triage      = \"low\"    # both agents, over the whole queue, per wave\n",
+        "# implement   = \"high\"   # writing the first draft\n",
+        "# review_1    = \"high\"   # the deep first review\n",
+        "# review_rest = \"low\"    # later rounds, which see a small delta\n",
+        "# respond     = \"high\"   # the author answering a review\n",
+        "# close       = \"low\"    # the closing merge safety pass\n",
+        "# screen      = \"low\"    # the follow-up screen, one call for the queue\n",
+        "# checkin     = \"high\"   # judging comments other people left\n",
+        "# split       = \"high\"   # proposing and checking a split\n",
+        "# round_1     = \"high\"   # read by any call above with no key set\n",
+        "# rest        = \"low\"    # the same, for later rounds and the close\n\n",
     ));
     out.push_str("[style]\n");
     out.push_str(&option_lines(STYLE_OPTIONS, &value));
@@ -2015,6 +2027,10 @@ fn cmd_doctor(config_path: Option<&Path>) -> Result<i32> {
         }
     }
 
+    for line in unknown_effort_values(&cfg) {
+        println!("\n  WARNING  {line}");
+    }
+
     println!(
         "\n  settings: max_rounds={} auto_merge={} worktrees={} followups={} terse={}",
         cfg.loop_cfg.max_rounds,
@@ -2055,6 +2071,47 @@ fn cmd_doctor(config_path: Option<&Path>) -> Result<i32> {
         }
     );
     Ok(if ok { 0 } else { 1 })
+}
+
+/// Scheduled effort values the agent that would receive them is not known to
+/// accept.
+///
+/// A warning rather than a refusal, for the reason the hints themselves carry:
+/// a CLI's options drift, and a stale allow list that refused a value which
+/// actually works would be worse than no hint at all. But `round_1 = "ultra"`
+/// against a claude agent is a call that fails at the CLI, and nothing said so
+/// until it ran.
+fn unknown_effort_values(cfg: &config::Config) -> Vec<String> {
+    let mut out = Vec::new();
+    for spec in &cfg.agents {
+        if spec.efforts.is_empty() {
+            continue;
+        }
+        let mut said: Vec<String> = Vec::new();
+        for call in config::Call::every() {
+            let Some(value) = cfg.effort_for(spec, call) else {
+                continue;
+            };
+            let known = spec
+                .efforts
+                .iter()
+                .any(|hint| hint.eq_ignore_ascii_case(value.trim()));
+            if known || said.contains(&value) {
+                continue;
+            }
+            said.push(value.clone());
+            out.push(format!(
+                "{} is asked for effort \"{value}\" on the {} call, which is not one it is known \
+                 to accept ({}). Put this agent's values under \
+                 [agents.{}.effort_schedule].",
+                spec.name,
+                call.key(),
+                spec.efforts.join(" | "),
+                spec.name
+            ));
+        }
+    }
+    out
 }
 
 fn first_line(text: &str) -> String {
@@ -2258,6 +2315,41 @@ mod tests {
     /// A disagreement is the one triage outcome that needs a person, and it
     /// reached them least reliably: a log line `--quiet` suppresses, an entry
     /// in plan.json, and nothing in the report at all.
+    /// `round_1 = "ultra"` against a claude agent is a call that fails at the
+    /// CLI, and nothing said so until it ran.
+    #[test]
+    fn doctor_says_when_a_scheduled_effort_is_not_one_the_agent_accepts() {
+        let text = "\
+[agents.claude]
+preset = \"claude\"
+
+[agents.codex]
+preset = \"codex\"
+
+[loop.effort_schedule]
+review_1 = \"ultra\"
+";
+        let cfg = config::parse(text).expect("parses");
+        let said = unknown_effort_values(&cfg);
+        assert_eq!(1, said.len(), "{said:?}");
+        assert!(said[0].starts_with("claude"), "{}", said[0]);
+        assert!(said[0].contains("ultra"), "{}", said[0]);
+        assert!(said[0].contains("review_1"), "{}", said[0]);
+        assert!(
+            said[0].contains("[agents.claude.effort_schedule]"),
+            "it has to say where to put the right value: {}",
+            said[0]
+        );
+
+        // With the value in each agent's own words, nothing is said.
+        let quiet = text.replace(
+            "[loop.effort_schedule]\nreview_1 = \"ultra\"\n",
+            "[agents.claude.effort_schedule]\nreview_1 = \"xhigh\"\n\n\
+             [agents.codex.effort_schedule]\nreview_1 = \"ultra\"\n",
+        );
+        assert!(unknown_effort_values(&config::parse(&quiet).expect("parses")).is_empty());
+    }
+
     #[test]
     fn a_contested_issue_reads_as_both_positions_with_their_reasons() {
         let mut positions_map = std::collections::BTreeMap::new();

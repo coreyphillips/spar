@@ -233,9 +233,29 @@ max_triage_chars  = 200000   # most every issue body TOGETHER may add to one
                              # so judging one on part of what it says is worse
                              # than not having reached it yet.
 
+# One key per kind of call, so a value means what its name says. A call with no
+# key set falls back to round_1 or rest, which is what the schedule used to be,
+# and then to the effort the agent's own block asked for.
+#
+# Values are each CLI's own vocabulary: `ultra` is not a value the claude preset
+# accepts, and `max` means different things to each. Where the two agents do not
+# share a word, put the schedule under [agents.NAME.effort_schedule] instead,
+# with exactly these keys. `spar doctor` says when a value is not one the agent
+# that would receive it is known to accept.
 [loop.effort_schedule]
-round_1 = "ultra"            # the deep first review
-rest    = "high"             # later rounds and the closing pass
+triage      = "low"          # both agents, over the whole queue, once per wave.
+                             # The most expensive call in a run, and the one the
+                             # two key schedule never mentioned.
+implement   = "high"         # writing the first draft
+review_1    = "ultra"        # the deep first review
+review_rest = "high"         # later rounds, which see a small delta
+respond     = "high"         # the author answering a review
+close       = "high"         # the closing merge safety pass
+screen      = "low"          # the follow-up screen, one call for the queue
+checkin     = "high"         # judging the comments other people left
+split       = "high"         # proposing and checking a split
+# round_1   = "ultra"        # read by any call above with no key of its own
+# rest      = "high"         # the same, for later rounds and the close
 
 [style]
 ban_em_dash        = true

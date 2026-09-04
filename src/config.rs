@@ -95,6 +95,13 @@ pub struct AgentSpec {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
+    /// This agent's own schedule, which wins over the shared one.
+    ///
+    /// Effort words are each CLI's own vocabulary, so one string for both
+    /// agents is a value that has to be legal in two languages at once. This is
+    /// where a schedule says `ultra` to codex and `high` to claude.
+    #[serde(default)]
+    pub effort_schedule: EffortSchedule,
     #[serde(default = "default_output")]
     pub output: OutputMode,
     /// For `jsonl`: the event fields that identify the agent's own message.
@@ -297,14 +304,127 @@ impl Trust {
     }
 }
 
+/// Which call is about to be made.
+///
+/// The schedule used to be two keys, `round_1` and `rest`, chosen by a round
+/// number that most of these calls do not have. Triage of the whole queue, the
+/// implement call, the follow-up screen, the check-in judge and the split
+/// proposer were all "round 1", so `round_1 = "ultra"` put every one of them at
+/// ultra, which is neither what the name says nor what anybody wants to pay
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Call {
+    /// Both agents, over the whole queue, once per wave.
+    Triage,
+    /// Writing the first draft.
+    Implement,
+    /// A review round. The first is the deep one.
+    Review(u32),
+    /// The author answering a review.
+    Respond(u32),
+    /// The closing merge-safety pass.
+    Close,
+    /// The follow-up screen, one call for the whole queue.
+    Screen,
+    /// A check-in call: the judge is round 1, the checker round 2.
+    Checkin(u32),
+    /// A split call: the proposer is round 1, the checker round 2.
+    Split(u32),
+}
+
+impl Call {
+    /// The schedule key this call reads.
+    pub fn key(self) -> &'static str {
+        match self {
+            Call::Triage => "triage",
+            Call::Implement => "implement",
+            Call::Review(round) if round <= 1 => "review_1",
+            Call::Review(_) => "review_rest",
+            Call::Respond(_) => "respond",
+            Call::Close => "close",
+            Call::Screen => "screen",
+            Call::Checkin(_) => "checkin",
+            Call::Split(_) => "split",
+        }
+    }
+
+    /// What the two key schedule would have used, so a config written before
+    /// the keys existed behaves exactly as it did.
+    fn legacy_round(self) -> u32 {
+        match self {
+            Call::Triage | Call::Implement | Call::Screen => 1,
+            Call::Review(round) | Call::Respond(round) => round,
+            Call::Checkin(round) | Call::Split(round) => round,
+            Call::Close => 2,
+        }
+    }
+
+    /// Every kind, for `doctor` to check a configuration against.
+    pub fn every() -> [Call; 9] {
+        [
+            Call::Triage,
+            Call::Implement,
+            Call::Review(1),
+            Call::Review(2),
+            Call::Respond(1),
+            Call::Close,
+            Call::Screen,
+            Call::Checkin(1),
+            Call::Split(1),
+        ]
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffortSchedule {
     /// The deep first review.
+    ///
+    /// Kept, and still read by every call that has no key of its own, so an
+    /// existing config keeps working exactly as it did.
     pub round_1: Option<String>,
     /// Every round after the first, and the closing pass. Both are asked a
     /// narrower question than the first review, so neither buys its depth again.
     pub rest: Option<String>,
+    /// Both agents, over the whole queue. The most expensive call in a run, and
+    /// the one the two key schedule never mentioned.
+    pub triage: Option<String>,
+    pub implement: Option<String>,
+    pub review_1: Option<String>,
+    pub review_rest: Option<String>,
+    pub respond: Option<String>,
+    pub close: Option<String>,
+    pub screen: Option<String>,
+    pub checkin: Option<String>,
+    pub split: Option<String>,
+}
+
+impl EffortSchedule {
+    /// What this schedule says about one call, if anything.
+    pub fn get(&self, call: Call) -> Option<String> {
+        let value = match call.key() {
+            "triage" => &self.triage,
+            "implement" => &self.implement,
+            "review_1" => &self.review_1,
+            "review_rest" => &self.review_rest,
+            "respond" => &self.respond,
+            "close" => &self.close,
+            "screen" => &self.screen,
+            "checkin" => &self.checkin,
+            _ => &self.split,
+        };
+        value.clone().filter(|s| !s.trim().is_empty())
+    }
+
+    /// What the old two key schedule would have said.
+    fn legacy(&self, call: Call) -> Option<String> {
+        let value = if call.legacy_round() <= 1 {
+            &self.round_1
+        } else {
+            &self.rest
+        };
+        value.clone().filter(|s| !s.trim().is_empty())
+    }
 }
 
 /// Every field takes its value from `LoopCfg::default()` when a config does not
@@ -566,17 +686,25 @@ impl Config {
         }
     }
 
+    /// What effort one agent is asked for on one call.
+    ///
+    /// Four places, most specific first: this agent's own schedule, the shared
+    /// schedule, the old `round_1`/`rest` pair, and the agent's plain `effort`.
+    /// The per agent layer is what makes a schedule expressible at all when the
+    /// two CLIs do not share a vocabulary: `ultra` is not a value the claude
+    /// preset accepts, and `max` means different things to each.
+    pub fn effort_for(&self, spec: &AgentSpec, call: Call) -> Option<String> {
+        spec.effort_schedule
+            .get(call)
+            .or_else(|| self.loop_cfg.effort_schedule.get(call))
+            .or_else(|| self.loop_cfg.effort_schedule.legacy(call))
+            .or_else(|| spec.effort.clone())
+    }
+
     /// Round 1 gets the deep pass; later rounds only see a small delta, and a
     /// full ultra review of a three line delta is money on fire.
     pub fn effort_for_round(&self, spec: &AgentSpec, round: u32) -> Option<String> {
-        let scheduled = if round <= 1 {
-            self.loop_cfg.effort_schedule.round_1.clone()
-        } else {
-            self.loop_cfg.effort_schedule.rest.clone()
-        };
-        scheduled
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| spec.effort.clone())
+        self.effort_for(spec, Call::Review(round))
     }
 
     pub fn base_branch(&self) -> &str {
@@ -792,6 +920,15 @@ pub fn known_options() -> Vec<OptionInfo> {
         &EffortSchedule {
             round_1: Some("high".into()),
             rest: Some("low".into()),
+            triage: Some("low".into()),
+            implement: Some("high".into()),
+            review_1: Some("high".into()),
+            review_rest: Some("low".into()),
+            respond: Some("high".into()),
+            close: Some("low".into()),
+            screen: Some("low".into()),
+            checkin: Some("high".into()),
+            split: Some("high".into()),
         },
     ));
     out
@@ -1186,6 +1323,52 @@ model = "gpt-5.6-sol"
         assert_eq!(Some("high".into()), cfg.effort_for_round(spec, 9));
     }
 
+    /// The schedule is one string handed to whichever agent holds the round,
+    /// and the two CLIs do not share a vocabulary.
+    ///
+    /// The README's own example pairs round_1 = "ultra" with a claude agent at
+    /// effort = "high", and ultra is not a value the claude preset accepts, so
+    /// the first review failed at the CLI whenever claude reviewed first.
+    #[test]
+    fn an_agent_can_carry_its_own_schedule_in_its_own_words() {
+        let text = format!(
+            "{TWO_AGENTS}\n[agents.claude.effort_schedule]\nreview_1 = \"xhigh\"\n\n\
+             [loop.effort_schedule]\nreview_1 = \"ultra\"\n"
+        );
+        let cfg = parse(&text).unwrap();
+        assert_eq!(
+            Some("xhigh".into()),
+            cfg.effort_for(cfg.spec("claude").unwrap(), Call::Review(1)),
+            "the agent's own schedule has to win"
+        );
+        assert_eq!(
+            Some("ultra".into()),
+            cfg.effort_for(cfg.spec("codex").unwrap(), Call::Review(1))
+        );
+    }
+
+    /// Every call used to read round_1 or rest by a round number most of them
+    /// do not have, so round_1 = "ultra" put triage over the whole queue, the
+    /// implement call and the follow-up screen at ultra too.
+    #[test]
+    fn each_kind_of_call_reads_its_own_key_and_falls_back_to_the_old_pair() {
+        let text = format!(
+            "{TWO_AGENTS}\n[loop.effort_schedule]\nround_1 = \"ultra\"\nrest = \"low\"\n\
+             triage = \"minimal\"\n"
+        );
+        let cfg = parse(&text).unwrap();
+        let spec = cfg.spec("claude").unwrap();
+
+        assert_eq!(Some("minimal".into()), cfg.effort_for(spec, Call::Triage));
+        // No key of its own: exactly what the two key schedule did.
+        for call in [Call::Implement, Call::Review(1), Call::Screen] {
+            assert_eq!(Some("ultra".into()), cfg.effort_for(spec, call), "{call:?}");
+        }
+        for call in [Call::Review(2), Call::Close, Call::Respond(3)] {
+            assert_eq!(Some("low".into()), cfg.effort_for(spec, call), "{call:?}");
+        }
+    }
+
     #[test]
     fn effort_falls_back_to_the_agents_own_setting() {
         let text = format!("{TWO_AGENTS}effort = \"low\"\n");
@@ -1201,6 +1384,7 @@ model = "gpt-5.6-sol"
             command: vec![CommandPart::One("x".into())],
             model: None,
             effort: None,
+            effort_schedule: EffortSchedule::default(),
             output: OutputMode::Text,
             message_match: BTreeMap::new(),
             message_path: None,

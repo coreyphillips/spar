@@ -25,7 +25,7 @@
 use std::path::Path;
 
 use crate::agent::Agent;
-use crate::config::Config;
+use crate::config::{Call, Config};
 use crate::error::{ErrorKind, Result};
 use crate::jsonx::exact_finding_key as finding_key;
 use crate::model::{
@@ -214,14 +214,8 @@ fn run_phases(
         .replace("{context}", &context);
 
     let reviews = concurrently(agents, |a| {
-        let effort = cfg.effort_for_round(&a.spec, 1);
-        a.review::<Review>(
-            &base_ref,
-            &prompt,
-            &schema::review(),
-            work_dir,
-            effort.as_deref(),
-        )
+        let effort = a.effort(cfg, Call::Review(1));
+        a.review::<Review>(&base_ref, &prompt, &schema::review(), work_dir, &effort)
     });
 
     let mut by_agent: Vec<(String, Vec<Finding>)> = Vec::new();
@@ -459,7 +453,7 @@ fn adjudicate(
             &prompt,
             &schema::adjudication(),
             work_dir,
-            cfg.effort_for_round(&adjudicator.spec, round).as_deref(),
+            &adjudicator.effort(cfg, Call::Review(round)),
         )
     });
 
@@ -552,7 +546,7 @@ fn rebut(
             &prompt,
             &schema::adjudication(),
             work_dir,
-            cfg.effort_for_round(&author.spec, round).as_deref(),
+            &author.effort(cfg, Call::Review(round)),
         )
     });
 

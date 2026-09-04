@@ -4990,6 +4990,15 @@ fn every_config_option_is_documented_in_the_example() {
     expected.extend(keys_of(&spar::config::EffortSchedule {
         round_1: Some("high".into()),
         rest: Some("low".into()),
+        triage: Some("low".into()),
+        implement: Some("high".into()),
+        review_1: Some("high".into()),
+        review_rest: Some("low".into()),
+        respond: Some("high".into()),
+        close: Some("low".into()),
+        screen: Some("low".into()),
+        checkin: Some("high".into()),
+        split: Some("high".into()),
     }));
     // Per-agent options, which a preset normally supplies but a user may set.
     expected.extend(

@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use crate::agent::Agent;
-use crate::config::Config;
+use crate::config::{Call, Config};
 use crate::error::Result;
 use crate::model::{
     Complexity, ContestedItem, Issue, Plan, PlanItem, Risk, SkippedItem, TriageResponse,
@@ -177,8 +177,8 @@ fn ask_one(
     prompt: &str,
     schema: &serde_json::Value,
 ) -> Answer {
-    let effort = cfg.effort_for_round(&agent.spec, 1);
-    let out = agent.ask_json::<TriageResponse>(prompt, schema, repo.root(), effort.as_deref());
+    let effort = agent.effort(cfg, Call::Triage);
+    let out = agent.ask_json::<TriageResponse>(prompt, schema, repo.root(), &effort);
     (agent.name().to_string(), out)
 }
 

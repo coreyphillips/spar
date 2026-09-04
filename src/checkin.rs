@@ -16,7 +16,7 @@ use std::path::Path;
 
 use crate::agent::{self, Agent};
 use crate::comments::{self, Gathered, Pending};
-use crate::config::{Config, PrComments, Trust};
+use crate::config::{Call, Config, PrComments, Trust};
 use crate::error::Result;
 use crate::model::{
     Answered, Ask, CheckDoc, CheckinDoc, CommentCheck, CommentVerdict, Dispute, FixReport,
@@ -855,7 +855,7 @@ fn act(
             .replace("{comments}", &block),
         &schema::checkin(),
         work_dir,
-        cfg.effort_for_round(&judge.spec, 1).as_deref(),
+        &judge.effort(cfg, Call::Checkin(1)),
     )?;
 
     log!("#{number}: {checker_name} checking those calls");
@@ -875,7 +875,7 @@ fn act(
             ),
         &schema::checkin_check(),
         work_dir,
-        cfg.effort_for_round(&checker.spec, 2).as_deref(),
+        &checker.effort(cfg, Call::Checkin(2)),
     ) {
         Ok(doc) => doc.checks,
         Err(e) if e.kind() == crate::error::ErrorKind::UncertainWrite => return Err(e),
@@ -1078,7 +1078,7 @@ fn implement(
             .replace("{comments}", &listed(&Fence::new(), &wanted)),
         &schema::checkin_fix(),
         work_dir,
-        cfg.effort_for_round(&implementor.spec, 1).as_deref(),
+        &implementor.effort(cfg, Call::Checkin(1)),
     ) {
         Ok(report) => report,
         Err(call) if call.kind() == crate::error::ErrorKind::UncertainWrite => return Err(call),

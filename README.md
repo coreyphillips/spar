@@ -1033,8 +1033,9 @@ close_skipped     = true
 worktrees         = true
 
 [loop.effort_schedule]
-round_1 = "ultra"           # the deep pass
-rest    = "high"            # later rounds and the closing pass
+triage      = "low"         # both agents, over the whole queue
+review_1    = "ultra"       # the deep pass
+review_rest = "high"        # later rounds and the closing pass
 
 [style]
 ban_em_dash        = true
@@ -1254,8 +1255,20 @@ abandoned.
 
 Every review round is a repo-aware pass at the configured effort. A full ultra
 review of a three-line round-3 delta is money on fire, which is what
-`effort_schedule` exists to prevent. Both agents bill against their respective
-subscriptions.
+`effort_schedule` exists to prevent. It has one key per kind of call, so a value
+means what its name says: `triage`, `implement`, `review_1`, `review_rest`,
+`respond`, `close`, `screen`, `checkin`, `split`. A call with no key set falls
+back to `round_1` or `rest`, which is what the schedule used to be, and then to
+the agent's own `effort`.
+
+Effort words are each CLI's own vocabulary, so a schedule that has to say
+different things to the two agents goes under `[agents.NAME.effort_schedule]`
+with the same keys, and that wins over the shared one. A fallback resolves its
+own value for the same call rather than inheriting one word from the agent that
+just failed. `spar doctor` says when a scheduled value is not one the agent that
+would receive it is known to accept.
+
+Both agents bill against their respective subscriptions.
 
 Rough shape per issue: two calls for triage, one to implement, up to two per
 review round, plus at most one closing review call when the run spends its

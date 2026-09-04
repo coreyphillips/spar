@@ -27,7 +27,7 @@ use crate::jsonx::{exact_finding_key as finding_key, finding_file, stable_findin
 use crate::model::{
     Action, Disposition, Dispute, Finding, Followup, Implementation, Issue, IssueRun, Ledger,
     LedgerEntry, NextAction, OwnFix, OwnFixDoc, PersistedState, PlanItem, PrView, ResponseDoc,
-    Review, Settled, Severity, SkippedItem, Status, STATE_VERSION,
+    Review, Settled, Severity, SkippedItem, Status, Verdict, STATE_VERSION,
 };
 use crate::repo::Repo;
 use crate::style::{self, Style};
@@ -1061,6 +1061,9 @@ fn review_loop(
         }
 
         let blocking = blocking_findings(&review.findings);
+        if let Some(said) = verdict_disagreement(&review, blocking.len()) {
+            logwarn!("{}: {holder} {said}", ctx.label);
+        }
         update_open_findings(&mut open_findings, &blocking, !review_wrote);
 
         if repo.style.pr_comments == PrComments::Rounds {
@@ -1531,6 +1534,9 @@ fn close_out(
     file_nonblocking(repo, &pass.findings, ctx.subject, state, cfg);
 
     let blocking = blocking_findings(&pass.findings);
+    if let Some(said) = verdict_disagreement(&pass, blocking.len()) {
+        logwarn!("{}: the closing pass {said}", ctx.label);
+    }
     remove_findings(&mut state.noted, &blocking);
     update_open_findings(open_findings, &blocking, true);
 
@@ -2033,6 +2039,28 @@ fn normalise_ledger_keys(ledger: &mut Ledger) {
 }
 
 /// Blocking findings, once each, in review order.
+/// Where a review's own two answers contradict each other, in words.
+///
+/// `verdict` is required by the schema and decides nothing: every path here
+/// reads `next_action` and the findings' severities. Keeping it and checking it
+/// is worth more than dropping it, because the disagreement is a signal about
+/// the answer: a review that says approve while raising a blocker has not
+/// decided what it thinks, and the reader of the pull request should know that
+/// the findings were what counted.
+pub(crate) fn verdict_disagreement(review: &Review, blocking: usize) -> Option<String> {
+    match (review.verdict, blocking, review.next_action) {
+        (Verdict::Approve, n, _) if n > 0 => Some(format!(
+            "the review says approve and raises {n} blocking finding(s); the findings decide"
+        )),
+        (Verdict::ChangesRequested, 0, NextAction::Merge) => Some(
+            "the review says changes_requested, raises nothing blocking, and asks to merge; the \
+             findings decide"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
 fn blocking_findings(findings: &[Finding]) -> Vec<Finding> {
     let mut kept = Vec::new();
     for finding in findings.iter().filter(|finding| finding.blocks()) {
@@ -4042,6 +4070,52 @@ mod tests {
         // And the guard can now count it, which it could not before.
         assert!(!check_relitigation(&mut ledger, &blocking, &mut state));
         assert!(check_relitigation(&mut ledger, &blocking, &mut state));
+    }
+
+    /// `verdict` is required by the schema and decides nothing, so a review can
+    /// contradict itself and nothing notices.
+    ///
+    /// The schema module says the fields are "what make convergence machine
+    /// checkable", so a field that checks nothing is noise in the one place
+    /// that is meant to be exact. It is kept and checked rather than dropped:
+    /// the contradiction says something about the answer, and the reader should
+    /// know the findings were what counted.
+    #[test]
+    fn a_review_that_contradicts_itself_says_so_and_the_findings_win() {
+        let blocker = finding("blocking", "Retry loop spins", "spins", "src/net.rs", true);
+        let approve_with_blocker = Review {
+            verdict: Verdict::Approve,
+            next_action: NextAction::HandBack,
+            summary: "one blocker".into(),
+            findings: vec![blocker],
+        };
+        let said = verdict_disagreement(&approve_with_blocker, 1).expect("noticed");
+        assert!(said.contains("approve"), "{said}");
+        assert!(said.contains("findings decide"), "{said}");
+
+        let changes_but_merge = Review {
+            verdict: Verdict::ChangesRequested,
+            next_action: NextAction::Merge,
+            summary: "nothing blocking".into(),
+            findings: vec![],
+        };
+        assert!(verdict_disagreement(&changes_but_merge, 0).is_some());
+
+        // The two ordinary shapes say nothing.
+        let clean = Review {
+            verdict: Verdict::Approve,
+            next_action: NextAction::Merge,
+            summary: "good".into(),
+            findings: vec![],
+        };
+        assert!(verdict_disagreement(&clean, 0).is_none());
+        let blocked = Review {
+            verdict: Verdict::ChangesRequested,
+            next_action: NextAction::HandBack,
+            summary: "one blocker".into(),
+            findings: vec![],
+        };
+        assert!(verdict_disagreement(&blocked, 1).is_none());
     }
 
     /// A commit landing says one point was answered, not that all of them were.

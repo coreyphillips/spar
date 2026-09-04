@@ -214,7 +214,7 @@ fn run_phases(
         .replace("{context}", &context);
 
     let reviews = concurrently(agents, |a| {
-        let effort = a.effort(cfg, Call::Review(1));
+        let effort = a.effort(cfg, Call::Review(1)).about(pr.number);
         a.review::<Review>(&base_ref, &prompt, &schema::review(), work_dir, &effort)
     });
 

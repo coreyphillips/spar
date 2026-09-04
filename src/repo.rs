@@ -3846,6 +3846,31 @@ impl Repo {
     }
 
     /// What `spar checkin` has already answered on one pull request or issue.
+    /// Where what a run spent is kept.
+    pub fn spend_path(&self) -> PathBuf {
+        self.root.join(STATE_DIR).join("state").join("spend.json")
+    }
+
+    /// Append this run's calls to the record.
+    ///
+    /// Appended rather than replaced, so a resumed pull request adds to the
+    /// count of what it has cost so far rather than starting it again, and so
+    /// anybody charting this has a file to chart.
+    pub fn record_spend(&self, calls: &[crate::spend::Spent]) -> Result<()> {
+        if calls.is_empty() {
+            return Ok(());
+        }
+        let mut all: Vec<crate::spend::Spent> = std::fs::read_to_string(self.spend_path())
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        all.extend(calls.iter().cloned());
+        if let Some(parent) = self.spend_path().parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        write_json_atomic(&self.spend_path(), &all)
+    }
+
     /// Who wrote the first draft of each issue, by number.
     ///
     /// Custody alternates within a pull request and the record of it lives in

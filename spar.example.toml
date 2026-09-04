@@ -225,6 +225,18 @@ checkin_resolve   = true     # mark a review thread resolved when spar made the
                              # change it asked for. A thread spar disagreed
                              # with is left open whatever this says: the person
                              # who raised it has not had their say yet.
+check             = []       # a command spar runs in the worktree after an
+                             # editing call committed and before the branch is
+                             # pushed: `check = "cargo test"`, or an argv list
+                             # for anything needing a space inside an argument.
+                             # Empty runs nothing. "I ran the tests" is the one
+                             # claim in a report nothing else checks, and a
+                             # broken push spends the reviewer's whole round on
+                             # a tree that does not build. On failure the output
+                             # goes back to the same agent once; a second
+                             # failure ends the round with the worktree kept and
+                             # nothing pushed. This is not waiting on CI, which
+                             # is expensive and somebody else's machine.
 max_checkin_comments = 20    # most unanswered comments spar answers on one
                              # pull request in a run. A backstop against a long
                              # argument being read back to somebody, not a

@@ -224,6 +224,143 @@ person to weigh, exactly as it would have been if you had not been asked.
 Optional:
 ";
 
+const CHECK_PROMPT: &str = "\
+The branch does not pass. spar ran `{command}` in this worktree after your
+change and it failed. This is the harness running it, not a claim by anybody.
+
+{output}
+
+Fix what it reports and leave the changes uncommitted, as before. If the failure
+is not caused by your change and the branch was already failing, say so in the
+summary and change nothing: the run stops either way, and saying so is worth
+more than a guess at somebody else's bug.
+
+Do not commit, push, or merge.";
+
+/// How long one check may run.
+///
+/// Long, because a real test suite is long, and a check that times out is
+/// reported as a failure like any other. Shorter than an agent call, because
+/// nothing here is waiting on a model.
+const CHECK_TIMEOUT_SECS: u64 = 1800;
+
+/// What a check run left behind.
+pub struct Checked {
+    pub command: String,
+    pub output: String,
+}
+
+/// Run the configured check in the worktree, once, and say what happened.
+fn run_check(cfg: &Config, work_dir: &Path) -> Option<std::result::Result<String, Checked>> {
+    let argv = cfg.loop_cfg.check.argv();
+    if argv.is_empty() {
+        return None;
+    }
+    let command = cfg.loop_cfg.check.describe();
+    logdim!("running the check: {command}");
+    let out = crate::proc::exec(
+        &argv,
+        &crate::proc::ExecOpts::new()
+            .cwd(work_dir)
+            .check(false)
+            .timeout_secs(CHECK_TIMEOUT_SECS)
+            .stop_descendants(true),
+    );
+    Some(match out {
+        Ok(out) if out.ok() => Ok(command),
+        Ok(out) => {
+            let text = format!("{}\n{}", out.stdout.trim_end(), out.stderr.trim_end());
+            Err(Checked {
+                command,
+                output: style::clip(text.trim(), 4000),
+            })
+        }
+        // A check that could not be run at all is a failure of the check rather
+        // than of the branch, and saying which is the whole of the message.
+        Err(e) => Err(Checked {
+            command,
+            output: format!("the check could not be run: {e}"),
+        }),
+    })
+}
+
+/// Run the check, and give the agent one go at what it reports.
+///
+/// One retry, the same shape as the JSON retry: a failing suite is usually a
+/// small thing the editing call did not run, and asking twice about the same
+/// failure is how a round is spent on nothing. A second failure ends the round
+/// with the output in the report and the worktree kept, which is what an
+/// uncommitted edit already does.
+#[allow(clippy::too_many_arguments)]
+fn check_before_push(
+    cfg: &Config,
+    repo: &Repo,
+    agent: &Agent,
+    work_dir: &Path,
+    label: &str,
+    call: crate::config::Call,
+) -> Result<Option<String>> {
+    let Some(first) = run_check(cfg, work_dir) else {
+        return Ok(None);
+    };
+    let failed = match first {
+        Ok(command) => {
+            log!("{label}: `{command}` passed");
+            return Ok(Some(command));
+        }
+        Err(failed) => failed,
+    };
+    logwarn!(
+        "{label}: `{}` failed, handing it back to {} once. Nothing is pushed until it passes.",
+        failed.command,
+        agent.name()
+    );
+
+    let prompt = CHECK_PROMPT
+        .replace("{command}", &failed.command)
+        .replace("{output}", &failed.output);
+    let baseline = repo.worktree_baseline(work_dir)?;
+    let before = repo.head_oid_checked(work_dir)?;
+    let answer = agent.edit(&prompt, work_dir, &agent.effort(cfg, call));
+    match answer {
+        Ok(summary) => {
+            commit_accepted_changes(
+                cfg,
+                repo,
+                work_dir,
+                &baseline,
+                &summary,
+                "Make the branch pass its check",
+            )?;
+        }
+        Err(error) => {
+            let error = defer_clean_edit_error(repo, work_dir, &baseline, error)?;
+            bail!(
+                "{label}: `{}` failed and the fix call failed too, so nothing was pushed.\n{}\n\n{error}",
+                failed.command,
+                failed.output
+            );
+        }
+    }
+    let moved = repo.head_oid_checked(work_dir)? != before;
+    match run_check(cfg, work_dir) {
+        Some(Ok(command)) => {
+            log!("{label}: `{command}` passed after one fix");
+            Ok(Some(command))
+        }
+        Some(Err(again)) => {
+            bail!(
+            "{label}: `{}` still fails after one fix{}, so nothing was pushed and the worktree \
+             was kept.\n{}",
+            again.command,
+            if moved { "" } else { " and nothing was committed" },
+            again.output
+        )
+        }
+        None => Ok(None),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Evidence
 // ---------------------------------------------------------------------------
@@ -737,6 +874,19 @@ fn implement_and_review(
         work.summary = item.title.clone();
     }
 
+    // Before the push, not after. Every round after a broken push is a round
+    // spent on a branch that should not have been pushed, and a reviewer told
+    // to confirm findings by running the code starts from a tree that does not
+    // build.
+    let checked = check_before_push(
+        cfg,
+        repo,
+        implementor,
+        work_dir,
+        &format!("#{number}"),
+        Call::Implement,
+    )?;
+
     // Nothing on this branch predates spar: the worktree was created from
     // `origin/<base>` in this invocation, and `refuse_issue_branch_rebuild`
     // has already refused to build over a branch that carried commits.
@@ -746,7 +896,7 @@ fn implement_and_review(
     // build over one that existed.
     repo.push(work_dir, branch, None)?;
 
-    let description = pr_body(number, &work, &repo.style);
+    let description = pr_body(number, &work, checked.as_deref(), &repo.style);
     let pr = match repo.pr_for_branch(branch) {
         Some(existing) => existing,
         None => {
@@ -1385,6 +1535,16 @@ fn review_loop(
             }
         }
 
+        if let Some(who) = &editor {
+            check_before_push(
+                cfg,
+                repo,
+                agent::find(agents, who)?,
+                &ctx.work_dir,
+                &ctx.label,
+                Call::Respond(round),
+            )?;
+        }
         if editor.is_some() {
             repo.rewrite_commits_if_needed(&ctx.work_dir, &base, Some(&published_head))?;
             repo.push(&ctx.work_dir, &ctx.branch, Some(&published_head))?;
@@ -3607,7 +3767,7 @@ fn implement_prompt(number: i64, title: &str, url: &str, body: &str) -> String {
 ///
 /// GitHub renders the file count and the plus and minus figures immediately
 /// above this, so neither appears here.
-pub fn pr_body(issue: i64, work: &Implementation, style: &Style) -> String {
+pub fn pr_body(issue: i64, work: &Implementation, checked: Option<&str>, style: &Style) -> String {
     let mut parts = vec![format!("Closes #{issue}")];
 
     for lead in [&work.summary, &work.problem] {
@@ -3617,7 +3777,13 @@ pub fn pr_body(issue: i64, work: &Implementation, style: &Style) -> String {
         }
     }
     parts.extend(section("What changed", &work.changes, style));
-    parts.extend(section("How to test", &work.testing, style));
+    // The testing list is the author's claim. This line is spar's, and it is
+    // the only one in the body that anybody else ran.
+    let mut testing = work.testing.clone();
+    if let Some(command) = checked {
+        testing.push(format!("`{command}` passed on this branch, run by spar."));
+    }
+    parts.extend(section("How to test", &testing, style));
 
     let notes = style::sentence(work.notes.as_deref().unwrap_or_default(), style);
     if !notes.is_empty() {
@@ -5756,7 +5922,7 @@ mod tests {
     /// GitHub renders the file count and the plus and minus figures in the
     /// header, immediately above whatever spar writes, so neither is here.
     fn a_pr_body_is_what_it_closes_and_what_changed() {
-        let body = pr_body(42, &worked(), &style());
+        let body = pr_body(42, &worked(), None, &style());
         assert_eq!(
             "Closes #42\n\n\
              Retry a 429 instead of failing the run.\n\n\
@@ -5782,7 +5948,7 @@ mod tests {
         };
         assert_eq!(
             "Closes #42\n\nRetry a 429 instead of failing the run.",
-            pr_body(42, &work, &style())
+            pr_body(42, &work, None, &style())
         );
     }
 
@@ -5790,7 +5956,7 @@ mod tests {
     fn a_pr_body_survives_an_implementor_that_said_nothing() {
         assert_eq!(
             "Closes #7",
-            pr_body(7, &Implementation::default(), &style())
+            pr_body(7, &Implementation::default(), None, &style())
         );
     }
 
@@ -5803,16 +5969,16 @@ mod tests {
             changes: vec![String::new(), "   ".into()],
             ..Implementation::default()
         };
-        let body = pr_body(42, &work, &style());
+        let body = pr_body(42, &work, None, &style());
         assert!(!body.contains("What changed"), "{body}");
     }
 
     #[test]
     fn notes_appear_only_when_there_is_something_to_note() {
         let mut work = worked();
-        assert!(!pr_body(42, &work, &style()).contains("## Notes"));
+        assert!(!pr_body(42, &work, None, &style()).contains("## Notes"));
         work.notes = Some("The retry is not applied to streaming calls.".into());
-        let body = pr_body(42, &work, &style());
+        let body = pr_body(42, &work, None, &style());
         assert!(body.contains("## Notes"), "{body}");
         assert!(body.contains("streaming calls"), "{body}");
     }

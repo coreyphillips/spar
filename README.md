@@ -964,6 +964,16 @@ neither carries the consequences. `--auto-merge` is off by default; the terminal
 state is "approved, ready for a human to merge". Branch protection on the target
 repo should be considered required, not optional, if you turn it on.
 
+**A claim nothing else checks.** Every claim an agent makes is checked
+mechanically where it can be, and "I ran the tests" was the exception: the
+report records it and spar pushed on that word. `[loop] check = "cargo test"`
+runs one command in the worktree after an editing call commits and before the
+branch is pushed, and fails closed. It is not waiting on CI, which is expensive
+and somebody else's machine. On failure the output goes back to the same agent
+once; a second failure ends the round with the worktree kept, the output in the
+report, and nothing pushed. The pull request body then carries a line saying the
+check passed, which is spar's claim rather than the model's. Unset, nothing runs.
+
 **Style rules models forget.** Prompting alone is unreliable over a long run.
 Every commit message, PR body, and comment is scrubbed deterministically and
 then re-verified. The gate looks for more than the scrub can fix, so a form it

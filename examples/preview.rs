@@ -189,6 +189,7 @@ fn main() {
                 ),
                 ..Implementation::default()
             },
+            Some("cargo test"),
             &style
         )
     );

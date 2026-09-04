@@ -226,7 +226,8 @@ fn an_offending_commit_message_is_rewritten_in_place() {
     );
 
     let repo = Repo::open(&fx.work, &cfg()).unwrap();
-    repo.rewrite_commits_if_needed(&fx.work, "main").unwrap();
+    repo.rewrite_commits_if_needed(&fx.work, "main", None)
+        .unwrap();
 
     let log = messages(&fx.work);
     assert!(!log.contains('\u{2014}'), "{log}");
@@ -245,7 +246,8 @@ fn a_clean_history_is_left_completely_alone() {
     let before = git(&fx.work, &["rev-parse", "HEAD"]);
 
     let repo = Repo::open(&fx.work, &cfg()).unwrap();
-    repo.rewrite_commits_if_needed(&fx.work, "main").unwrap();
+    repo.rewrite_commits_if_needed(&fx.work, "main", None)
+        .unwrap();
 
     assert_eq!(
         before,
@@ -268,7 +270,8 @@ fn only_the_offending_commit_of_several_loses_its_dash() {
     commit(&fx.work, "c.txt", "three\n", "Third commit, also fine");
 
     let repo = Repo::open(&fx.work, &cfg()).unwrap();
-    repo.rewrite_commits_if_needed(&fx.work, "main").unwrap();
+    repo.rewrite_commits_if_needed(&fx.work, "main", None)
+        .unwrap();
 
     let log = messages(&fx.work);
     assert!(!log.contains('\u{2013}'), "{log}");
@@ -283,6 +286,50 @@ fn only_the_offending_commit_of_several_loses_its_dash() {
     );
 }
 
+/// The commits somebody else pushed are not spar's to rewrite.
+///
+/// A resumed pull request, or a check-in on somebody's branch, reaches the
+/// scrub with the author's own commits in the range. Rewriting one changes a
+/// SHA that is already published: their local branch diverges from the remote
+/// and their next push is rejected. The style gate is for what spar writes.
+#[test]
+fn a_commit_that_was_already_on_the_branch_keeps_its_sha() {
+    let fx = repo("floor");
+    std::env::set_var("SPAR_SELF_BIN", SPAR_BIN);
+    commit(
+        &fx.work,
+        "a.txt",
+        "one\n",
+        "Their commit \u{2014} written by a person",
+    );
+    let theirs = git(&fx.work, &["rev-parse", "HEAD"]);
+    commit(
+        &fx.work,
+        "b.txt",
+        "two\n",
+        "spar's commit \u{2013} not fine",
+    );
+
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    repo.rewrite_commits_if_needed(&fx.work, "main", Some(theirs.trim()))
+        .unwrap();
+
+    let log = messages(&fx.work);
+    assert!(
+        log.contains("Their commit \u{2014} written by a person"),
+        "a person's message was rewritten:\n{log}"
+    );
+    assert!(
+        !log.contains("spar's commit \u{2013}"),
+        "spar's own message was not scrubbed:\n{log}"
+    );
+    assert_eq!(
+        theirs.trim(),
+        git(&fx.work, &["rev-parse", "HEAD~1"]).trim(),
+        "the published sha changed, which is the divergence this prevents"
+    );
+}
+
 #[test]
 fn the_tree_is_unchanged_by_a_message_rewrite() {
     let fx = repo("tree");
@@ -294,7 +341,8 @@ fn the_tree_is_unchanged_by_a_message_rewrite() {
         "Work \u{2014} done",
     );
     let repo = Repo::open(&fx.work, &cfg()).unwrap();
-    repo.rewrite_commits_if_needed(&fx.work, "main").unwrap();
+    repo.rewrite_commits_if_needed(&fx.work, "main", None)
+        .unwrap();
     assert_eq!(
         "content that must survive\n",
         std::fs::read_to_string(fx.work.join("a.txt")).unwrap()

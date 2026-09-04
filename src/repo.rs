@@ -2652,8 +2652,8 @@ impl Repo {
     ///
     /// `None` when it is not an ancestor, which is not the same as nothing
     /// having landed. `rewrite_commits_if_needed` rewrites hashes from the first
-    /// offending commit onward, so a head recorded before a round can still be a
-    /// readable object and no longer be on the branch. `git log` answers that
+    /// offending commit spar made onward, so a head recorded part way through a
+    /// round can still be a readable object and no longer be on the branch. `git log` answers that
     /// with every commit on the branch, so without the check the one caller
     /// would report the whole branch as unread, which is the widest possible
     /// wrong answer.
@@ -2745,8 +2745,25 @@ impl Repo {
     ///
     /// `git filter-branch` calls back into this same binary, so there is no
     /// interpreter to find and no second copy of the rules to drift.
-    pub fn rewrite_commits_if_needed(&self, cwd: &Path, base: &str) -> Result<()> {
-        let range = format!("{}..HEAD", self.base_ref(cwd, base));
+    ///
+    /// `floor` is the head spar found when it started, and nothing at or below
+    /// it is rewritten. The style gate is for what spar writes, and a person's
+    /// commit message is not that: rewriting one changes a published SHA, which
+    /// diverges the branch under somebody's own checkout and is exactly the
+    /// history rewrite this design promises never to do. A `None` floor means
+    /// every commit above the base is spar's own, which is true of a branch
+    /// spar created in this invocation and of nothing else.
+    pub fn rewrite_commits_if_needed(
+        &self,
+        cwd: &Path,
+        base: &str,
+        floor: Option<&str>,
+    ) -> Result<()> {
+        let base_ref = self.base_ref(cwd, base);
+        let floor = floor.filter(|f| !f.trim().is_empty()).unwrap_or(&base_ref);
+        self.report_commits_left_alone(cwd, &base_ref, floor);
+
+        let range = format!("{floor}..HEAD");
         let raw = self.git_try_at(Some(cwd), &["log", &range, "--format=%H%x00%B%x1e"]);
 
         let offenders = raw
@@ -2793,6 +2810,39 @@ impl Repo {
             );
         }
         Ok(())
+    }
+
+    /// Say out loud when a message spar will not touch breaks the style rules.
+    ///
+    /// Silence here would read as "there was nothing to scrub", and the point
+    /// of the floor is that there was something and spar chose to leave it.
+    fn report_commits_left_alone(&self, cwd: &Path, base_ref: &str, floor: &str) {
+        if floor == base_ref {
+            return;
+        }
+        let raw = self.git_try_at(
+            Some(cwd),
+            &[
+                "log",
+                &format!("{base_ref}..{floor}"),
+                "--format=%H%x00%B%x1e",
+            ],
+        );
+        let left: Vec<&str> = raw
+            .split('\x1e')
+            .filter_map(|entry| entry.split_once('\0'))
+            .filter(|(_, body)| !style::violations(body, &self.style).is_empty())
+            .map(|(hash, _)| &hash.trim()[..hash.trim().len().min(8)])
+            .collect();
+        if left.is_empty() {
+            return;
+        }
+        logdim!(
+            "{} commit message(s) already on the branch break the style rules and were left \
+             alone: {}. spar does not rewrite commits it did not write.",
+            left.len(),
+            left.join(", ")
+        );
     }
 
     /// Push by explicit refspec from HEAD.

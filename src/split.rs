@@ -1596,7 +1596,10 @@ fn build_one(
     if let Err(e) = additive(branch, parent.head_branch, &repo.branch_prefix) {
         return failed_part_edit(repo, dir, &slice_head, e);
     }
-    if let Err(e) = repo.rewrite_commits_if_needed(dir, against) {
+    // A part branch is built in this invocation and pushed create-only, so
+    // every commit on it above the base is spar's own and nothing is
+    // republished under a SHA somebody already has.
+    if let Err(e) = repo.rewrite_commits_if_needed(dir, against, None) {
         return failed_part_edit(repo, dir, &slice_head, e);
     }
     let disposable_head = if stand_alone_work {

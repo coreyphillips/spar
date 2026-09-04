@@ -156,16 +156,30 @@ fn exec_with_input(argv: &[String], opts: &ExecOpts, input: Option<&[u8]>) -> Re
         .spawn()
         .map_err(|e| SparError::new(format!("could not run `{}`: {e}", abbreviate(argv))))?;
 
-    if let Some(bytes) = input {
-        if let Some(mut pipe) = child.stdin.take() {
-            let _ = pipe.write_all(bytes);
-        }
-        // Dropping the handle closes the pipe, which the child needs in order
-        // to see EOF and exit.
-    }
-
+    // Readers first, writer second, and the writer on its own thread.
+    //
+    // A child that writes as it reads, `git check-attr --stdin` being the one
+    // that bit, blocks on a full stdout pipe long before it has drained an
+    // input larger than the pipe buffer. Writing stdin here on the calling
+    // thread would then block against a child blocked on output nobody is
+    // reading yet, and because that happens before the poll loop below, the
+    // timeout would never fire. Neither side can stall now: output is draining
+    // from the moment the child starts.
     let out_reader = Reader::spawn(child.stdout.take().expect("stdout piped"));
     let err_reader = Reader::spawn(child.stderr.take().expect("stderr piped"));
+
+    if let Some(bytes) = input {
+        if let Some(mut pipe) = child.stdin.take() {
+            let owned = bytes.to_vec();
+            // Detached: a child that exits early leaves the write erroring with
+            // a broken pipe, which is its answer and not a failure of ours.
+            // Dropping the handle at the end of the thread closes the pipe,
+            // which the child needs in order to see EOF and exit.
+            std::thread::spawn(move || {
+                let _ = pipe.write_all(&owned);
+            });
+        }
+    }
 
     let deadline = Instant::now() + opts.timeout;
     let mut poll = Duration::from_millis(5);
@@ -675,6 +689,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(400_000, text.len());
+    }
+
+    /// Input larger than a pipe buffer, from a child that answers as it reads.
+    ///
+    /// This is the shape `git check-attr --stdin` has on a repository of a few
+    /// thousand files. Writing stdin before the readers started deadlocked the
+    /// pair: the child blocked writing to a stdout pipe nobody was draining,
+    /// spar blocked writing the rest of stdin, and the timeout never fired
+    /// because the poll loop had not been reached.
+    #[test]
+    fn large_input_and_large_output_together_do_not_deadlock() {
+        let line = "a".repeat(199);
+        let input = std::iter::repeat_n(line.as_str(), 5_000)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(input.len() > 900_000, "the input has to outgrow the pipe");
+
+        let start = Instant::now();
+        // `cat` on both streams, so the child is writing while it is still
+        // reading and neither pipe can be left unattended.
+        let out = run(
+            &argv(&["sh", "-c", "tee /dev/stderr"]),
+            &ExecOpts::new().timeout_secs(60).stdin(input.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(input.len(), out.trim_end().len());
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the call did not return promptly: {:?}",
+            start.elapsed()
+        );
     }
 
     /// The reason the readers are never joined. A grandchild that inherited

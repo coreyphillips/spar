@@ -5132,9 +5132,33 @@ fn stable_file_metadata(left: &std::fs::Metadata, right: &std::fs::Metadata) -> 
     }
 }
 
+/// How many paths one `check-attr` call is asked about.
+///
+/// `check-attr` answers with three NUL fields per attribute per path, so the
+/// output is several times the input. A whole monorepo in one call is megabytes
+/// in both directions, and the 30 second timeout below is a timeout on the
+/// batch. Batching keeps each call small enough to be honest about.
+const ATTRIBUTE_BATCH: usize = 1000;
+
 fn check_attributes(
     cwd: &Path,
     paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<BTreeMap<PathBuf, BTreeMap<String, String>>> {
+    let paths = paths.into_iter().collect::<BTreeSet<_>>();
+    if paths.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let ordered = paths.into_iter().collect::<Vec<_>>();
+    let mut values: BTreeMap<PathBuf, BTreeMap<String, String>> = BTreeMap::new();
+    for batch in ordered.chunks(ATTRIBUTE_BATCH) {
+        values.extend(check_attribute_batch(cwd, batch)?);
+    }
+    Ok(values)
+}
+
+fn check_attribute_batch(
+    cwd: &Path,
+    batch: &[PathBuf],
 ) -> Result<BTreeMap<PathBuf, BTreeMap<String, String>>> {
     const NAMES: [&str; 6] = [
         "filter",
@@ -5144,10 +5168,7 @@ fn check_attributes(
         "eol",
         "crlf",
     ];
-    let paths = paths.into_iter().collect::<BTreeSet<_>>();
-    if paths.is_empty() {
-        return Ok(BTreeMap::new());
-    }
+    let paths = batch.iter().cloned().collect::<BTreeSet<_>>();
     let mut input = String::new();
     for path in &paths {
         let path = path.to_str().ok_or_else(|| {

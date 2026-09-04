@@ -36,13 +36,21 @@ pub fn triage() -> Value {
                             "type": "string",
                             "description": "One sentence. This is posted verbatim on the issue when both agents decline it, and the issue may well stay open afterwards, so write it for the person who opened it rather than as a verdict."
                         },
-                        "complexity": {"type": "string", "enum": ["s", "m", "l"]},
+                        "complexity": {
+                            "type": "string",
+                            "enum": ["s", "m", "l"],
+                            "description": "How much work the change is. s: one file, or a handful of lines across two, covered by an existing test or one obvious one. m: several files in one area, or a new function others call, or one that needs its own tests written. l: a new module, a change to an interface other code depends on, a format that has to migrate, or anything you cannot verify by running something that already exists. This decides the order the run works in, cheapest first, and the larger of the two reviewers' answers is used."
+                        },
                         "depends_on": {
                             "type": "array",
                             "items": {"type": "integer"},
                             "description": "Issue numbers from this same list that should land first. Empty if none."
                         },
-                        "risk": {"type": "string", "enum": ["low", "med", "high"]}
+                        "risk": {
+                            "type": "string",
+                            "enum": ["low", "med", "high"],
+                            "description": "The blast radius if the change is wrong, and how easily it is undone. low: contained in one place and a revert puts everything back. med: other code calls into it, or it changes behaviour somebody may rely on, but the failure is visible. high: it touches data that persists, a security or permission boundary, or a path whose failure is silent. The larger of the two reviewers' answers is used."
+                        }
                     },
                     "required": ["issue", "worth_doing", "tracker", "reason", "complexity", "depends_on", "risk"]
                 }

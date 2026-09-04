@@ -3331,7 +3331,7 @@ impl Repo {
             "view",
             &number.to_string(),
             "--json",
-            "number,url,title,headRefName,baseRefName,state,closingIssuesReferences,isCrossRepository",
+            "number,url,title,body,headRefName,baseRefName,state,closingIssuesReferences,isCrossRepository",
         ])?;
         serde_json::from_str(&text).map_err(|e| spar_err!("unexpected shape for PR #{number}: {e}"))
     }

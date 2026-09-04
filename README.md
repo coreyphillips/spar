@@ -970,6 +970,13 @@ too, and past it whole issues wait for the next run rather than every issue
 losing its tail. A verdict is posted on the issue and can close it, so judging
 one on part of what it says is worse than not having reached it yet.
 
+Every pass that judges the branch is given the same thing: the review rounds,
+the closing pass, the author's response, `spar review`, and `spar checkin` all
+carry the issue body under the same rule, alongside the pull request description
+labelled as the author's own account of the change, which is a claim to check
+rather than a statement of fact. A reviewer asked whether the change resolves
+the issue cannot answer that from a title.
+
 The issue's URL goes with the body, not instead of it. Comments are not fetched,
 so an agent that can reach the network is told where the discussion is and asked
 to read it when a body leaves something open. It is not a substitute for the

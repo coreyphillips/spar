@@ -44,7 +44,7 @@ pub(crate) fn review_only_prompt() -> &'static str {
 
 const REVIEW_ONLY_PROMPT: &str = "\
 Review pull request #{number} against `{base}`: {title}
-
+{context}
 You are reviewing somebody else's work. Your checkout is detached and read only.
 Do not modify, commit, or push anything. The only thing you produce is findings.
 
@@ -186,10 +186,32 @@ fn run_phases(
     // The ref spar compares against, not the bare branch name: in a linked
     // worktree the local branch is whatever the primary checkout last had.
     let base_ref = repo.base_ref(work_dir, base);
+    // The issue it says it closes, and the author's own account of the change.
+    // The reviewer is asked whether the change does what it claims, and both
+    // halves of that question were missing from the prompt.
+    let linked = pr.closing_issues_references.first().map(|r| r.number);
+    let (issue_body, issue_url) = match linked.map(|n| repo.read_issue(n)) {
+        Some(Ok(issue)) => {
+            let (body, _) = issue.body_for_prompt(cfg.loop_cfg.max_issue_chars);
+            (body, issue.url)
+        }
+        Some(Err(e)) => {
+            logdim!("could not read the linked issue for PR #{}: {e}", pr.number);
+            (String::new(), String::new())
+        }
+        None => (String::new(), String::new()),
+    };
+    let context = crate::review::context_block(
+        linked.unwrap_or(pr.number),
+        &issue_url,
+        &issue_body,
+        &pr.body,
+    );
     let prompt = REVIEW_ONLY_PROMPT
         .replace("{number}", &pr.number.to_string())
         .replace("{base}", &base_ref)
-        .replace("{title}", &pr.title);
+        .replace("{title}", &pr.title)
+        .replace("{context}", &context);
 
     let reviews = concurrently(agents, |a| {
         let effort = cfg.effort_for_round(&a.spec, 1);

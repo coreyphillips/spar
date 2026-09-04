@@ -129,6 +129,7 @@ fn pr(number: i64, head: &str) -> PrView {
         number,
         url: format!("https://example.invalid/pull/{number}"),
         title: format!("PR {number}"),
+        body: format!("What PR {number} says it does."),
         head_ref_name: head.to_string(),
         base_ref_name: "main".into(),
         state: "OPEN".into(),

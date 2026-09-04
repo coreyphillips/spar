@@ -20,7 +20,7 @@ use crate::model::{Followup, Issue, IssueRef, ItemKind, PersistedState, PrRef, P
 use crate::proc::{self, ExecOpts};
 use crate::style::{self, Style};
 use crate::textsim;
-use crate::{bail, logdim, spar_err};
+use crate::{bail, logdim, logwarn, spar_err};
 
 /// gh returns newest first, so its `--limit` cannot be used to take the lowest
 /// numbered items: it would slice the newest N and then sorting that slice
@@ -3224,11 +3224,17 @@ impl Repo {
     /// spar's own branch naming is checked first because it is exact and cheap.
     /// Falling back to GitHub's own issue linkage is what lets spar pick up a
     /// pull request a person started on a branch named anything at all.
-    pub fn open_pr_for_issue(&self, issue: i64) -> Option<PrRef> {
-        if let Some(pr) = self.pr_for_branch(&self.branch_for_issue(issue)) {
-            return Some(pr);
+    ///
+    /// An error rather than `None` when the question could not be asked. The
+    /// two answers are not interchangeable: "no pull request exists" is the one
+    /// that makes spar implement over the top of somebody's work and open a
+    /// second pull request for the same issue.
+    pub fn try_open_pr_for_issue(&self, issue: i64, base: &str) -> Result<Option<PrRef>> {
+        let mine = self.pr_for_branch_failing_closed(&self.branch_for_issue(issue), base, issue)?;
+        if let Some(pr) = mine {
+            return Ok(Some(pr));
         }
-        let text = self.gh_try(&[
+        let listed = match self.gh(&[
             "pr",
             "list",
             "--state",
@@ -3236,9 +3242,65 @@ impl Repo {
             "--limit",
             &FETCH_CEILING.to_string(),
             "--json",
-            "number,url,title,closingIssuesReferences",
-        ]);
-        find_linked_pr(&text, issue)
+            "number,url,title,baseRefName,closingIssuesReferences",
+        ]) {
+            Ok(text) => linked_pr_rows(&text).ok_or_else(|| {
+                spar_err!("could not read the pull request list while looking for #{issue}")
+            })?,
+            Err(e) => return self.unanswered_pr_lookup(issue, e).map(|()| None),
+        };
+        if listed.len() >= FETCH_CEILING {
+            logwarn!(
+                "#{issue}: the open pull request list filled its page of {FETCH_CEILING}, so a                  pull request past it cannot be seen from here."
+            );
+        }
+        let default = self.default_branch(base);
+        if !base.eq_ignore_ascii_case(&default) {
+            // GitHub populates closingIssuesReferences only for pull requests
+            // targeting the default branch, so on any other base the linkage is
+            // silence rather than an answer.
+            logwarn!(
+                "#{issue}: the base branch is `{base}` and the default is `{default}`. GitHub                  links closing issues only on the default branch, so an existing pull request                  for this issue may not be found. Name the pull request instead of the issue if                  there is one."
+            );
+        }
+        Ok(pick_linked_pr(&listed, issue))
+    }
+
+    /// spar's own branch, with a failed lookup kept as a failure.
+    fn pr_for_branch_failing_closed(
+        &self,
+        branch: &str,
+        base: &str,
+        issue: i64,
+    ) -> Result<Option<PrRef>> {
+        match self.try_pr_for_branch(branch, base) {
+            Ok(found) => Ok(found),
+            Err(e) => self.unanswered_pr_lookup(issue, e).map(|()| None),
+        }
+    }
+
+    /// What to do when GitHub would not say whether a pull request exists.
+    ///
+    /// An error, because "no pull request exists" is the answer that makes spar
+    /// implement from scratch and open a second pull request over somebody's
+    /// work. The one exception is a repository gh cannot reach at all: there is
+    /// no pull request to collide with when there is no GitHub repository in
+    /// play, and every later write would fail anyway. That case is a warning and
+    /// a `None`, so a run against a plain git remote behaves as it always did.
+    fn unanswered_pr_lookup(&self, issue: i64, e: crate::error::SparError) -> Result<()> {
+        if self.gh(&["repo", "view", "--json", "name"]).is_ok() {
+            return Err(spar_err!(
+                "could not check whether a pull request already exists for #{issue}: {}. \
+                 Refusing to implement over the top of work that may already be open.",
+                e.last_line()
+            ));
+        }
+        logwarn!(
+            "#{issue}: this repository could not be read through gh ({}), so spar cannot tell \
+             whether a pull request already exists for it.",
+            e.last_line()
+        );
+        Ok(())
     }
 
     pub fn pr_view(&self, number: i64) -> Result<PrView> {
@@ -6491,28 +6553,32 @@ pub fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<
     write_text_atomic(path, &serde_json::to_string_pretty(value)?)
 }
 
-/// Among the open pull requests gh listed, the first that would close `issue`.
-///
-/// Separated from the gh call so the real payload shape can be tested. GitHub
-/// returns far more per linked issue than the number, and silently failing to
-/// parse it would look exactly like "no pull request exists", which is the
-/// answer that makes spar implement over the top of somebody's work.
-pub fn find_linked_pr(json: &str, issue: i64) -> Option<PrRef> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Row {
-        number: i64,
-        #[serde(default)]
-        url: String,
-        #[serde(default)]
-        title: String,
-        #[serde(default)]
-        closing_issues_references: Vec<IssueRef>,
-    }
+/// One row of `gh pr list --json number,url,title,baseRefName,closingIssuesReferences`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkedPrRow {
+    number: i64,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    closing_issues_references: Vec<IssueRef>,
+}
 
-    serde_json::from_str::<Vec<Row>>(json.trim())
-        .ok()?
-        .into_iter()
+/// The listed pull requests, or `None` when the payload could not be read.
+///
+/// Separated from the gh call so the real payload shape can be tested, and kept
+/// distinct from an empty list, because silently failing to parse would look
+/// exactly like "no pull request exists", which is the answer that makes spar
+/// implement over the top of somebody's work.
+pub fn linked_pr_rows(json: &str) -> Option<Vec<LinkedPrRow>> {
+    serde_json::from_str::<Vec<LinkedPrRow>>(json.trim()).ok()
+}
+
+/// Among the listed pull requests, the first that would close `issue`.
+pub fn pick_linked_pr(rows: &[LinkedPrRow], issue: i64) -> Option<PrRef> {
+    rows.iter()
         .find(|row| {
             row.closing_issues_references
                 .iter()
@@ -6520,9 +6586,14 @@ pub fn find_linked_pr(json: &str, issue: i64) -> Option<PrRef> {
         })
         .map(|row| PrRef {
             number: row.number,
-            url: row.url,
-            title: row.title,
+            url: row.url.clone(),
+            title: row.title.clone(),
         })
+}
+
+/// Both halves together, for the tests that hold the real payload.
+pub fn find_linked_pr(json: &str, issue: i64) -> Option<PrRef> {
+    pick_linked_pr(&linked_pr_rows(json)?, issue)
 }
 
 /// Flatten whatever `gh api --paginate` printed into a list of comments.
@@ -8259,6 +8330,27 @@ mod linked_pr_tests {
         assert!(find_linked_pr("[]", 1).is_none());
         assert!(find_linked_pr("gh: Not Found (HTTP 404)", 1).is_none());
         assert!(find_linked_pr("[{\"number\":", 1).is_none());
+    }
+
+    /// "gh could not answer" and "nobody is working on it" are different
+    /// answers, and only one of them means implement from scratch.
+    ///
+    /// The parse used to fold both into `None`, so an authentication failure or
+    /// a rate limit read as an empty list and spar opened a second pull request
+    /// for an issue somebody already had work open on.
+    #[test]
+    fn an_unreadable_list_is_not_an_empty_list() {
+        assert!(linked_pr_rows("gh: Not Found (HTTP 404)").is_none());
+        assert!(linked_pr_rows("[{\"number\":").is_none());
+        assert!(linked_pr_rows("").is_none());
+
+        let empty = linked_pr_rows("[]").expect("an empty list is an answer");
+        assert!(empty.is_empty());
+        assert!(pick_linked_pr(&empty, 14238).is_none());
+
+        let listed = linked_pr_rows(REAL_PAYLOAD).expect("the real payload reads");
+        assert_eq!(3, listed.len());
+        assert_eq!(14252, pick_linked_pr(&listed, 14238).unwrap().number);
     }
 
     /// A fork PR cannot be pushed to, so the flag has to survive parsing.

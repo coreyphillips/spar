@@ -333,7 +333,11 @@ a diff, the loop can take custody of it.
 checks its own branch naming first, then falls back to GitHub's issue linkage, so
 a pull request somebody else started on a branch called anything at all is found
 and continued rather than duplicated. Running spar again on work in progress is
-always a resume, never a restart.
+always a resume, never a restart. A lookup that fails is an error for that issue
+rather than an answer, since "no pull request exists" is the answer that makes
+spar implement over the top of somebody's work. spar also says when the list
+filled its page, and when the base is not the default branch, where GitHub does
+not record closing links at all.
 
 If a branch carries pushed commits that no open pull request accounts for, spar
 refuses rather than force pushing over them, and says how to recover.

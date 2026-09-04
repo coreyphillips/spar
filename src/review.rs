@@ -444,13 +444,25 @@ pub fn run_issue(
     // holds because the remote tracking ref survives the local branch being
     // deleted, so the push succeeds and the previous round's work is gone from
     // the PR with nothing to say it ever existed.
-    if let Some(existing) = repo.open_pr_for_issue(item.issue) {
-        log!(
-            "#{}: {} is already open, continuing it instead of implementing again",
-            item.issue,
-            existing.url
-        );
-        return resume_pr(agents, cfg, repo, existing.number, None);
+    // A failed lookup is not an answer. "No pull request exists" is what makes
+    // spar implement from scratch, so it has to be something GitHub said.
+    match repo.try_open_pr_for_issue(item.issue, cfg.base_branch()) {
+        Ok(Some(existing)) => {
+            log!(
+                "#{}: {} is already open, continuing it instead of implementing again",
+                item.issue,
+                existing.url
+            );
+            return resume_pr(agents, cfg, repo, existing.number, None);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            let mut state = IssueRun::new(item.issue, item.title.clone());
+            state.status = Status::Error;
+            state.notes.push(e.to_string());
+            log!("#{} failed: {e}", item.issue);
+            return state;
+        }
     }
 
     let mut state = IssueRun::new(item.issue, item.title.clone());

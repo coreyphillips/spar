@@ -1235,6 +1235,10 @@ pub struct PrView {
     pub url: String,
     #[serde(default)]
     pub title: String,
+    /// The description, which is the author's own account of the change. Read
+    /// by every pass that judges whether the change does what it claims.
+    #[serde(default)]
+    pub body: String,
     #[serde(default)]
     pub head_ref_name: String,
     #[serde(default)]

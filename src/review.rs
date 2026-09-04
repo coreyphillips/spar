@@ -64,7 +64,7 @@ make no changes and set not_worth_doing, with the reason.";
 const REVIEW_PROMPT: &str = "\
 Review the changes on this branch against `{base}`. They implement issue
 #{number}: {title}
-
+{context}
 Review thoroughly: correctness, edge cases, error handling, security, and
 whether the change actually resolves the issue. Read surrounding code, do not
 only read the diff.
@@ -116,7 +116,7 @@ accepts every review comment to get approved produces worse code, not better.
 
 const CLOSE_PROMPT: &str = "\
 This closes the review of issue #{number}: {title}
-
+{context}
 This is the final merge-safety audit. Read the full branch against `{base}` and
 answer one question: does the branch still contain anything that must not
 merge. Do not spend this pass on optional improvements or style.
@@ -176,7 +176,7 @@ Do not commit, push, or merge.";
 
 const RESPOND_PROMPT: &str = "\
 Here is a review of your PR for issue #{number}.
-
+{context}
 {findings}
 
 For each point, choose exactly one disposition:
@@ -706,10 +706,11 @@ fn implement_and_review(
     // build over one that existed.
     repo.push(work_dir, branch, None)?;
 
+    let description = pr_body(number, &work, &repo.style);
     let pr = match repo.pr_for_branch(branch) {
         Some(existing) => existing,
         None => {
-            let body = pr_body(number, &work, &repo.style);
+            let body = description.clone();
             repo.create_pr(
                 work_dir,
                 branch,
@@ -727,6 +728,7 @@ fn implement_and_review(
         work_dir: work_dir.to_path_buf(),
         branch: branch.to_string(),
         pr_number: pr.number,
+        context: context_block(number, &issue.url, &body, &description),
         label: format!("#{number}"),
         subject: number,
         title: item.title.clone(),
@@ -884,10 +886,34 @@ fn resume_inner(
         }
     }
 
+    // The issue the pull request closes, when it names one. A failure to read
+    // it costs the prompts their context and nothing else, so it is a warning.
+    let issue = (subject != pr_number)
+        .then(|| repo.read_issue(subject))
+        .transpose()
+        .unwrap_or_else(|e| {
+            logdim!("could not read issue #{subject} for context: {e}");
+            None
+        });
+    let (issue_body, issue_url) = match &issue {
+        Some(issue) => {
+            let (body, shortened) = issue.body_for_prompt(cfg.loop_cfg.max_issue_chars);
+            if shortened {
+                logwarn!(
+                    "PR #{pr_number}: the issue body was shortened to fit the prompt. Raise \
+                     max_issue_chars if the rest matters."
+                );
+            }
+            (body, issue.url.clone())
+        }
+        None => (String::new(), String::new()),
+    };
+
     let ctx = LoopCtx {
         work_dir,
         branch,
         pr_number,
+        context: context_block(subject, &issue_url, &issue_body, &pr.body),
         label: format!("PR #{pr_number}"),
         subject,
         title: pr.title.clone(),
@@ -933,6 +959,9 @@ struct LoopCtx {
     label: String,
     subject: i64,
     title: String,
+    /// The issue as filed and the author's account of the change, for every
+    /// prompt that has to judge whether the branch answers the issue.
+    context: String,
     start_round: u32,
     holder: String,
     release: Release,
@@ -1007,6 +1036,7 @@ fn review_loop(
             &base_ref,
             ctx.subject,
             &ctx.title,
+            &ctx.context,
             ledger,
             &open_findings,
             round,
@@ -1233,6 +1263,7 @@ fn review_loop(
             );
             let prompt = RESPOND_PROMPT
                 .replace("{number}", &ctx.subject.to_string())
+                .replace("{context}", &ctx.context)
                 .replace("{findings}", &findings_for_prompt(&blocking));
             let before_response = repo.head_oid_checked(&ctx.work_dir)?;
             let worktree_baseline = repo.worktree_baseline(&ctx.work_dir)?;
@@ -1428,6 +1459,7 @@ fn close_out(
         &repo.base_ref(&ctx.work_dir, cfg.base_branch()),
         ctx.subject,
         &ctx.title,
+        &ctx.context,
         audited_head,
         landed.as_deref(),
         ledger,
@@ -3413,6 +3445,7 @@ fn close_prompt(
     base: &str,
     number: i64,
     title: &str,
+    context: &str,
     from: &str,
     landed: Option<&[String]>,
     ledger: &Ledger,
@@ -3443,6 +3476,7 @@ fn close_prompt(
     CLOSE_PROMPT
         .replace("{number}", &number.to_string())
         .replace("{title}", title)
+        .replace("{context}", context)
         .replace("{base}", base)
         .replace("{landed}", &landed)
         .replace("{open}", &open_findings_block(open_findings))
@@ -3482,10 +3516,12 @@ fn closing_answers(ledger: &Ledger, round: u32) -> String {
 ///
 /// Built here rather than inline in the loop, because a prompt built inline is a
 /// prompt with no test.
+#[allow(clippy::too_many_arguments)]
 fn review_prompt(
     base: &str,
     number: i64,
     title: &str,
+    context: &str,
     ledger: &Ledger,
     open_findings: &[Finding],
     round: u32,
@@ -3495,6 +3531,7 @@ fn review_prompt(
         .replace("{base}", base)
         .replace("{number}", &number.to_string())
         .replace("{title}", title)
+        .replace("{context}", context)
         .replace("{open}", &open_findings_block(open_findings))
         .replace("{answers}", &answers_block(ledger, round))
         .replace("{settled}", &settled_block(ledger))
@@ -3734,6 +3771,42 @@ pub fn skip_comment(item: &SkippedItem, style: &Style) -> String {
     // issue it duplicated and the reader saw the point twice.
     let lines = crate::textsim::dedupe_by(reasons, crate::textsim::same_reason);
     bullets(&lines)
+}
+
+/// What the branch was for, and what its author says it does.
+///
+/// Every call is a fresh process and nothing carries between them but the
+/// branch and the prompt, so a reviewer asked to judge "whether the change
+/// actually resolves the issue" against a title alone cannot answer the
+/// question. The most valuable kind of blocking finding is "the issue asked for
+/// X and the branch does not do X", and it needs the issue. The author's
+/// testing notes are the cheapest way for a reviewer to check a fix, and they
+/// are in the description.
+///
+/// A link is not a substitute: codex runs under `-s workspace-write`, which has
+/// no network, which is the reason the implement prompt carries the body rather
+/// than a link. The same reason applies here.
+pub(crate) fn context_block(number: i64, url: &str, issue_body: &str, pr_body: &str) -> String {
+    let mut out = String::new();
+    let body = issue_body.trim();
+    if !body.is_empty() {
+        out.push_str(&format!("\nIssue #{number} as filed"));
+        if !url.trim().is_empty() {
+            out.push_str(&format!(", at {}", url.trim()));
+        }
+        out.push_str(&format!(
+            ":\n\n{body}\n\nThat is the issue body as filed. The discussion since is not \
+             included.\n"
+        ));
+    }
+    let claim = pr_body.trim();
+    if !claim.is_empty() {
+        out.push_str(&format!(
+            "\nThe pull request description, which is the author's own account of this change. \
+             It is a claim to check against the code, not a statement of fact:\n\n{claim}\n"
+        ));
+    }
+    out
 }
 
 /// Findings as a model should see them: full detail, since this one is not for
@@ -4971,6 +5044,7 @@ mod tests {
             "origin/main",
             42,
             "Retry a 429",
+            "",
             "9f8e7d6",
             Some(&landed),
             &fixed_ledger(),
@@ -4993,6 +5067,7 @@ mod tests {
             "origin/main",
             42,
             "Retry a 429",
+            "",
             "9f8e7d6",
             Some(&[]),
             &Ledger::new(),
@@ -5017,6 +5092,7 @@ mod tests {
             "origin/main",
             42,
             "Retry a 429",
+            "",
             "9f8e7d6",
             None,
             &fixed_ledger(),
@@ -5037,6 +5113,7 @@ mod tests {
             "origin/main",
             42,
             "t",
+            "",
             "9f8e7d6",
             Some(&[]),
             &Ledger::new(),
@@ -5053,6 +5130,7 @@ mod tests {
             "origin/main",
             42,
             "t",
+            "",
             "9f8e7d6",
             Some(&[]),
             &Ledger::new(),
@@ -5082,6 +5160,7 @@ mod tests {
             "origin/main",
             42,
             "t",
+            "",
             "9f8e7d6",
             Some(&[]),
             &Ledger::new(),
@@ -5196,7 +5275,16 @@ mod tests {
         // The resolved ref, because that is what the loop passes and what spar
         // itself compares against. In a linked worktree the local branch is
         // whatever the primary checkout last had.
-        let empty = review_prompt("origin/main", 42, "Retry a 429", &Ledger::new(), &[], 1, 3);
+        let empty = review_prompt(
+            "origin/main",
+            42,
+            "Retry a 429",
+            "",
+            &Ledger::new(),
+            &[],
+            1,
+            3,
+        );
         assert!(!empty.contains('{'), "{empty}");
         assert!(
             empty.contains("`origin/main`"),
@@ -5212,10 +5300,80 @@ mod tests {
                 entry.round = 2;
             }
         }
-        let full = review_prompt("origin/main", 42, "Retry a 429", &ledger, &[], 3, 3);
+        let full = review_prompt("origin/main", 42, "Retry a 429", "", &ledger, &[], 3, 3);
         assert!(!full.contains('{'), "{full}");
         assert!(full.contains("fixed point") && full.contains("refuted point"));
         assert!(full.contains("last round"), "{full}");
+    }
+
+    /// A reviewer asked whether the change resolves the issue was given the
+    /// title and nothing else.
+    ///
+    /// Every call is a fresh process, so what the prompt does not carry does
+    /// not exist. An issue titled "Retry on 429" whose body specifies honouring
+    /// Retry-After and a five attempt cap was reviewed against those four
+    /// words, and "the issue asked for X and the branch does not do X" is the
+    /// most valuable blocking finding there is.
+    #[test]
+    fn every_pass_that_judges_the_branch_is_given_the_issue_and_the_description() {
+        let context = context_block(
+            42,
+            "https://github.com/example/project/issues/42",
+            "Honour Retry-After and cap at five attempts.",
+            "## What changed\n\nBounded the loop. Ran the 429 test.",
+        );
+        assert!(context.contains("Honour Retry-After"), "{context}");
+        assert!(context.contains("issues/42"), "{context}");
+        assert!(
+            context.contains("discussion since is not included"),
+            "{context}"
+        );
+        assert!(context.contains("Ran the 429 test"), "{context}");
+        assert!(
+            context.contains("claim to check"),
+            "the description has to be labelled as the author's own account:\n{context}"
+        );
+
+        let review = review_prompt(
+            "origin/main",
+            42,
+            "Retry on 429",
+            &context,
+            &Ledger::new(),
+            &[],
+            1,
+            3,
+        );
+        let close = close_prompt(
+            "origin/main",
+            42,
+            "Retry on 429",
+            &context,
+            "9f8e7d6",
+            Some(&[]),
+            &Ledger::new(),
+            &[],
+            1,
+        );
+        let respond = RESPOND_PROMPT
+            .replace("{number}", "42")
+            .replace("{context}", &context)
+            .replace("{findings}", "(none)");
+        for prompt in [review, close, respond] {
+            assert!(prompt.contains("Honour Retry-After"), "{prompt}");
+            assert!(prompt.contains("Ran the 429 test"), "{prompt}");
+            assert!(!prompt.contains('{'), "{prompt}");
+        }
+    }
+
+    /// Nothing to say is said as nothing, not as an empty heading. A resumed
+    /// pull request that closes no issue has no body to carry.
+    #[test]
+    fn a_pull_request_with_no_issue_behind_it_carries_no_empty_headings() {
+        assert_eq!("", context_block(7, "", "", ""));
+        let only_description = context_block(7, "", "", "What it does.");
+        assert!(!only_description.contains("as filed"), "{only_description}");
+        assert!(only_description.contains("What it does."));
     }
 
     #[test]
@@ -5231,6 +5389,7 @@ mod tests {
             "origin/main",
             42,
             "Retry a 429",
+            "",
             &Ledger::new(),
             &open,
             2,
@@ -5240,6 +5399,7 @@ mod tests {
             "origin/main",
             42,
             "Retry a 429",
+            "",
             "9f8e7d6",
             Some(&[]),
             &Ledger::new(),

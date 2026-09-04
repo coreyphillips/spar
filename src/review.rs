@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::agent::{self, Agent};
-use crate::config::{Config, Drafts, Followups, PrComments};
+use crate::config::{Call, Config, Drafts, Followups, PrComments};
 use crate::error::{ErrorKind, Result, SparError};
 use crate::jsonx::{exact_finding_key as finding_key, finding_file, stable_finding_key};
 use crate::model::{
@@ -627,7 +627,7 @@ fn implement_and_review(
         &prompt,
         &schema::implementation(),
         work_dir,
-        cfg.effort_for_round(&implementor.spec, 1).as_deref(),
+        &implementor.effort(cfg, Call::Implement),
     );
 
     if answer.is_ok() {
@@ -1047,11 +1047,11 @@ fn review_loop(
         last_round = round;
         state.rounds = round;
         let reviewer = agent::find(agents, &holder)?;
-        let effort = cfg.effort_for_round(&reviewer.spec, round);
+        let effort = reviewer.effort(cfg, Call::Review(round));
         log!(
             "{}: round {round}, {holder} reviewing ({})",
             ctx.label,
-            effort.as_deref().unwrap_or("default effort")
+            effort.describe()
         );
 
         let prompt = review_prompt(
@@ -1074,7 +1074,7 @@ fn review_loop(
             &prompt,
             &schema::review(),
             &ctx.work_dir,
-            effort.as_deref(),
+            &effort,
         );
         if let Err(error) = &review {
             if error.kind() == crate::error::ErrorKind::UncertainWrite {
@@ -1209,7 +1209,7 @@ fn review_loop(
                 &prompt,
                 &schema::own_fix(),
                 &ctx.work_dir,
-                effort.as_deref(),
+                &effort,
             ) {
                 Ok(doc) => {
                     commit_accepted_changes(
@@ -1294,7 +1294,7 @@ fn review_loop(
                 &prompt,
                 &schema::response(),
                 &ctx.work_dir,
-                cfg.effort_for_round(&author.spec, round).as_deref(),
+                &author.effort(cfg, Call::Respond(round)),
             );
             let response = match response {
                 Ok(response) => {
@@ -1479,11 +1479,11 @@ fn close_out(
     }
 
     let closer = agent::find(agents, holder)?;
-    let effort = cfg.effort_for_round(&closer.spec, closing_effort_round(round));
+    let effort = closer.effort(cfg, Call::Close);
     log!(
         "{}: closing, {holder} checking what the last round left ({})",
         ctx.label,
-        effort.as_deref().unwrap_or("default effort")
+        effort.describe()
     );
 
     let prompt = close_prompt(
@@ -1502,7 +1502,7 @@ fn close_out(
     // `ask_json` rather than `Agent::review`: this prompt already defines the
     // full merge-safety scope and calls out the unread delta and carried points.
     // Appending a second scope would make the closing instructions compete.
-    let pass = closer.ask_json(&prompt, &schema::review(), &ctx.work_dir, effort.as_deref());
+    let pass = closer.ask_json(&prompt, &schema::review(), &ctx.work_dir, &effort);
     if let Err(e) = &pass {
         if e.kind() == crate::error::ErrorKind::UncertainWrite {
             return Err(e.clone());
@@ -2213,10 +2213,6 @@ fn ending_without_landing(open_findings: &[Finding]) -> Ending<'_> {
     } else {
         Ending::Unresolved(open_findings)
     }
-}
-
-fn closing_effort_round(round: u32) -> u32 {
-    round.saturating_add(1)
 }
 
 fn closing_next_actor(holder: &str) -> String {
@@ -5103,10 +5099,21 @@ mod tests {
         assert!(matches!(ending_without_landing(&[]), Ending::Unchanged));
     }
 
+    /// The closing pass reads a small delta and answers one question, so it
+    /// never buys the first review's depth again. It has its own key now, and
+    /// falls back to `rest` rather than to `round_1`.
     #[test]
     fn a_closing_pass_uses_the_later_effort_tier() {
-        assert_eq!(2, closing_effort_round(1));
-        assert_eq!(8, closing_effort_round(7));
+        use crate::config::{Call, EffortSchedule};
+        let schedule = EffortSchedule {
+            round_1: Some("ultra".into()),
+            rest: Some("low".into()),
+            ..EffortSchedule::default()
+        };
+        assert_eq!(None, schedule.get(Call::Close));
+        let mut with_key = schedule.clone();
+        with_key.close = Some("medium".into());
+        assert_eq!(Some("medium".to_string()), with_key.get(Call::Close));
     }
 
     #[test]

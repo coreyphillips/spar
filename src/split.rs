@@ -33,7 +33,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::agent::{self, Agent};
-use crate::config::Config;
+use crate::config::{Call, Config};
 use crate::error::{ErrorKind, Result, SparError};
 use crate::model::{
     Implementation, Issue, IssueRun, ItemKind, PrRow, PrView, SplitCheck, SplitPart, SplitProposal,
@@ -496,7 +496,7 @@ pub fn screen(
         &format!("{SCREEN_PROMPT}{text}"),
         &schema::split_screen(),
         repo.root(),
-        cfg.effort_for_round(&agent.spec, 1).as_deref(),
+        &agent.effort(cfg, Call::Split(1)),
     )?;
     Ok(answer.items)
 }
@@ -1431,7 +1431,7 @@ fn build_one(
         &prompt,
         &schema::implementation(),
         dir,
-        cfg.effort_for_round(&implementor.spec, 1).as_deref(),
+        &implementor.effort(cfg, Call::Split(1)),
     ) {
         Ok(work) => work,
         Err(e) if e.kind() == ErrorKind::UncertainWrite => {
@@ -1883,7 +1883,7 @@ fn propose_and_check(
         propose_prompt,
         &schema::split_proposal(),
         work_dir,
-        cfg.effort_for_round(&proposer.spec, 1).as_deref(),
+        &proposer.effort(cfg, Call::Split(1)),
     )?;
     if !proposal.should_split {
         return Ok(decide(
@@ -1912,7 +1912,7 @@ fn propose_and_check(
             .replace("{parts}", &render_parts(&proposal.parts)),
         &schema::split_check(),
         work_dir,
-        cfg.effort_for_round(&checker.spec, 2).as_deref(),
+        &checker.effort(cfg, Call::Split(2)),
     )?;
 
     Ok(decide(&proposal, &check, cfg.loop_cfg.max_split_parts))

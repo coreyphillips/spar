@@ -96,6 +96,45 @@ impl std::fmt::Debug for Agent {
     }
 }
 
+/// What one call asks for, and what its stand in would ask for.
+///
+/// Two values rather than one because a fallback runs a different CLI, whose
+/// effort words are its own. Handing the primary's word to it is wrong, and
+/// dropping the schedule at the handover, which is what happened before, makes
+/// a fallback ignore a configuration it has its own answer for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Effort {
+    pub primary: Option<String>,
+    pub fallback: Option<String>,
+}
+
+impl Effort {
+    /// One value, for a call with no fallback to think about.
+    pub fn just(primary: Option<String>) -> Self {
+        Self {
+            primary,
+            fallback: None,
+        }
+    }
+
+    fn asked(&self) -> Option<&str> {
+        self.primary.as_deref()
+    }
+
+    /// What the stand in is asked for, once it is the one answering.
+    fn handed_over(&self) -> Effort {
+        Effort {
+            primary: self.fallback.clone(),
+            fallback: None,
+        }
+    }
+
+    /// For a log line naming what a call was asked for.
+    pub fn describe(&self) -> &str {
+        self.primary.as_deref().unwrap_or("default effort")
+    }
+}
+
 impl Agent {
     pub fn new(spec: AgentSpec) -> Self {
         let fallback = spec
@@ -399,7 +438,7 @@ impl Agent {
 
     // -- the two operations everything else is built from -------------------
 
-    pub fn ask(&self, prompt: &str, cwd: &Path, effort: Option<&str>) -> Result<String> {
+    pub fn ask(&self, prompt: &str, cwd: &Path, effort: &Effort) -> Result<String> {
         let baseline = EditBaseline::capture(cwd)?;
         self.ask_with_access(prompt, cwd, effort, Access::Read, Some(&baseline))
     }
@@ -407,7 +446,7 @@ impl Agent {
     /// Ask for a call that may modify the working tree.
     ///
     /// The caller commits accepted edits after validating the response.
-    pub fn edit(&self, prompt: &str, cwd: &Path, effort: Option<&str>) -> Result<String> {
+    pub fn edit(&self, prompt: &str, cwd: &Path, effort: &Effort) -> Result<String> {
         let baseline = EditBaseline::capture(cwd)?;
         self.ask_with_access(prompt, cwd, effort, Access::Edit, Some(&baseline))
     }
@@ -416,7 +455,7 @@ impl Agent {
         &self,
         prompt: &str,
         cwd: &Path,
-        effort: Option<&str>,
+        effort: &Effort,
         access: Access,
         baseline: Option<&EditBaseline>,
     ) -> Result<String> {
@@ -426,11 +465,27 @@ impl Agent {
             Err(e) => match recovery_error(&e, baseline, cwd, access) {
                 Some(recovery) => Err(recovery),
                 None => self.hand_over(e, |backup| {
-                    backup.ask_with_access(prompt, cwd, None, access, baseline)
+                    backup.ask_with_access(prompt, cwd, &effort.handed_over(), access, baseline)
                 }),
             },
         };
         finish_call(result, access, baseline, cwd)
+    }
+
+    /// What this agent, and its stand in, are asked for on one call.
+    ///
+    /// Both at once, because the fallback runs a different CLI: its effort word
+    /// has to come from its own configuration rather than from the agent that
+    /// just failed.
+    pub fn effort(&self, cfg: &crate::config::Config, call: crate::config::Call) -> Effort {
+        Effort {
+            primary: cfg.effort_for(&self.spec, call),
+            fallback: self
+                .spec
+                .fallback
+                .as_deref()
+                .and_then(|spec| cfg.effort_for(spec, call)),
+        }
     }
 
     /// Give a failed call to the fallback, if there is one.
@@ -440,9 +495,11 @@ impl Agent {
     /// answer, which is why `ask_json` does not; asking a different CLI is a
     /// different question, and the alternative here is losing the run.
     ///
-    /// The scheduled effort is deliberately not passed on. Effort words are
-    /// each CLI's own vocabulary, and the one in hand belongs to the agent that
-    /// just failed, so the fallback uses whatever its own config asked for.
+    /// The primary's effort word is never passed on: effort words are each
+    /// CLI's own vocabulary, and the one in hand belongs to the agent that just
+    /// failed. What the fallback is asked for is resolved from its own
+    /// configuration for this same call, so a schedule reaches a stand in
+    /// rather than being dropped at the handover.
     fn hand_over<T>(&self, primary: SparError, run: impl FnOnce(&Agent) -> Result<T>) -> Result<T> {
         let Some(backup) = self.fallback() else {
             return Err(primary);
@@ -478,7 +535,7 @@ impl Agent {
         &self,
         prompt: &str,
         cwd: &Path,
-        effort: Option<&str>,
+        effort: &Effort,
         schema_file: Option<&Path>,
         schema: Option<&str>,
         access: Access,
@@ -492,6 +549,7 @@ impl Agent {
             system: Some(STYLE_RULES.to_string()),
             model: self.spec.model.clone(),
             effort: effort
+                .asked()
                 .map(str::to_string)
                 .or_else(|| self.spec.effort.clone()),
             cwd: Some(cwd.display().to_string()),
@@ -534,7 +592,7 @@ impl Agent {
         prompt: &str,
         schema: &Value,
         cwd: &Path,
-        effort: Option<&str>,
+        effort: &Effort,
     ) -> Result<T> {
         let baseline = EditBaseline::capture(cwd)?;
         self.ask_json_with_access(prompt, schema, cwd, effort, Access::Read, Some(&baseline))
@@ -548,7 +606,7 @@ impl Agent {
         prompt: &str,
         schema: &Value,
         cwd: &Path,
-        effort: Option<&str>,
+        effort: &Effort,
     ) -> Result<T> {
         let baseline = EditBaseline::capture(cwd)?;
         self.ask_json_with_access(prompt, schema, cwd, effort, Access::Edit, Some(&baseline))
@@ -559,7 +617,7 @@ impl Agent {
         prompt: &str,
         schema: &Value,
         cwd: &Path,
-        effort: Option<&str>,
+        effort: &Effort,
         access: Access,
         baseline: Option<&EditBaseline>,
     ) -> Result<T> {
@@ -571,7 +629,14 @@ impl Agent {
             Err(e) => match recovery_error(&e, baseline, cwd, access) {
                 Some(recovery) => Err(recovery),
                 None => self.hand_over(e, |backup| {
-                    backup.ask_json_retrying::<T>(prompt, schema, cwd, None, access, baseline)
+                    backup.ask_json_retrying::<T>(
+                        prompt,
+                        schema,
+                        cwd,
+                        &effort.handed_over(),
+                        access,
+                        baseline,
+                    )
                 }),
             },
         };
@@ -605,7 +670,7 @@ impl Agent {
         prompt: &str,
         schema: &Value,
         cwd: &Path,
-        effort: Option<&str>,
+        effort: &Effort,
         access: Access,
         baseline: Option<&EditBaseline>,
     ) -> Result<T> {
@@ -666,7 +731,7 @@ impl Agent {
         prompt: &str,
         schema: &Value,
         cwd: &Path,
-        effort: Option<&str>,
+        effort: &Effort,
         access: Access,
     ) -> Result<T> {
         let text = if self.supports_schema() {
@@ -709,7 +774,7 @@ impl Agent {
         prompt: &str,
         schema: &Value,
         cwd: &Path,
-        effort: Option<&str>,
+        effort: &Effort,
     ) -> Result<T> {
         let scoped = format!(
             "{prompt}\n\nThe changes under review are the diff between `{base}` and HEAD in your \
@@ -1372,6 +1437,7 @@ mod tests {
             command,
             model: None,
             effort: None,
+            effort_schedule: crate::config::EffortSchedule::default(),
             output: OutputMode::Text,
             message_match: BTreeMap::new(),
             message_path: None,
@@ -2001,7 +2067,9 @@ mod tests {
             shell("primary", "echo refused >&2; exit 1"),
             shell("backup", "echo stood in"),
         );
-        let answer = agent.ask("hi", Path::new("."), None).expect("fallback");
+        let answer = agent
+            .ask("hi", Path::new("."), &Effort::default())
+            .expect("fallback");
         assert_eq!("stood in", answer);
     }
 
@@ -2016,7 +2084,9 @@ mod tests {
             ),
             shell("backup", "printf 'fallback ran\\n' > fallback.txt"),
         );
-        let err = agent.edit("change it", &dir, None).unwrap_err();
+        let err = agent
+            .edit("change it", &dir, &Effort::default())
+            .unwrap_err();
 
         assert!(err.message().contains("refused"), "{err}");
         assert_eq!(
@@ -2048,7 +2118,9 @@ mod tests {
             shell("backup", "printf 'fallback ran\n' > fallback.txt"),
         );
 
-        let err = agent.edit("change it", &dir, None).unwrap_err();
+        let err = agent
+            .edit("change it", &dir, &Effort::default())
+            .unwrap_err();
 
         assert!(err.message().contains("refused"), "{err}");
         assert_eq!(
@@ -2074,7 +2146,9 @@ mod tests {
             shell("backup", "printf 'fallback ran\n' > fallback.txt"),
         );
 
-        let err = agent.edit("change it", &dir, None).unwrap_err();
+        let err = agent
+            .edit("change it", &dir, &Effort::default())
+            .unwrap_err();
 
         assert!(err.message().contains("refused"), "{err}");
         assert_eq!(
@@ -2097,7 +2171,9 @@ mod tests {
             shell("backup", "printf 'fallback ran\n' > fallback.txt"),
         );
 
-        let err = agent.edit("change it", &dir, None).unwrap_err();
+        let err = agent
+            .edit("change it", &dir, &Effort::default())
+            .unwrap_err();
 
         assert!(err.message().contains("refused"), "{err}");
         assert_eq!("preserved", git_at(&dir, &["log", "-1", "--pretty=%s"]));
@@ -2129,7 +2205,7 @@ mod tests {
                 "change it",
                 &serde_json::json!({"type": "object"}),
                 &dir,
-                None,
+                &Effort::default(),
             )
             .unwrap_err();
 
@@ -2165,7 +2241,7 @@ mod tests {
                 "change it",
                 &serde_json::json!({"type": "object"}),
                 &dir,
-                None,
+                &Effort::default(),
             )
             .unwrap_err();
 
@@ -2195,7 +2271,9 @@ mod tests {
             "/bin/sh",
         );
 
-        let err = agent.edit("change it", &linked, None).unwrap_err();
+        let err = agent
+            .edit("change it", &linked, &Effort::default())
+            .unwrap_err();
 
         assert_eq!(ErrorKind::UncertainWrite, err.kind());
         assert!(err.message().contains("Git marker"), "{err}");
@@ -2224,7 +2302,9 @@ mod tests {
             shell("backup", "printf 'fallback ran\n' > fallback.txt"),
         );
 
-        let err = agent.ask("read it", &linked, None).unwrap_err();
+        let err = agent
+            .ask("read it", &linked, &Effort::default())
+            .unwrap_err();
 
         assert_eq!(ErrorKind::UncertainWrite, err.kind());
         assert_eq!(marker, std::fs::read(linked.join(".git")).unwrap());
@@ -2244,7 +2324,7 @@ mod tests {
             "/bin/sh",
         );
 
-        let err = agent.ask("read it", &dir, None).unwrap_err();
+        let err = agent.ask("read it", &dir, &Effort::default()).unwrap_err();
 
         assert_eq!(ErrorKind::UncertainWrite, err.kind());
         assert!(err.message().contains("read-only call"), "{err}");
@@ -2282,7 +2362,9 @@ mod tests {
             "/bin/sh",
         );
 
-        let answer = agent.ask("read it", &dir, None).expect("answer kept");
+        let answer = agent
+            .ask("read it", &dir, &Effort::default())
+            .expect("answer kept");
 
         assert_eq!("reviewed", answer.trim());
         assert_eq!(
@@ -2310,7 +2392,7 @@ mod tests {
             "/bin/sh",
         );
 
-        let err = agent.ask("read it", &dir, None).unwrap_err();
+        let err = agent.ask("read it", &dir, &Effort::default()).unwrap_err();
 
         assert_eq!(ErrorKind::UncertainWrite, err.kind());
         assert!(err.message().contains("read-only call"), "{err}");
@@ -2333,7 +2415,7 @@ mod tests {
             "/bin/sh",
         );
 
-        let err = agent.ask("read it", &dir, None).unwrap_err();
+        let err = agent.ask("read it", &dir, &Effort::default()).unwrap_err();
 
         assert_eq!(ErrorKind::UncertainWrite, err.kind());
         assert!(err.message().contains("read-only call"), "{err}");
@@ -2352,7 +2434,9 @@ mod tests {
             "/bin/sh",
         );
 
-        let err = agent.edit("change it", &dir, None).unwrap_err();
+        let err = agent
+            .edit("change it", &dir, &Effort::default())
+            .unwrap_err();
 
         assert_eq!(ErrorKind::UncertainWrite, err.kind());
         assert!(err.message().contains("Git entry"), "{err}");
@@ -2370,7 +2454,9 @@ mod tests {
             shell("backup", "printf 'fallback ran\n' > fallback.txt"),
         );
 
-        let err = agent.edit("change it", &linked, None).unwrap_err();
+        let err = agent
+            .edit("change it", &linked, &Effort::default())
+            .unwrap_err();
 
         assert_eq!(ErrorKind::UncertainWrite, err.kind());
         assert!(err.message().contains("deleted"), "{err}");
@@ -2396,7 +2482,9 @@ mod tests {
             shell("backup", "printf 'fallback ran\n' > fallback.txt"),
         );
 
-        let err = agent.edit("change it", &linked, None).unwrap_err();
+        let err = agent
+            .edit("change it", &linked, &Effort::default())
+            .unwrap_err();
 
         assert_eq!(ErrorKind::UncertainWrite, err.kind());
         assert!(err.message().contains("already exists"), "{err}");
@@ -2418,7 +2506,7 @@ mod tests {
     fn without_a_fallback_the_original_error_is_what_surfaces() {
         let agent = Agent::with_bin(shell("primary", "echo refused >&2; exit 1"), "/bin/sh");
         let err = agent
-            .ask("hi", Path::new("."), None)
+            .ask("hi", Path::new("."), &Effort::default())
             .expect_err("no backup");
         assert!(err.message().contains("refused"), "{err}");
     }
@@ -2432,7 +2520,7 @@ mod tests {
             shell("backup", "echo out of quota >&2; exit 1"),
         );
         let err = agent
-            .ask("hi", Path::new("."), None)
+            .ask("hi", Path::new("."), &Effort::default())
             .expect_err("both fail");
         let text = err.message();
         let primary_at = text.find("policy refusal").expect("primary reason");
@@ -2475,7 +2563,7 @@ mod tests {
                 "q",
                 &serde_json::json!({"type": "object"}),
                 Path::new("."),
-                None,
+                &Effort::default(),
             )
             .expect("the stand in answers");
         assert!(answer.is_object());
@@ -2496,7 +2584,7 @@ mod tests {
                 "q",
                 &serde_json::json!({"type": "object"}),
                 Path::new("."),
-                None,
+                &Effort::default(),
             )
             .expect_err("nothing answers");
         assert!(err.message().contains("twice"), "{err}");
@@ -2518,7 +2606,7 @@ mod tests {
                 "q",
                 &serde_json::json!({"type": "object"}),
                 Path::new("."),
-                None,
+                &Effort::default(),
             )
             .expect("the stand in answers in the end");
         assert!(answer.is_object());
@@ -2535,7 +2623,9 @@ mod tests {
         let agent = with_fallback(primary, shell("backup", "echo stood in"));
         assert_eq!(
             "stood in",
-            agent.ask("hi", Path::new("."), None).expect("fallback")
+            agent
+                .ask("hi", Path::new("."), &Effort::default())
+                .expect("fallback")
         );
     }
 
@@ -2562,6 +2652,7 @@ mod schema_placeholder_tests {
             command,
             model: None,
             effort: None,
+            effort_schedule: crate::config::EffortSchedule::default(),
             output: OutputMode::Text,
             message_match: BTreeMap::new(),
             message_path: None,

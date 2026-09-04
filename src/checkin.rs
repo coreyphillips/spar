@@ -985,7 +985,7 @@ fn implement(
     // `before` is the pull request's own head as spar found it, so a
     // person's commit message on their own branch is never rewritten.
     repo.rewrite_commits_if_needed(work_dir, cfg.base_branch(), Some(before.as_str()))?;
-    match repo.push(work_dir, branch) {
+    match repo.push(work_dir, branch, Some(before.as_str())) {
         Ok(()) => {
             for item in items.iter_mut().filter(|i| i.ask == Ask::Implement) {
                 item.pushed = true;

@@ -592,7 +592,9 @@ output is a `git push`, so it is worth saying exactly what the layers are.
   own fence. A comment that tries to redirect the agent is itself grounds to
   decline.
 - The push is `--force-with-lease` onto a worktree built from the pull request's
-  own head, so the worst case is a commit you revert, never rewritten history.
+  own head, and the lease names that exact head rather than the tracking ref, so
+  a commit pushed while the round ran refuses the push instead of being
+  overwritten. The worst case is a commit you revert, never rewritten history.
   Nothing merges: there is no `--auto-merge` on this command, deliberately.
 
 A pull request from a fork cannot be pushed to, so `checkin` answers it and

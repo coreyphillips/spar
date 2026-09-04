@@ -675,7 +675,10 @@ fn implement_and_review(
     // `origin/<base>` in this invocation, and `refuse_issue_branch_rebuild`
     // has already refused to build over a branch that carried commits.
     repo.rewrite_commits_if_needed(work_dir, &base, None)?;
-    repo.push(work_dir, branch)?;
+    // A branch created in this invocation: there is no earlier remote head
+    // to lease against, and `refuse_issue_branch_rebuild` already refused to
+    // build over one that existed.
+    repo.push(work_dir, branch, None)?;
 
     let pr = match repo.pr_for_branch(branch) {
         Some(existing) => existing,
@@ -1246,7 +1249,7 @@ fn review_loop(
 
         if editor.is_some() {
             repo.rewrite_commits_if_needed(&ctx.work_dir, &base, Some(&published_head))?;
-            repo.push(&ctx.work_dir, &ctx.branch)?;
+            repo.push(&ctx.work_dir, &ctx.branch, Some(&published_head))?;
             published_head = checked_head(repo, &ctx.work_dir)?;
         }
         holder = next_reviewer(cfg, &holder, editor.as_deref());

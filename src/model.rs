@@ -691,6 +691,35 @@ pub struct Disposition {
     pub new_issue_body: Option<String>,
 }
 
+/// What a reviewer did about one of its own findings when it chose to fix them.
+///
+/// The other three editing calls return a structured report. This one returned
+/// free text, and three things were inferred from it: that every finding was
+/// fixed, what the commit subject should be, and that the author had nothing to
+/// answer. A reviewer that fixed two of three points and said so in prose had
+/// all three recorded as fixed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnFix {
+    #[serde(default, deserialize_with = "de_string")]
+    pub title: String,
+    /// Carried for the same reason a disposition carries it: the ledger key has
+    /// to be the one the finding hashes to.
+    #[serde(default, deserialize_with = "de_string")]
+    pub file: String,
+    #[serde(deserialize_with = "de_bool")]
+    pub fixed: bool,
+    #[serde(default, deserialize_with = "de_string")]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnFixDoc {
+    #[serde(default, deserialize_with = "de_string")]
+    pub summary: String,
+    #[serde(default)]
+    pub fixes: Vec<OwnFix>,
+}
+
 /// One reviewer's judgement of a finding the *other* reviewer raised.
 ///
 /// This is the whole point of review only mode. A finding both models raise

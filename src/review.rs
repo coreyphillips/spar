@@ -26,8 +26,8 @@ use crate::error::{ErrorKind, Result, SparError};
 use crate::jsonx::{exact_finding_key as finding_key, finding_file, stable_finding_key};
 use crate::model::{
     Action, Disposition, Dispute, Finding, Followup, Implementation, Issue, IssueRun, Ledger,
-    LedgerEntry, NextAction, PersistedState, PlanItem, PrView, ResponseDoc, Review, Settled,
-    Severity, SkippedItem, Status, STATE_VERSION,
+    LedgerEntry, NextAction, OwnFix, OwnFixDoc, PersistedState, PlanItem, PrView, ResponseDoc,
+    Review, Settled, Severity, SkippedItem, Status, STATE_VERSION,
 };
 use crate::repo::Repo;
 use crate::style::{self, Style};
@@ -105,6 +105,13 @@ Then choose next_action:
 - merge: no blocking findings, the PR is good.
 - fix_myself: there are blocking findings and you will fix them directly.
 - hand_back: there are blocking findings the author should address.
+
+Choose fix_myself for a mechanical fix nobody would argue about: the missing
+guard, the wrong comparison, the case the code plainly meant to handle. Choose
+hand_back when the author might reasonably disagree, or when the fix needs
+context you do not have. Fixing it yourself costs the author its chance to
+refute the point, and a refutation is a legitimate outcome here: an author that
+accepts every review comment to get approved produces worse code, not better.
 {open}{answers}{settled}{round}";
 
 const CLOSE_PROMPT: &str = "\
@@ -155,8 +162,15 @@ Fix what the point says and nothing else. The smallest change that answers it is
 the right one: no refactor alongside it, no capability nobody asked for, no
 handling for cases nobody raised. Every line you add is what the next pass
 reviews, so a fix that grows the branch buys another round of findings about the
-fix. If a point cannot be answered without a change bigger than the point, say so
-rather than making the change.
+fix. If a point cannot be answered without a change bigger than the point, set
+fixed=false for it and say why, rather than making the change.
+
+Report on every point above: fixed=true only where a change in the working tree
+answers it, and fixed=false with the reason where you left it. A point you
+report as left stays open and goes to the author, with your reason, so write
+that reason for them. Copy each title and file across exactly as given, so your
+answer can be matched back to the finding. The summary becomes the commit
+subject, so write one sentence naming what changed.
 
 Do not commit, push, or merge.";
 
@@ -1135,16 +1149,23 @@ fn review_loop(
             let prompt = FIX_PROMPT.replace("{findings}", &findings_for_prompt(&blocking));
             let before_fix = repo.head_oid_checked(&ctx.work_dir)?;
             let worktree_baseline = repo.worktree_baseline(&ctx.work_dir)?;
-            let fix_error = match reviewer.edit(&prompt, &ctx.work_dir, effort.as_deref()) {
-                Ok(summary) => {
+            let mut report: Option<OwnFixDoc> = None;
+            let fix_error = match reviewer.edit_json::<OwnFixDoc>(
+                &prompt,
+                &schema::own_fix(),
+                &ctx.work_dir,
+                effort.as_deref(),
+            ) {
+                Ok(doc) => {
                     commit_accepted_changes(
                         cfg,
                         repo,
                         &ctx.work_dir,
                         &worktree_baseline,
-                        &summary,
+                        &doc.summary,
                         "Address blocking review findings",
                     )?;
+                    report = Some(doc);
                     None
                 }
                 Err(error) => Some(defer_clean_edit_error(
@@ -1161,10 +1182,25 @@ fn review_loop(
                     // out left this path with the hole the other one had: the
                     // next pass reads a fix with nothing saying it was asked
                     // for, and the guard that ends an argument cannot count it.
-                    // The reviewer wrote both the finding and the fix, so its
-                    // own detail is the claim.
-                    record_own_fixes(&blocking, ledger, state, round);
+                    //
+                    // Only the ones the report claims. A commit landing says
+                    // one point was answered, not that all of them were, and a
+                    // false Fixed entry either sends the closing pass to check
+                    // code that does not exist or lets the point through on the
+                    // claim alone.
+                    let fixes = report.as_ref().map(|d| d.fixes.as_slice()).unwrap_or(&[]);
+                    let (claimed, left) = split_own_fixes(&blocking, fixes);
+                    record_own_fixes(&claimed, ledger, state, round);
                     remove_findings(&mut open_findings, &blocking);
+                    extend_findings(&mut open_findings, &left);
+                    if !left.is_empty() {
+                        state.notes.push(format!(
+                            "{holder} fixed {} of {} of its own findings in round {round}; the \
+                             rest stay open",
+                            claimed.len(),
+                            blocking.len()
+                        ));
+                    }
                     editor = Some(who);
                 }
                 None if fix_error.is_none() => {
@@ -2195,6 +2231,54 @@ fn record_nonblocking_outcome_with_match(
     }
 }
 
+/// Split the reviewer's own findings by what its fix call says it did.
+///
+/// Returns the ones it reports fixed, and the ones it reports leaving with the
+/// reason attached to the detail, because the author reads that next round and
+/// "the reviewer tried this and stopped" is the useful half of it. A finding
+/// with no entry stays open too: an unanswered point is not a fixed one.
+fn split_own_fixes(blocking: &[Finding], fixes: &[OwnFix]) -> (Vec<Finding>, Vec<Finding>) {
+    let mut claimed = Vec::new();
+    let mut left = Vec::new();
+    let mut used = vec![false; fixes.len()];
+    for finding in blocking {
+        match matching_disposition(finding, blocking, fixes) {
+            Ok((index, fix)) if !used[index] => {
+                used[index] = true;
+                if fix.fixed {
+                    claimed.push(finding.clone());
+                    continue;
+                }
+                let mut open = finding.clone();
+                let reason = fix.reason.trim();
+                if !reason.is_empty() {
+                    open.detail = format!(
+                        "{}\n\nThe reviewer chose to fix this itself and did not: {reason}",
+                        open.detail.trim()
+                    );
+                }
+                logwarn!("'{}' was not fixed: {reason}", finding.title);
+                left.push(open);
+            }
+            Ok(_) => {
+                logwarn!(
+                    "'{}' has more than one matching entry in the fix report, so it stays open",
+                    finding.title
+                );
+                left.push(finding.clone());
+            }
+            Err(reason) => {
+                logwarn!(
+                    "'{}' has {reason} in the fix report, so it stays open",
+                    finding.title
+                );
+                left.push(finding.clone());
+            }
+        }
+    }
+    (claimed, left)
+}
+
 /// Put the findings a reviewer fixed itself in the ledger.
 ///
 /// The other path has an author's disposition to record, naming which points it
@@ -2309,24 +2393,52 @@ pub(crate) fn same_finding_parts(a_title: &str, a_file: &str, b_title: &str, b_f
     finding_key(a_title, a_file) == finding_key(b_title, b_file)
 }
 
-fn disposition_matches(finding: &Finding, disposition: &Disposition) -> bool {
-    same_point(&finding.title, &disposition.title) && finding.file.trim() == disposition.file.trim()
+/// An answer to a finding, from whichever side of the round wrote it.
+///
+/// One matching rule for both, because the ledger key it produces has to be the
+/// same key the next round's finding hashes to whether the author answered the
+/// point or the reviewer answered its own.
+pub(crate) trait Answer {
+    fn title(&self) -> &str;
+    fn file(&self) -> &str;
 }
 
-fn stable_disposition_matches(finding: &Finding, disposition: &Disposition) -> bool {
+impl Answer for Disposition {
+    fn title(&self) -> &str {
+        &self.title
+    }
+    fn file(&self) -> &str {
+        &self.file
+    }
+}
+
+impl Answer for OwnFix {
+    fn title(&self) -> &str {
+        &self.title
+    }
+    fn file(&self) -> &str {
+        &self.file
+    }
+}
+
+fn answer_matches<A: Answer>(finding: &Finding, answer: &A) -> bool {
+    same_point(&finding.title, answer.title()) && finding.file.trim() == answer.file().trim()
+}
+
+fn stable_answer_matches<A: Answer>(finding: &Finding, answer: &A) -> bool {
     stable_finding_key(&finding.title, &finding.file)
-        == stable_finding_key(&disposition.title, &disposition.file)
+        == stable_finding_key(answer.title(), answer.file())
 }
 
-fn sole_disposition_match<'a>(
+fn sole_answer_match<'a, A: Answer>(
     finding: &Finding,
-    dispositions: &'a [Disposition],
-    matches: impl Fn(&Finding, &Disposition) -> bool,
-) -> std::result::Result<Option<(usize, &'a Disposition)>, &'static str> {
-    let mut matched = dispositions
+    answers: &'a [A],
+    matches: impl Fn(&Finding, &A) -> bool,
+) -> std::result::Result<Option<(usize, &'a A)>, &'static str> {
+    let mut matched = answers
         .iter()
         .enumerate()
-        .filter(|(_, disposition)| matches(finding, disposition));
+        .filter(|(_, answer)| matches(finding, answer));
     let first = matched.next();
     if matched.next().is_some() {
         return Err("more than one matching disposition");
@@ -2334,22 +2446,20 @@ fn sole_disposition_match<'a>(
     Ok(first)
 }
 
-/// Match a disposition back to the finding it answers, so the ledger key it
+/// Match an answer back to the finding it answers, so the ledger key it
 /// records is the same key the next round's finding will hash to. Exact
 /// locations lead. A line-tolerant match is safe only when the finding and its
-/// disposition are each unique at that stable repository path.
-fn matching_disposition<'a>(
+/// answer are each unique at that stable repository path.
+fn matching_disposition<'a, A: Answer>(
     finding: &Finding,
     findings: &[Finding],
-    dispositions: &'a [Disposition],
-) -> std::result::Result<(usize, &'a Disposition), &'static str> {
-    if let Some(exact) = sole_disposition_match(finding, dispositions, disposition_matches)? {
+    answers: &'a [A],
+) -> std::result::Result<(usize, &'a A), &'static str> {
+    if let Some(exact) = sole_answer_match(finding, answers, answer_matches)? {
         return Ok(exact);
     }
     if unique_stable_finding(findings, finding) {
-        if let Some(stable) =
-            sole_disposition_match(finding, dispositions, stable_disposition_matches)?
-        {
+        if let Some(stable) = sole_answer_match(finding, answers, stable_answer_matches)? {
             return Ok(stable);
         }
     }
@@ -3919,6 +4029,72 @@ mod tests {
         assert!(check_relitigation(&mut ledger, &blocking, &mut state));
     }
 
+    /// A commit landing says one point was answered, not that all of them were.
+    ///
+    /// The fix call used to return free text, and every blocking finding was
+    /// recorded Fixed as soon as anything committed. A reviewer that fixed two
+    /// of three and said so in prose had all three settled, and the next
+    /// reviewer was told "the author says it fixed them" for one nobody had
+    /// touched.
+    #[test]
+    fn a_finding_the_fix_call_declined_stays_open() {
+        let blocking = vec![
+            finding("blocking", "Unbounded loop", "spins", "src/x.rs:88", true),
+            finding("blocking", "Missing guard", "panics", "src/y.rs:12", true),
+        ];
+        let fixes = vec![
+            OwnFix {
+                title: "Unbounded loop".into(),
+                file: "src/x.rs:88".into(),
+                fixed: true,
+                reason: "bounded it on max_attempts".into(),
+            },
+            OwnFix {
+                title: "Missing guard".into(),
+                file: "src/y.rs:12".into(),
+                fixed: false,
+                reason: "the guard belongs in the caller, which this branch does not touch".into(),
+            },
+        ];
+
+        let (claimed, left) = split_own_fixes(&blocking, &fixes);
+
+        assert_eq!(1, claimed.len());
+        assert_eq!("Unbounded loop", claimed[0].title);
+        assert_eq!(1, left.len());
+        assert_eq!("Missing guard", left[0].title);
+        assert!(
+            left[0].detail.contains("belongs in the caller"),
+            "the author is not told why it was left: {}",
+            left[0].detail
+        );
+
+        // And only the claimed one settles.
+        let mut ledger = Ledger::new();
+        let mut state = IssueRun::new(1, "t");
+        record_own_fixes(&claimed, &mut ledger, &mut state, 1);
+        assert!(ledger.contains_key(&finding_key("Unbounded loop", "src/x.rs:88")));
+        assert!(
+            !ledger.contains_key(&finding_key("Missing guard", "src/y.rs:12")),
+            "a point nobody fixed was recorded as fixed"
+        );
+    }
+
+    /// A point the report says nothing about is not a fixed point either.
+    #[test]
+    fn a_finding_the_fix_report_never_mentions_stays_open() {
+        let blocking = vec![finding(
+            "blocking",
+            "Unbounded loop",
+            "spins",
+            "src/x.rs:88",
+            true,
+        )];
+        let (claimed, left) = split_own_fixes(&blocking, &[]);
+        assert!(claimed.is_empty());
+        assert_eq!(1, left.len());
+    }
+
     /// The settled block tells a reviewer the code will not change for a point.
     /// That is the opposite of what happened to a fix, and a fixed point printed
     /// there reads as an argument already won.
@@ -4163,7 +4339,7 @@ mod tests {
         let blocking = [finding("blocking", "Unbounded loop", "d", "src/x.rs", true)];
         let recorded = finding_key(&blocking[0].title, &blocking[0].file);
         let answer = disposition("unbounded loop!", "src/x.rs", Action::Refuted);
-        assert!(disposition_matches(&blocking[0], &answer));
+        assert!(answer_matches(&blocking[0], &answer));
         assert_eq!(recorded, finding_key(&answer.title, &answer.file));
     }
 
@@ -4198,15 +4374,15 @@ mod tests {
             "src/x.rs",
             true,
         )];
-        assert!(disposition_matches(
+        assert!(answer_matches(
             &findings[0],
             &disposition("unbounded loop", "src/x.rs", Action::Refuted)
         ));
-        assert!(!disposition_matches(
+        assert!(!answer_matches(
             &findings[0],
             &disposition("something else", "src/x.rs", Action::Refuted)
         ));
-        assert!(!disposition_matches(
+        assert!(!answer_matches(
             &findings[0],
             &disposition("unbounded loop", "src/y.rs", Action::Refuted)
         ));
@@ -4262,7 +4438,11 @@ mod tests {
     fn an_omitted_disposition_leaves_the_blocker_unmatched() {
         let blocker = finding("blocking", "Unbounded loop", "d", "src/x.rs", true);
         assert!(matches!(
-            matching_disposition(&blocker, std::slice::from_ref(&blocker), &[]),
+            matching_disposition(
+                &blocker,
+                std::slice::from_ref(&blocker),
+                &[] as &[Disposition]
+            ),
             Err("no matching disposition")
         ));
     }

@@ -104,7 +104,9 @@ writes: 3 attempted, 2 succeeded, 1 failed
 
 One failed write does not stop independent work. Spar finishes the remaining
 items, reports every outcome together, and returns a non-zero status if any
-write failed. This includes partial failures and cleanup with
+write failed. The same holds for a failed triage in a later wave: it ends the
+waves, and the run still resumes the pull requests named on the command line and
+prints the report, with the waves that did not run named in it. This includes partial failures and cleanup with
 `spar clean --pr-state`. `spar post` follows the same policy.
 
 The counts describe logical outcomes, not command invocations. If a GitHub

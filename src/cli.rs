@@ -613,6 +613,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
             let sorted = classify(&repo, &numbers)?;
             let mut results = Vec::new();
+            let mut stopped = Vec::new();
             work_issues(
                 &agents,
                 &cfg,
@@ -620,17 +621,20 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 sorted.issues.clone(),
                 &plan_out,
                 &mut results,
+                &mut stopped,
             )?;
 
+            // Reached even when a wave failed: these were named on the command
+            // line and do not depend on triage.
             for number in sorted.prs {
                 results.push(review::resume_pr(&agents, &cfg, &repo, number, None));
             }
 
-            if results.is_empty() {
+            if results.is_empty() && stopped.is_empty() {
                 log!("nothing scheduled");
                 return Ok(report_writes(&repo));
             }
-            Ok(report(&results, &cfg, &repo))
+            Ok(report_with(&results, &cfg, &repo, &stopped))
         }
         Command::Followup {
             common,
@@ -657,12 +661,21 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 return Ok(report_writes(&repo));
             }
             let mut results = Vec::new();
-            work_issues(&agents, &cfg, &repo, wave, &plan_out, &mut results)?;
-            if results.is_empty() {
+            let mut stopped = Vec::new();
+            work_issues(
+                &agents,
+                &cfg,
+                &repo,
+                wave,
+                &plan_out,
+                &mut results,
+                &mut stopped,
+            )?;
+            if results.is_empty() && stopped.is_empty() {
                 log!("nothing scheduled");
                 return Ok(report_writes(&repo));
             }
-            Ok(report(&results, &cfg, &repo))
+            Ok(report_with(&results, &cfg, &repo, &stopped))
         }
 
         Command::Resume {
@@ -794,6 +807,7 @@ fn work_issues(
     first_wave: Vec<i64>,
     plan_out: &Path,
     results: &mut Vec<IssueRun>,
+    stopped: &mut Vec<String>,
 ) -> Result<()> {
     let mut handled: BTreeSet<i64> = BTreeSet::new();
     let mut leftover: BTreeSet<i64> = BTreeSet::new();
@@ -841,7 +855,29 @@ fn work_issues(
             plan_out.with_extension(format!("wave{plans_written}.json"))
         };
         plans_written += 1;
-        let plan = make_plan(agents, cfg, repo, &fetched, &plan_path)?;
+        // A triage failure is one CLI out of quota or refusing, in the cheapest
+        // step of the next wave, on a run that may have spent an hour. It ends
+        // the waves; it does not throw away the record of what the earlier ones
+        // did, which is the only place a person learns what the run made.
+        let plan = match make_plan(agents, cfg, repo, &fetched, &plan_path) {
+            Ok(plan) => plan,
+            Err(e) => {
+                logwarn!("triage failed for {}: {e}", numbers(&wave.numbers));
+                stopped.push(format!(
+                    "triage failed for {}, so it was not worked: {}",
+                    numbers(&wave.numbers),
+                    first_line(&e.to_string())
+                ));
+                for later in &queue {
+                    stopped.push(format!(
+                        "{} was not reached after that failure",
+                        numbers(&later.numbers)
+                    ));
+                }
+                queue.clear();
+                break;
+            }
+        };
         act_on_plan(cfg, repo, &plan);
 
         // No recursion: a child that triage calls a tracker in its turn is
@@ -1863,6 +1899,11 @@ fn first_line(text: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn report(results: &[IssueRun], cfg: &Config, repo: &Repo) -> i32 {
+    report_with(results, cfg, repo, &[])
+}
+
+/// The same, plus the waves that never ran.
+fn report_with(results: &[IssueRun], cfg: &Config, repo: &Repo, stopped: &[String]) -> i32 {
     println!("\n{}", "=".repeat(60));
     for r in results {
         println!(
@@ -1903,7 +1944,13 @@ fn report(results: &[IssueRun], cfg: &Config, repo: &Repo) -> i32 {
              Set followups = \"issues\" to file them."
         );
     }
-    let issue_exit = i32::from(!results.iter().all(IssueRun::succeeded));
+    if !stopped.is_empty() {
+        println!();
+        for line in stopped {
+            println!("{line}");
+        }
+    }
+    let issue_exit = i32::from(!results.iter().all(IssueRun::succeeded) || !stopped.is_empty());
     issue_exit.max(report_writes(repo))
 }
 

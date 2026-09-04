@@ -14,6 +14,7 @@
 //! at the same heading level. A real file had 25 `##` lines and 5 entries, so a
 //! naive split would file twenty issues, four of them titled "Impact".
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::Path;
@@ -252,8 +253,11 @@ For each entry decide:
   - already_fixed: go and look. Name the function or the change that fixed it,
     so somebody reading this can check you.
   - not_worth_it: real, still there, and not worth a maintainer's queue.
-  - duplicate: an open issue, or an earlier entry in this list, already covers
-    it. Put that number in duplicate_of.
+  - duplicate: something else already covers it. An open issue goes in
+    duplicate_of_issue, another entry in this list goes in duplicate_of_entry
+    by its number here. They are separate fields because an entry is not an
+    issue: an entry you point at may itself be dropped, and this one is then
+    kept rather than lost with it.
 - reason: one sentence. For anything but still_relevant this is the only record
   of why the entry was dropped, so give the reason rather than the verdict
   restated.
@@ -432,64 +436,137 @@ pub fn run(
     }
 
     let mut disposed: Vec<Entry> = Vec::new();
-    for (i, entry) in taken.iter().enumerate() {
-        let number = i as i64 + 1;
-        let Some(verdict) = verdicts.iter().find(|v| v.entry == number) else {
-            // Never read as "drop it". Filing something nobody looked at
-            // defeats the point of the screen; leaving it costs one line.
-            logwarn!(
-                "no verdict for '{}', leaving it in the file",
-                first_line(&entry.title)
-            );
-            outcome.held += 1;
-            continue;
-        };
+    // What each entry became, so a sibling that says it duplicates one can be
+    // answered after the batch rather than guessed at during it. An entry
+    // pointing at one that was itself dropped, or failed to file, is kept:
+    // archiving it as covered by an issue number that is really an entry
+    // number sends a reader to an unrelated issue and loses both copies.
+    let mut filed_as: BTreeMap<i64, i64> = BTreeMap::new();
+    let mut deferred: Vec<usize> = Vec::new();
 
-        // "Duplicate of nothing in particular" is unfalsifiable, and
-        // `find_similar_issue` on the filing path is exactly the check for it.
-        let files = verdict.verdict == Screened::StillRelevant
-            || (verdict.verdict == Screened::Duplicate && verdict.duplicate_of.is_none());
-
-        if files {
-            let title = if verdict.title.trim().is_empty() {
-                entry.title.as_str()
-            } else {
-                verdict.title.as_str()
-            };
-            match crate::review::file_as_issue(repo, title, &entry.body) {
-                Ok(filed) => {
-                    log!("  {}", filed.describe(title));
-                    if let Some(n) = filed.number() {
-                        outcome.issues.push(n);
-                    }
-                    repo.archive_followup(title, &entry.body, &format!("Filed: {}", filed.note()));
-                }
-                Err(e) => {
-                    logwarn!("could not file '{}': {e}", first_line(title));
-                    outcome.held += 1;
-                    continue;
-                }
+    for pass in 0..2 {
+        for (i, entry) in taken.iter().enumerate() {
+            let number = i as i64 + 1;
+            if pass == 0 && disposed.iter().any(|d| d.title == entry.title) {
+                continue;
             }
-        } else {
-            let why = dropped_note(verdict);
-            log!("  dropped '{}': {why}", first_line(&entry.title));
-            repo.archive_followup(&entry.title, &entry.body, &format!("Dropped: {why}"));
-        }
+            if pass == 1 && !deferred.contains(&i) {
+                continue;
+            }
+            let Some(verdict) = verdicts.iter().find(|v| v.entry == number) else {
+                // Never read as "drop it". Filing something nobody looked at
+                // defeats the point of the screen; leaving it costs one line.
+                logwarn!(
+                    "no verdict for '{}', leaving it in the file",
+                    first_line(&entry.title)
+                );
+                outcome.held += 1;
+                continue;
+            };
 
-        disposed.push(entry.clone());
-        // Written after the entry is dealt with, never before. The window is
-        // one entry wide and it always falls on the side of filing twice rather
-        // than losing one: an entry filed and not yet removed is found again
-        // next run and matched to the issue that was just created, while an
-        // entry removed before it was filed is gone.
-        crate::repo::write_text_atomic(path, &without(&original, &disposed)).map_err(|e| {
-            spar_err!(
+            // An entry that says it duplicates a sibling waits for the sibling to
+            // be dealt with, because what happened to that one decides this one.
+            if pass == 0
+                && verdict.verdict == Screened::Duplicate
+                && verdict.duplicate_of_entry.is_some()
+            {
+                deferred.push(i);
+                continue;
+            }
+            let covered_by = verdict
+                .duplicate_of_entry
+                .and_then(|target| filed_as.get(&target).copied())
+                .or(verdict.duplicate_of_issue);
+            if verdict.verdict == Screened::Duplicate
+                && verdict.duplicate_of_entry.is_some()
+                && covered_by.is_none()
+            {
+                logwarn!(
+                    "'{}' was called a duplicate of entry {}, which was not filed, so it stays in \
+                 the file",
+                    first_line(&entry.title),
+                    verdict.duplicate_of_entry.unwrap_or_default()
+                );
+                outcome.held += 1;
+                continue;
+            }
+
+            // "Duplicate of nothing in particular" is unfalsifiable, and
+            // `find_similar_issue` on the filing path is exactly the check for it.
+            let files = verdict.verdict == Screened::StillRelevant
+                || (verdict.verdict == Screened::Duplicate && !verdict.names_a_duplicate());
+
+            if files {
+                let retitled = !verdict.title.trim().is_empty()
+                    && !verdict
+                        .title
+                        .trim()
+                        .eq_ignore_ascii_case(entry.title.trim());
+                let title = if verdict.title.trim().is_empty() {
+                    entry.title.as_str()
+                } else {
+                    verdict.title.as_str()
+                };
+                match crate::review::file_as_issue(repo, title, &entry.body) {
+                    Ok(filed) => {
+                        log!("  {}", filed.describe(title));
+                        if let Some(n) = filed.number() {
+                            outcome.issues.push(n);
+                            filed_as.insert(number, n);
+                        }
+                        // Archived under the title it was written with, so the next
+                        // run that rediscovers the same defect in the original
+                        // wording finds it here rather than appending it again. The
+                        // new title goes in the verdict, and gets a heading of its
+                        // own, so either wording is recognised.
+                        repo.archive_followup(
+                            &entry.title,
+                            &entry.body,
+                            &format!(
+                                "Filed: {}{}",
+                                filed.note(),
+                                if retitled {
+                                    format!(", retitled to '{}'", title.trim())
+                                } else {
+                                    String::new()
+                                }
+                            ),
+                        );
+                        if retitled {
+                            repo.archive_followup(
+                                title,
+                                &format!("The same entry as '{}'.", entry.title.trim()),
+                                &format!("Filed: {}", filed.note()),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        logwarn!("could not file '{}': {e}", first_line(title));
+                        outcome.held += 1;
+                        continue;
+                    }
+                }
+            } else {
+                let why = dropped_note(verdict, covered_by);
+                log!("  dropped '{}': {why}", first_line(&entry.title));
+                repo.archive_followup(&entry.title, &entry.body, &format!("Dropped: {why}"));
+            }
+
+            disposed.push(entry.clone());
+            // Written after the entry is dealt with, never before. The window is
+            // one entry wide and it always falls on the side of filing twice rather
+            // than losing one: an entry filed and not yet removed is found again
+            // next run and matched to the issue that was just created, while an
+            // entry removed before it was filed is gone.
+            crate::repo::write_text_atomic(path, &without(&original, &disposed)).map_err(|e| {
+                spar_err!(
                 "{e}\n{} follow-up(s) were already dealt with. Remove them from {} by hand before \
                  running this again, or they will be filed twice.",
                 disposed.len(),
                 path.display()
             )
-        })?;
+            })?;
+        }
     }
 
     let filed = outcome.issues.len();
@@ -514,9 +591,9 @@ fn first_line(text: &str) -> String {
     crate::style::clip(text.trim().lines().next().unwrap_or("").trim(), 80)
 }
 
-fn dropped_note(v: &ScreenVerdict) -> String {
+fn dropped_note(v: &ScreenVerdict, covered_by: Option<i64>) -> String {
     let reason = v.reason.trim();
-    match (v.verdict, v.duplicate_of) {
+    match (v.verdict, covered_by) {
         (Screened::Duplicate, Some(n)) if reason.is_empty() => format!("#{n} already covers it"),
         (Screened::Duplicate, Some(n)) => format!("#{n} already covers it. {reason}"),
         (_, _) if reason.is_empty() => v.verdict.to_string(),
@@ -801,7 +878,19 @@ Found while working on #590.
             verdict: v,
             title: String::new(),
             reason: "because".into(),
-            duplicate_of: dup,
+            duplicate_of_issue: dup,
+            duplicate_of_entry: None,
+        }
+    }
+
+    fn duplicate_of_entry(entry: i64, target: i64) -> ScreenVerdict {
+        ScreenVerdict {
+            entry,
+            verdict: Screened::Duplicate,
+            title: String::new(),
+            reason: "same as the one above".into(),
+            duplicate_of_issue: None,
+            duplicate_of_entry: Some(target),
         }
     }
 
@@ -814,7 +903,7 @@ Found while working on #590.
         let without_number = verdict(1, Screened::Duplicate, None);
         let files = |v: &ScreenVerdict| {
             v.verdict == Screened::StillRelevant
-                || (v.verdict == Screened::Duplicate && v.duplicate_of.is_none())
+                || (v.verdict == Screened::Duplicate && !v.names_a_duplicate())
         };
         assert!(!files(&with_number));
         assert!(files(&without_number));
@@ -859,9 +948,31 @@ Found while working on #590.
     /// to survive into the log line and the archive.
     #[test]
     fn a_dropped_entry_carries_its_reason_and_the_issue_it_duplicates() {
-        let note = dropped_note(&verdict(1, Screened::Duplicate, Some(412)));
+        let v = verdict(1, Screened::Duplicate, Some(412));
+        let note = dropped_note(&v, v.duplicate_of_issue);
         assert!(note.contains("#412"), "{note}");
         assert!(note.contains("because"), "{note}");
+    }
+
+    /// An entry number is not an issue number, and one field could not say
+    /// which it was.
+    ///
+    /// Entry 4 duplicating entry 2 was archived as covered by issue #2, an
+    /// unrelated issue, and if entry 2 was then ruled already fixed or failed
+    /// to file, neither copy was filed at all.
+    #[test]
+    fn a_duplicate_of_a_sibling_is_kept_apart_from_a_duplicate_of_an_issue() {
+        let sibling = duplicate_of_entry(4, 2);
+        assert!(sibling.names_a_duplicate(), "it points at something");
+        assert_eq!(None, sibling.duplicate_of_issue);
+
+        // Unresolved, it names nothing to send a reader to.
+        let unresolved = dropped_note(&sibling, None);
+        assert!(!unresolved.contains("#2"), "{unresolved}");
+
+        // Resolved after the batch, it names the issue that entry became.
+        let resolved = dropped_note(&sibling, Some(512));
+        assert!(resolved.contains("#512"), "{resolved}");
     }
 }
 

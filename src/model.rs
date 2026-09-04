@@ -384,9 +384,23 @@ pub struct ScreenVerdict {
     pub title: String,
     #[serde(default, deserialize_with = "de_string")]
     pub reason: String,
-    /// The issue or sibling entry a duplicate points at.
+    /// The open issue a duplicate points at.
+    ///
+    /// Kept apart from `duplicate_of_entry`, because one number cannot say
+    /// which it is and the two are acted on differently: an issue already
+    /// exists, while a sibling entry may itself be dropped or fail to file.
     #[serde(default, deserialize_with = "de_opt_i64")]
-    pub duplicate_of: Option<i64>,
+    pub duplicate_of_issue: Option<i64>,
+    /// The number of another entry in the same list a duplicate points at.
+    #[serde(default, deserialize_with = "de_opt_i64")]
+    pub duplicate_of_entry: Option<i64>,
+}
+
+impl ScreenVerdict {
+    /// Whether this verdict names anything at all as the thing that covers it.
+    pub fn names_a_duplicate(&self) -> bool {
+        self.duplicate_of_issue.is_some() || self.duplicate_of_entry.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

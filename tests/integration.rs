@@ -1303,6 +1303,24 @@ fn a_local_followup_is_written_once_and_only_once() {
         "provenance is written once: {notes}"
     );
     assert!(!notes.contains("From #42."), "{notes}");
+
+    // A title that is a prefix of one already here is a different defect, and
+    // the substring check called it a duplicate and dropped it.
+    assert!(
+        matches!(
+            repo.append_local_followup("Retry", &body(45)),
+            Followup::Recorded(_)
+        ),
+        "a shorter title was swallowed by a longer heading"
+    );
+    // The same title in another case is the same entry.
+    assert!(matches!(
+        repo.append_local_followup("RETRY IS UNBOUNDED", &body(46)),
+        Followup::Covered(_)
+    ));
+    let notes = std::fs::read_to_string(fx.work.join(".spar").join("followups.md")).unwrap();
+    assert!(notes.contains("## Retry\n"), "{notes}");
+    assert_eq!(1, notes.matches("## Retry is unbounded").count(), "{notes}");
 }
 
 /// The writer and the reader live in different modules, and only this crosses

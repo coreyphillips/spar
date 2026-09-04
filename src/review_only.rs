@@ -205,7 +205,13 @@ fn run_phases(
     let mut by_agent: Vec<(String, Vec<Finding>)> = Vec::new();
     for (name, result) in reviews {
         match result {
-            Ok(review) => by_agent.push((name, review.findings)),
+            Ok(review) => {
+                let blocking = review.findings.iter().filter(|f| f.blocks()).count();
+                if let Some(said) = crate::review::verdict_disagreement(&review, blocking) {
+                    logwarn!("{name} {said}");
+                }
+                by_agent.push((name, review.findings));
+            }
             Err(e) if e.kind() == ErrorKind::UncertainWrite => return Err(e),
             Err(e) => {
                 // One reviewer failing is a degraded review, not a dead one,

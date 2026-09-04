@@ -57,7 +57,11 @@ pub fn review() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "verdict": {"type": "string", "enum": ["approve", "changes_requested"]},
+            "verdict": {
+                "type": "string",
+                "enum": ["approve", "changes_requested"],
+                "description": "Your overall call. The findings and next_action are what act, so this has to agree with them: approve means you raised nothing blocking. A disagreement between the two is reported and the findings decide."
+            },
             "next_action": {"type": "string", "enum": ["merge", "fix_myself", "hand_back"]},
             "summary": {
                 "type": "string",

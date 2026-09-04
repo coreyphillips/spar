@@ -172,6 +172,37 @@ pub fn same_subject(a: &str, b: &str) -> bool {
     containment(&a, &b) >= SAME_SUBJECT && shared(&a, &b) >= 5
 }
 
+/// How much of a title has to be shared before a body can be read as covering
+/// it.
+///
+/// Lower than `SAME_SUBJECT`, because two people naming one defect share fewer
+/// words in a title than in a whole issue, and the point of the test is not to
+/// be strict but to require the subject to appear at all.
+const SAME_TITLE: f64 = 0.34;
+
+/// Whether an existing issue already describes this one.
+///
+/// The title is weighed on its own, and that is the whole change from
+/// `same_subject`. `containment` normalises by the smaller token set, so a long
+/// umbrella issue, a "known issues" list, or a tracker has a large enough
+/// vocabulary that any short finding about the same module scores as covered,
+/// and the finding is then dropped without anything being written. Requiring
+/// the titles to overlap costs a genuine duplicate nothing: two people naming
+/// one defect name the same thing.
+pub fn covers(new_title: &str, new_body: &str, old_title: &str, old_body: &str) -> bool {
+    let mine = format!("{new_title} {new_body}");
+    let theirs = format!("{old_title} {old_body}");
+    same_subject(&mine, &theirs) && titles_overlap(new_title, old_title)
+}
+
+fn titles_overlap(a: &str, b: &str) -> bool {
+    let (a, b) = (strip_provenance(a), strip_provenance(b));
+    if a.trim().eq_ignore_ascii_case(b.trim()) {
+        return true;
+    }
+    containment(&a, &b) >= SAME_TITLE && shared(&a, &b) >= 2
+}
+
 /// Whether `candidate` says anything `existing` does not.
 ///
 /// The question behind "should this be a comment on the issue that already
@@ -372,6 +403,74 @@ mod real_corpus {
                 "#{dup} vs #{original} only scored {score:.3}"
             );
         }
+    }
+
+    /// The title carries its own weight, and the real duplicates survive it.
+    ///
+    /// Weighing the title separately is what stops a long issue absorbing every
+    /// short finding in its module, and it has to cost a genuine duplicate
+    /// nothing: two people naming one defect name the same thing.
+    #[test]
+    fn the_real_duplicates_survive_the_title_test() {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(CORPUS).expect("fixture");
+        let by: BTreeMap<u64, (String, String)> = rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r["number"].as_u64().expect("number"),
+                    (
+                        r["title"].as_str().unwrap_or("").to_string(),
+                        r["body"].as_str().unwrap_or("").to_string(),
+                    ),
+                )
+            })
+            .collect();
+        for (dup, original) in [(489u64, 487u64), (490, 485)] {
+            let (dt, db) = &by[&dup];
+            let (ot, ob) = &by[&original];
+            assert!(covers(dt, db, ot, ob), "#{dup} vs #{original}");
+        }
+    }
+
+    /// A long umbrella issue has a large enough vocabulary to contain any short
+    /// finding about the same module, and `containment` normalises by the
+    /// smaller token set, so it scored as covering all of them. The finding was
+    /// then dropped with nothing written anywhere.
+    #[test]
+    fn a_long_umbrella_issue_does_not_absorb_every_finding_in_its_module() {
+        let umbrella_title = "Known issues in the retry and cache layers";
+        let umbrella_body = "\
+            A running list. The retry loop needs a cap. The cache eviction is \
+            wrong under load. The connection pool leaks sockets on failover. \
+            The backoff calculation ignores Retry-After. Header parsing accepts \
+            duplicate keys. The metrics counter double counts retries. Cache \
+            keys collide across tenants. The socket timeout is hard coded.";
+        let finding_title = "Cache keys collide across tenants";
+        let finding_body = "Two tenants with the same object name share a cache entry.";
+
+        assert!(
+            same_subject(
+                &format!("{finding_title} {finding_body}"),
+                &format!("{umbrella_title} {umbrella_body}")
+            ),
+            "the old rule has to absorb it, or this proves nothing"
+        );
+        assert!(
+            !covers(finding_title, finding_body, umbrella_title, umbrella_body),
+            "a list that mentions the module absorbed a finding and wrote nothing"
+        );
+
+        // An issue actually about that defect still covers it, however the
+        // wording differs.
+        assert!(
+            covers(
+                finding_title,
+                finding_body,
+                "Cache keys collide between tenants",
+                "Two tenants storing the same object name share one cache entry."
+            ),
+            "a real duplicate was filed twice"
+        );
     }
 
     /// Everything else in that run is a genuinely separate defect, and merging

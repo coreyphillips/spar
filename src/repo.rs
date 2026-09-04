@@ -3626,23 +3626,36 @@ impl Repo {
     /// A tracker's body quotes every item in its checklist, so searching for an
     /// item's words matches the tracker before it matches anything else. That
     /// would link an item to the issue it is written in.
+    /// The search a tracker runs, which wants closed issues too: a checklist
+    /// item matching a closed issue is a done item that wants a link.
     pub fn find_similar_issue_apart_from(
         &self,
         title: &str,
         body: &str,
         apart_from: Option<i64>,
     ) -> Option<ExistingIssue> {
-        self.try_find_similar_issue_apart_from(title, body, apart_from)
+        self.try_similar_issue(title, body, apart_from, true)
             .ok()
             .flatten()
     }
 
-    /// The same search, preserving lookup failure for a caller about to write.
+    /// The search a filing runs, over open issues only.
     pub fn try_find_similar_issue_apart_from(
         &self,
         title: &str,
         body: &str,
         apart_from: Option<i64>,
+    ) -> Result<Option<ExistingIssue>> {
+        self.try_similar_issue(title, body, apart_from, false)
+    }
+
+    /// The same search, preserving lookup failure for a caller about to write.
+    fn try_similar_issue(
+        &self,
+        title: &str,
+        body: &str,
+        apart_from: Option<i64>,
+        include_closed: bool,
     ) -> Result<Option<ExistingIssue>> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -3667,11 +3680,20 @@ impl Repo {
             .filter(|c| !matches!(c, '"' | '\'' | '\n' | '\r'))
             .take(120)
             .collect();
+        // Open issues only when something is about to be filed. A fuzzy match
+        // against a closed one is the case worth keeping rather than dropping:
+        // a defect that was fixed, closed, and has come back is exactly the
+        // finding a maintainer wants, and "#N covers it and is closed" wrote it
+        // nowhere. An exact match is still checked against every state, since
+        // that is a regression of one specific issue rather than a resemblance
+        // to one, and a tracker still searches closed issues because a
+        // checklist item matching one is a done item that wants a link.
+        let state = if include_closed { "all" } else { "open" };
         let text = self.gh(&[
             "issue",
             "list",
             "--state",
-            "all",
+            state,
             "--limit",
             "100",
             "--search",
@@ -3681,15 +3703,13 @@ impl Repo {
         ])?;
         let rows: Vec<Row> = serde_json::from_str(text.trim())
             .map_err(|e| spar_err!("unexpected issue search for {title:?}: {e}"))?;
-        let wanted = format!("{title} {body}");
 
         Ok(rows
             .into_iter()
             .filter(|row| Some(row.number) != apart_from)
             .find(|row| {
-                let theirs = format!("{} {}", row.title, row.body);
                 row.title.trim().eq_ignore_ascii_case(title.trim())
-                    || textsim::same_subject(&wanted, &theirs)
+                    || textsim::covers(title, body, &row.title, &row.body)
             })
             .map(|row| ExistingIssue {
                 number: row.number,

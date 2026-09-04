@@ -106,6 +106,16 @@ impl std::fmt::Debug for Agent {
 pub struct Effort {
     pub primary: Option<String>,
     pub fallback: Option<String>,
+    /// The kind of call, as the effort schedule names it. Carried here because
+    /// every call site already builds one of these, and the accounting needs to
+    /// know what it was asked, not only who was asked.
+    pub kind: &'static str,
+    /// The issue or pull request the call is about, when it is about one.
+    pub subject: Option<i64>,
+    /// Set on the second ask after an unusable answer, and on a stand in, so
+    /// the accounting can say which calls were not the first attempt.
+    retry: bool,
+    standing_in: bool,
 }
 
 impl Effort {
@@ -113,8 +123,14 @@ impl Effort {
     pub fn just(primary: Option<String>) -> Self {
         Self {
             primary,
-            fallback: None,
+            ..Self::default()
         }
+    }
+
+    /// Say which issue or pull request this call is about.
+    pub fn about(mut self, subject: i64) -> Self {
+        self.subject = Some(subject);
+        self
     }
 
     fn asked(&self) -> Option<&str> {
@@ -126,12 +142,67 @@ impl Effort {
         Effort {
             primary: self.fallback.clone(),
             fallback: None,
+            kind: self.kind,
+            subject: self.subject,
+            retry: false,
+            standing_in: true,
         }
     }
 
     /// For a log line naming what a call was asked for.
     pub fn describe(&self) -> &str {
         self.primary.as_deref().unwrap_or("default effort")
+    }
+
+    /// The same call, asked again after an unusable answer.
+    fn asked_again(&self) -> Effort {
+        Effort {
+            retry: true,
+            ..self.clone()
+        }
+    }
+}
+
+/// What the call was actually asked for, which is the schedule's word or the
+/// agent's own.
+fn values_effort(effort: &Effort, spec: &AgentSpec) -> String {
+    effort
+        .asked()
+        .map(str::to_string)
+        .or_else(|| spec.effort.clone())
+        .unwrap_or_default()
+}
+
+/// Tokens, where a CLI's event stream reports them.
+///
+/// Best effort by design: codex's `--json` carries a usage event and most CLIs
+/// carry nothing, so this reads the last total it can find and leaves the field
+/// blank otherwise rather than guessing.
+fn tokens_used(stdout: &str) -> Option<u64> {
+    let mut found = None;
+    for line in stdout.lines().rev().take(200) {
+        let line = line.trim();
+        if !line.starts_with('{') || !line.contains("token") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        found = total_tokens(&value);
+        if found.is_some() {
+            break;
+        }
+    }
+    found
+}
+
+fn total_tokens(value: &Value) -> Option<u64> {
+    if let Some(total) = value.get("total_tokens").and_then(Value::as_u64) {
+        return Some(total);
+    }
+    match value {
+        Value::Object(fields) => fields.values().find_map(total_tokens),
+        _ => None,
     }
 }
 
@@ -485,6 +556,10 @@ impl Agent {
                 .fallback
                 .as_deref()
                 .and_then(|spec| cfg.effort_for(spec, call)),
+            kind: call.key(),
+            subject: None,
+            retry: false,
+            standing_in: false,
         }
     }
 
@@ -570,7 +645,24 @@ impl Agent {
         let git_file = match access {
             Access::Read | Access::Edit => GitFile::capture(cwd)?,
         };
+        let started = std::time::Instant::now();
         let called = proc::exec(&argv, &opts);
+        // Recorded whatever happened, including the failures: a run whose cost
+        // was two timeouts and a hand-over is a run whose report should say so.
+        crate::spend::record(crate::spend::Spent {
+            agent: self.name().to_string(),
+            kind: effort.kind.to_string(),
+            effort: values_effort(effort, &self.spec),
+            subject: effort.subject,
+            seconds: started.elapsed().as_secs_f64(),
+            retry: effort.retry,
+            fallback: effort.standing_in,
+            tokens: called
+                .as_ref()
+                .ok()
+                .and_then(|out| tokens_used(&out.stdout)),
+            ok: called.as_ref().is_ok_and(|out| out.ok()),
+        });
         after_call_is_quiet(&called, || {
             if let Some(git_file) = git_file {
                 git_file.restore_if_changed(cwd)?;
@@ -691,7 +783,12 @@ impl Agent {
                     e.first_line()
                 ),
             };
-            match self.ask_json_once::<T>(&asked, schema, cwd, effort, access) {
+            let effort = if attempt > 1 {
+                effort.asked_again()
+            } else {
+                effort.clone()
+            };
+            match self.ask_json_once::<T>(&asked, schema, cwd, &effort, access) {
                 Ok(parsed) => {
                     if attempt > 1 {
                         logdim!("{} answered on the retry", self.spec.name);

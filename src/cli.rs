@@ -16,6 +16,7 @@ use crate::proc::{self, ExecOpts};
 use crate::repo::{Repo, WriteSummary};
 use crate::review;
 use crate::review_only;
+use crate::spend;
 use crate::split;
 use crate::style;
 use crate::tracker;
@@ -2147,6 +2148,12 @@ fn report_with(
     stopped: &[String],
     parked: &[String],
 ) -> i32 {
+    // What the run spent, recorded as it happened. Kept beside the run so a
+    // resume adds to it rather than starting the count again.
+    let spent = spend::taken();
+    if let Err(e) = repo.record_spend(&spent) {
+        logdim!("could not record what this run spent: {e}");
+    }
     println!("\n{}", "=".repeat(60));
     for r in results {
         println!(
@@ -2174,6 +2181,9 @@ fn report_with(
                 report_item(&finding.title, &finding.file)
             );
         }
+        if let Some(cost) = spend::for_subject(&spent, r.issue) {
+            println!("       {cost}");
+        }
     }
     println!("{}", "=".repeat(60));
 
@@ -2193,6 +2203,9 @@ fn report_with(
             "\n{recorded} follow-up(s) recorded in .spar/followups.md, not on the tracker. \
              Set followups = \"issues\" to file them."
         );
+    }
+    if let Some(summary) = spend::summary(&spent) {
+        println!("\n{summary}");
     }
     for lines in [parked, stopped] {
         if lines.is_empty() {

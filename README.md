@@ -1285,6 +1285,12 @@ would receive it is known to accept.
 
 Both agents bill against their respective subscriptions.
 
+The report ends with what the run spent: calls per agent, wall time, retries and
+hand-overs, and tokens where a CLI reports them, with a line under each issue for
+its own share. Every call is also named at `logdim` as it happens, and the whole
+record is appended to `.spar/state/spend.json`, so a resumed pull request adds to
+the count rather than starting it again and anybody charting it has a file.
+
 Rough shape per issue: two calls for triage, one to implement, up to two per
 review round, plus at most one closing review call when the run spends its
 budget and leaves something new to read. `spar review` is cheaper, four to six

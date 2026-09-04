@@ -855,7 +855,7 @@ fn act(
             .replace("{comments}", &block),
         &schema::checkin(),
         work_dir,
-        &judge.effort(cfg, Call::Checkin(1)),
+        &judge.effort(cfg, Call::Checkin(1)).about(number),
     )?;
 
     log!("#{number}: {checker_name} checking those calls");
@@ -875,7 +875,7 @@ fn act(
             ),
         &schema::checkin_check(),
         work_dir,
-        &checker.effort(cfg, Call::Checkin(2)),
+        &checker.effort(cfg, Call::Checkin(2)).about(number),
     ) {
         Ok(doc) => doc.checks,
         Err(e) if e.kind() == crate::error::ErrorKind::UncertainWrite => return Err(e),
@@ -1078,7 +1078,7 @@ fn implement(
             .replace("{comments}", &listed(&Fence::new(), &wanted)),
         &schema::checkin_fix(),
         work_dir,
-        &implementor.effort(cfg, Call::Checkin(1)),
+        &implementor.effort(cfg, Call::Checkin(1)).about(number),
     ) {
         Ok(report) => report,
         Err(call) if call.kind() == crate::error::ErrorKind::UncertainWrite => return Err(call),

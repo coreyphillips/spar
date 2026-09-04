@@ -782,7 +782,7 @@ fn implement_and_review(
         &prompt,
         &schema::implementation(),
         work_dir,
-        &implementor.effort(cfg, Call::Implement),
+        &implementor.effort(cfg, Call::Implement).about(number),
     );
 
     if answer.is_ok() {
@@ -1215,7 +1215,7 @@ fn review_loop(
         last_round = round;
         state.rounds = round;
         let reviewer = agent::find(agents, &holder)?;
-        let effort = reviewer.effort(cfg, Call::Review(round));
+        let effort = reviewer.effort(cfg, Call::Review(round)).about(ctx.subject);
         log!(
             "{}: round {round}, {holder} reviewing ({})",
             ctx.label,
@@ -1462,7 +1462,7 @@ fn review_loop(
                 &prompt,
                 &schema::response(),
                 &ctx.work_dir,
-                &author.effort(cfg, Call::Respond(round)),
+                &author.effort(cfg, Call::Respond(round)).about(ctx.subject),
             );
             let response = match response {
                 Ok(response) => {
@@ -1657,7 +1657,7 @@ fn close_out(
     }
 
     let closer = agent::find(agents, holder)?;
-    let effort = closer.effort(cfg, Call::Close);
+    let effort = closer.effort(cfg, Call::Close).about(ctx.subject);
     log!(
         "{}: closing, {holder} checking what the last round left ({})",
         ctx.label,

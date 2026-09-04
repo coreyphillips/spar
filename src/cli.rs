@@ -11,7 +11,7 @@ use crate::checkin;
 use crate::config::{self, Config};
 use crate::error::Result;
 use crate::followups;
-use crate::model::{Issue, IssueRun, ItemKind, Plan, Status};
+use crate::model::{Issue, IssueRun, ItemKind, Plan, PlanItem, Status};
 use crate::proc::{self, ExecOpts};
 use crate::repo::{Repo, WriteSummary};
 use crate::review;
@@ -810,6 +810,10 @@ fn work_issues(
     stopped: &mut Vec<String>,
 ) -> Result<()> {
     let mut handled: BTreeSet<i64> = BTreeSet::new();
+    // Issues whose work is on the base branch by the time the next one is
+    // built. Only a merge puts it there, which is why `auto_merge = false`,
+    // the default, means a dependent waits for a person.
+    let mut landed: BTreeSet<i64> = BTreeSet::new();
     let mut leftover: BTreeSet<i64> = BTreeSet::new();
     let mut queue: VecDeque<Wave> = VecDeque::from([Wave::first(first_wave)]);
     let mut plans_written = 0usize;
@@ -897,7 +901,19 @@ fn work_issues(
             let Some(issue) = fetched.iter().find(|i| i.number == item.issue) else {
                 continue;
             };
-            results.push(review::run_issue(agents, cfg, repo, item, issue));
+            if let Some(why) = held_back(item, &plan, &landed) {
+                log!("#{}: {why}", item.issue);
+                let mut held = IssueRun::new(item.issue, item.title.clone());
+                held.status = Status::Pending;
+                held.notes.push(why);
+                results.push(held);
+                continue;
+            }
+            let run = review::run_issue(agents, cfg, repo, item, issue);
+            if run.status == Status::Merged {
+                landed.insert(item.issue);
+            }
+            results.push(run);
         }
 
         // Whatever this wave filed becomes the next one, budget allowing.
@@ -925,6 +941,43 @@ fn work_issues(
         );
     }
     Ok(())
+}
+
+/// Why an item is not being worked yet, or `None` to work it.
+///
+/// Triage collects `depends_on` and `order` sorts by it, and the base was never
+/// changed: `run_issue` creates every worktree from `origin/<base>` whatever
+/// came before it. With `auto_merge = false`, the default and the recommended
+/// setting, a dependency that ends approved is not on the base when the
+/// dependent is implemented, and the implementor either fails, re-implements
+/// it, or declares the issue not worth doing.
+///
+/// Holding is the honest answer: the work is not there, and building on a base
+/// that lacks it spends a full issue's budget to find that out.
+fn held_back(item: &PlanItem, plan: &Plan, landed: &BTreeSet<i64>) -> Option<String> {
+    for dep in &item.depends_on {
+        if landed.contains(dep) {
+            continue;
+        }
+        if plan.order.iter().any(|other| other.issue == *dep) {
+            return Some(format!(
+                "held back: #{dep} is in this run and has not merged, so its work is not on the \
+                 base this would be built from. Merge #{dep} and run #{} again.",
+                item.issue
+            ));
+        }
+        if plan.skipped.iter().any(|s| s.issue == *dep) {
+            return Some(format!(
+                "held back: #{dep}, which it depends on, was declined by both reviewers"
+            ));
+        }
+        if plan.contested.iter().any(|c| c.issue == *dep) {
+            return Some(format!(
+                "held back: the reviewers disagree about #{dep}, which it depends on"
+            ));
+        }
+    }
+    None
 }
 
 /// One pass of the pipeline, and where it came from.
@@ -1223,8 +1276,22 @@ fn make_plan(
     log!("plan written to {}", plan_out.display());
 
     for item in &plan.order {
+        // The dependencies too: they decide the order, and an item held back
+        // because one of them did not land is easier to read next to them.
+        let after = if item.depends_on.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " after {}",
+                item.depends_on
+                    .iter()
+                    .map(|n| format!("#{n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         log!(
-            "  do   #{} [{}/{}] {}",
+            "  do   #{} [{}/{}]{after} {}",
             item.issue,
             item.complexity,
             item.risk,
@@ -1992,6 +2059,87 @@ fn report_item(title: &str, file: &str) -> String {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    fn planned(issue: i64, depends_on: Vec<i64>) -> PlanItem {
+        PlanItem {
+            issue,
+            title: format!("issue {issue}"),
+            complexity: crate::model::Complexity::S,
+            risk: crate::model::Risk::Low,
+            depends_on,
+            reason: "worth doing".into(),
+        }
+    }
+
+    /// Ordering by dependency did half a job: it sorted, and then every
+    /// worktree was still built from origin/<base>.
+    ///
+    /// With auto_merge off, the default and the recommended setting, a
+    /// dependency that ends approved is not on the base when the dependent is
+    /// implemented. The implementor then fails, re-implements the dependency,
+    /// or declares the issue not worth doing, having spent a full issue's
+    /// budget to find that out.
+    #[test]
+    fn a_dependent_waits_for_a_dependency_that_has_not_landed() {
+        let plan = Plan {
+            order: vec![planned(9, vec![]), planned(10, vec![9])],
+            ..Plan::default()
+        };
+        let mut landed = BTreeSet::new();
+
+        let why = held_back(&plan.order[1], &plan, &landed).expect("held");
+        assert!(why.contains("#9"), "{why}");
+        assert!(why.contains("has not merged"), "{why}");
+        assert!(held_back(&plan.order[0], &plan, &landed).is_none());
+
+        // Merged is the only thing that puts the work on the base.
+        landed.insert(9);
+        assert!(held_back(&plan.order[1], &plan, &landed).is_none());
+    }
+
+    /// The case the ordering stayed quietest about: a dependency nobody is
+    /// going to do.
+    #[test]
+    fn a_dependent_on_a_declined_or_contested_issue_is_held_with_the_reason() {
+        let declined = Plan {
+            order: vec![planned(10, vec![9])],
+            skipped: vec![crate::model::SkippedItem {
+                issue: 9,
+                title: "issue 9".into(),
+                reasons: Default::default(),
+                tracker: false,
+            }],
+            ..Plan::default()
+        };
+        let why = held_back(&declined.order[0], &declined, &BTreeSet::new()).expect("held");
+        assert!(why.contains("declined by both reviewers"), "{why}");
+
+        let contested = Plan {
+            order: vec![planned(10, vec![9])],
+            contested: vec![crate::model::ContestedItem {
+                issue: 9,
+                title: "issue 9".into(),
+                positions: Default::default(),
+                reasons: Default::default(),
+                note: None,
+            }],
+            ..Plan::default()
+        };
+        let why = held_back(&contested.order[0], &contested, &BTreeSet::new()).expect("held");
+        assert!(why.contains("disagree about #9"), "{why}");
+    }
+
+    /// A dependency that is not in this run at all is somebody else's business:
+    /// it may well be merged already, and holding on it would stop work that is
+    /// perfectly buildable. It is logged by `report_dependencies` instead.
+    #[test]
+    fn a_dependency_outside_the_run_does_not_hold_anything() {
+        let plan = Plan {
+            order: vec![planned(10, vec![900])],
+            ..Plan::default()
+        };
+        assert!(held_back(&plan.order[0], &plan, &BTreeSet::new()).is_none());
+    }
 
     #[test]
     fn report_items_include_their_location() {

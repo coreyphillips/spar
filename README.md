@@ -921,7 +921,11 @@ repo should be considered required, not optional, if you turn it on.
 
 **Style rules models forget.** Prompting alone is unreliable over a long run.
 Every commit message, PR body, and comment is scrubbed deterministically and
-then re-verified. A leak is a hard error, not a warning. The scrub is bounded to
+then re-verified. The gate looks for more than the scrub can fix, so a form it
+cannot clean is the hard error rather than a leak. Fenced blocks and inline code
+spans are left exactly as they are: a snippet somebody is being asked to
+reproduce is evidence, and a trailer naming a person rather than a tool is an
+ordinary trailer. The scrub is bounded to
 the commits spar itself made: on a resumed pull request, or a check-in on
 somebody's branch, a message that was already there is reported and left alone,
 because rewriting it would change a published sha under the person who wrote it.

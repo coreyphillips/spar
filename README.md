@@ -480,6 +480,13 @@ An entry is only removed after its issue exists, so a run that dies halfway
 files one thing twice rather than losing one. The duplicate is caught by the
 same search that catches every other one.
 
+That search reads open issues, and weighs the title separately from the body, so
+a long umbrella issue cannot absorb every short finding about the module it
+mentions. A finding whose text matches an issue somebody already closed is filed
+again with a reference to it, since a defect that was fixed and has come back is
+the finding most worth keeping. Whichever way it goes, the log names the issue
+that absorbed it.
+
 ## Working a tracking issue's checklist
 
 Both agents recognise a tracker and decline to open one pull request for it,

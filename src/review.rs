@@ -2805,8 +2805,6 @@ pub enum Filed {
     AddedTo(i64, String),
     /// An open issue already covered it, and this pass added nothing.
     Covered(i64, String),
-    /// A closed issue already covered it. Nothing was written.
-    AlreadyClosed(i64, String),
 }
 
 impl From<Filed> for Followup {
@@ -2815,10 +2813,6 @@ impl From<Filed> for Followup {
             Filed::Opened(_, url) | Filed::AddedTo(_, url) | Filed::Covered(_, url) => {
                 Followup::Recorded(url)
             }
-            // Covered rather than recorded: the point is genuinely tracked, so
-            // raising it again is waste, but the issue holding it is closed and
-            // must not be handed out as work.
-            Filed::AlreadyClosed(_, url) => Followup::Covered(url),
         }
     }
 }
@@ -2827,9 +2821,6 @@ impl Filed {
     pub fn url(&self) -> Option<&str> {
         match self {
             Filed::Opened(_, url) | Filed::AddedTo(_, url) | Filed::Covered(_, url) => Some(url),
-            // The work is done and closed. Reporting it as filed would put it
-            // back into a wave to be implemented again.
-            Filed::AlreadyClosed(_, _) => None,
         }
     }
 
@@ -2837,10 +2828,7 @@ impl Filed {
     /// narrower question of what there is to work.
     pub fn issue(&self) -> i64 {
         match self {
-            Filed::Opened(n, _)
-            | Filed::AddedTo(n, _)
-            | Filed::Covered(n, _)
-            | Filed::AlreadyClosed(n, _) => *n,
+            Filed::Opened(n, _) | Filed::AddedTo(n, _) | Filed::Covered(n, _) => *n,
         }
     }
 
@@ -2848,7 +2836,6 @@ impl Filed {
     pub fn number(&self) -> Option<i64> {
         match self {
             Filed::Opened(n, _) | Filed::AddedTo(n, _) | Filed::Covered(n, _) => Some(*n),
-            Filed::AlreadyClosed(_, _) => None,
         }
     }
 
@@ -2858,7 +2845,6 @@ impl Filed {
             Filed::Opened(n, _) => format!("#{n}"),
             Filed::AddedTo(n, _) => format!("added to #{n}"),
             Filed::Covered(n, _) => format!("#{n} already says this"),
-            Filed::AlreadyClosed(n, _) => format!("#{n} covers it and is closed"),
         }
     }
 
@@ -2868,7 +2854,6 @@ impl Filed {
             Filed::Opened(n, _) => format!("filed #{n}: {title}"),
             Filed::AddedTo(n, _) => format!("added to #{n}: {title}"),
             Filed::Covered(n, _) => format!("#{n} already says this: {title}"),
-            Filed::AlreadyClosed(n, _) => format!("#{n} covers it and is closed: {title}"),
         }
     }
 }
@@ -2908,33 +2893,63 @@ pub fn file_as_issue_apart_from(
     let issue_body = repo.record_failed_write(repo.clean_issue_body(body))?;
     let exact =
         repo.record_failed_write(repo.try_exact_issue_apart_from(&title, &issue_body, apart_from))?;
+    let mut body_to_file = issue_body.clone();
     if let Some(existing) = exact {
-        return Ok(if existing.open {
-            Filed::Covered(existing.number, existing.url)
-        } else {
-            Filed::AlreadyClosed(existing.number, existing.url)
-        });
-    }
-    let similar = repo.record_failed_write(repo.try_find_similar_issue_apart_from(
-        &title,
-        &issue_body,
-        apart_from,
-    ))?;
-    if let Some(existing) = similar {
-        let known = format!("{} {}", existing.title, existing.body);
-        if !existing.open {
-            return Ok(Filed::AlreadyClosed(existing.number, existing.url));
+        if existing.open {
+            logdim!("'{title}' is already open as #{}", existing.number);
+            return Ok(Filed::Covered(existing.number, existing.url));
         }
-        if crate::textsim::adds_information(&issue_body, &known) {
-            repo.comment_issue(existing.number, &issue_body)?;
-            return Ok(Filed::AddedTo(existing.number, existing.url));
+        // A closed issue with this exact text is a defect that was fixed and
+        // has come back, which is the finding most worth keeping. It used to
+        // leave the run with no record anywhere: no issue, no queue entry, no
+        // wave, and the ledger recorded the point as filed, so the reviewer
+        // keeping the pull request was told not to raise it again.
+        logdim!(
+            "'{title}' matches #{}, which is closed, so it is being filed again",
+            existing.number
+        );
+        body_to_file = regression_body(&issue_body, existing.number);
+    } else {
+        let similar = repo.record_failed_write(repo.try_find_similar_issue_apart_from(
+            &title,
+            &issue_body,
+            apart_from,
+        ))?;
+        if let Some(existing) = similar {
+            let known = format!("{} {}", existing.title, existing.body);
+            if crate::textsim::adds_information(&issue_body, &known) {
+                logdim!(
+                    "'{title}' is covered by #{} and adds something, so it goes there as a \
+                     comment",
+                    existing.number
+                );
+                repo.comment_issue(existing.number, &issue_body)?;
+                return Ok(Filed::AddedTo(existing.number, existing.url));
+            }
+            logdim!(
+                "'{title}' is covered by #{} '{}', which already says it",
+                existing.number,
+                style::clip(&existing.title, 60)
+            );
+            return Ok(Filed::Covered(existing.number, existing.url));
         }
-        return Ok(Filed::Covered(existing.number, existing.url));
     }
-    let url = repo.create_issue_apart_from(&title, &issue_body, apart_from)?;
+    let url = repo.create_issue_apart_from(&title, &body_to_file, apart_from)?;
     let number = filed_issue_number(&url)
         .ok_or_else(|| spar_err!("filed an issue but could not read its number from {url}"))?;
     Ok(Filed::Opened(number, url))
+}
+
+/// The body for a finding that matches an issue somebody already closed.
+///
+/// Filing again rather than reopening: reopening writes on somebody's decision,
+/// and the reference costs a reader one click to find the history.
+pub(crate) fn regression_body(body: &str, closed: i64) -> String {
+    format!(
+        "{}\n\nThis was filed before as #{closed}, which is closed. The evidence above is from \
+         a later run, so it looks like it has come back.",
+        body.trim()
+    )
 }
 
 fn file_out_of_scope(
@@ -6159,21 +6174,25 @@ mod followup_outcome_tests {
         assert!(reasoning.contains("#485"), "{reasoning}");
     }
 
-    /// A closed issue already carries the point, so raising it again is waste.
-    /// It is still not something to hand anybody as work.
+    /// A finding that matches a closed issue is a defect that came back, and
+    /// it used to leave the run with no record anywhere.
+    ///
+    /// `Filed::AlreadyClosed` wrote nothing and reported no url, so the finding
+    /// appeared in no issue, no queue and no wave, while the ledger recorded
+    /// the point as filed and told the next reviewer not to raise it again. The
+    /// similarity search reached every issue ever filed, so a fixed and closed
+    /// defect that regressed was the case that hit it.
     #[test]
-    fn a_closed_issue_covering_the_point_settles_it_without_offering_work() {
-        let recorded = Followup::from(Filed::AlreadyClosed(9, URL.into()));
-        assert_eq!(Followup::Covered(URL.into()), recorded);
-        assert_eq!(
-            None,
-            recorded.url(),
-            "a closed issue is not work to pick up"
-        );
+    fn a_finding_that_matches_a_closed_issue_is_filed_again_with_the_reference() {
+        let body = regression_body("The retry loop spins on 429.", 485);
+        assert!(body.contains("The retry loop spins on 429."), "{body}");
+        assert!(body.contains("#485"), "{body}");
+        assert!(body.contains("closed"), "{body}");
 
-        let (outcome, reasoning) = entry(recorded).unwrap();
-        assert_eq!(Settled::Filed, outcome);
-        assert!(reasoning.contains("#485"), "{reasoning}");
+        // And what it produces is ordinary work, with a url to pick up.
+        let recorded = Followup::from(Filed::Opened(9, URL.into()));
+        assert_eq!(Followup::Recorded(URL.into()), recorded);
+        assert_eq!(Some(URL), recorded.url());
     }
 
     /// An open issue that already covers the point is worth linking from the

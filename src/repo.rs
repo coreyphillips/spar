@@ -31,6 +31,15 @@ pub const FETCH_CEILING: usize = 500;
 /// terminated with `-->`, so GitHub renders the whole block as nothing.
 pub const STATE_MARKER: &str = "<!-- spar:state";
 
+/// The signature on a comment spar composed, invisible when rendered.
+///
+/// spar posts as whoever ran it, so a comment from the viewer proves nothing
+/// about who wrote it. Without this, spar's own outcome and round comments
+/// counted as the viewer having answered, and `checkin` skipped a person's
+/// comment as "replied to since" because a bookkeeping comment happened to be
+/// newer than it.
+pub const COMMENT_MARKER: &str = "<!-- spar:comment -->";
+
 /// An entry boundary in the local follow-up note, on the same principle as
 /// `STATE_MARKER` and rendered as nothing for the same reason.
 ///
@@ -439,6 +448,20 @@ fn pr_for_base(text: &str, branch: &str, base: &str) -> Result<Option<PrRef>> {
             url: row.url,
             title: row.title,
         }))
+}
+
+/// Sign a comment spar composed, so it can be told from one the same account
+/// wrote by hand. Idempotent: a body already signed is returned as it is.
+fn signed(body: &str) -> String {
+    if body.contains(COMMENT_MARKER) {
+        return body.to_string();
+    }
+    format!("{body}\n\n{COMMENT_MARKER}")
+}
+
+/// Whether a comment body is one spar composed rather than one a person wrote.
+pub fn is_spar_comment(body: &str) -> bool {
+    body.contains(COMMENT_MARKER) || body.contains(STATE_MARKER)
 }
 
 fn has_exact_comment(comments: &[Value], body: &str) -> bool {
@@ -3282,7 +3305,7 @@ impl Repo {
     }
 
     pub fn comment_pr(&self, number: i64, body: &str) -> Result<()> {
-        let body = self.record_failed_write(self.clean(body))?;
+        let body = signed(&self.record_failed_write(self.clean(body))?);
         let comments = self.record_failed_write(self.try_issue_comments(number))?;
         if has_exact_comment(&comments, &body) {
             return Ok(());
@@ -3298,7 +3321,7 @@ impl Repo {
     }
 
     pub fn comment_issue(&self, number: i64, body: &str) -> Result<()> {
-        let body = self.record_failed_write(self.clean(body))?;
+        let body = signed(&self.record_failed_write(self.clean(body))?);
         let comments = self.record_failed_write(self.try_issue_comments(number))?;
         if has_exact_comment(&comments, &body) {
             return Ok(());

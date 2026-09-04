@@ -644,20 +644,7 @@ pub fn gather(repo: &Repo, number: i64, pr: bool, seen: &Answered) -> Result<Gat
     // narrowed by the watermark so one summary comment cannot silently swallow
     // a comment spar never read.
     let top = repo.issue_comments(number);
-    let viewer_times: Vec<String> = top
-        .iter()
-        .filter(|c| {
-            c.get("user")
-                .and_then(|u| u.get("login"))
-                .and_then(Value::as_str)
-                .is_some_and(|l| same_login(l, &viewer))
-        })
-        .filter_map(|c| {
-            c.get("created_at")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect();
+    let viewer_times = viewer_answer_times(&top, &viewer);
 
     let mut loose: Vec<(String, Pending)> = Vec::new();
     if pr {
@@ -687,6 +674,34 @@ pub fn gather(repo: &Repo, number: i64, pr: bool, seen: &Answered) -> Result<Gat
     }
 
     Ok(out)
+}
+
+/// When the viewer answered on this pull request, in their own words.
+///
+/// spar posts as whoever ran it, so "the viewer commented after this" is not
+/// evidence that anybody read the comment: a state block or a round summary
+/// posted by an earlier `spar resume` is a comment by the viewer too. Counting
+/// one as an answer is how `checkin`, whose whole reason for existing is that
+/// "somebody who leaves a review comment is talking to nobody", made that true
+/// again for anyone who commented before a round ran.
+fn viewer_answer_times(comments: &[Value], viewer: &str) -> Vec<String> {
+    comments
+        .iter()
+        .filter(|c| {
+            c.get("user")
+                .and_then(|u| u.get("login"))
+                .and_then(Value::as_str)
+                .is_some_and(|l| same_login(l, viewer))
+        })
+        .filter(|c| {
+            !crate::repo::is_spar_comment(c.get("body").and_then(Value::as_str).unwrap_or(""))
+        })
+        .filter_map(|c| {
+            c.get("created_at")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 /// One review body or top level comment, when it is somebody else's and says
@@ -986,6 +1001,50 @@ mod tests {
         assert!(answered_after(&mine, "2026-01-02T03:04:05Z"));
         assert!(!answered_after(&mine, "2026-01-02T05:00:00Z"));
         assert!(!answered_after(&[], "2026-01-02T03:04:05Z"));
+    }
+
+    /// spar's own bookkeeping is not an answer to anybody.
+    ///
+    /// spar posts as whoever ran it, so a state block or a round summary from
+    /// an earlier `spar resume` is a comment by the viewer. Counting one made
+    /// `checkin` skip a person's comment as "replied to since", which is the
+    /// exact silence `checkin` exists to end.
+    #[test]
+    fn a_state_block_posted_after_a_comment_does_not_answer_it() {
+        let rows: Vec<Value> = serde_json::from_str(&format!(
+            r#"[
+              {{"body":"please rename this","user":{{"login":"alice"}},
+               "created_at":"2026-01-02T03:00:00Z"}},
+              {{"body":"{} more","user":{{"login":"me"}},
+               "created_at":"2026-01-02T04:00:00Z"}},
+              {{"body":"round 2, codex reviewing\n\n{}","user":{{"login":"me"}},
+               "created_at":"2026-01-02T05:00:00Z"}}
+            ]"#,
+            crate::repo::STATE_MARKER,
+            crate::repo::COMMENT_MARKER
+        ))
+        .unwrap();
+
+        let times = viewer_answer_times(&rows, "me");
+        assert!(
+            times.is_empty(),
+            "spar's own comments counted as the viewer answering: {times:?}"
+        );
+        assert!(!answered_after(&times, "2026-01-02T03:00:00Z"));
+
+        // A comment the person actually wrote still answers.
+        let mut rows = rows;
+        rows.push(
+            serde_json::from_str(
+                r#"{"body":"good point, will fix","user":{"login":"me"},
+                    "created_at":"2026-01-02T06:00:00Z"}"#,
+            )
+            .unwrap(),
+        );
+        assert!(answered_after(
+            &viewer_answer_times(&rows, "me"),
+            "2026-01-02T03:00:00Z"
+        ));
     }
 
     /// An odd payload must make spar stay quiet rather than post. The fail safe

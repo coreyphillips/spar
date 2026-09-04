@@ -545,7 +545,9 @@ spar checkin 108 --again         # re-read what spar already answered
 Unanswered means three things: an inline review thread GitHub has not marked
 resolved, a review summary, and a top level comment, in each case written by
 somebody other than you and not already answered. Comments you wrote are
-excluded, and so is spar's own hidden state block.
+excluded, and so is everything spar wrote: it posts under your account, so every
+comment it composes carries a hidden signature, and neither the state block nor
+an outcome or round comment counts as you having answered anybody.
 
 Both agents then judge each one. The first rules on it with the code checked
 out; the second reads the same comments and those rulings, goes to the code, and

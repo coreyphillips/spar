@@ -2344,7 +2344,7 @@ fn tracker_reread_failure_is_counted_before_nothing_is_scheduled() {
 set -eu
 printf '%s\n' "$*" >> "$SPAR_FAKE_GH_LOG"
 if [ "$1" = api ] && [ "$2" = --paginate ]; then
-  printf '%s\n' '[{"body":"- Tracks checklist work"}]'
+  printf '%s\n' '[{"body":"- Tracks checklist work\n\n<!-- spar:comment -->"}]'
   exit 0
 fi
 if [ "$1" = api ]; then
@@ -5122,7 +5122,7 @@ fn post_counts_a_reported_failure_as_success_when_read_back_finds_it() {
 case "$1 $2" in
   "api --paginate")
     if [ -f "$SPAR_FAKE_COMMENT_LANDED" ]; then
-      printf '%s\n' '[{"body":"review landed"}]'
+      printf '%s\n' '[{"body":"review landed\n\n<!-- spar:comment -->"}]'
     else
       printf '%s\n' '[]'
     fi

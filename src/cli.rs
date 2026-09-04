@@ -326,6 +326,13 @@ pub struct TriageFlags {
     /// Comment on a declined issue but leave it open.
     #[arg(long)]
     pub no_close_skipped: bool,
+    /// Ask again about issues a previous run's triage disagreed on.
+    ///
+    /// A disagreement is parked for a person to decide. Without this it is not
+    /// re-triaged, because asking two agents the same question again costs two
+    /// calls per run and very likely gets the same answer.
+    #[arg(long)]
+    pub retriage: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +621,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let sorted = classify(&repo, &numbers)?;
             let mut results = Vec::new();
             let mut stopped = Vec::new();
+            let mut parked = Vec::new();
             work_issues(
                 &agents,
                 &cfg,
@@ -622,6 +630,8 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 &plan_out,
                 &mut results,
                 &mut stopped,
+                &mut parked,
+                triage_flags.retriage,
             )?;
 
             // Reached even when a wave failed: these were named on the command
@@ -630,11 +640,16 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 results.push(review::resume_pr(&agents, &cfg, &repo, number, None));
             }
 
-            if results.is_empty() && stopped.is_empty() {
+            if results.is_empty() {
+                // Nothing was worked, so the table would be an empty banner.
+                // What was parked or stopped still has to reach the person.
                 log!("nothing scheduled");
-                return Ok(report_writes(&repo));
+                for line in parked.iter().chain(stopped.iter()) {
+                    println!("{line}");
+                }
+                return Ok(report_writes(&repo).max(i32::from(!stopped.is_empty())));
             }
-            Ok(report_with(&results, &cfg, &repo, &stopped))
+            Ok(report_with(&results, &cfg, &repo, &stopped, &parked))
         }
         Command::Followup {
             common,
@@ -662,6 +677,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
             let mut results = Vec::new();
             let mut stopped = Vec::new();
+            let mut parked = Vec::new();
             work_issues(
                 &agents,
                 &cfg,
@@ -670,12 +686,19 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 &plan_out,
                 &mut results,
                 &mut stopped,
+                &mut parked,
+                triage_flags.retriage,
             )?;
-            if results.is_empty() && stopped.is_empty() {
+            if results.is_empty() {
+                // Nothing was worked, so the table would be an empty banner.
+                // What was parked or stopped still has to reach the person.
                 log!("nothing scheduled");
-                return Ok(report_writes(&repo));
+                for line in parked.iter().chain(stopped.iter()) {
+                    println!("{line}");
+                }
+                return Ok(report_writes(&repo).max(i32::from(!stopped.is_empty())));
             }
-            Ok(report_with(&results, &cfg, &repo, &stopped))
+            Ok(report_with(&results, &cfg, &repo, &stopped, &parked))
         }
 
         Command::Resume {
@@ -800,6 +823,7 @@ impl Overrides {
 /// pipeline, and it has to stay the same. An issue spar filed for itself gets
 /// no easier a ride through triage than one a person opened, which is the whole
 /// reason the screening pass is one agent and this is two.
+#[allow(clippy::too_many_arguments)]
 fn work_issues(
     agents: &[Agent],
     cfg: &Config,
@@ -808,7 +832,16 @@ fn work_issues(
     plan_out: &Path,
     results: &mut Vec<IssueRun>,
     stopped: &mut Vec<String>,
+    parked: &mut Vec<String>,
+    retriage: bool,
 ) -> Result<()> {
+    // Issues a previous run's triage disagreed about. They are waiting on a
+    // person, and asking the pair again costs two calls and gets the same
+    // answer, so they are left alone until somebody says otherwise.
+    let waiting = repo.read_contested();
+    if retriage && !waiting.is_empty() {
+        repo.forget_contested(&waiting.keys().copied().collect::<Vec<_>>());
+    }
     let mut handled: BTreeSet<i64> = BTreeSet::new();
     // Issues whose work is on the base branch by the time the next one is
     // built. Only a merge puts it there, which is why `auto_merge = false`,
@@ -826,6 +859,23 @@ fn work_issues(
     // doing.
     while let Some(mut wave) = queue.pop_front() {
         wave.numbers.retain(|n| !handled.contains(n));
+        if !retriage {
+            wave.numbers.retain(|n| {
+                let Some(known) = waiting.get(n) else {
+                    return true;
+                };
+                log!(
+                    "#{n} was contested on an earlier run and is waiting on you: {}. Pass \
+                     --retriage to ask again.",
+                    positions_of(known)
+                );
+                parked.push(format!(
+                    "#{n} contested and parked for you: {}",
+                    positions_of(known)
+                ));
+                false
+            });
+        }
         if wave.numbers.is_empty() {
             continue;
         }
@@ -883,6 +933,32 @@ fn work_issues(
             }
         };
         act_on_plan(cfg, repo, &plan);
+        repo.remember_contested(&plan.contested);
+        for item in &plan.contested {
+            parked.push(format!(
+                "#{} contested and parked for you: {}",
+                item.issue,
+                positions(&item.positions, &item.reasons)
+            ));
+        }
+        for item in &plan.skipped {
+            let what = if item.tracker {
+                "left open as a tracker"
+            } else if cfg.loop_cfg.close_skipped {
+                "commented on and closed"
+            } else {
+                "commented on and left open"
+            };
+            parked.push(format!(
+                "#{} skipped by both reviewers, {what}: {}",
+                item.issue,
+                item.reasons
+                    .values()
+                    .next()
+                    .map(|r| first_line(r))
+                    .unwrap_or_default()
+            ));
+        }
 
         // No recursion: a child that triage calls a tracker in its turn is
         // commented on and held like any other. `file_non_blocking` records
@@ -941,6 +1017,30 @@ fn work_issues(
         );
     }
     Ok(())
+}
+
+/// Both sides of a disagreement on one line, for the report and the log.
+fn positions(
+    positions: &std::collections::BTreeMap<String, String>,
+    reasons: &std::collections::BTreeMap<String, String>,
+) -> String {
+    if positions.is_empty() {
+        return "no positions recorded".to_string();
+    }
+    positions
+        .iter()
+        .map(|(name, side)| match reasons.get(name) {
+            Some(why) if !why.trim().is_empty() => {
+                format!("{name} says {side} ({})", first_line(why))
+            }
+            _ => format!("{name} says {side}"),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn positions_of(known: &crate::model::Contested) -> String {
+    positions(&known.positions, &known.reasons)
 }
 
 /// Why an item is not being worked yet, or `None` to work it.
@@ -1966,11 +2066,22 @@ fn first_line(text: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn report(results: &[IssueRun], cfg: &Config, repo: &Repo) -> i32 {
-    report_with(results, cfg, repo, &[])
+    report_with(results, cfg, repo, &[], &[])
 }
 
-/// The same, plus the waves that never ran.
-fn report_with(results: &[IssueRun], cfg: &Config, repo: &Repo, stopped: &[String]) -> i32 {
+/// The same, plus what needs a person: waves that never ran, and the issues
+/// triage parked or declined.
+///
+/// `stopped` is work that did not happen and makes the run non-zero. `parked`
+/// is an outcome rather than a failure, and is the record of what is waiting on
+/// a decision, which used to reach a person only through plan.json.
+fn report_with(
+    results: &[IssueRun],
+    cfg: &Config,
+    repo: &Repo,
+    stopped: &[String],
+    parked: &[String],
+) -> i32 {
     println!("\n{}", "=".repeat(60));
     for r in results {
         println!(
@@ -2011,9 +2122,12 @@ fn report_with(results: &[IssueRun], cfg: &Config, repo: &Repo, stopped: &[Strin
              Set followups = \"issues\" to file them."
         );
     }
-    if !stopped.is_empty() {
+    for lines in [parked, stopped] {
+        if lines.is_empty() {
+            continue;
+        }
         println!();
-        for line in stopped {
+        for line in lines {
             println!("{line}");
         }
     }
@@ -2139,6 +2253,35 @@ mod tests {
             ..Plan::default()
         };
         assert!(held_back(&plan.order[0], &plan, &BTreeSet::new()).is_none());
+    }
+
+    /// A disagreement is the one triage outcome that needs a person, and it
+    /// reached them least reliably: a log line `--quiet` suppresses, an entry
+    /// in plan.json, and nothing in the report at all.
+    #[test]
+    fn a_contested_issue_reads_as_both_positions_with_their_reasons() {
+        let mut positions_map = std::collections::BTreeMap::new();
+        positions_map.insert("claude".to_string(), "do".to_string());
+        positions_map.insert("codex".to_string(), "skip".to_string());
+        let mut reasons = std::collections::BTreeMap::new();
+        reasons.insert(
+            "claude".to_string(),
+            "the retry path is still wrong".to_string(),
+        );
+        reasons.insert(
+            "codex".to_string(),
+            "fixed in the rewrite last month".to_string(),
+        );
+
+        let line = positions(&positions_map, &reasons);
+        assert!(line.contains("claude says do"), "{line}");
+        assert!(line.contains("codex says skip"), "{line}");
+        assert!(line.contains("the retry path is still wrong"), "{line}");
+        assert!(line.contains("fixed in the rewrite"), "{line}");
+
+        // A verdict with no reason still names who said what.
+        let bare = positions(&positions_map, &Default::default());
+        assert!(bare.contains("claude says do"), "{bare}");
     }
 
     #[test]

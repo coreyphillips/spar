@@ -271,7 +271,10 @@ neither sees the other's answer. Then reconcile mechanically:
 - Both say skip, the shared reasoning is posted and the issue is closed as not
   planned. Turn that off with `close_skipped = false`.
 - They disagree, that issue is parked for you and the run continues. One agent
-  never overrules the other.
+  never overrules the other. The terminal report lists it with both positions
+  and both reasons, and it is remembered in `.spar/state/contested.json`, so
+  later runs leave it alone rather than spending two calls asking the same
+  question again. `--retriage` asks again once you have acted on it.
 
 Scheduled issues are ordered by dependency, then cheapest first, so blockers
 clear early and risky work inherits a healthier base. Every worktree is built

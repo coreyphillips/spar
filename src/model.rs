@@ -880,6 +880,23 @@ pub struct ContestedItem {
     pub note: Option<String>,
 }
 
+/// An issue triage disagreed about, remembered between runs.
+///
+/// A disagreement is the one triage outcome that needs a person, and it was
+/// also the one that reached them least reliably: a log line suppressed by
+/// `--quiet`, an entry in `plan.json`, and two calls spent on it again on every
+/// later run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Contested {
+    #[serde(default)]
+    pub title: String,
+    /// Agent name to "do" or "skip".
+    #[serde(default)]
+    pub positions: BTreeMap<String, String>,
+    #[serde(default)]
+    pub reasons: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Plan {
     #[serde(default)]

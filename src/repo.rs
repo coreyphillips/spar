@@ -16,7 +16,10 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{Config, Drafts, Followups, StateStore};
 use crate::error::Result;
-use crate::model::{Followup, Issue, IssueRef, ItemKind, PersistedState, PrRef, PrRow, PrView};
+use crate::model::{
+    Contested, ContestedItem, Followup, Issue, IssueRef, ItemKind, PersistedState, PrRef, PrRow,
+    PrView,
+};
 use crate::proc::{self, ExecOpts};
 use crate::style::{self, Style};
 use crate::textsim;
@@ -3843,6 +3846,65 @@ impl Repo {
     }
 
     /// What `spar checkin` has already answered on one pull request or issue.
+    /// Where the issues triage disagreed about are remembered.
+    ///
+    /// One file rather than one per issue: it is read once per run, before any
+    /// triage call, to decide what not to ask about again.
+    pub fn contested_path(&self) -> PathBuf {
+        self.root
+            .join(STATE_DIR)
+            .join("state")
+            .join("contested.json")
+    }
+
+    /// The issues a person has been asked to decide, by number.
+    pub fn read_contested(&self) -> BTreeMap<i64, Contested> {
+        std::fs::read_to_string(self.contested_path())
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    /// Remember an issue triage could not agree on.
+    ///
+    /// Best effort: a run that cannot write this asks again next time, which is
+    /// what it did before this existed.
+    pub fn remember_contested(&self, items: &[ContestedItem]) {
+        if items.is_empty() {
+            return;
+        }
+        let mut known = self.read_contested();
+        for item in items {
+            known.insert(
+                item.issue,
+                Contested {
+                    title: item.title.clone(),
+                    positions: item.positions.clone(),
+                    reasons: item.reasons.clone(),
+                },
+            );
+        }
+        if let Some(parent) = self.contested_path().parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = write_json_atomic(&self.contested_path(), &known) {
+            logdim!("could not record the contested issues: {e}");
+        }
+    }
+
+    /// Ask about them again, because a person has acted on them.
+    pub fn forget_contested(&self, numbers: &[i64]) {
+        let mut known = self.read_contested();
+        let before = known.len();
+        known.retain(|number, _| !numbers.contains(number));
+        if known.len() == before {
+            return;
+        }
+        if let Err(e) = write_json_atomic(&self.contested_path(), &known) {
+            logdim!("could not update the contested issues: {e}");
+        }
+    }
+
     pub fn checkin_state_path(&self, number: i64) -> PathBuf {
         self.root
             .join(STATE_DIR)

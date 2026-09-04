@@ -4005,19 +4005,46 @@ impl Repo {
         try_parse_comment_pages(&self.gh(&["api", "--paginate", &path])?)
     }
 
+    /// spar's own state comments on a pull request, newest last.
+    ///
+    /// Three tests, because the answer decides what gets patched over and what
+    /// gets deleted. A comment matching the marker loosely, which is what
+    /// somebody asking "why is there a `<!-- spar:state` block on this PR?"
+    /// writes, is named in the log and left exactly where it is.
     fn try_state_comments(&self, number: i64) -> Result<Vec<(i64, String)>> {
-        Ok(self
-            .try_issue_comments(number)?
-            .into_iter()
-            .filter_map(|c| {
-                let body = c.get("body").and_then(Value::as_str)?.to_string();
-                if !body.contains("spar:state") {
-                    return None;
-                }
-                let id = c.get("id").and_then(Value::as_i64)?;
-                Some((id, body))
-            })
-            .collect())
+        let viewer = self.viewer_login()?.to_string();
+        let mut mine = Vec::new();
+        let mut theirs = Vec::new();
+        for comment in self.try_issue_comments(number)? {
+            let Some(body) = comment.get("body").and_then(Value::as_str) else {
+                continue;
+            };
+            if !body.contains("spar:state") {
+                continue;
+            }
+            let Some(id) = comment.get("id").and_then(Value::as_i64) else {
+                continue;
+            };
+            let author = comment
+                .get("user")
+                .and_then(|u| u.get("login"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if is_state_comment(body, author, &viewer) {
+                mine.push((id, body.to_string()));
+            } else {
+                theirs.push(format!("@{author}"));
+            }
+        }
+        if !theirs.is_empty() {
+            logdim!(
+                "left {} comment(s) on #{number} that mention spar:state alone: {}. Only spar's \
+                 own state block is patched or deleted.",
+                theirs.len(),
+                theirs.join(", ")
+            );
+        }
+        Ok(mine)
     }
 
     fn try_state_comment_id(&self, number: i64) -> Result<Option<i64>> {
@@ -6507,6 +6534,20 @@ pub fn parse_comment_pages(text: &str) -> Vec<Value> {
     out
 }
 
+/// Whether a comment is a state block spar itself wrote.
+///
+/// The body has to open with the marker, so a person quoting it in a sentence
+/// is not one; it has to parse, so a half-quoted block is not one; and it has
+/// to be the viewer's own comment, the way `comments.rs` already tells spar's
+/// writes apart. Anything less and `write_pr_state` patches somebody's comment
+/// with JSON, and `spar clean --pr-state` later deletes it.
+pub fn is_state_comment(body: &str, author: &str, viewer: &str) -> bool {
+    body.trim_start().starts_with(STATE_MARKER)
+        && !viewer.trim().is_empty()
+        && author.trim().eq_ignore_ascii_case(viewer.trim())
+        && parse_state_comment(body).is_some()
+}
+
 /// Extract the payload from a state comment. The marker is followed by JSON and
 /// terminated with `-->`.
 pub fn parse_state_comment(body: &str) -> Option<PersistedState> {
@@ -7957,6 +7998,58 @@ mod tests {
     #[test]
     fn an_unrelated_json_block_is_not_state() {
         assert!(parse_state_comment("here is a snippet\n```json\n{\"round\": 99}\n```").is_none());
+    }
+
+    /// Patching and deleting a comment is not something to do on a substring.
+    ///
+    /// A maintainer who notices the block and asks about it writes a comment
+    /// containing `spar:state`, and the loose filter could not tell theirs from
+    /// spar's. The next `persist` replaced their words with JSON and
+    /// `spar clean --pr-state` later deleted it.
+    #[test]
+    fn a_persons_comment_about_the_state_block_is_not_the_state_block() {
+        let block = format!(
+            "{STATE_MARKER}\n{}\n-->",
+            serde_json::to_string(&state()).unwrap()
+        );
+        assert!(is_state_comment(&block, "spar-bot", "spar-bot"));
+        assert!(
+            is_state_comment(&block, "Spar-Bot", "spar-bot"),
+            "a login differs only in case"
+        );
+
+        assert!(
+            !is_state_comment(
+                "why is there a `<!-- spar:state` block on this PR?",
+                "maintainer",
+                "spar-bot"
+            ),
+            "a question about the block was treated as the block"
+        );
+        assert!(
+            !is_state_comment(&block, "maintainer", "spar-bot"),
+            "somebody else's comment is not spar's to rewrite"
+        );
+        assert!(
+            !is_state_comment(
+                &format!("here is what spar writes:\n\n{block}"),
+                "spar-bot",
+                "spar-bot"
+            ),
+            "the marker has to open the body, not appear in it"
+        );
+        assert!(
+            !is_state_comment(
+                &format!("{STATE_MARKER}\n{{not json\n-->"),
+                "spar-bot",
+                "spar-bot"
+            ),
+            "a block that does not parse is not state"
+        );
+        assert!(
+            !is_state_comment(&block, "spar-bot", ""),
+            "an unknown viewer proves nothing about who wrote it"
+        );
     }
 
     #[test]

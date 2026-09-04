@@ -226,6 +226,21 @@ pub fn allowed(ask: Ask, p: &Pending, mode: &Mode, can_push: bool) -> (Ask, Opti
     if mode.reply_only {
         return (Ask::Answer, Some("--reply-only was given".into()));
     }
+    // A preview that pushes is not a preview. Somebody who ran the dry run
+    // because they did not trust the change would have it on their branch,
+    // with the terminal telling them it is not there.
+    if mode.dry_run {
+        return (
+            Ask::Answer,
+            Some("--dry-run was given, so nothing is committed or pushed".into()),
+        );
+    }
+    if !mode.posts {
+        return (
+            Ask::Answer,
+            Some("pr_comments is \"none\", so nothing is posted, committed, or pushed".into()),
+        );
+    }
     if !can_push {
         return (
             Ask::Answer,
@@ -795,6 +810,7 @@ fn act(
     };
 
     // -- file -------------------------------------------------------------
+    let files_issues = mode.posts && !mode.dry_run;
     for item in items.iter_mut().filter(|i| i.ask == Ask::Defer) {
         let verdict = verdicts
             .verdicts
@@ -809,6 +825,12 @@ fn act(
             .filter(|b| !b.trim().is_empty())
             .unwrap_or_else(|| item.reasoning.clone());
         let body = format!("{body}\n\nRaised by @{} on #{number}.", item.pending.author);
+        if !files_issues {
+            // Filing is a write like any other, and a preview that opens an
+            // issue on somebody's repository is not one.
+            println!("\n[would file] {title}\n{body}\n");
+            continue;
+        }
         match crate::review::file_as_issue(repo, &title, &body) {
             Ok(filed) => {
                 log!("  {}", filed.describe(&title));
@@ -1053,8 +1075,9 @@ fn post(
         } else {
             "pr_comments is none"
         };
-        // The push is suppressed too, and that is deliberate: a commit
-        // answering a comment whose answer nobody can see is the worst
+        // Nothing was committed, pushed, or filed either: `allowed` downgraded
+        // every Implement and the Defer branch printed instead of filing. A
+        // commit answering a comment whose answer nobody can see is the worst
         // available outcome.
         let saved = repo.save_pending_comment(number, &summary.unwrap_or_default());
         match saved {
@@ -1347,6 +1370,30 @@ mod tests {
         // Everything else passes through untouched: the gate is about writing.
         for ask in [Ask::Decline, Ask::Defer, Ask::Answer, Ask::Nothing] {
             assert_eq!(ask, allowed(ask, &pending("NONE", true), &m, false).0);
+        }
+    }
+
+    /// A preview that pushes is not a preview.
+    ///
+    /// `--dry-run` is documented as "every reply and every change, posted
+    /// nowhere", and `pr_comments = "none"` as the standing equivalent.
+    /// Somebody who ran the dry run because they did not trust the change is
+    /// the person who most needs it to change nothing.
+    #[test]
+    fn a_dry_run_judges_the_comment_and_changes_nothing() {
+        let m = mode();
+        for quiet in [Mode { dry_run: true, ..m }, Mode { posts: false, ..m }] {
+            let (ask, why) = allowed(Ask::Implement, &pending("OWNER", true), &quiet, true);
+            assert_eq!(Ask::Answer, ask, "an agreed change reached the fix pass");
+            assert!(
+                why.is_some(),
+                "the judgement is still printed, so it needs its because"
+            );
+            // The judgement itself is untouched: the downgrade is about
+            // writing, not about what the agents decided.
+            for ask in [Ask::Decline, Ask::Defer, Ask::Answer, Ask::Nothing] {
+                assert_eq!(ask, allowed(ask, &pending("OWNER", true), &quiet, true).0);
+            }
         }
     }
 

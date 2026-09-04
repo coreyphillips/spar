@@ -33,7 +33,7 @@ use crate::model::{
 };
 use crate::repo::{Repo, WorktreeCheckpoint};
 use crate::style::{self, Style};
-use crate::{log, logdim, schema, spar_err};
+use crate::{log, logdim, logwarn, schema, spar_err};
 
 /// The independent review prompt, for the test that holds it and
 /// `schema::review()` to one definition of each severity.
@@ -264,7 +264,7 @@ fn run_phases(
         checkpoint,
         &format!("review worktree for PR #{}", pr.number),
     )?;
-    finish(repo, pr, state, &judged, dry_run)
+    finish(repo, pr, state, &judged, by_agent.len(), dry_run)
 }
 
 /// Findings both reviewers reached on their own, matched by finding key.
@@ -324,6 +324,72 @@ fn dedupe_exact_findings(findings: &[Finding]) -> Vec<Finding> {
     unique
 }
 
+/// The finding a verdict rules on, or `None` with the reason.
+///
+/// Exact title and location first, then the line-tolerant key when it
+/// identifies a single eligible finding, which is the fallback the custody loop
+/// learned to use. Neither tolerated a paraphrased title before, and a miss did
+/// nothing at all: a rejection was discarded and the finding went to a
+/// maintainer tagged as unexamined, with the argument against it nowhere.
+fn matching_finding(
+    judged: &[Judged],
+    title: &str,
+    file: &str,
+    eligible: impl Fn(&Judged) -> bool,
+) -> std::result::Result<usize, &'static str> {
+    let key = finding_key(title, file);
+    let exact: Vec<usize> = judged
+        .iter()
+        .enumerate()
+        .filter(|(_, j)| eligible(j) && finding_key(&j.finding.title, &j.finding.file) == key)
+        .map(|(i, _)| i)
+        .collect();
+    if exact.len() == 1 {
+        return Ok(exact[0]);
+    }
+    if exact.len() > 1 {
+        return Err("matched more than one finding");
+    }
+    let stable = crate::jsonx::stable_finding_key(title, file);
+    let loose: Vec<usize> = judged
+        .iter()
+        .enumerate()
+        .filter(|(_, j)| {
+            eligible(j)
+                && crate::jsonx::stable_finding_key(&j.finding.title, &j.finding.file) == stable
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if loose.len() == 1 {
+        return Ok(loose[0]);
+    }
+    if loose.len() > 1 {
+        return Err("matched more than one finding");
+    }
+    // Last, the place alone. An adjudicator reads a finding and writes the
+    // point back in its own words, which no hash of the title can follow, and
+    // "Retry loop never terminates" against "Retry loop does not terminate" is
+    // the ordinary shape of that. It is safe here only because the adjudicator
+    // was handed exactly the eligible findings and exactly one of them is at
+    // this path: two findings in one file fall through to the miss below rather
+    // than guess between them.
+    let here: Vec<usize> = judged
+        .iter()
+        .enumerate()
+        .filter(|(_, j)| {
+            eligible(j)
+                && !file.trim().is_empty()
+                && crate::jsonx::finding_file(&j.finding.file) == crate::jsonx::finding_file(file)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    match here.len() {
+        1 => Ok(here[0]),
+        0 => Err("matched no finding"),
+        _ => Err("matched more than one finding"),
+    }
+}
+
 fn adjudicate(
     agents: &[Agent],
     cfg: &Config,
@@ -379,22 +445,20 @@ fn adjudicate(
             }
         };
         for verdict in doc.verdicts {
-            let key = finding_key(&verdict.title, &verdict.file);
-            let Some(target) = judged.iter_mut().find(|j| {
-                j.raised_by != name
-                    && (finding_key(&j.finding.title, &j.finding.file) == key
-                        || crate::review::same_finding_parts(
-                            &j.finding.title,
-                            &j.finding.file,
-                            &verdict.title,
-                            &verdict.file,
-                        ))
-            }) else {
-                continue;
+            let found = matching_finding(judged, &verdict.title, &verdict.file, |j| {
+                j.raised_by != name && j.standing == Standing::Unverified
+            });
+            let target = match found {
+                Ok(index) => &mut judged[index],
+                Err(why) => {
+                    logwarn!(
+                        "{name}'s ruling on '{}' {why}, so it was dropped and that finding goes \
+                         to a maintainer unexamined",
+                        verdict.title
+                    );
+                    continue;
+                }
             };
-            if target.standing != Standing::Unverified {
-                continue;
-            }
             target.counterpoint = Some(style::summary(&verdict.reasoning, &repo.style));
             if verdict.agrees {
                 target.standing = Standing::Confirmed;
@@ -474,19 +538,19 @@ fn rebut(
             }
         };
         for verdict in doc.verdicts {
-            let key = finding_key(&verdict.title, &verdict.file);
-            let Some(target) = judged.iter_mut().find(|j| {
-                j.raised_by == name
-                    && j.standing == Standing::Disputed
-                    && (finding_key(&j.finding.title, &j.finding.file) == key
-                        || crate::review::same_finding_parts(
-                            &j.finding.title,
-                            &j.finding.file,
-                            &verdict.title,
-                            &verdict.file,
-                        ))
-            }) else {
-                continue;
+            let found = matching_finding(judged, &verdict.title, &verdict.file, |j| {
+                j.raised_by == name && j.standing == Standing::Disputed
+            });
+            let target = match found {
+                Ok(index) => &mut judged[index],
+                Err(why) => {
+                    logwarn!(
+                        "{name}'s answer to the objection on '{}' {why}, so it was dropped and \
+                         the point stays disputed with no defence",
+                        verdict.title
+                    );
+                    continue;
+                }
             };
             if verdict.agrees {
                 // Stands by it. Kept separate from the objection so a person
@@ -506,18 +570,32 @@ fn finish(
     pr: &PrView,
     state: &mut IssueRun,
     judged: &[Judged],
+    reviewers: usize,
     dry_run: bool,
 ) -> Result<()> {
     let blocking = judged
         .iter()
         .filter(|j| j.finding.blocks() && j.standing.counts())
         .count();
+    // A blocking finding the two reviewers disagree about is not a clean pull
+    // request. The comment says "the reviewers disagree, your call", and the
+    // terminal used to say `clean` beside it.
+    let contested = judged
+        .iter()
+        .filter(|j| j.finding.blocks() && j.standing == Standing::Disputed)
+        .count();
 
-    state.status = if blocking == 0 {
+    state.status = if blocking == 0 && contested == 0 {
         Status::Clean
     } else {
         Status::Reviewed
     };
+    if contested > 0 {
+        state.notes.push(format!(
+            "{contested} blocking finding{} the reviewers disagree about, which is your call",
+            plural(contested)
+        ));
+    }
     for j in judged.iter().filter(|j| j.standing == Standing::Disputed) {
         state.disputes.push(crate::model::Dispute {
             title: style::title(&j.finding.title, &repo.style),
@@ -526,7 +604,7 @@ fn finish(
         });
     }
 
-    let comment = verdict_comment(judged, &repo.style);
+    let comment = verdict_comment_from(judged, &repo.style, reviewers);
     // `pr_comments = "none"` promises spar will not comment on a pull request.
     // Review mode used to post regardless, which made the promise false and left
     // --dry-run as the only way to keep it.
@@ -553,8 +631,13 @@ fn finish(
         Ok(()) => log!(
             "PR #{}: {}",
             pr.number,
-            if blocking == 0 {
+            if blocking == 0 && contested == 0 {
                 "no blocking findings, review posted".to_string()
+            } else if blocking == 0 {
+                format!(
+                    "{contested} disputed blocking finding{}, review posted",
+                    plural(contested)
+                )
             } else {
                 format!(
                     "{blocking} blocking finding{}, review posted",
@@ -592,6 +675,14 @@ impl Standing {
 
 /// The one thing a maintainer reads.
 pub fn verdict_comment(judged: &[Judged], style: &Style) -> String {
+    verdict_comment_from(judged, style, 2)
+}
+
+/// The same, told how many reviewers actually answered.
+///
+/// "Two independent reviews." is what makes [both] and [one reviewer only] mean
+/// anything, and it was printed whether two answered or one did.
+pub fn verdict_comment_from(judged: &[Judged], style: &Style, reviewers: usize) -> String {
     let live: Vec<&Judged> = judged.iter().filter(|j| j.standing.counts()).collect();
     let pick = |severity: Severity| -> Vec<&Judged> {
         live.iter()
@@ -614,10 +705,15 @@ pub fn verdict_comment(judged: &[Judged], style: &Style) -> String {
     // "Two independent reviews" stays: it is the only thing that makes [both],
     // [one reviewer only] and the disagreement heading below mean anything. The
     // counts go, because everything they count is listed immediately after.
-    let mut out = vec![if blocking.is_empty() && disputed.is_empty() {
-        "Two independent reviews, nothing blocking a merge.".to_string()
+    let heading = if reviewers >= 2 {
+        "Two independent reviews"
     } else {
-        "Two independent reviews.".to_string()
+        "One review, nothing cross-checked"
+    };
+    let mut out = vec![if blocking.is_empty() && disputed.is_empty() {
+        format!("{heading}, nothing blocking a merge.")
+    } else {
+        format!("{heading}.")
     }];
     let _ = withdrawn;
 
@@ -761,6 +857,153 @@ mod tests {
 
     fn from(name: &str, findings: Vec<Finding>) -> (String, Vec<Finding>) {
         (name.to_string(), findings)
+    }
+
+    // -- matching a verdict back to its finding ---------------------------
+
+    fn unverified(title: &str, file: &str, raised_by: &str) -> Judged {
+        Judged {
+            finding: finding("blocking", title, file),
+            raised_by: raised_by.to_string(),
+            standing: Standing::Unverified,
+            counterpoint: None,
+            defence: None,
+        }
+    }
+
+    /// An adjudicator rewords the title it is ruling on, and its ruling was
+    /// dropped without a word.
+    ///
+    /// This is the mode the README recommends as the cheapest way to adopt
+    /// spar, and its whole value is the attestation. A dropped rejection puts a
+    /// finding a reviewer went to the code and rejected in front of a
+    /// maintainer tagged as unexamined, with the argument against it nowhere.
+    #[test]
+    fn a_paraphrased_verdict_still_finds_its_finding() {
+        let judged = vec![unverified(
+            "Retry loop never terminates",
+            "src/net.rs:88",
+            "claude",
+        )];
+        let eligible = |j: &Judged| j.raised_by != "codex" && j.standing == Standing::Unverified;
+
+        // Punctuation and case noise.
+        assert_eq!(
+            Ok(0),
+            matching_finding(
+                &judged,
+                "retry loop never terminates!",
+                "src/net.rs:88",
+                eligible
+            )
+        );
+        // A dropped line number, which #48 taught the custody loop to tolerate.
+        assert_eq!(
+            Ok(0),
+            matching_finding(
+                &judged,
+                "Retry loop does not terminate",
+                "src/net.rs",
+                eligible
+            )
+        );
+    }
+
+    /// The fallback is only safe where it is unambiguous.
+    #[test]
+    fn a_line_free_verdict_does_not_choose_between_two_findings_in_one_file() {
+        let judged = vec![
+            unverified("Retry loop never terminates", "src/net.rs:88", "claude"),
+            unverified("Retry loop leaks a socket", "src/net.rs:120", "claude"),
+        ];
+        let eligible = |j: &Judged| j.raised_by != "codex" && j.standing == Standing::Unverified;
+
+        assert_eq!(
+            Err("matched more than one finding"),
+            matching_finding(&judged, "Something about retries", "src/net.rs", eligible),
+            "the fallback guessed between two findings in one file"
+        );
+        // The exact one still lands.
+        assert_eq!(
+            Ok(1),
+            matching_finding(
+                &judged,
+                "Retry loop leaks a socket",
+                "src/net.rs:120",
+                eligible
+            )
+        );
+    }
+
+    /// A pull request whose only blocking finding is disputed is not clean.
+    ///
+    /// `Standing::Disputed` does not count toward the blocking total, so the
+    /// terminal said `clean` while the posted comment said "the reviewers
+    /// disagree, your call" about a merge blocker.
+    #[test]
+    fn a_disputed_blocker_is_not_a_clean_pull_request() {
+        let disputed = |title: &str| Judged {
+            finding: finding("blocking", title, "src/net.rs"),
+            raised_by: "claude".into(),
+            standing: Standing::Disputed,
+            counterpoint: Some("I read the code and it terminates".into()),
+            defence: None,
+        };
+        let judged = vec![disputed("Retry loop never terminates")];
+
+        let contested = judged
+            .iter()
+            .filter(|j| j.finding.blocks() && j.standing == Standing::Disputed)
+            .count();
+        let counted = judged
+            .iter()
+            .filter(|j| j.finding.blocks() && j.standing.counts())
+            .count();
+        assert_eq!(0, counted, "a disputed finding is not attested");
+        assert_eq!(
+            1, contested,
+            "and it is still a blocker somebody has to weigh"
+        );
+
+        // Which is what the comment says about it.
+        let text = verdict_comment(&judged, &Style::default());
+        assert!(text.contains("the reviewers disagree, your call"), "{text}");
+        assert!(
+            !text.contains("nothing blocking a merge"),
+            "the header contradicted the section below it:\n{text}"
+        );
+    }
+
+    /// The header is what makes [both] and [one reviewer only] mean anything.
+    #[test]
+    fn the_header_counts_the_reviewers_that_answered() {
+        let judged = vec![Judged {
+            finding: finding("non-blocking", "A small thing", "a.rs"),
+            raised_by: "claude".into(),
+            standing: Standing::Unverified,
+            counterpoint: None,
+            defence: None,
+        }];
+        let two = verdict_comment_from(&judged, &Style::default(), 2);
+        assert!(two.starts_with("Two independent reviews"), "{two}");
+
+        let one = verdict_comment_from(&judged, &Style::default(), 1);
+        assert!(
+            one.starts_with("One review, nothing cross-checked"),
+            "{one}"
+        );
+    }
+
+    /// A verdict on somebody's own finding is not eligible: each agent rules on
+    /// what the other raised.
+    #[test]
+    fn a_verdict_never_matches_the_agent_that_raised_the_finding() {
+        let judged = vec![unverified("Retry loop spins", "src/net.rs", "codex")];
+        assert_eq!(
+            Err("matched no finding"),
+            matching_finding(&judged, "Retry loop spins", "src/net.rs", |j| j.raised_by
+                != "codex")
+        );
     }
 
     // -- corroboration ---------------------------------------------------

@@ -965,6 +965,13 @@ fn review_loop(
         first.saturating_sub(1),
         &holder,
     )?;
+    // The ref spar itself compares against, which is what the reviewer has to
+    // be told to compare against. In a linked worktree the local branch is
+    // whatever the primary checkout last had: often behind origin, sometimes
+    // ahead of it with unpushed commits, and either way not the base this
+    // branch was built from.
+    let base_ref = repo.base_ref(&ctx.work_dir, &base);
+
     // The head the last review in this invocation read. Empty until one has
     // run, and in-invocation on purpose: a resumed run's closing pass reads what
     // this invocation's rounds produced, not what some earlier one did.
@@ -983,7 +990,7 @@ fn review_loop(
         );
 
         let prompt = review_prompt(
-            &base,
+            &base_ref,
             ctx.subject,
             &ctx.title,
             ledger,
@@ -997,7 +1004,7 @@ fn review_loop(
         // reads what landed after the last one of these.
         audited_head = before_review.head.clone();
         let review = reviewer.review::<Review>(
-            &base,
+            &base_ref,
             &prompt,
             &schema::review(),
             &ctx.work_dir,
@@ -1379,7 +1386,7 @@ fn close_out(
     );
 
     let prompt = close_prompt(
-        cfg.base_branch(),
+        &repo.base_ref(&ctx.work_dir, cfg.base_branch()),
         ctx.subject,
         &ctx.title,
         audited_head,
@@ -4692,7 +4699,7 @@ mod tests {
     fn the_closing_prompt_names_every_fix_it_has_to_check() {
         let landed = vec!["abc1234 Bound the retry loop".to_string()];
         let prompt = close_prompt(
-            "main",
+            "origin/main",
             42,
             "Retry a 429",
             "9f8e7d6",
@@ -4705,7 +4712,7 @@ mod tests {
         assert!(prompt.contains("bounded it on max_attempts"), "{prompt}");
         assert!(prompt.contains("abc1234 Bound the retry loop"), "{prompt}");
         assert!(prompt.contains("git diff 9f8e7d6..HEAD"), "{prompt}");
-        assert!(prompt.contains("git diff main...HEAD"), "{prompt}");
+        assert!(prompt.contains("git diff origin/main...HEAD"), "{prompt}");
         assert!(!prompt.contains('{'), "{prompt}");
     }
 
@@ -4714,7 +4721,7 @@ mod tests {
     #[test]
     fn a_close_with_nothing_landed_says_so_rather_than_leaving_a_hole() {
         let prompt = close_prompt(
-            "main",
+            "origin/main",
             42,
             "Retry a 429",
             "9f8e7d6",
@@ -4738,7 +4745,7 @@ mod tests {
     #[test]
     fn a_rewritten_branch_admits_it_cannot_say_what_landed() {
         let prompt = close_prompt(
-            "main",
+            "origin/main",
             42,
             "Retry a 429",
             "9f8e7d6",
@@ -4748,7 +4755,7 @@ mod tests {
             1,
         );
         assert!(prompt.contains("were rewritten"), "{prompt}");
-        assert!(prompt.contains("git diff main...HEAD"), "{prompt}");
+        assert!(prompt.contains("git diff origin/main...HEAD"), "{prompt}");
         assert!(!prompt.contains("nobody has read it"), "{prompt}");
         assert!(!prompt.contains('{'), "{prompt}");
     }
@@ -4758,7 +4765,7 @@ mod tests {
     #[test]
     fn the_closing_prompt_forbids_the_writing_the_loop_rolls_back() {
         let prompt = close_prompt(
-            "main",
+            "origin/main",
             42,
             "t",
             "9f8e7d6",
@@ -4774,7 +4781,7 @@ mod tests {
     #[test]
     fn the_closing_prompt_keeps_confirmed_merge_blockers_blocking() {
         let prompt = close_prompt(
-            "main",
+            "origin/main",
             42,
             "t",
             "9f8e7d6",
@@ -4803,7 +4810,7 @@ mod tests {
     #[test]
     fn the_closing_pass_is_offered_a_severity_rather_than_the_field_that_gates() {
         let prompt = close_prompt(
-            "main",
+            "origin/main",
             42,
             "t",
             "9f8e7d6",
@@ -4917,9 +4924,16 @@ mod tests {
 
     #[test]
     fn the_review_prompt_leaves_nothing_unsubstituted() {
-        let empty = review_prompt("main", 42, "Retry a 429", &Ledger::new(), &[], 1, 3);
+        // The resolved ref, because that is what the loop passes and what spar
+        // itself compares against. In a linked worktree the local branch is
+        // whatever the primary checkout last had.
+        let empty = review_prompt("origin/main", 42, "Retry a 429", &Ledger::new(), &[], 1, 3);
         assert!(!empty.contains('{'), "{empty}");
-        assert!(empty.contains("main") && empty.contains("#42") && empty.contains("Retry a 429"));
+        assert!(
+            empty.contains("`origin/main`"),
+            "the reviewer was told to read a different ref than spar compares:\n{empty}"
+        );
+        assert!(empty.contains("#42") && empty.contains("Retry a 429"));
 
         let mut ledger = ledger_with("refuted point", "a.rs");
         ledger.extend(ledger_with("fixed point", "b.rs"));
@@ -4929,7 +4943,7 @@ mod tests {
                 entry.round = 2;
             }
         }
-        let full = review_prompt("main", 42, "Retry a 429", &ledger, &[], 3, 3);
+        let full = review_prompt("origin/main", 42, "Retry a 429", &ledger, &[], 3, 3);
         assert!(!full.contains('{'), "{full}");
         assert!(full.contains("fixed point") && full.contains("refuted point"));
         assert!(full.contains("last round"), "{full}");
@@ -4944,9 +4958,17 @@ mod tests {
             "src/net.rs:88",
             true,
         )];
-        let review = review_prompt("main", 42, "Retry a 429", &Ledger::new(), &open, 2, 3);
+        let review = review_prompt(
+            "origin/main",
+            42,
+            "Retry a 429",
+            &Ledger::new(),
+            &open,
+            2,
+            3,
+        );
         let close = close_prompt(
-            "main",
+            "origin/main",
             42,
             "Retry a 429",
             "9f8e7d6",

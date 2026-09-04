@@ -870,7 +870,7 @@ fn split_pr_inner(
     let prompt = PROPOSE_PR_PROMPT
         .replace("{number}", &number.to_string())
         .replace("{title}", &pr.title)
-        .replace("{base}", base)
+        .replace("{base}", &repo.base_ref(read_only, base))
         .replace("{count}", &changed.len().to_string())
         .replace("{files}", &listed(&changed));
 
@@ -1420,7 +1420,7 @@ fn build_one(
 
     let prompt = STAND_ALONE_PROMPT
         .replace("{parent}", &number.to_string())
-        .replace("{base}", against)
+        .replace("{base}", &repo.base_ref(dir, against))
         .replace("{index}", &index.to_string())
         .replace("{total}", &total.to_string())
         .replace("{title}", part.title.trim())

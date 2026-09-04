@@ -175,6 +175,34 @@ fn the_default_branch_comes_from_origin_head_not_an_assumption() {
     assert_eq!("main", repo.default_branch("some-other-guess"));
 }
 
+/// The reviewer is told to read the ref spar reads.
+///
+/// In a linked worktree the local `main` is whatever the primary checkout last
+/// had. Behind origin, a reviewer told to diff against it sees every upstream
+/// commit in between as part of the pull request, and raises findings about
+/// code the author never touched.
+#[test]
+fn the_base_a_prompt_names_is_the_base_spar_compares_against() {
+    let fx = repo("baseref");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    commit(
+        &fx.work,
+        "upstream.rs",
+        "upstream\n",
+        "somebody else's work",
+    );
+    git(&fx.work, &["push", "origin", "main"]);
+    // Local main left behind, which is the ordinary state of a worktree run.
+    git(&fx.work, &["reset", "--hard", "HEAD~1"]);
+
+    assert_eq!("origin/main", repo.base_ref(&fx.work, "main"));
+    assert_ne!(
+        git(&fx.work, &["rev-parse", "main"]),
+        git(&fx.work, &["rev-parse", "origin/main"]),
+        "the two refs have to differ for this to prove anything"
+    );
+}
+
 #[test]
 fn a_repository_with_no_origin_head_falls_back_to_the_configured_branch() {
     let fx = repo("nohead");

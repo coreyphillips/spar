@@ -2690,8 +2690,12 @@ if [ "$1" = pr ] && [ "$2" = view ] && [ "$3" = 7 ]; then
   printf '%s\n' '{"state":"MERGED"}'
   exit 0
 fi
+if [ "$1" = api ] && [ "$2" = user ]; then
+  printf '%s\n' 'spar-bot'
+  exit 0
+fi
 if [ "$1" = api ] && [ "$2" = --paginate ]; then
-  printf '%s\n' '[{"id":77,"body":"<!-- spar:state\\n{}\\n-->"}]'
+  printf '%s\n' '[{"id":77,"user":{"login":"spar-bot"},"body":"<!-- spar:state\n{\"version\":2,\"round\":1,\"next_actor\":\"alpha\",\"status\":\"approved\"}\n-->"}]'
   exit 0
 fi
 if [ "$1" = api ] && [ "$2" = -X ] && [ "$3" = DELETE ]; then

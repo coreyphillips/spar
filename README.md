@@ -412,7 +412,9 @@ the human who ran spar and authorship reveals nothing about who acted last. Spar
 therefore keeps its own state: round number, whose turn is next, and the full
 disputed ledger. That lives in `.spar/state/` by default, and can also travel on
 the PR as a hidden comment (`state_store = "pr"`) if a run might be picked up
-from another machine.
+from another machine. That comment is identified by the marker opening the body,
+by the payload parsing, and by the author being spar's own account, so a comment
+somebody wrote about the block is never patched over or deleted, only reported.
 
 Each checkpoint is bound to the exact published PR head. If the branch moves
 without a matching checkpoint, `resume` refuses to guess who may safely review

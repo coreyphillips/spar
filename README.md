@@ -600,9 +600,11 @@ output is a `git push`, so it is worth saying exactly what the layers are.
 - **The trust gate reads the whole thread**, not its newest message, so waiting
   for somebody with write access to reply is not a way through it.
 - Comment bodies reach the agents inside a marked block, as data rather than
-  instruction, with the marker stripped out of the body so it cannot close its
-  own fence. A comment that tries to redirect the agent is itself grounds to
-  decline.
+  instruction. The marker carries a suffix generated per run, so it cannot be
+  named in advance, and any line that reads as one, in any case, with any dash,
+  is stripped out of the body, the diff hunk, the pull request title, and the
+  first agent's summary of it all before the second agent reads it. A comment
+  that tries to redirect the agent is itself grounds to decline.
 - The push is `--force-with-lease` onto a worktree built from the pull request's
   own head, and the lease names that exact head rather than the tracking ref, so
   a commit pushed while the round ran refuses the push instead of being

@@ -274,8 +274,13 @@ neither sees the other's answer. Then reconcile mechanically:
   never overrules the other.
 
 Scheduled issues are ordered by dependency, then cheapest first, so blockers
-clear early and risky work inherits a healthier base. The plan is written to
-`plan.json`.
+clear early and risky work inherits a healthier base. Every worktree is built
+from `origin/<base>`, so a dependency's work is only there once it has merged:
+an issue whose dependency has not merged is held back with the reason rather
+than built on a base that lacks it, and so is one whose dependency both
+reviewers declined or disagreed about. A dependency outside the run is named in
+the log and holds nothing, since it may well be merged already. The plan is
+written to `plan.json`, and the preview names what each item waits on.
 
 **Per issue.** An isolated git worktree, so a failed issue cannot poison the
 next one's base. The first agent implements and opens a PR. Custody passes to

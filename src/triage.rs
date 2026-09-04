@@ -317,7 +317,7 @@ fn reconcile(issues: &[Issue], verdicts: &[(String, BTreeMap<i64, TriageVerdict>
     }
 
     Plan {
-        order: order(agreed),
+        order: order(agreed, &skipped, &contested),
         skipped,
         contested,
     }
@@ -325,8 +325,13 @@ fn reconcile(issues: &[Issue], verdicts: &[(String, BTreeMap<i64, TriageVerdict>
 
 /// Topological by dependency, then cheapest first, so blockers clear early and
 /// the large risky items inherit a healthier base.
-pub fn order(items: Vec<PlanItem>) -> Vec<PlanItem> {
+pub fn order(
+    items: Vec<PlanItem>,
+    skipped: &[SkippedItem],
+    contested: &[ContestedItem],
+) -> Vec<PlanItem> {
     let by_number: BTreeMap<i64, PlanItem> = items.iter().map(|i| (i.issue, i.clone())).collect();
+    report_dependencies(&items, &by_number, skipped, contested);
 
     let mut entry: Vec<&PlanItem> = items.iter().collect();
     entry.sort_by_key(|i| (i.complexity.rank(), i.issue));
@@ -346,10 +351,13 @@ pub fn order(items: Vec<PlanItem>) -> Vec<PlanItem> {
             return;
         }
         let Some(item) = by_number.get(&number) else {
-            return; // a dependency outside this run's list
+            return; // a dependency outside this run's list, reported above
         };
         if visiting.contains(&number) {
-            return; // dependency cycle, break it rather than hang
+            // A cycle, broken here rather than hung on. Reported above, since
+            // whichever node was visited first decides the order and that is
+            // not something to settle silently.
+            return;
         }
         visiting.push(number);
         let mut deps = item.depends_on.clone();
@@ -372,6 +380,74 @@ pub fn order(items: Vec<PlanItem>) -> Vec<PlanItem> {
         );
     }
     ordered
+}
+
+/// Say what each item depends on, and what became of a dependency that is not
+/// being worked.
+///
+/// The ordering spends a triage question and a sort on this, and the case where
+/// it matters most, a dependency that is not going to be done, was the case it
+/// stayed quiet about.
+fn report_dependencies(
+    items: &[PlanItem],
+    by_number: &BTreeMap<i64, PlanItem>,
+    skipped: &[SkippedItem],
+    contested: &[ContestedItem],
+) {
+    for item in items {
+        for dep in &item.depends_on {
+            if by_number.contains_key(dep) {
+                continue;
+            }
+            let why = if skipped.iter().any(|s| s.issue == *dep) {
+                "both reviewers declined it"
+            } else if contested.iter().any(|c| c.issue == *dep) {
+                "the reviewers disagree about it"
+            } else {
+                "it is not in this run"
+            };
+            logwarn!(
+                "#{} depends on #{dep}, which is not scheduled: {why}",
+                item.issue
+            );
+        }
+    }
+    for cycle in cycles(by_number) {
+        logwarn!(
+            "a dependency cycle among {}, broken at whichever was reached first",
+            numbers(&cycle)
+        );
+    }
+}
+
+/// Members of any dependency cycle inside the scheduled items.
+fn cycles(by_number: &BTreeMap<i64, PlanItem>) -> Vec<Vec<i64>> {
+    let mut found: Vec<Vec<i64>> = Vec::new();
+    for start in by_number.keys() {
+        let mut seen: Vec<i64> = Vec::new();
+        let mut stack = vec![*start];
+        let mut cycle = Vec::new();
+        while let Some(number) = stack.pop() {
+            if seen.contains(&number) {
+                continue;
+            }
+            seen.push(number);
+            let Some(item) = by_number.get(&number) else {
+                continue;
+            };
+            for dep in &item.depends_on {
+                if dep == start {
+                    cycle = seen.clone();
+                    cycle.sort_unstable();
+                }
+                stack.push(*dep);
+            }
+        }
+        if !cycle.is_empty() && !found.contains(&cycle) {
+            found.push(cycle);
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -489,7 +565,10 @@ mod tests {
     }
 
     fn numbers(items: Vec<PlanItem>) -> Vec<i64> {
-        order(items).into_iter().map(|i| i.issue).collect()
+        order(items, &[], &[])
+            .into_iter()
+            .map(|i| i.issue)
+            .collect()
     }
 
     #[test]

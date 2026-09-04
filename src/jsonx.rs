@@ -56,7 +56,7 @@ pub fn candidates(text: &str) -> Vec<Value> {
         push(value);
     }
 
-    for opener in [b'{', b'['] {
+    for opener in *b"{[" {
         for (start, end) in spans(text, opener) {
             if let Ok(value) = serde_json::from_str::<Value>(&text[start..end]) {
                 push(value);

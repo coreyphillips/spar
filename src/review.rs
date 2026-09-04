@@ -101,6 +101,13 @@ Reviewing one issue should not manufacture ten more. If you find yourself with
 several out of scope findings, keep the ones that would bite somebody and drop
 the rest.
 
+What each label means for what happens next, so you can choose it knowing:
+- blocking: the author answers it this round, or you fix it yourself, and the
+  pull request does not merge until it is settled.
+- non-blocking: offered to the author in the same round as an optional fix, and
+  reported for a person either way. Nothing holds the merge for it.
+- nit: dropped. Nobody acts on it.
+
 Then choose next_action:
 - merge: no blocking findings, the PR is good.
 - fix_myself: there are blocking findings and you will fix them directly.
@@ -199,8 +206,23 @@ handling for cases nobody raised. Every line you add is what the next pass
 reviews, so a fix that grows the branch buys another round of findings about the
 fix. If a point cannot be answered without a change bigger than the point, say so
 rather than making the change.
-
+{optional}
 Leave any fixes uncommitted. Do not commit, push, or merge.";
+
+/// The non-blocking findings, offered rather than required.
+///
+/// The author is making a commit anyway for the blocking points, and these are
+/// real defects the reviewer judged smaller than another round. Nobody acted on
+/// them before: they were listed for a person at the end and the merged pull
+/// request kept them.
+const OPTIONAL_HEADER: &str = "\
+These are not blocking and will not hold the merge. You are making a commit for
+the points above anyway, so fix the ones that are a line or two, and decline the
+rest with a reason. Declining costs nothing: what you decline is reported for a
+person to weigh, exactly as it would have been if you had not been asked.
+
+Optional:
+";
 
 // ---------------------------------------------------------------------------
 // Evidence
@@ -1264,7 +1286,8 @@ fn review_loop(
             let prompt = RESPOND_PROMPT
                 .replace("{number}", &ctx.subject.to_string())
                 .replace("{context}", &ctx.context)
-                .replace("{findings}", &findings_for_prompt(&blocking));
+                .replace("{findings}", &findings_for_prompt(&blocking))
+                .replace("{optional}", &optional_block(&review.findings));
             let before_response = repo.head_oid_checked(&ctx.work_dir)?;
             let worktree_baseline = repo.worktree_baseline(&ctx.work_dir)?;
             let response: Result<ResponseDoc> = author.edit_json(
@@ -1333,6 +1356,14 @@ fn review_loop(
                 );
                 remove_findings(&mut open_findings, &blocking);
                 extend_findings(&mut open_findings, &unresolved);
+                apply_optional_dispositions(
+                    repo,
+                    cfg,
+                    &response,
+                    &review.findings,
+                    state,
+                    ctx.subject,
+                );
             }
         }
 
@@ -3809,6 +3840,75 @@ pub(crate) fn context_block(number: i64, url: &str, issue_body: &str, pr_body: &
     out
 }
 
+/// The non-blocking findings a round can offer the author, if there are any.
+pub(crate) fn optional_findings(findings: &[Finding]) -> Vec<Finding> {
+    findings
+        .iter()
+        .filter(|f| f.in_scope && f.severity == Severity::NonBlocking)
+        .cloned()
+        .collect()
+}
+
+fn optional_block(findings: &[Finding]) -> String {
+    let optional = optional_findings(findings);
+    if optional.is_empty() {
+        return String::new();
+    }
+    format!("\n{OPTIONAL_HEADER}{}\n", findings_for_prompt(&optional))
+}
+
+/// Act on what the author said about the optional findings.
+///
+/// Nothing here touches the ledger, the round budget, or the merge gate: these
+/// points never gated anything and they still do not. A fix takes the point off
+/// the list a person is handed at the end, since it is answered; a decline or a
+/// refutation leaves it exactly where it was.
+fn apply_optional_dispositions(
+    repo: &Repo,
+    cfg: &Config,
+    response: &ResponseDoc,
+    findings: &[Finding],
+    state: &mut IssueRun,
+    subject: i64,
+) {
+    let optional = optional_findings(findings);
+    if optional.is_empty() {
+        return;
+    }
+    let mut fixed = 0usize;
+    for finding in &optional {
+        let Ok((_, disposition)) = matching_disposition(finding, &optional, &response.dispositions)
+        else {
+            continue;
+        };
+        let unique = unique_stable_finding(&optional, finding);
+        match disposition.action {
+            Action::Fixed => {
+                fixed += 1;
+                forget_noted(state, finding, unique);
+            }
+            Action::FiledIssue => {
+                let title = disposition
+                    .new_issue_title
+                    .clone()
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or_else(|| finding.title.clone());
+                let body = disposition
+                    .new_issue_body
+                    .clone()
+                    .filter(|b| !b.trim().is_empty())
+                    .unwrap_or_else(|| finding.detail.clone());
+                let recorded = file_followup(repo, &title, &body, subject, cfg, state);
+                record_nonblocking_outcome_with_match(state, finding, Some(&recorded), unique);
+            }
+            Action::Refuted => {}
+        }
+    }
+    if fixed > 0 {
+        logdim!("the author also fixed {fixed} non-blocking finding(s)");
+    }
+}
+
 /// Findings as a model should see them: full detail, since this one is not for
 /// a human to read.
 pub(crate) fn findings_for_prompt(findings: &[Finding]) -> String {
@@ -5358,12 +5458,88 @@ mod tests {
         let respond = RESPOND_PROMPT
             .replace("{number}", "42")
             .replace("{context}", &context)
-            .replace("{findings}", "(none)");
+            .replace("{findings}", "(none)")
+            .replace("{optional}", "");
         for prompt in [review, close, respond] {
             assert!(prompt.contains("Honour Retry-After"), "{prompt}");
             assert!(prompt.contains("Ran the 429 test"), "{prompt}");
             assert!(!prompt.contains('{'), "{prompt}");
         }
+    }
+
+    /// The author is making a commit anyway, and nobody was acting on these.
+    ///
+    /// Under the defaults a non-blocking finding is kept in state.noted and
+    /// listed for a person at the end, so a reviewer being properly restrained
+    /// about what costs a round was deciding which real defects reach the
+    /// merged code. Handing them to the author as optional costs no extra call.
+    #[test]
+    fn the_author_is_offered_the_non_blocking_findings_it_never_saw() {
+        let findings = vec![
+            finding(
+                "blocking",
+                "Retry loop spins",
+                "confirmed",
+                "src/net.rs:88",
+                true,
+            ),
+            finding(
+                "non-blocking",
+                "Timeout is hard coded",
+                "thirty seconds, in one place",
+                "src/net.rs:44",
+                true,
+            ),
+            finding(
+                "nit",
+                "Log line says retrying",
+                "wording",
+                "src/net.rs:102",
+                true,
+            ),
+            finding(
+                "non-blocking",
+                "Out of scope thing",
+                "predates the branch",
+                "src/cache.rs",
+                false,
+            ),
+        ];
+
+        let optional = optional_findings(&findings);
+        assert_eq!(1, optional.len(), "{optional:?}");
+        assert_eq!("Timeout is hard coded", optional[0].title);
+
+        let prompt = RESPOND_PROMPT
+            .replace("{number}", "42")
+            .replace("{context}", "")
+            .replace("{findings}", &findings_for_prompt(&[findings[0].clone()]))
+            .replace("{optional}", &optional_block(&findings));
+        assert!(prompt.contains("Timeout is hard coded"), "{prompt}");
+        assert!(prompt.contains("will not hold the merge"), "{prompt}");
+        assert!(
+            !prompt.contains("Log line says retrying"),
+            "a nit is dropped, not offered:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("Out of scope thing"),
+            "an out of scope point is filed, not offered:\n{prompt}"
+        );
+        assert!(!prompt.contains('{'), "{prompt}");
+
+        // Nothing optional means nothing said about it.
+        let none = optional_block(&[findings[0].clone()]);
+        assert_eq!("", none);
+    }
+
+    /// The reviewer chooses the label, so it has to know what each one costs.
+    #[test]
+    fn the_review_prompt_says_what_happens_to_each_severity() {
+        assert!(
+            REVIEW_PROMPT.contains("offered to the author"),
+            "{REVIEW_PROMPT}"
+        );
+        assert!(REVIEW_PROMPT.contains("nit: dropped"), "{REVIEW_PROMPT}");
     }
 
     /// Nothing to say is said as nothing, not as an empty heading. A resumed

@@ -326,7 +326,12 @@ matters: a competent reviewer can always find something, so "no objections
 remaining" is not a stopping condition, but "no blocking objections" is. A real
 defect too small to be worth another round is `non-blocking`, and every in-scope
 one a reviewer chose not to gate on is listed under "Noted, not blocking", so
-downgrading a point is visible rather than a way to delete it.
+downgrading a point is visible rather than a way to delete it. The author is
+handed those points in the same response call it is already making, marked
+optional: a two line fix lands with the round it was going to spend anyway, and
+anything it declines is reported for you exactly as before. Nothing about that
+touches the round budget or the merge gate, and the reviewer is told what each
+label costs, so it chooses one knowing where the point ends up.
 
 A run that reaches an ending reports unresolved points, deadlocks, unchanged
 branches, and unread closing work on the pull request when comments are

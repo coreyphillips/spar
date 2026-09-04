@@ -106,6 +106,12 @@ If one of them turns out to be wrong once you are in the code, leave it alone
 and set changed=false with the reason. You are not obliged to make a change you
 now believe is a mistake, and saying so is a better answer than making it.
 
+For each comment, list in files the repository relative paths your change to it
+touched, and leave that empty when you changed nothing for it. The list is
+checked against the diff: a comment whose files are not in it is answered in
+words rather than reported as fixed, because a reply claiming a change nobody
+can see in the diff is worse than no reply at all.
+
 {fence}
 
 {comments}";
@@ -139,6 +145,9 @@ pub struct Settled {
     pub reasoning: String,
     /// What the fix pass said it did.
     pub summary: String,
+    /// The files the fix pass said it changed for this comment, checked
+    /// against the commit before anything is claimed as fixed.
+    pub files: Vec<String>,
     pub changed: bool,
     pub pushed: bool,
     /// Why a change that was agreed on did not happen.
@@ -159,6 +168,7 @@ impl Settled {
             request: judge.request.clone(),
             reasoning: judge.reasoning.clone(),
             summary: String::new(),
+            files: Vec::new(),
             changed: false,
             pushed: false,
             blocked: None,
@@ -192,7 +202,11 @@ pub fn settle(judge: &CommentVerdict, check: Option<&CommentCheck>) -> Ask {
         (Ask::Implement, None) | (Ask::Defer, None) => Ask::Answer,
 
         (Ask::Implement, _) if unsure => Ask::Answer,
-        (Ask::Implement, Some(c)) if c.agrees => Ask::Implement,
+        // Both fields have to say the same thing. A checker that returns
+        // agrees=true alongside ask=defer is a checker contradicting itself,
+        // and a model inconsistency must not resolve toward putting a commit
+        // on somebody's branch.
+        (Ask::Implement, Some(c)) if c.agrees && c.ask == Ask::Implement => Ask::Implement,
         (Ask::Implement, Some(c)) => match c.ask {
             Ask::Decline => Ask::Decline,
             Ask::Defer => Ask::Defer,
@@ -247,12 +261,12 @@ pub fn allowed(ask: Ask, p: &Pending, mode: &Mode, can_push: bool) -> (Ask, Opti
             Some("the branch is on a fork, so spar cannot push to it".into()),
         );
     }
-    if !mode.trust.may_act_on(&p.association) {
+    if !mode.trust.may_act_on(&p.gate_association) {
         return (
             Ask::Answer,
             Some(format!(
                 "@{} cannot write to this repository, and checkin_trust is \"write\"",
-                p.author
+                p.gate_author
             )),
         );
     }
@@ -873,6 +887,54 @@ fn render_verdicts(verdicts: &[CommentVerdict]) -> String {
         .join("\n")
 }
 
+/// Take back a "fixed" for any comment the commit does not answer.
+///
+/// One fix call answers several comments and reports on each of them, and
+/// `HEAD` moving proves only that it answered one. Two agreed comments where
+/// the agent edits one and reports both produced two "Done" replies and two
+/// resolved threads for a single fix. The files each comment names are checked
+/// against the files the commit actually touched, so what is claimed is what is
+/// in the diff.
+fn unclaim_untouched(items: &mut [Settled], landed: &[String], number: i64) {
+    for item in items
+        .iter_mut()
+        .filter(|i| i.ask == Ask::Implement && i.changed)
+    {
+        if item
+            .files
+            .iter()
+            .any(|named| landed.iter().any(|path| same_path(named, path)))
+        {
+            continue;
+        }
+        logwarn!(
+            "#{number}: the fix call reported {} as changed, but the commit does not touch the \
+             file(s) it named, so it is being answered rather than claimed as fixed",
+            item.pending.ref_id
+        );
+        item.changed = false;
+        item.pushed = false;
+        item.ask = Ask::Answer;
+        item.blocked = Some("no change for this comment is in the commit".into());
+        if item.reasoning.trim().is_empty() {
+            item.reasoning = item.summary.clone();
+        }
+    }
+}
+
+/// Whether two paths name the same file. A model writes `./src/x.rs` or
+/// `src/x.rs` for the same thing, and git answers with the second.
+fn same_path(named: &str, landed: &str) -> bool {
+    let tidy = |p: &str| {
+        p.trim()
+            .trim_start_matches("./")
+            .trim_start_matches('/')
+            .to_string()
+    };
+    let (named, landed) = (tidy(named), tidy(landed));
+    !named.is_empty() && (named == landed || landed.ends_with(&format!("/{named}")))
+}
+
 /// Make the changes both agents agreed on, and push them.
 ///
 /// `HEAD` is compared before and after. A report of work with no commit behind
@@ -938,6 +1000,7 @@ fn implement(
             .find(|d| d.ref_id.trim() == item.pending.ref_id)
         {
             item.summary = done.summary.clone();
+            item.files = done.files.clone();
             item.changed = done.changed;
             if !done.changed {
                 // The third refusal, with the code open. A better answer than
@@ -990,6 +1053,8 @@ fn implement(
         return Ok(FixPublication::NoCommit);
     }
     let after = repo.head_oid_checked(work_dir)?;
+    let landed = repo.files_changed_between(work_dir, before.as_str(), after.as_str());
+    unclaim_untouched(items, &landed, number);
 
     if before == after {
         repo.refuse_new_ignored_files(work_dir, &worktree_baseline)?;
@@ -1201,6 +1266,8 @@ mod tests {
             newest: "c1".into(),
             author: "alice".into(),
             association: association.into(),
+            gate_author: "alice".into(),
+            gate_association: association.into(),
             body: "@alice: add a null check".into(),
             file: Some("src/x.rs".into()),
             line: Some(91),
@@ -1371,6 +1438,67 @@ mod tests {
         for ask in [Ask::Decline, Ask::Defer, Ask::Answer, Ask::Nothing] {
             assert_eq!(ask, allowed(ask, &pending("NONE", true), &m, false).0);
         }
+    }
+
+    /// A checker contradicting itself must not resolve toward writing.
+    ///
+    /// Models return `agrees: true` alongside `ask: defer`, and reading only
+    /// `agrees` turned that into a commit on somebody's branch.
+    #[test]
+    fn a_checker_that_agrees_but_asks_for_something_else_does_not_implement() {
+        let mut c = check(true, Ask::Defer, true);
+        assert_eq!(
+            Ask::Defer,
+            settle(&judge(Ask::Implement, true), Some(&c)),
+            "agrees overrode the checker's own ask"
+        );
+
+        c.ask = Ask::Decline;
+        assert_eq!(Ask::Decline, settle(&judge(Ask::Implement, true), Some(&c)));
+
+        // The two saying the same thing is still the one path that implements.
+        c.ask = Ask::Implement;
+        assert_eq!(
+            Ask::Implement,
+            settle(&judge(Ask::Implement, true), Some(&c))
+        );
+    }
+
+    /// One fix call answers several comments, and HEAD moving proves it
+    /// answered one of them.
+    ///
+    /// Marking every agreed comment fixed produced a "Done" reply and a
+    /// resolved thread for a comment no commit touched, which is exactly the
+    /// claim the design says a reply never makes.
+    #[test]
+    fn a_comment_the_commit_does_not_touch_is_answered_rather_than_claimed() {
+        let mut items = vec![settled(Ask::Implement), settled(Ask::Implement)];
+        items[0].pending.ref_id = "c1".into();
+        items[0].changed = true;
+        items[0].files = vec!["src/net.rs".into()];
+        items[1].pending.ref_id = "c2".into();
+        items[1].changed = true;
+        items[1].files = vec!["src/cache.rs".into()];
+
+        unclaim_untouched(&mut items, &["src/net.rs".to_string()], 7);
+
+        assert_eq!(Ask::Implement, items[0].ask);
+        assert!(items[0].changed, "the fix that landed was taken back");
+        assert_eq!(Ask::Answer, items[1].ask);
+        assert!(!items[1].changed, "a fix nobody can see was still claimed");
+        assert!(items[1].blocked.is_some(), "the reply has to say why");
+    }
+
+    /// `./src/x.rs` and `src/x.rs` are the same file, and only one of them is
+    /// what git answers with.
+    #[test]
+    fn a_path_written_differently_is_still_the_same_file() {
+        assert!(same_path("./src/x.rs", "src/x.rs"));
+        assert!(same_path("src/x.rs", "src/x.rs"));
+        assert!(same_path("x.rs", "src/x.rs"));
+        assert!(!same_path("src/y.rs", "src/x.rs"));
+        assert!(!same_path("", "src/x.rs"));
+        assert!(!same_path("rs", "src/x.rs"), "a suffix is not a path");
     }
 
     /// A preview that pushes is not a preview.

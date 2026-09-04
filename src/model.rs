@@ -507,7 +507,10 @@ pub struct CommentCheck {
     pub ref_id: String,
     #[serde(deserialize_with = "de_bool")]
     pub agrees: bool,
-    /// What this agent would do instead. Read only when `agrees` is false.
+    /// What this agent would do. It has to say implement alongside
+    /// `agrees` before anything is implemented: the two coming apart is the
+    /// model contradicting itself, and that resolves toward saying rather than
+    /// doing.
     pub ask: Ask,
     #[serde(deserialize_with = "de_bool")]
     pub unambiguous: bool,
@@ -535,6 +538,10 @@ pub struct FixOutcome {
     /// the thread, so it is written for the person who asked.
     #[serde(default, deserialize_with = "de_string")]
     pub summary: String,
+    /// The paths this comment's change touched, checked against the diff so a
+    /// reply never claims a fix that is not in it.
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

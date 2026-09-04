@@ -555,9 +555,14 @@ pub fn checkin_fix() -> Value {
                         "summary": {
                             "type": "string",
                             "description": "One sentence naming what changed, or why it was left alone. This is posted in the thread the comment sits in, so write it for the person who asked rather than for this harness."
+                        },
+                        "files": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Repository relative paths this comment's change touched, empty when nothing was changed. Checked against the diff: a comment whose files are not in it is answered in words rather than reported as fixed."
                         }
                     },
-                    "required": ["ref_id", "changed", "summary"]
+                    "required": ["ref_id", "changed", "summary", "files"]
                 }
             }
         },

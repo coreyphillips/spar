@@ -2739,6 +2739,25 @@ impl Repo {
         .collect()
     }
 
+    /// The files one commit range touched, for checking a claim against the
+    /// diff rather than against the report that made it.
+    pub fn files_changed_between(&self, cwd: &Path, from: &str, to: &str) -> Vec<String> {
+        self.git_try_at(
+            Some(cwd),
+            &[
+                "diff",
+                "--name-only",
+                "--no-renames",
+                "-z",
+                &format!("{from}..{to}"),
+            ],
+        )
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect()
+    }
+
     /// Where `refname` left the base: the commit its own change is measured
     /// from, and the one a slice of that change has to be taken against.
     pub fn merge_base(&self, cwd: &Path, base: &str, refname: &str) -> Result<String> {

@@ -593,8 +593,12 @@ output is a `git push`, so it is worth saying exactly what the layers are.
   commit they did not ask for.
 - **Ambiguity is a stop, not a guess.** Either agent saying the comment could be
   read two ways turns it into a reply asking what was meant.
-- **A third refusal, with the code open**, and a mechanical check that `HEAD`
-  actually moved. A reply never claims a fix that is not in the diff.
+- **A third refusal, with the code open**, and a mechanical check per comment:
+  the fix call names the files it changed for each one, and they are checked
+  against what the commit actually touched. A reply never claims a fix that is
+  not in the diff.
+- **The trust gate reads the whole thread**, not its newest message, so waiting
+  for somebody with write access to reply is not a way through it.
 - Comment bodies reach the agents inside a marked block, as data rather than
   instruction, with the marker stripped out of the body so it cannot close its
   own fence. A comment that tries to redirect the agent is itself grounds to

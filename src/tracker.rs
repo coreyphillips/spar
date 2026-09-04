@@ -239,7 +239,34 @@ pub struct Item {
 /// level HTML tag, and anything that is not a task list line. Nested items are
 /// ordinary items, since every edit here is line local.
 pub fn parse(body: &str) -> Vec<Item> {
+    parse_reporting(body).0
+}
+
+/// A checkbox line the parser deliberately did not read as an item.
+///
+/// The README says a line spar cannot rewrite is "skipped with a reason", and
+/// these were skipped without one. All of them are the safe direction, and none
+/// of them were visible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skipped {
+    pub line: usize,
+    pub text: String,
+    pub why: &'static str,
+}
+
+pub fn parse_reporting(body: &str) -> (Vec<Item>, Vec<Skipped>) {
     let mut out = Vec::new();
+    let mut skipped: Vec<Skipped> = Vec::new();
+    let note = |index: usize, line: &str, why: &'static str, skipped: &mut Vec<Skipped>| {
+        let quoted = line.trim_start().trim_start_matches('>').trim_start();
+        if item_of(quoted).is_some() || item_of(line).is_some() {
+            skipped.push(Skipped {
+                line: index + 1,
+                text: quoted.to_string(),
+                why,
+            });
+        }
+    };
     // The glyph and length a close has to match, and the column it opened in,
     // since a fence four columns further in is code rather than the close.
     let mut fence: Option<(char, usize, usize)> = None;
@@ -256,6 +283,7 @@ pub fn parse(body: &str) -> Vec<Item> {
         // items they decided against. GitHub renders none of it.
         if comment {
             comment = !line.contains("-->");
+            note(index, line, "it is inside an HTML comment", &mut skipped);
             continue;
         }
         if let Some(kind) = html {
@@ -266,6 +294,7 @@ pub fn parse(body: &str) -> Vec<Item> {
             if ends {
                 html = None;
             }
+            note(index, line, "it is inside a raw HTML block", &mut skipped);
             continue;
         }
         let indent = indent_width(line);
@@ -282,6 +311,7 @@ pub fn parse(body: &str) -> Vec<Item> {
                     fence = None;
                 }
             }
+            note(index, line, "it is inside a code fence", &mut skipped);
             continue;
         }
         // A blank line closes nothing: a list survives one, and both markdown
@@ -322,6 +352,9 @@ pub fn parse(body: &str) -> Vec<Item> {
         }
         comment = opens_comment(line);
         let Some(caps) = item_of(line) else {
+            if line.trim_start().starts_with('>') {
+                note(index, line, "it is inside a block quote", &mut skipped);
+            }
             continue;
         };
         let text = caps["rest"].trim().to_string();
@@ -333,7 +366,7 @@ pub fn parse(body: &str) -> Vec<Item> {
             checked: &caps["state"] != " ",
         });
     }
-    out
+    (out, skipped)
 }
 
 /// Where a list line's content starts, in columns, or `None` if it is not one.
@@ -533,11 +566,17 @@ fn indent_width(line: &str) -> usize {
 }
 
 /// Whether the line leaves an HTML comment open behind it.
+///
+/// CommonMark opens an HTML block only when `<!--` starts the line. An inline
+/// one, for example in a code span like `` - [ ] document the `<!--` syntax ``,
+/// renders as text on GitHub, and treating it as an opener silently skipped
+/// every item after it.
 fn opens_comment(line: &str) -> bool {
-    match line.rfind("<!--") {
-        Some(at) => !line[at + 4..].contains("-->"),
-        None => false,
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with("<!--") {
+        return false;
     }
+    !trimmed[4..].contains("-->")
 }
 
 fn without_eol(line: &str) -> &str {
@@ -767,20 +806,21 @@ fn shape(body: &str, home: &str, max: usize) -> Vec<(Item, Shape)> {
             Shape::Hold("another item is written identically, so a link could go to either".into())
         } else if item.text.is_empty() {
             Shape::Hold("the item has no text".into())
-        } else if taken >= max {
-            Shape::Over
         } else {
             match &item.reference {
+                // An item that already links an issue needs a tick or an
+                // adoption, never a new issue, so it costs the cap nothing.
+                // Counting it meant five linked items and
+                // max_tracker_children = 5 left a sixth unlinked item Over on
+                // every run, and closed items past the cap were never ticked.
                 Some(reference) => match reference.local(home) {
-                    Some(number) => {
-                        taken += 1;
-                        Shape::Names(number)
-                    }
+                    Some(number) => Shape::Names(number),
                     None => Shape::Hold(format!(
                         "it names an issue in another repository: {}",
                         reference.names()
                     )),
                 },
+                None if taken >= max => Shape::Over,
                 None => {
                     taken += 1;
                     Shape::Needs
@@ -912,6 +952,7 @@ pub fn decompose(cfg: &Config, repo: &Repo, tracker: i64) -> Vec<i64> {
     }
     log!("#{tracker}: {} unchecked checklist item(s)", steps.len());
     report_overflow(cfg, tracker, &steps);
+    report_skipped(tracker, &body);
     apply(repo, tracker, &steps)
 }
 
@@ -1070,6 +1111,22 @@ fn write(repo: &Repo, tracker: i64, raw: &str, change: &Change) -> bool {
     }
 }
 
+/// Name every checkbox line the parser would not touch, and why.
+///
+/// The safe direction, but silent: an item inside a code fence, a raw HTML
+/// block, an HTML comment, or a block quote is left alone, and until now
+/// nothing said so.
+fn report_skipped(tracker: i64, body: &str) {
+    for skip in parse_reporting(body).1 {
+        logdim!(
+            "  left line {} of #{tracker} alone, '{}': {}",
+            skip.line,
+            style::clip(&style::one_line(&skip.text), 60),
+            skip.why
+        );
+    }
+}
+
 fn report_overflow(cfg: &Config, tracker: i64, steps: &[Step]) {
     let left: Vec<String> = steps
         .iter()
@@ -1145,6 +1202,7 @@ pub fn preview(cfg: &Config, repo: &Repo, tracker: i64) {
         return;
     }
     println!("\n#{tracker}, if decompose_trackers let it act on the checklist:");
+    report_skipped(tracker, &body);
 
     let mut projected = body.clone();
     for step in &steps {
@@ -1731,6 +1789,48 @@ Write the parts like this:
             "an issue closed before GitHub recorded a reason still ticks"
         );
         assert_eq!(Action::Adopt(12), issue_action(&issue("OPEN", None)));
+    }
+
+    /// The cap is on issues spar files, and a linked item needs none.
+    ///
+    /// Counting linked items meant five open linked items with
+    /// max_tracker_children = 5 left a sixth unlinked item Over on every run,
+    /// and closed items past the cap were never ticked at all.
+    #[test]
+    fn the_cap_counts_only_the_items_that_need_an_issue_filed() {
+        let body = "- [ ] a #1\n- [ ] b #2\n- [ ] c\n- [ ] d\n";
+        assert_eq!(
+            vec![Shape::Names(1), Shape::Names(2), Shape::Needs, Shape::Over],
+            shapes(body, 1)
+        );
+    }
+
+    /// An inline `<!--` renders as text on GitHub, so treating it as an opener
+    /// skipped every item after it with nothing said.
+    #[test]
+    fn an_inline_comment_marker_does_not_hide_the_rest_of_the_list() {
+        let body = "- [ ] document the `<!--` syntax\n- [ ] the next one\n";
+        assert_eq!(vec![Shape::Needs, Shape::Needs], shapes(body, 5));
+
+        // A real opener still opens: it starts the line.
+        let body = "<!-- notes\n- [ ] hidden\n-->\n- [ ] visible\n";
+        assert_eq!(vec![Shape::Needs], shapes(body, 5));
+    }
+
+    /// A line spar will not rewrite is skipped with a reason, and these had
+    /// none.
+    #[test]
+    fn a_checkbox_spar_will_not_touch_says_why() {
+        let body = "<!-- later\n- [ ] in a comment\n-->\n\n> - [ ] in a quote\n\n```\n- [ ] in a fence\n```\n";
+        let reasons: Vec<&str> = parse_reporting(body).1.iter().map(|s| s.why).collect();
+        assert_eq!(
+            vec![
+                "it is inside an HTML comment",
+                "it is inside a block quote",
+                "it is inside a code fence",
+            ],
+            reasons
+        );
     }
 
     /// A checked item does not spend the budget, since nothing is done to it.

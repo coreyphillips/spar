@@ -1053,6 +1053,15 @@ pub struct Issue {
     pub body: Option<String>,
     #[serde(default)]
     pub state: String,
+    /// Why it was closed: `completed` or `not_planned`, empty when open or
+    /// when the field was not asked for.
+    ///
+    /// The tracker's tick means the work landed, and a closed issue on its own
+    /// does not say that. With `close_skipped = true`, the default, an item
+    /// both agents declined is closed as not planned, and ticking it writes
+    /// "this was done" into somebody's checklist.
+    #[serde(default, rename = "stateReason")]
+    pub state_reason: Option<String>,
     #[serde(default)]
     pub url: String,
     #[serde(default)]
@@ -1094,6 +1103,24 @@ impl Issue {
 
     pub fn is_closed(&self) -> bool {
         self.state.eq_ignore_ascii_case("closed")
+    }
+
+    /// Closed because the work was done, rather than because somebody decided
+    /// not to do it.
+    ///
+    /// An unknown reason counts as completed: GitHub leaves `stateReason`
+    /// empty on issues closed before it existed, and reading those as declined
+    /// would leave every old checklist unticked.
+    pub fn closed_as_completed(&self) -> bool {
+        self.is_closed() && !self.closed_as_not_planned()
+    }
+
+    pub fn closed_as_not_planned(&self) -> bool {
+        self.is_closed()
+            && self
+                .state_reason
+                .as_deref()
+                .is_some_and(|reason| reason.eq_ignore_ascii_case("not_planned"))
     }
 }
 

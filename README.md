@@ -519,7 +519,9 @@ rewrites text a person wrote:
   with a reason.
 - **It ticks a box and never unchecks one.** A checked box next to an open issue
   is left alone: every state that produces one is a state where you are right
-  and the heuristic is wrong. An item linked by a fuzzy match is not ticked in
+  and the heuristic is wrong. A tick means the work landed, so an issue closed
+  as not planned, which is what `close_skipped` writes when both agents decline
+  an item, leaves the box alone and says why. An item linked by a fuzzy match is not ticked in
   the same run that linked it, even when the match is closed, so the link is in
   front of you first.
 - **Line surgery, proved.** A reference is appended to one line, or one `[ ]`

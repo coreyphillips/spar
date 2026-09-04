@@ -3074,7 +3074,7 @@ impl Repo {
                 "view",
                 &number.to_string(),
                 "--json",
-                "number,title,body,labels,state,url",
+                "number,title,body,labels,state,stateReason,url",
             ])
             .map_err(|e| spar_err!("could not read issue #{number}: {}", e.last_line()))?;
         serde_json::from_str(&text)
@@ -3090,7 +3090,7 @@ impl Repo {
                     "view",
                     &number.to_string(),
                     "--json",
-                    "number,title,body,labels,state,url",
+                    "number,title,body,labels,state,stateReason,url",
                 ])
                 .map_err(|e| spar_err!("could not read issue #{number}: {}", e.last_line()))?;
             let issue: Issue = serde_json::from_str(&text)
@@ -3510,7 +3510,7 @@ impl Repo {
             "--limit",
             &FETCH_CEILING.to_string(),
             "--json",
-            "number,title,body,labels,state,url",
+            "number,title,body,labels,state,stateReason,url",
         ]);
         serde_json::from_str::<Vec<Issue>>(text.trim()).unwrap_or_default()
     }
@@ -3593,7 +3593,7 @@ impl Repo {
             "--limit",
             "100",
             "--json",
-            "number,title,url,body,state",
+            "number,title,url,body,state,stateReason",
         ])?;
         let rows = serde_json::from_str::<Vec<Row>>(text.trim())
             .map_err(|e| spar_err!("unexpected issue list while verifying {title:?}: {e}"))?;
@@ -3677,7 +3677,7 @@ impl Repo {
             "--search",
             query.trim(),
             "--json",
-            "number,title,url,body,state",
+            "number,title,url,body,state,stateReason",
         ])?;
         let rows: Vec<Row> = serde_json::from_str(text.trim())
             .map_err(|e| spar_err!("unexpected issue search for {title:?}: {e}"))?;

@@ -3905,6 +3905,7 @@ fn a_structured_implementation_is_committed_before_review() {
         title: item.title.clone(),
         body: Some("Make the change".into()),
         state: "OPEN".into(),
+        state_reason: None,
         url: "https://example.invalid/issues/70".into(),
         labels: Vec::new(),
     };
@@ -3957,6 +3958,7 @@ fn an_editing_call_cannot_select_a_new_parent_side_git_filter() {
         title: item.title.clone(),
         body: Some("Change the attributes".into()),
         state: "OPEN".into(),
+        state_reason: None,
         url: "https://example.invalid/issues/74".into(),
         labels: Vec::new(),
     };
@@ -4021,6 +4023,7 @@ fn an_ignored_only_success_is_kept_instead_of_treated_as_no_work() {
         title: item.title.clone(),
         body: Some("Add the ignored fixture".into()),
         state: "OPEN".into(),
+        state_reason: None,
         url: "https://example.invalid/issues/75".into(),
         labels: Vec::new(),
     };
@@ -4087,6 +4090,7 @@ fn tracked_and_ignored_edits_stop_before_a_managed_commit() {
         title: item.title.clone(),
         body: Some("Make the change".into()),
         state: "OPEN".into(),
+        state_reason: None,
         url: "https://example.invalid/issues/81".into(),
         labels: Vec::new(),
     };
@@ -4158,6 +4162,7 @@ fn a_direct_commit_with_ignored_output_stops_before_push() {
         title: item.title.clone(),
         body: Some("Make the change".into()),
         state: "OPEN".into(),
+        state_reason: None,
         url: "https://example.invalid/issues/82".into(),
         labels: Vec::new(),
     };
@@ -4226,6 +4231,7 @@ fn ignored_build_artifacts_do_not_stop_a_managed_commit_or_push() {
         title: item.title.clone(),
         body: Some("Make and test the change".into()),
         state: "OPEN".into(),
+        state_reason: None,
         url: "https://example.invalid/issues/83".into(),
         labels: Vec::new(),
     };
@@ -4300,6 +4306,7 @@ fn a_decline_that_created_an_ignored_file_keeps_the_worktree() {
         title: item.title.clone(),
         body: Some("Inspect before declining".into()),
         state: "OPEN".into(),
+        state_reason: None,
         url: "https://example.invalid/issues/77".into(),
         labels: Vec::new(),
     };
@@ -4347,6 +4354,7 @@ fn a_failed_implementation_keeps_its_files_and_diagnostic() {
         title: item.title.clone(),
         body: Some("Make a change".into()),
         state: "OPEN".into(),
+        state_reason: None,
         url: "https://example.invalid/issues/73".into(),
         labels: Vec::new(),
     };
@@ -4399,6 +4407,7 @@ fn a_failed_implementation_with_a_clean_commit_continues_to_review() {
         title: item.title.clone(),
         body: Some("Make the change".into()),
         state: "OPEN".into(),
+        state_reason: None,
         url: "https://example.invalid/issues/80".into(),
         labels: Vec::new(),
     };
@@ -4449,6 +4458,7 @@ fn a_recovery_commit_in_the_shared_checkout_is_not_reset() {
         title: item.title.clone(),
         body: Some("Do not reset the branch".into()),
         state: "OPEN".into(),
+        state_reason: None,
         url: "https://example.invalid/issues/71".into(),
         labels: Vec::new(),
     };
@@ -4496,6 +4506,7 @@ fn an_off_checkout_issue_branch_with_recovery_commits_is_not_reset() {
         title: item.title.clone(),
         body: Some("Do not reset the existing target branch".into()),
         state: "OPEN".into(),
+        state_reason: None,
         url: "https://example.invalid/issues/78".into(),
         labels: Vec::new(),
     };
@@ -4545,6 +4556,7 @@ fn a_pull_request_head_allows_an_off_checkout_issue_branch_to_reset() {
         title: item.title.clone(),
         body: Some("Start a new round from the base".into()),
         state: "OPEN".into(),
+        state_reason: None,
         url: "https://example.invalid/issues/79".into(),
         labels: Vec::new(),
     };
@@ -4601,6 +4613,7 @@ fn a_pr_head_lets_the_shared_checkout_advance_after_the_pr_closes() {
         title: item.title.clone(),
         body: Some("Start from the base".into()),
         state: "OPEN".into(),
+        state_reason: None,
         url: "https://example.invalid/issues/75".into(),
         labels: Vec::new(),
     };
@@ -4655,6 +4668,7 @@ fn a_managed_edit_in_the_shared_checkout_is_kept_uncommitted() {
         title: item.title.clone(),
         body: Some("Make a change".into()),
         state: "OPEN".into(),
+        state_reason: None,
         url: "https://example.invalid/issues/76".into(),
         labels: Vec::new(),
     };

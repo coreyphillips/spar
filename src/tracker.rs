@@ -26,7 +26,7 @@ use regex::Regex;
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::model::ItemKind;
+use crate::model::{Issue, ItemKind};
 use crate::repo::Repo;
 use crate::review;
 use crate::style;
@@ -834,8 +834,7 @@ pub fn plan(repo: &Repo, cfg: &Config, tracker: i64, body: &str, home: &str) -> 
 fn resolve(repo: &Repo, number: i64) -> Action {
     match repo.item_kind(number) {
         Ok(ItemKind::Issue) => match repo.read_issue(number) {
-            Ok(issue) if issue.is_closed() => Action::Tick(number),
-            Ok(_) => Action::Adopt(number),
+            Ok(issue) => issue_action(&issue),
             Err(e) => Action::Hold(format!("could not read #{number}: {}", e.first_line())),
         },
         // A merged pull request is the work landing, which is what the tick is
@@ -853,6 +852,26 @@ fn resolve(repo: &Repo, number: i64) -> Action {
         },
         Err(e) => Action::Hold(format!("could not read #{number}: {}", e.first_line())),
     }
+}
+
+/// What an item's own issue says about the box beside it.
+///
+/// A tick says the work landed. An issue closed as not planned is the
+/// opposite: somebody, or both agents under `close_skipped`, decided against
+/// it, and "spar decided not to do this" is indistinguishable from "this was
+/// done" once the box is ticked. spar never unchecks one, so the correction
+/// would be somebody else's job.
+fn issue_action(issue: &Issue) -> Action {
+    let number = issue.number;
+    if issue.closed_as_not_planned() {
+        return Action::Hold(format!(
+            "#{number} was closed as not planned, so the item is not done"
+        ));
+    }
+    if issue.is_closed() {
+        return Action::Tick(number);
+    }
+    Action::Adopt(number)
 }
 
 /// An issue that already covers this item, the tracker itself apart.
@@ -1678,6 +1697,40 @@ Write the parts like this:
             vec![Shape::Needs, Shape::Needs, Shape::Over, Shape::Over],
             shapes(body, 2)
         );
+    }
+
+    /// A tick means the work landed, and a decline is not that.
+    ///
+    /// With `close_skipped = true`, the default, an item whose issue both
+    /// agents declined is closed as not planned. Ticking it writes "this was
+    /// done" into somebody's checklist, and since spar never unchecks a box,
+    /// correcting it is left to them.
+    #[test]
+    fn an_item_closed_as_not_planned_is_not_ticked() {
+        let issue = |state: &str, reason: Option<&str>| Issue {
+            number: 12,
+            title: "migrate the cache to v2".into(),
+            body: None,
+            state: state.into(),
+            state_reason: reason.map(str::to_string),
+            url: String::new(),
+            labels: Vec::new(),
+        };
+
+        assert!(matches!(
+            issue_action(&issue("CLOSED", Some("not_planned"))),
+            Action::Hold(_)
+        ));
+        assert_eq!(
+            Action::Tick(12),
+            issue_action(&issue("CLOSED", Some("completed")))
+        );
+        assert_eq!(
+            Action::Tick(12),
+            issue_action(&issue("CLOSED", None)),
+            "an issue closed before GitHub recorded a reason still ticks"
+        );
+        assert_eq!(Action::Adopt(12), issue_action(&issue("OPEN", None)));
     }
 
     /// A checked item does not spend the budget, since nothing is done to it.

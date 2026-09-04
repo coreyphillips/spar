@@ -490,7 +490,7 @@ pub fn checkin_issue(
     }
 }
 
-fn failed(number: i64, label: String, e: crate::error::SparError) -> IssueRun {
+pub(crate) fn failed(number: i64, label: String, e: crate::error::SparError) -> IssueRun {
     log!("{label} check-in failed: {e}");
     let mut state = IssueRun::new(number, label);
     state.status = Status::Error;

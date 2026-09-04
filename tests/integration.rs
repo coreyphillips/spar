@@ -2335,6 +2335,83 @@ esac
     );
 }
 
+/// "gh could not answer" must not read as "nobody is working on this".
+///
+/// A person opens a pull request from a branch named anything, with "Closes
+/// #42" in the body. If the linkage lookup fails while spar is deciding, and
+/// the failure reads as no pull request, spar implements from scratch and opens
+/// a second one for the same issue.
+#[cfg(unix)]
+#[test]
+fn a_failed_linkage_lookup_refuses_to_implement_over_open_work() {
+    let fx = repo("linkage-failure");
+    let answer = r#"{"issues":[{"issue":42,"worth_doing":true,"tracker":false,"reason":"worth it","complexity":"s","depends_on":[],"risk":"low"}]}"#;
+    let gh = r#"
+set -eu
+printf '%s\n' "$*" >> "$SPAR_FAKE_GH_LOG"
+if [ "$1" = pr ] && [ "$2" = list ]; then
+  printf '%s\n' 'API rate limit exceeded' >&2
+  exit 1
+fi
+if [ "$1" = repo ] && [ "$2" = view ]; then
+  printf '%s\n' '{"name":"project"}'
+  exit 0
+fi
+if [ "$1" = issue ] && [ "$2" = view ]; then
+  printf '%s\n' '{"number":42,"title":"Retry on 429","body":"Honour Retry-After","labels":[],"state":"OPEN","url":"https://github.com/example/project/issues/42"}'
+  exit 0
+fi
+if [ "$1" = issue ] && [ "$2" = list ]; then
+  printf '%s\n' '[]'
+  exit 0
+fi
+if [ "$1" = api ]; then
+  printf '%s\n' 'issue'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 64
+"#;
+    let (config, path) = fake_commands(&fx, answer, gh);
+    let screen = fx.dir.join("fake-bin").join("screen");
+    let command = serde_json::to_string(screen.to_str().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        format!("[agents.a]\ncommand = [{command}]\n\n[agents.b]\ncommand = [{command}]\n"),
+    )
+    .unwrap();
+    let calls = fx.dir.join("gh-calls.log");
+
+    let (ok, out, err) = spar_with_env(
+        &[
+            "run",
+            "42",
+            "--config",
+            config.to_str().unwrap(),
+            "--repo",
+            fx.work.to_str().unwrap(),
+        ],
+        &fx.dir,
+        &[
+            ("PATH", path.as_str()),
+            ("SPAR_FAKE_GH_LOG", calls.to_str().unwrap()),
+        ],
+    );
+
+    assert!(
+        !ok,
+        "the lookup failed and the run reported success:\n{out}\n{err}"
+    );
+    assert!(
+        out.contains("Refusing to implement") || err.contains("Refusing to implement"),
+        "{out}\n{err}"
+    );
+    assert!(
+        !fx.work.join(".spar-worktrees").join("issue-42").exists(),
+        "spar started implementing anyway"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn tracker_reread_failure_is_counted_before_nothing_is_scheduled() {

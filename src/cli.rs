@@ -375,12 +375,15 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let sorted = classify(&repo, &numbers)?;
             let mut targets = sorted.prs;
             for number in sorted.issues {
-                match repo.open_pr_for_issue(number) {
-                    Some(pr) => {
+                match repo.try_open_pr_for_issue(number, cfg.base_branch()) {
+                    Ok(Some(pr)) => {
                         log!("#{number} is an issue; reviewing its open PR {}", pr.url);
                         targets.push(pr.number);
                     }
-                    None => logwarn!("#{number} is an issue with no open pull request to review"),
+                    Ok(None) => {
+                        logwarn!("#{number} is an issue with no open pull request to review")
+                    }
+                    Err(e) => logwarn!("#{number}: {e}"),
                 }
             }
             let mut results = Vec::new();
@@ -449,17 +452,22 @@ fn dispatch(cli: Cli) -> Result<i32> {
             // catch, and when the issue has work open there is a branch to act
             // on, so route to it rather than refusing.
             for number in sorted.issues {
-                match repo.open_pr_for_issue(number) {
-                    Some(pr) => {
+                match repo.try_open_pr_for_issue(number, cfg.base_branch()) {
+                    Ok(Some(pr)) => {
                         log!(
                             "#{number} is an issue; checking in on its open PR {}",
                             pr.url
                         );
                         results.push(checkin::checkin_pr(&agents, &cfg, &repo, pr.number, &mode));
                     }
-                    None => {
+                    Ok(None) => {
                         results.push(checkin::checkin_issue(&agents, &cfg, &repo, number, &mode))
                     }
+                    // Answering the issue instead would be answering on the
+                    // wrong thing when a pull request is what could not be
+                    // seen, and this command's replies are visible to
+                    // everybody reading it.
+                    Err(e) => results.push(checkin::failed(number, format!("#{number}"), e)),
                 }
             }
             if results.is_empty() {
@@ -497,10 +505,18 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 // branch instead, the way `checkin` and `review` already do.
                 let target = match kind {
                     ItemKind::Pr => Some(number),
-                    ItemKind::Issue => repo.open_pr_for_issue(number).map(|pr| {
-                        log!("#{number} is an issue; splitting its open PR {}", pr.url);
-                        pr.number
-                    }),
+                    ItemKind::Issue => {
+                        match repo.try_open_pr_for_issue(number, cfg.base_branch()) {
+                            Ok(found) => found.map(|pr| {
+                                log!("#{number} is an issue; splitting its open PR {}", pr.url);
+                                pr.number
+                            }),
+                            Err(e) => {
+                                logwarn!("#{number}: {e}");
+                                continue;
+                            }
+                        }
+                    }
                 };
                 // An issue and the pull request it routes to can both be named,
                 // and the queue can hold both. Splitting one pull request twice
@@ -694,8 +710,8 @@ fn dispatch(cli: Cli) -> Result<i32> {
             // An issue number handed to `resume` is not a mistake worth
             // refusing over. If work is already open for it, continue that.
             for number in sorted.issues {
-                match repo.open_pr_for_issue(number) {
-                    Some(pr) => {
+                match repo.try_open_pr_for_issue(number, cfg.base_branch()) {
+                    Ok(Some(pr)) => {
                         log!("#{number} is an issue; continuing its open PR {}", pr.url);
                         results.push(review::resume_pr(
                             &agents,
@@ -705,10 +721,11 @@ fn dispatch(cli: Cli) -> Result<i32> {
                             next_actor.as_deref(),
                         ));
                     }
-                    None => logwarn!(
+                    Ok(None) => logwarn!(
                         "#{number} is an issue with no open pull request. Use `spar run {number}` \
                          to implement it."
                     ),
+                    Err(e) => logwarn!("#{number}: {e}"),
                 }
             }
             if results.is_empty() {

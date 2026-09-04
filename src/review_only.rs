@@ -183,15 +183,18 @@ fn run_phases(
             .collect::<Vec<_>>()
             .join(" and ")
     );
+    // The ref spar compares against, not the bare branch name: in a linked
+    // worktree the local branch is whatever the primary checkout last had.
+    let base_ref = repo.base_ref(work_dir, base);
     let prompt = REVIEW_ONLY_PROMPT
         .replace("{number}", &pr.number.to_string())
-        .replace("{base}", base)
+        .replace("{base}", &base_ref)
         .replace("{title}", &pr.title);
 
     let reviews = concurrently(agents, |a| {
         let effort = cfg.effort_for_round(&a.spec, 1);
         a.review::<Review>(
-            base,
+            &base_ref,
             &prompt,
             &schema::review(),
             work_dir,

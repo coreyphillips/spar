@@ -16,7 +16,8 @@ static FENCE: LazyLock<Regex> = LazyLock::new(|| {
 ///
 /// Models wrap JSON in prose or fences despite explicit instructions not to,
 /// and some emit a draft before the real answer, so the *last* well formed
-/// value wins: fenced blocks first, then brace matching backwards from the end.
+/// value wins: fenced blocks first, then the whole text, then balanced spans
+/// with the last closing one first.
 pub fn extract_json(text: &str) -> Result<Value> {
     if text.trim().is_empty() {
         return Err(SparError::new("empty response, expected JSON"));
@@ -30,7 +31,7 @@ pub fn extract_json(text: &str) -> Result<Value> {
 /// Every JSON value plausibly present in a model response, most likely first.
 ///
 /// Fenced blocks come first because a model that fences its answer means it,
-/// then whole objects matched backwards from the end.
+/// then the whole trimmed text, then the balanced spans inside it.
 pub fn candidates(text: &str) -> Vec<Value> {
     let mut out = Vec::new();
     let mut push = |value: Value| {
@@ -49,32 +50,61 @@ pub fn candidates(text: &str) -> Vec<Value> {
         }
     }
 
-    let bytes = text.as_bytes();
-    for (opener, closer) in [(b'{', b'}'), (b'[', b']')] {
-        let mut end = rfind_byte(bytes, closer, bytes.len());
-        while let Some(e) = end {
-            let mut depth = 0i32;
-            let mut start = None;
-            for i in (0..=e).rev() {
-                if bytes[i] == closer {
-                    depth += 1;
-                } else if bytes[i] == opener {
-                    depth -= 1;
-                    if depth == 0 {
-                        start = Some(i);
-                        break;
-                    }
-                }
+    // A CLI that returns exactly the object is the common case and needs no
+    // scanning at all.
+    if let Ok(value) = serde_json::from_str::<Value>(text.trim()) {
+        push(value);
+    }
+
+    for opener in [b'{', b'['] {
+        for (start, end) in spans(text, opener) {
+            if let Ok(value) = serde_json::from_str::<Value>(&text[start..end]) {
+                push(value);
             }
-            if let Some(s) = start {
-                if let Ok(value) = serde_json::from_str::<Value>(&text[s..=e]) {
-                    push(value);
-                }
-            }
-            end = rfind_byte(bytes, closer, e);
         }
     }
     out
+}
+
+/// Byte ranges of balanced `{}` or `[]` pairs, last closing first.
+///
+/// String aware, which the backwards scan this replaces was not. A review whose
+/// detail quotes code is the ordinary case, and code has braces: an unbalanced
+/// `{` inside a string made the depth reach zero at the wrong byte, the
+/// substring failed to parse, and the outer object was never found at all. The
+/// answer was then reported as "a JSON array", because the `[` pass had matched
+/// the findings list, which is not what happened and sends the retry after the
+/// wrong problem.
+///
+/// Last closing first because `extract_into` tries candidates in order and a
+/// model that emits a draft before its real answer means the later one.
+fn spans(text: &str, opener: u8) -> Vec<(usize, usize)> {
+    let closer = if opener == b'{' { b'}' } else { b']' };
+    let bytes = text.as_bytes();
+    let mut open_at: Vec<usize> = Vec::new();
+    let mut found: Vec<(usize, usize)> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, byte) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match *byte {
+            b'\\' if in_string => escaped = true,
+            b'"' => in_string = !in_string,
+            _ if in_string => {}
+            b if b == opener => open_at.push(i),
+            b if b == closer => {
+                if let Some(start) = open_at.pop() {
+                    found.push((start, i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    found.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    found
 }
 
 /// Whether a response looks cut off rather than merely malformed.
@@ -173,12 +203,6 @@ fn envelope_hint(value: &Value) -> &'static str {
     } else {
         ""
     }
-}
-
-fn rfind_byte(haystack: &[u8], needle: u8, before: usize) -> Option<usize> {
-    haystack[..before.min(haystack.len())]
-        .iter()
-        .rposition(|b| *b == needle)
 }
 
 fn head(text: &str, max: usize) -> String {
@@ -433,6 +457,63 @@ mod tests {
         let key = finding_key("anything", "file.rs");
         assert_eq!(12, key.len());
         assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+}
+
+#[cfg(test)]
+mod brace_tests {
+    use super::*;
+
+    /// A finding that quotes code is the ordinary case, and code has braces.
+    ///
+    /// The backwards scan counted raw bytes, so a lone `{` inside a string made
+    /// the depth reach zero at the wrong byte and the outer object was never
+    /// found. The `[` pass then offered the findings array as the only
+    /// candidate, and the model was told "the answer was a JSON array", which
+    /// is not what happened, so the retry was spent on the wrong problem.
+    #[test]
+    fn a_brace_inside_a_string_does_not_lose_the_answer() {
+        let text = r#"{"verdict":"approve","next_action":"merge","summary":"the loop `for (;;) {` never breaks","findings":[]}"#;
+        let found = candidates(text);
+        assert!(!found.is_empty(), "nothing was found at all");
+        assert_eq!(
+            "approve",
+            found[0]["verdict"].as_str().unwrap_or_default(),
+            "the outer object was lost: {found:?}"
+        );
+    }
+
+    /// The same, in the other direction: an unbalanced closer.
+    #[test]
+    fn an_unbalanced_closer_inside_a_string_is_not_a_closer() {
+        let text = r#"prose first
+{"summary":"the guard ends with } and no else","findings":[{"title":"a {"}]}"#;
+        let found = candidates(text);
+        assert_eq!(
+            "the guard ends with } and no else",
+            found[0]["summary"].as_str().unwrap_or_default(),
+            "{found:?}"
+        );
+    }
+
+    /// A model that answers with exactly the object needs no scanning, and
+    /// that is the common case for a CLI with native structured output.
+    #[test]
+    fn the_whole_answer_is_tried_before_anything_is_scanned() {
+        let found = candidates("  {\"a\":1}\n");
+        assert_eq!(1, found[0]["a"].as_i64().unwrap_or_default());
+    }
+
+    /// An array answer still reaches the parser, braces in its strings and all.
+    #[test]
+    fn an_array_with_braces_in_its_strings_still_parses() {
+        let text = r#"here it is: [{"title":"missing } in the macro"},{"title":"second"}]"#;
+        let found = candidates(text);
+        let array = found
+            .iter()
+            .find(|v| v.is_array())
+            .expect("the array was lost");
+        assert_eq!(2, array.as_array().unwrap().len());
     }
 }
 

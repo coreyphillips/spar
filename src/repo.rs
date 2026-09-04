@@ -2845,18 +2845,32 @@ impl Repo {
         );
     }
 
-    /// Push by explicit refspec from HEAD.
+    /// Push by explicit refspec from HEAD, leasing the head spar reviewed.
     ///
     /// A resumed PR is checked out under a local name (`pr-N`) that does not
     /// match its remote branch, so pushing by branch name would resolve the
     /// wrong local ref or fail outright.
-    pub fn push(&self, cwd: &Path, branch: &str) -> Result<()> {
+    ///
+    /// `expected` is the remote head spar last read. A bare `--force-with-lease`
+    /// leases the implicit tracking ref instead, which is shared across every
+    /// worktree and is updated by any `git fetch`. The editing agent is a real
+    /// CLI with shell access, and fetching is a normal thing for it to do: one
+    /// `git fetch` mid round moves the tracking ref to whatever the remote holds
+    /// and the lease then passes against a head spar never reviewed, which
+    /// silently drops somebody's commit. Naming the head makes the push refuse
+    /// exactly that case.
+    pub fn push(&self, cwd: &Path, branch: &str, expected: Option<&str>) -> Result<()> {
+        let expected = expected.map(str::trim).filter(|head| !head.is_empty());
+        if let Some(head) = expected {
+            self.refuse_push_that_drops(cwd, head)?;
+        }
         let refspec = format!("HEAD:{branch}");
+        let lease = match expected {
+            Some(head) => format!("--force-with-lease=refs/heads/{branch}:{head}"),
+            None => "--force-with-lease".to_string(),
+        };
         let pushed = self
-            .git_at(
-                Some(cwd),
-                &["push", "--force-with-lease", "origin", &refspec],
-            )
+            .git_at(Some(cwd), &["push", &lease, "origin", &refspec])
             .map(|_| ())
             .map_err(|e| {
                 spar_err!(
@@ -2866,6 +2880,26 @@ impl Repo {
                 )
             });
         self.record_write(pushed)
+    }
+
+    /// Refuse a push whose HEAD does not contain the head spar reviewed.
+    ///
+    /// The lease answers the remote moving. This answers the local side moving:
+    /// an agent that reset or rebased the worktree leaves a HEAD that would
+    /// publish over the reviewed head rather than on top of it, and the lease
+    /// cannot tell the difference because the remote is exactly where spar left
+    /// it.
+    fn refuse_push_that_drops(&self, cwd: &Path, expected: &str) -> Result<()> {
+        let head = self.head_oid_checked(cwd)?;
+        if head == expected || self.is_ancestor_checked(cwd, expected, &head)? {
+            return Ok(());
+        }
+        bail!(
+            "refusing to push {head} because it does not contain the reviewed head {expected}. \
+             The worktree at {} was kept and nothing was published. Restore {expected} or reapply \
+             the intended commits on top of it before resuming.",
+            cwd.display()
+        )
     }
 
     /// Create one remote branch for a split without ever moving an existing ref.

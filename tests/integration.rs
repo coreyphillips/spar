@@ -739,6 +739,87 @@ fn a_split_push_never_rewrites_a_branch_that_appeared_after_allocation() {
     );
 }
 
+/// The lease has to name the head spar reviewed, not the tracking ref.
+///
+/// The tracking ref is shared across every worktree and moves on any `git
+/// fetch`. The editing agent is a real CLI with shell access, and fetching is
+/// an ordinary thing for it to do, so a bare `--force-with-lease` can be
+/// satisfied by a head spar never read and the push then drops somebody's
+/// commit.
+#[test]
+fn a_fetch_during_a_round_does_not_let_the_push_drop_a_commit() {
+    let fx = repo("lease");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    commit(&fx.work, "base.rs", "base\n", "on main");
+    git(&fx.work, &["push", "origin", "main"]);
+    git(&fx.work, &["push", "origin", "HEAD:feature"]);
+    let reviewed = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+
+    // Somebody pushes to the branch, from their own checkout.
+    let theirs = fx.dir.join("theirs");
+    git(
+        &fx.dir,
+        &[
+            "clone",
+            "-b",
+            "feature",
+            fx.dir.join("origin.git").to_str().unwrap(),
+            theirs.to_str().unwrap(),
+        ],
+    );
+    git(&theirs, &["config", "user.email", "them@example.invalid"]);
+    git(&theirs, &["config", "user.name", "them"]);
+    git(&theirs, &["config", "commit.gpgsign", "false"]);
+    commit(&theirs, "theirs.rs", "theirs\n", "their commit");
+    git(&theirs, &["push", "origin", "HEAD:feature"]);
+    let head_they_pushed = git(&theirs, &["rev-parse", "HEAD"]);
+
+    // The agent fetches while it works, which is what moves the tracking ref
+    // out from under the implicit lease.
+    git(&fx.work, &["fetch", "origin"]);
+    commit(&fx.work, "ours.rs", "ours\n", "our commit");
+
+    let error = repo
+        .push(&fx.work, "feature", Some(&reviewed))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("could not push"), "{error}");
+
+    git(&fx.work, &["fetch", "origin", "feature"]);
+    assert_eq!(
+        head_they_pushed,
+        git(&fx.work, &["rev-parse", "origin/feature"]),
+        "their commit was dropped from the branch"
+    );
+}
+
+/// The other half: a HEAD that no longer contains the reviewed head is a reset
+/// or a rebase in the worktree, and the remote being exactly where spar left it
+/// means the lease cannot see it.
+#[test]
+fn a_head_that_dropped_the_reviewed_commit_is_refused_before_the_push() {
+    let fx = repo("lease-local");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    commit(&fx.work, "base.rs", "base\n", "on main");
+    git(&fx.work, &["push", "origin", "main"]);
+    commit(&fx.work, "reviewed.rs", "reviewed\n", "reviewed commit");
+    git(&fx.work, &["push", "origin", "HEAD:feature"]);
+    let reviewed = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+
+    git(&fx.work, &["reset", "--hard", "HEAD~1"]);
+    commit(&fx.work, "other.rs", "other\n", "a different commit");
+
+    let error = repo
+        .push(&fx.work, "feature", Some(&reviewed))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("does not contain the reviewed head"),
+        "{error}"
+    );
+    assert!(error.contains(&reviewed), "{error}");
+}
+
 /// A pushed branch is a durable retry guard when the parent comment or pull
 /// request creation failed after the push.
 #[test]

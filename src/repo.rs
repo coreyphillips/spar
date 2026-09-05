@@ -5891,10 +5891,24 @@ fn initialized_submodule(parent: &Path, relative: &Path) -> Result<Option<PathBu
     Ok(Some(canonical))
 }
 
+/// A Git entry the outer repository cannot account for.
+///
+/// A checkout Git itself reports as a nested repository is expected. Its
+/// directory is recorded by identity in the untracked snapshot and keeps the
+/// worktree from being released, so a reviewer that clones a reproduction into
+/// ignored build output neither loses that clone nor fails the run over it.
+/// The scan does not descend into one, because what is under it belongs to
+/// that repository.
+///
+/// A Git entry Git does not report is the one worth stopping for. Running
+/// `git init` inside a directory that already holds tracked files leaves
+/// nothing in any listing while making every file written under it invisible
+/// to the outer worktree, so SPAR can no longer prove what is there.
 fn unexpected_nested_git_entry(cwd: &Path) -> Result<Option<PathBuf>> {
     let root = std::fs::canonicalize(cwd)
         .map_err(|e| spar_err!("could not resolve {}: {e}", cwd.display()))?;
     let mut allowed = BTreeSet::from([root.join(".git")]);
+    let mut checkouts = BTreeSet::new();
     let mut repositories = vec![root.clone()];
     let mut visited = BTreeSet::new();
     while let Some(repository) = repositories.pop() {
@@ -5902,6 +5916,12 @@ fn unexpected_nested_git_entry(cwd: &Path) -> Result<Option<PathBuf>> {
             .map_err(|e| spar_err!("could not resolve {}: {e}", repository.display()))?;
         if !visited.insert(canonical.clone()) {
             bail!("submodule recursion revisited {}", canonical.display());
+        }
+        for raw in untracked_listing(&canonical, &["ls-files", "--others", "-z"])? {
+            let (path, nested) = untracked_record(&raw, "untracked")?;
+            if nested {
+                checkouts.insert(canonical.join(path));
+            }
         }
         for link in gitlinks(&canonical)? {
             let Some(submodule) = initialized_submodule(&canonical, &link.path)? else {
@@ -5933,7 +5953,7 @@ fn unexpected_nested_git_entry(cwd: &Path) -> Result<Option<PathBuf>> {
             let kind = entry
                 .file_type()
                 .map_err(|e| spar_err!("could not inspect {}: {e}", path.display()))?;
-            if kind.is_dir() {
+            if kind.is_dir() && !checkouts.contains(&path) {
                 directories.push(path);
             }
         }
@@ -5944,8 +5964,9 @@ fn unexpected_nested_git_entry(cwd: &Path) -> Result<Option<PathBuf>> {
 pub(crate) fn git_state(cwd: &Path) -> Result<GitState> {
     if let Some(path) = unexpected_nested_git_entry(cwd)? {
         bail!(
-            "the worktree contains an untracked Git entry at {}. It was kept because its \
-             repository objects are not represented by the outer index.",
+            "the worktree contains a Git entry at {} that Git does not report as a nested \
+             checkout. Files under it are invisible to the outer worktree, so SPAR cannot \
+             prove they are unchanged.",
             path.display()
         );
     }
@@ -7795,6 +7816,47 @@ mod tests {
         assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
         assert!(error.to_string().contains("Git entry"), "{error}");
         assert!(nested.join(".git").exists());
+    }
+
+    /// A reviewer that clones a reproduction into ignored build output used to
+    /// lose the whole review. The state check refused every Git entry it had
+    /// not put there, including the one Git reports as a nested checkout and
+    /// the untracked snapshot already records by identity.
+    #[test]
+    fn a_repository_cloned_into_build_output_leaves_the_state_readable() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("cloned-repro", 918);
+        exclude_paths(&repo, &["target/"]);
+        let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+        let repro = path.join("target/pr918-repro");
+        std::fs::create_dir_all(&repro).unwrap();
+        test_git(&repro, &["init"]);
+        std::fs::write(repro.join("main.rs"), "fn main() {}\n").unwrap();
+
+        repo.require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .unwrap();
+
+        assert!(repository_has_recoverable_work(&path, true).unwrap());
+        assert!(repro.join(".git").exists());
+    }
+
+    /// What sits under a nested checkout is that repository's business, so the
+    /// scan stops at its directory rather than reading a checkout of its own
+    /// as an entry the outer worktree has to account for.
+    #[test]
+    fn a_repository_inside_a_nested_checkout_is_left_alone() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("checkout-in-checkout", 919);
+        exclude_paths(&repo, &["target/"]);
+        let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+        let repro = path.join("target/repro");
+        let vendored = repro.join("vendor/dep");
+        std::fs::create_dir_all(&vendored).unwrap();
+        test_git(&repro, &["init"]);
+        test_git(&vendored, &["init"]);
+
+        repo.require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .unwrap();
+
+        assert!(vendored.join(".git").exists());
     }
 
     #[test]

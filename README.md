@@ -945,7 +945,12 @@ output is not such a change: verifying a finding usually means building the
 project and running its tests, and a reviewer held to a byte-identical `dist/`
 loses the review it just did. What it was asked to judge is the tracked tree,
 and that is compared as strictly as ever, along with every other untracked
-file.
+file. A repository cloned into that output is not such a change either. Git
+reports it as a nested checkout, spar records it by identity without reading
+inside it, and the worktree is kept afterwards rather than removed. A Git entry
+Git does not report, such as `git init` run inside a tracked directory, still
+stops the call, since every file written under one is invisible to the outer
+worktree.
 
 Successful editing calls leave their files uncommitted, and spar stages and
 commits them only after accepting the structured report. A failed editing call

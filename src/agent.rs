@@ -17,8 +17,9 @@ use crate::error::{ErrorKind, Result, SparError};
 use crate::jsonx;
 use crate::proc::{self, ExecOpts};
 use crate::repo::{
-    attribute_state, git_state, ignored_untracked_state, safe_git_state, uncertain_worktree_change,
-    AttributeState, GitState, IgnoredState,
+    attribute_state, git_state, ignored_untracked_state, probe_again_on_failure, safe_git_state,
+    uncertain_worktree_change, AttributeState, GitState, IgnoredState,
+    EDITED_GIT_MARKER as GIT_MARKER_RECOVERY,
 };
 use crate::{bail, log, logdim, logwarn, spar_err};
 
@@ -885,8 +886,6 @@ impl Agent {
     }
 }
 
-const GIT_MARKER_RECOVERY: &str = ".spar-edited-git-marker";
-
 /// The repository state before a logical editing operation begins.
 ///
 /// This is recovery tracking, not an operating-system security boundary. It
@@ -934,7 +933,7 @@ impl EditBaseline {
         })
     }
 
-    fn recovery_needed(&self, cwd: &Path) -> Result<bool> {
+    fn recovery_needed(&self, cwd: &Path, access: Access) -> Result<bool> {
         if !self.git_entry.still_matches(cwd)? {
             return Err(uncertain_worktree_change(
                 cwd,
@@ -945,7 +944,7 @@ impl EditBaseline {
                 ),
             ));
         }
-        let attributes = attribute_state(cwd).map_err(|e| {
+        let attributes = probe_again_on_failure(|| attribute_state(cwd)).map_err(|e| {
             uncertain_worktree_change(
                 cwd,
                 format!(
@@ -966,10 +965,19 @@ impl EditBaseline {
                 ),
             ));
         }
-        let current = git_state(cwd).map_err(|e| recovery_probe_error(cwd, "state", &e))?;
-        let ignored = ignored_untracked_state(cwd)
+        let current = probe_again_on_failure(|| git_state(cwd))
+            .map_err(|e| recovery_probe_error(cwd, "state", &e))?;
+        let ignored = probe_again_on_failure(|| ignored_untracked_state(cwd))
             .map_err(|e| recovery_probe_error(cwd, "ignored files", &e))?;
-        Ok(current != self.git_state || self.ignored_untracked.changed_beyond_generated(&ignored))
+        // A call asked only to read is judged on what it left behind, and the
+        // project's own ignore rules say which of that is build output. An
+        // editing call is held to the stricter rule, because what it writes is
+        // about to be staged.
+        let untracked = match access {
+            Access::Read => self.ignored_untracked.changed_beyond_ignored(&ignored),
+            Access::Edit => self.ignored_untracked.changed_beyond_generated(&ignored),
+        };
+        Ok(current != self.git_state || untracked)
     }
 }
 
@@ -1067,7 +1075,7 @@ fn recovery_error(
         return Some(error.clone());
     }
     let baseline = baseline?;
-    match baseline.recovery_needed(cwd) {
+    match baseline.recovery_needed(cwd, access) {
         Ok(false) => None,
         Ok(true) if access == Access::Edit => Some(changed_edit_failure(error)),
         Ok(true) => Some(uncertain_worktree_change(
@@ -1118,7 +1126,7 @@ fn finish_call<T>(
             ),
         ));
     }
-    match baseline.recovery_needed(cwd) {
+    match baseline.recovery_needed(cwd, access) {
         Ok(false) => Ok(value),
         Ok(true) => Err(uncertain_worktree_change(
             cwd,
@@ -2477,8 +2485,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The list of build directories was always a guess. This is the case that
+    /// proved it: a generator writing a lockfile beside its own manifest, which
+    /// the project ignores and no directory name catches.
     #[test]
-    fn a_read_that_writes_an_ignored_file_elsewhere_is_still_discarded() {
+    fn a_read_that_writes_a_new_ignored_file_elsewhere_keeps_its_answer() {
         let dir = built_repo("successful-read-ignored");
         let agent = Agent::with_bin(
             shell(
@@ -2489,12 +2500,42 @@ mod tests {
             "/bin/sh",
         );
 
+        let answer = agent
+            .ask("read it", &dir, &Effort::default())
+            .expect("answer kept");
+
+        assert_eq!("reviewed", answer.trim());
+        assert_eq!(
+            "TOKEN=x\n",
+            std::fs::read_to_string(dir.join("local.env")).unwrap()
+        );
+        assert!(
+            !std::fs::read_dir(&dir).unwrap().flatten().any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".spar-recovery-needed-"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_that_rewrites_an_existing_ignored_file_elsewhere_is_discarded() {
+        let dir = built_repo("successful-read-existing-ignored");
+        std::fs::write(dir.join("local.env"), "TOKEN=before\n").unwrap();
+        let agent = Agent::with_bin(
+            shell(
+                "reader",
+                "printf 'TOKEN=after\n' > local.env; echo reviewed",
+            ),
+            "/bin/sh",
+        );
+
         let err = agent.ask("read it", &dir, &Effort::default()).unwrap_err();
 
         assert_eq!(ErrorKind::UncertainWrite, err.kind());
         assert!(err.message().contains("read-only call"), "{err}");
         assert_eq!(
-            "TOKEN=x\n",
+            "TOKEN=after\n",
             std::fs::read_to_string(dir.join("local.env")).unwrap()
         );
         let _ = std::fs::remove_dir_all(&dir);

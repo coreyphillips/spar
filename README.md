@@ -940,17 +940,32 @@ than from what landed. Custody now follows checked `HEAD` values on both sides
 of every call. Spar commits an accepted fix before choosing the next reviewer.
 The custody loop rolls back a review pass that writes before it can count as
 approval. Detached review, split, and check-in inspections instead stop and keep
-the worktree if files or `HEAD` change. Rebuilding recognized build and cache
-output is not such a change: verifying a finding usually means building the
+the worktree if files or `HEAD` change. Writing a file the project's own ignore
+rules cover is not such a change: verifying a finding usually means building the
 project and running its tests, and a reviewer held to a byte-identical `dist/`
-loses the review it just did. What it was asked to judge is the tracked tree,
-and that is compared as strictly as ever, along with every other untracked
-file. A repository cloned into that output is not such a change either. Git
-reports it as a nested checkout, spar records it by identity without reading
-inside it, and the worktree is kept afterwards rather than removed. A Git entry
-Git does not report, such as `git init` run inside a tracked directory, still
-stops the call, since every file written under one is invisible to the outer
-worktree.
+loses the review it just did. Which paths those are is a question the repository
+already answers, so spar asks Git rather than matching a list of directory
+names it wrote down in advance. A review died over that difference: a reviewer
+ran the project's own binding generator to check a finding, that left a lockfile
+beside its own manifest instead of under `target/`, and both agents lost an hour
+of work to a path Git had been told to disown.
+
+Only creating such a file is forgiven. Rewriting or deleting one that was
+already there still stops the call, because that is where a person's `.env` or
+saved log lives, and an ordinary untracked file still stops it too, because a
+reviewer is asked to keep its scratch out of the tree. What it was asked to
+judge is the tracked tree, and that is compared byte for byte as strictly as
+ever, whatever ignore rules appear beside it. A repository cloned into the
+output is not such a change either. Git reports it as a nested checkout, spar
+records it by identity without reading inside it, and the worktree is kept
+afterwards rather than removed. A Git entry Git does not report, such as
+`git init` run inside a tracked directory, still stops the call, since every
+file written under one is invisible to the outer worktree.
+
+Probes are held to the same standard. A path Git listed and a build then deleted,
+or one that appears between two listings of the same tree, is a fact about a
+worktree being built in rather than evidence of damage, and no longer ends the
+run.
 
 Successful editing calls leave their files uncommitted, and spar stages and
 commits them only after accepting the structured report. A failed editing call
@@ -1109,9 +1124,15 @@ because they may be required work. Recognized test and build artifacts, such as
 files under `target/` or `dist/`, are treated the same way everywhere: writing
 or rewriting them never fails a call, whether it was asked to edit or only to
 read, they are left out of the commit, and they do not keep a finished worktree
-from being removed, since whatever wrote them writes them again. An ignored file
-anywhere else, an ordinary untracked file, or a repository nested in the output
-still stops the call and keeps the worktree.
+from being removed, since whatever wrote them writes them again.
+
+A call asked only to read is held to a rule of its own, because it has no commit
+to protect. Creating a file the project ignores never fails it, wherever that
+file sits, since the repository's ignore rules are the project's own account of
+what its build writes and a list of directory names can only ever approximate
+them. Rewriting or deleting an ignored file that was already there does fail it,
+and so does an ordinary untracked file or a repository nested in the output. On
+an editing call all of those still stop the commit and keep the worktree.
 
 Include `{schema}` or `{schema_file}` and spar uses the CLI's native structured
 output. This is worth doing rather than optional: without it spar asks for JSON
@@ -1262,6 +1283,23 @@ reconstruction cannot be proved. It verifies that a candidate path belongs to
 this repository before removing it, and ordinary cleanup never forces removal.
 `spar clean --all` is the explicit force path for worktrees and branches spar
 recorded owning.
+
+`spar review` is the exception, in one direction only. Its checkout is detached,
+built by `git worktree add` from `refs/pull/N/head` at the start of every run,
+and there is no `--keep-worktrees` to make one outlive the run that wrote it.
+Reviewing the same pull request again therefore rebuilds it over whatever ignored
+files the last review's build left, because the rebuild replaces the checkout
+regardless. Cleanup still keeps it: nothing is deleted until a later review
+actually asks for that checkout again. An ordinary untracked file, a local
+commit, or a repository cloned into the output still refuses the rebuild, and
+says so.
+
+When spar cannot prove what happened to a worktree, it writes the reason into a
+`.spar-recovery-needed-<pid>-<n>` file in the directory the call ran in, and
+names that path in the error. Nothing removes one, so it is there to read later.
+It is spar's own note rather than something a call did, so it is left out of the
+comparison a later call is held to, and rebuilding a review checkout reads it out
+first rather than being blocked by it.
 
 Cleanup only ever touches local branches spar recorded creating. Branch names
 default to `issue-N`, `pr-N`, and `split-N-I`, with a numeric suffix when a split

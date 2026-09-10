@@ -4999,6 +4999,75 @@ fn a_local_commit_in_a_review_worktree_is_not_rebuilt() {
     repo.release_review_worktree(8);
 }
 
+fn exclude_in(work: &std::path::Path, line: &str) {
+    use std::io::Write;
+    let path = work.join(".git").join("info").join("exclude");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(file, "{line}").unwrap();
+}
+
+/// The wedge. A review leaves build output the old directory list did not
+/// recognize, plus the marker written when it refused, and every later review
+/// of that pull request was then refused too. Rebuilding is what the next run
+/// was going to do to that checkout anyway.
+#[test]
+fn a_review_worktree_is_rebuilt_over_its_own_leftovers() {
+    let fx = repo("prhead-rebuild-over-output");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    git(
+        &fx.work,
+        &["push", "-q", "origin", "HEAD:refs/pull/11/head"],
+    );
+    let path = repo.worktree_for_pr_head(11).unwrap();
+    // The real case has this rule committed. `info/exclude` is the common Git
+    // directory's copy, which a linked worktree shares, and it keeps the rule
+    // out of the comparison as a file in its own right.
+    exclude_in(&fx.work, "generated/");
+    std::fs::create_dir_all(path.join("generated")).unwrap();
+    std::fs::write(path.join("generated/Cargo.lock"), "# generated\n").unwrap();
+    std::fs::write(
+        path.join(".spar-recovery-needed-1234-0"),
+        "an earlier call was refused\n",
+    )
+    .unwrap();
+
+    let rebuilt = repo
+        .worktree_for_pr_head(11)
+        .expect("a review checkout is rebuilt from origin, not preserved");
+
+    assert_eq!(path, rebuilt);
+    assert!(!path.join("generated/Cargo.lock").exists());
+    assert!(!path.join(".spar-recovery-needed-1234-0").exists());
+    repo.release_review_worktree(11);
+}
+
+/// The relaxation stops at the edge of the review checkout: an ordinary
+/// untracked file is still somebody's, and still refuses.
+#[test]
+fn an_ordinary_untracked_file_still_stops_a_review_rebuild() {
+    let fx = repo("prhead-untracked-blocks");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    git(
+        &fx.work,
+        &["push", "-q", "origin", "HEAD:refs/pull/12/head"],
+    );
+    let path = repo.worktree_for_pr_head(12).unwrap();
+    std::fs::write(path.join("notes.txt"), "keep me\n").unwrap();
+
+    let error = repo.worktree_for_pr_head(12).unwrap_err().to_string();
+
+    assert!(error.contains("uncommitted changes"), "{error}");
+    assert_eq!(
+        "keep me\n",
+        std::fs::read_to_string(path.join("notes.txt")).unwrap()
+    );
+    repo.release_review_worktree(12);
+}
+
 #[test]
 fn review_worktrees_are_swept_by_clean_all() {
     let fx = repo("prheadclean");

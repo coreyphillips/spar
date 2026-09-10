@@ -155,7 +155,15 @@ fn review_inner(
         dry_run,
     );
     outcome?;
-    repo.release_review_worktree_checked(pr_number, &checkpoint)?;
+    // The verdict was posted by `finish`, several statements ago. A checkout
+    // that cannot be tidied afterwards is a worktree to go and look at, not a
+    // reason to report an hour of review as `rounds=0` and an error.
+    if let Err(e) = repo.release_review_worktree_checked(pr_number, &checkpoint) {
+        logwarn!("PR #{pr_number}: {e}");
+        state
+            .notes
+            .push(format!("the review worktree was kept: {e}"));
+    }
     Ok(state)
 }
 

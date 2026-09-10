@@ -55,6 +55,47 @@ pub const FOLLOWUP_MARKER: &str = "<!-- spar:followup -->";
 const WORKTREE_DIR: &str = ".spar-worktrees";
 const STATE_DIR: &str = ".spar";
 
+/// Files SPAR writes into a worktree itself, which no agent ever authors.
+pub(crate) const RECOVERY_MARKER_PREFIX: &str = ".spar-recovery-needed-";
+pub(crate) const EDITED_GIT_MARKER: &str = ".spar-edited-git-marker";
+
+/// What SPAR is allowed to throw away when it decides a checkout can go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Disposable {
+    /// Recognized build output, and nothing else. Somebody may have put the
+    /// rest there and want it back.
+    BuildOutput,
+    /// Every ignored file, and SPAR's own markers. Only rebuilding a review
+    /// checkout qualifies, and only because the next statement replaces it with
+    /// a fresh checkout of the same ref: what is there came from an earlier
+    /// `spar review` of the same pull request, and `git worktree add` would
+    /// write over it regardless. Refusing instead left the command unusable on
+    /// any project whose build writes outside `target/`, since a single
+    /// lockfile beside a generator's manifest blocked every later run.
+    ReviewOutput,
+}
+
+/// Whether `path` is one of the files SPAR leaves in a worktree root.
+///
+/// A marker is evidence for a person, not something a call did to the tree, and
+/// two reviewers share one checkout: the marker written when the first one's
+/// answer was refused is otherwise a brand new untracked file in the snapshot
+/// the second one is compared against, so one refusal took the other review
+/// down with it.
+pub(crate) fn is_spar_marker(path: &Path) -> bool {
+    let mut components = path.components();
+    let Some(std::path::Component::Normal(name)) = components.next() else {
+        return false;
+    };
+    if components.next().is_some() {
+        return false;
+    }
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name == EDITED_GIT_MARKER || name.starts_with(RECOVERY_MARKER_PREFIX)
+}
+
 /// How many names one part of a split may be tried on before giving up. High
 /// enough that nobody reaches it by splitting the same pull request again, low
 /// enough that a repository where every name is taken says so rather than
@@ -296,6 +337,38 @@ impl IgnoredState {
                 return false;
             }
             !(is_generated_artifact(path) && self.disposable(path) && after.disposable(path))
+        })
+    }
+
+    /// Whether a read-only call left anything behind that is not its own
+    /// output.
+    ///
+    /// `changed_beyond_generated` answers this from a list of directory names,
+    /// which is a guess about where a build writes. The repository already
+    /// states where it writes, in its own ignore rules, and a review died over
+    /// the gap: a reviewer ran the project's binding generator to check a
+    /// finding, that wrote a lockfile beside its own manifest rather than under
+    /// `target/`, and both agents lost an hour of work to a path Git had been
+    /// told to disown.
+    ///
+    /// Only creation is forgiven, and only of a path Git reports as ignored.
+    /// Rewriting or deleting something that was already there stays exactly as
+    /// fatal as before, because that is where a person's `.env` or saved log
+    /// lives, and an ordinary untracked file still fails, because a reviewer
+    /// was asked to keep its scratch out of the tree.
+    pub(crate) fn changed_beyond_ignored(&self, after: &Self) -> bool {
+        let mut paths: BTreeSet<&PathBuf> = self.files.keys().collect();
+        paths.extend(after.files.keys());
+        paths.into_iter().any(|path| {
+            if self.files.get(path) == after.files.get(path)
+                && self.is_ignored(path) == after.is_ignored(path)
+            {
+                return false;
+            }
+            if is_generated_artifact(path) && self.disposable(path) && after.disposable(path) {
+                return false;
+            }
+            self.files.contains_key(path) || !after.is_ignored(path)
         })
     }
 
@@ -663,7 +736,15 @@ impl Repo {
         let path = Path::new(git_dir).join("info").join("exclude");
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
 
-        let wanted = [format!("/{WORKTREE_DIR}/"), format!("/{STATE_DIR}/")];
+        // The marker too. It is written into whichever directory the call ran
+        // in, which for a shared checkout is the repository root, and an
+        // untracked file there is one `git add -A` away from being committed.
+        // The error names its path, which is how a person is meant to find it.
+        let wanted = [
+            format!("/{WORKTREE_DIR}/"),
+            format!("/{STATE_DIR}/"),
+            format!("{RECOVERY_MARKER_PREFIX}*"),
+        ];
         let missing: Vec<&String> = wanted
             .iter()
             .filter(|line| !existing.lines().any(|l| l.trim() == line.as_str()))
@@ -680,7 +761,7 @@ impl Repo {
         if !existing.is_empty() && !existing.ends_with('\n') {
             block.push('\n');
         }
-        block.push_str("\n# added by spar: its worktrees and run state\n");
+        block.push_str("\n# added by spar: its worktrees, run state, and recovery markers\n");
         for line in missing {
             block.push_str(line);
             block.push('\n');
@@ -921,7 +1002,11 @@ impl Repo {
         let path = self.worktree_path(&format!("issue-{issue}"));
 
         self.refuse_issue_branch_rebuild(issue, base)?;
-        self.refuse_dirty_worktree(&path, &format!("worktree for issue #{issue}"))?;
+        self.refuse_dirty_worktree(
+            &path,
+            &format!("worktree for issue #{issue}"),
+            Disposable::BuildOutput,
+        )?;
 
         if !self.branch_deletion_is_safe(&branch)? {
             bail!(
@@ -1319,7 +1404,12 @@ impl Repo {
     /// The path sits under a predictable directory, but that does not establish
     /// ownership. A clean independent repository at the same path must survive
     /// even when `git worktree remove` rejects it.
-    fn remove_worktree_at_with_force(&self, path: &Path, force: bool) -> Result<bool> {
+    fn remove_worktree_at_with_force(
+        &self,
+        path: &Path,
+        force: bool,
+        disposable: Disposable,
+    ) -> Result<bool> {
         let existed = path.exists();
         if path.exists() {
             match self.worktree_belongs_to_repo(path) {
@@ -1341,7 +1431,7 @@ impl Repo {
                 }
             }
             if !force {
-                match self.has_recoverable_work(path) {
+                match self.has_recoverable_work(path, disposable) {
                     Ok(true) => {
                         logdim!(
                             "kept {} because it contains recoverable files or repository state",
@@ -1361,8 +1451,13 @@ impl Repo {
                 }
             }
         }
+        // Git refuses to remove a worktree holding any untracked file, which is
+        // the same question SPAR has just answered in more detail: under
+        // `ReviewOutput` the checks above have already established that nothing
+        // there is worth keeping. `--force` here is that answer being carried
+        // out, not the check being skipped, which is what `force` means.
         let path_str = path.display().to_string();
-        let command_ok = if force {
+        let command_ok = if force || disposable == Disposable::ReviewOutput {
             self.git_try_without_automation(&["worktree", "remove", "--force", &path_str])?
         } else {
             self.git_try_without_automation(&["worktree", "remove", &path_str])?
@@ -1371,12 +1466,17 @@ impl Repo {
     }
 
     fn remove_worktree_at(&self, path: &Path) -> Result<bool> {
-        self.remove_worktree_at_with_force(path, false)
+        self.remove_worktree_at_with_force(path, false, Disposable::BuildOutput)
+    }
+
+    /// Remove a review checkout that is about to be rebuilt from origin.
+    fn remove_review_worktree_at(&self, path: &Path) -> Result<bool> {
+        self.remove_worktree_at_with_force(path, false, Disposable::ReviewOutput)
     }
 
     /// Force removal is reserved for the explicit `clean --all` path.
     fn remove_worktree_at_force(&self, path: &Path) -> bool {
-        match self.remove_worktree_at_with_force(path, true) {
+        match self.remove_worktree_at_with_force(path, true, Disposable::BuildOutput) {
             Ok(removed) => removed,
             Err(error) => {
                 logdim!(
@@ -1393,14 +1493,14 @@ impl Repo {
     ///
     /// There is deliberately no force fallback, so Git can still refuse a
     /// removal if tracked or non-ignored work appears after the final check.
-    fn remove_worktree_at_checked(&self, path: &Path) -> Result<bool> {
+    fn remove_worktree_at_checked(&self, path: &Path, disposable: Disposable) -> Result<bool> {
         if path.exists() && !self.worktree_belongs_to_repo(path)? {
             bail!(
                 "{} is not a worktree owned by this repository, so it was kept",
                 path.display()
             );
         }
-        if path.exists() && self.has_recoverable_work(path)? {
+        if path.exists() && self.has_recoverable_work(path, disposable)? {
             bail!(
                 "the verified worktree at {} contains recoverable files or repository state. It \
                  was kept.",
@@ -1419,7 +1519,12 @@ impl Repo {
         Ok(!path.exists())
     }
 
-    fn refuse_dirty_worktree(&self, path: &Path, label: &str) -> Result<()> {
+    fn refuse_dirty_worktree(
+        &self,
+        path: &Path,
+        label: &str,
+        disposable: Disposable,
+    ) -> Result<()> {
         if !path.is_dir() {
             return Ok(());
         }
@@ -1455,7 +1560,7 @@ impl Repo {
             }
             return Ok(());
         }
-        let dirty = self.has_recoverable_work(path).map_err(|e| {
+        let dirty = self.has_recoverable_work(path, disposable).map_err(|e| {
             spar_err!(
                 "could not verify whether the existing {label} at {} is clean, so it was kept: \
                  {}",
@@ -1505,7 +1610,11 @@ impl Repo {
                 );
             }
         }
-        self.refuse_dirty_worktree(&path, &format!("worktree for PR #{}", pr.number))?;
+        self.refuse_dirty_worktree(
+            &path,
+            &format!("worktree for PR #{}", pr.number),
+            Disposable::BuildOutput,
+        )?;
         if !self.branch_deletion_is_safe(&local)? {
             bail!(
                 "the existing branch {local} has a tip or reflog-only commit that no surviving \
@@ -1562,7 +1671,7 @@ impl Repo {
             std::fs::create_dir_all(parent)
                 .map_err(|e| spar_err!("could not create {}: {e}", parent.display()))?;
         }
-        if !self.remove_worktree_at(&path)? {
+        if !self.remove_review_worktree_at(&path)? {
             bail!(
                 "the existing review worktree for PR #{number} could not be removed safely. Its \
                  reference was kept."
@@ -1602,8 +1711,37 @@ impl Repo {
                 path.display()
             );
         }
-        self.refuse_dirty_worktree(&path, &format!("review worktree for PR #{number}"))?;
+        self.report_recovery_markers(&path);
+        self.refuse_dirty_worktree(
+            &path,
+            &format!("review worktree for PR #{number}"),
+            Disposable::ReviewOutput,
+        )?;
         Ok(())
+    }
+
+    /// Read out what an earlier run refused to explain away, before rebuilding
+    /// over it.
+    ///
+    /// The marker is the only record of why a call's answer was thrown out, and
+    /// a review checkout is rebuilt on the next run. Saying it here is what
+    /// keeps the file from being the thing that quietly blocks the command
+    /// instead.
+    fn report_recovery_markers(&self, path: &Path) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with(RECOVERY_MARKER_PREFIX) {
+                continue;
+            }
+            match std::fs::read_to_string(entry.path()) {
+                Ok(detail) => logwarn!("an earlier run left {name}: {}", detail.trim()),
+                Err(e) => logdim!("could not read {}: {e}", entry.path().display()),
+            }
+        }
     }
 
     /// A worktree for one part of a split, on a new branch off `start`.
@@ -1632,7 +1770,11 @@ impl Repo {
             std::fs::create_dir_all(dir)
                 .map_err(|e| spar_err!("could not create {}: {e}", dir.display()))?;
         }
-        self.refuse_dirty_worktree(&path, &format!("worktree for part {index} of PR #{parent}"))?;
+        self.refuse_dirty_worktree(
+            &path,
+            &format!("worktree for part {index} of PR #{parent}"),
+            Disposable::BuildOutput,
+        )?;
         // The name is free, so there is no branch to delete. A directory can
         // still be in the way, left by a worktree that was pruned from git's
         // records without being removed from disk.
@@ -1801,7 +1943,7 @@ impl Repo {
                 return false;
             }
         }
-        match self.remove_worktree_at_checked(dir) {
+        match self.remove_worktree_at_checked(dir, Disposable::BuildOutput) {
             Ok(true) => {}
             Ok(false) => return false,
             Err(error) => {
@@ -1902,7 +2044,7 @@ impl Repo {
                  worktree and reference were kept."
             );
         }
-        if !self.remove_worktree_at_checked(&path)? {
+        if !self.remove_worktree_at_checked(&path, Disposable::BuildOutput)? {
             bail!(
                 "the verified review worktree at {} could not be removed, so its reference was \
                  kept",
@@ -2090,8 +2232,8 @@ impl Repo {
 
     /// Whether removing a worktree would delete any local file Git does not
     /// reproduce from its commits, including ignored untracked files.
-    fn has_recoverable_work(&self, cwd: &Path) -> Result<bool> {
-        repository_has_recoverable_work(cwd, true)
+    fn has_recoverable_work(&self, cwd: &Path, disposable: Disposable) -> Result<bool> {
+        repository_has_recoverable_work_with(cwd, true, disposable)
     }
 
     /// Record ignored artifacts that existed before an editing call.
@@ -2141,7 +2283,7 @@ impl Repo {
                 ),
             ));
         }
-        let attributes = attribute_state(cwd).map_err(|e| {
+        let attributes = probe_again_on_failure(|| attribute_state(cwd)).map_err(|e| {
             uncertain_worktree_change(
                 cwd,
                 format!(
@@ -2161,7 +2303,7 @@ impl Repo {
                 ),
             ));
         }
-        let git_state = git_state(cwd).map_err(|e| {
+        let git_state = probe_again_on_failure(|| git_state(cwd)).map_err(|e| {
             uncertain_worktree_change(
                 cwd,
                 format!(
@@ -2171,7 +2313,7 @@ impl Repo {
                 ),
             )
         })?;
-        let ignored = ignored_untracked_state(cwd).map_err(|e| {
+        let ignored = probe_again_on_failure(|| ignored_untracked_state(cwd)).map_err(|e| {
             uncertain_worktree_change(
                 cwd,
                 format!(
@@ -2184,7 +2326,7 @@ impl Repo {
         if git_state != checkpoint.git_state
             || checkpoint
                 .ignored_untracked
-                .changed_beyond_generated(&ignored)
+                .changed_beyond_ignored(&ignored)
         {
             return Err(uncertain_worktree_change(
                 cwd,
@@ -4487,7 +4629,7 @@ impl Repo {
                 }
                 let path = base.join(&name);
                 if !force_all {
-                    match self.has_recoverable_work(&path) {
+                    match self.has_recoverable_work(&path, Disposable::BuildOutput) {
                         Ok(true) => {
                             logdim!(
                                 "kept {} because it contains uncommitted changes or ignored files",
@@ -4678,6 +4820,23 @@ impl Repo {
 // Free helpers
 // ---------------------------------------------------------------------------
 
+/// Take a read-only probe again before treating its failure as evidence.
+///
+/// Every probe is a Git invocation under a thirty second cap plus a walk over a
+/// tree an agent may still be building in. A probe that fails proves nothing
+/// about the worktree, and there is a real difference between "the tree moved"
+/// and "the question could not be asked just then", which the caller turns into
+/// the same run-ending error.
+pub(crate) fn probe_again_on_failure<T>(probe: impl Fn() -> Result<T>) -> Result<T> {
+    match probe() {
+        Ok(value) => Ok(value),
+        Err(first) => {
+            logdim!("retrying a worktree probe after: {}", first.last_line());
+            probe()
+        }
+    }
+}
+
 /// Read attribute files without asking Git to inspect working-tree content.
 ///
 /// A newly written attribute can select a clean or smudge filter. It must be
@@ -4710,11 +4869,17 @@ fn collect_attribute_files(
         .filter(|entry| entry.path.file_name() == Some(OsStr::new(".gitattributes")))
         .map(|entry| entry.path.clone())
         .collect();
+    // Ignored on purpose. A `.gitattributes` under build output can only select
+    // filters for paths that are themselves ignored, and no ignored path is
+    // ever staged or compared as tracked content, so it cannot reach a managed
+    // commit. Capturing it meant `cargo package` or `npm ci` writing one into
+    // its own output ended a read-only call outright.
     let untracked = run_git_bytes(
         repository,
         &[
             "ls-files",
             "--others",
+            "--exclude-standard",
             "-z",
             "--",
             ".gitattributes",
@@ -4771,7 +4936,7 @@ fn write_recovery_marker(cwd: &Path, detail: &str) -> Result<PathBuf> {
     for _ in 0..1000 {
         let serial = NEXT.fetch_add(1, Ordering::Relaxed);
         let path = cwd.join(format!(
-            ".spar-recovery-needed-{}-{serial}",
+            "{RECOVERY_MARKER_PREFIX}{}-{serial}",
             std::process::id()
         ));
         let mut options = OpenOptions::new();
@@ -4883,6 +5048,9 @@ fn collect_untracked_files(
     {
         let (relative, nested) = untracked_record(raw, "untracked")?;
         let from_root = prefix.join(&relative);
+        if is_spar_marker(&from_root) {
+            continue;
+        }
         let absolute = root.join(&from_root);
         let fingerprint = if nested {
             nested_repository_fingerprint(&absolute)?
@@ -4913,17 +5081,28 @@ fn collect_untracked_files(
             repository.display()
         );
     }
+    // Two `ls-files` runs cannot be made to agree about a tree that is being
+    // built in. A path named only by the second one was created between them,
+    // which is a fact about the moment, not a corruption: record it and let the
+    // comparison decide, rather than ending a run that had nothing wrong with
+    // it.
     for raw in ignored_listed
         .split(|byte| *byte == 0)
         .filter(|raw| !raw.is_empty())
     {
-        let (relative, _) = untracked_record(raw, "ignored")?;
+        let (relative, nested) = untracked_record(raw, "ignored")?;
         let from_root = prefix.join(relative);
-        if !files.contains_key(&from_root) {
-            bail!(
-                "git classified an unlisted path as ignored: {:?}",
-                from_root
-            );
+        if is_spar_marker(&from_root) {
+            continue;
+        }
+        if let std::collections::btree_map::Entry::Vacant(slot) = files.entry(from_root.clone()) {
+            let absolute = root.join(&from_root);
+            let fingerprint = if nested {
+                nested_repository_fingerprint(&absolute)?
+            } else {
+                ignored_file_fingerprint(&absolute)?
+            };
+            slot.insert(fingerprint);
         }
         if !ignored.insert(from_root.clone()) {
             bail!(
@@ -5932,14 +6111,23 @@ fn unexpected_nested_git_entry(cwd: &Path) -> Result<Option<PathBuf>> {
         }
     }
 
+    // A build deletes its own directories while this walks them. A directory
+    // that is gone holds no Git entry, so skipping it answers the question
+    // being asked; erroring instead ended runs whose worktrees were fine.
     let scan_root = root.clone();
     let mut directories = vec![root];
     while let Some(directory) = directories.pop() {
-        let entries = std::fs::read_dir(&directory)
-            .map_err(|e| spar_err!("could not inspect {}: {e}", directory.display()))?;
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(spar_err!("could not inspect {}: {e}", directory.display())),
+        };
         for entry in entries {
-            let entry =
-                entry.map_err(|e| spar_err!("could not inspect {}: {e}", directory.display()))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(spar_err!("could not inspect {}: {e}", directory.display())),
+            };
             let path = entry.path();
             if directory == scan_root && entry.file_name() == OsStr::new(WORKTREE_DIR) {
                 continue;
@@ -5950,9 +6138,11 @@ fn unexpected_nested_git_entry(cwd: &Path) -> Result<Option<PathBuf>> {
                 }
                 continue;
             }
-            let kind = entry
-                .file_type()
-                .map_err(|e| spar_err!("could not inspect {}: {e}", path.display()))?;
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(spar_err!("could not inspect {}: {e}", path.display())),
+            };
             if kind.is_dir() && !checkouts.contains(&path) {
                 directories.push(path);
             }
@@ -6077,11 +6267,19 @@ pub(crate) fn safe_git_state(cwd: &Path) -> Result<GitState> {
 }
 
 fn repository_has_recoverable_work(cwd: &Path, include_ignored: bool) -> Result<bool> {
+    repository_has_recoverable_work_with(cwd, include_ignored, Disposable::BuildOutput)
+}
+
+fn repository_has_recoverable_work_with(
+    cwd: &Path,
+    include_ignored: bool,
+    disposable: Disposable,
+) -> Result<bool> {
     if include_ignored && unexpected_nested_git_entry(cwd)?.is_some() {
         return Ok(true);
     }
     let mut visited = BTreeSet::new();
-    repository_has_recoverable_work_inner(cwd, include_ignored, &mut visited)
+    repository_has_recoverable_work_inner(cwd, include_ignored, disposable, &mut visited)
 }
 
 fn has_recoverable_worktree_admin_state(cwd: &Path) -> Result<bool> {
@@ -6385,9 +6583,13 @@ fn commit_has_shared_ref_except(cwd: &Path, oid: &str, exclude: Option<&str>) ->
 /// which is nearly all of them, so a merged pull request still left its
 /// checkout behind. A repository nested in that output is somebody else's
 /// history and counts whatever it sits under.
-fn has_untracked_work_worth_keeping(cwd: &Path) -> Result<bool> {
+fn has_untracked_work_worth_keeping(cwd: &Path, disposable: Disposable) -> Result<bool> {
     let ordinary = untracked_listing(cwd, &["ls-files", "--others", "--exclude-standard", "-z"])?;
-    if !ordinary.is_empty() {
+    for raw in &ordinary {
+        let (path, _) = untracked_record(raw, "untracked")?;
+        if disposable == Disposable::ReviewOutput && is_spar_marker(&path) {
+            continue;
+        }
         return Ok(true);
     }
     let listed = untracked_listing(
@@ -6402,7 +6604,13 @@ fn has_untracked_work_worth_keeping(cwd: &Path) -> Result<bool> {
     )?;
     for raw in listed {
         let (path, nested) = untracked_record(&raw, "ignored")?;
-        if nested || !is_generated_artifact(&path) {
+        // A repository cloned into the output keeps the checkout whatever the
+        // mode: its objects exist nowhere else, which is the one thing a
+        // rebuild from origin cannot replace.
+        if nested {
+            return Ok(true);
+        }
+        if disposable == Disposable::BuildOutput && !is_generated_artifact(&path) {
             return Ok(true);
         }
     }
@@ -6427,6 +6635,7 @@ fn untracked_listing(cwd: &Path, args: &[&str]) -> Result<Vec<Vec<u8>>> {
 fn repository_has_recoverable_work_inner(
     cwd: &Path,
     include_ignored: bool,
+    disposable: Disposable,
     visited: &mut BTreeSet<PathBuf>,
 ) -> Result<bool> {
     let canonical = std::fs::canonicalize(cwd)
@@ -6434,7 +6643,7 @@ fn repository_has_recoverable_work_inner(
     if !visited.insert(canonical.clone()) {
         bail!("submodule recursion revisited {}", canonical.display());
     }
-    if include_ignored && has_untracked_work_worth_keeping(cwd)? {
+    if include_ignored && has_untracked_work_worth_keeping(cwd, disposable)? {
         return Ok(true);
     }
     if !unsafe_index_flags(cwd)?.is_empty() {
@@ -6526,7 +6735,8 @@ fn repository_has_recoverable_work_inner(
         if head.trim() != link.oid {
             return Ok(true);
         }
-        if repository_has_recoverable_work_inner(&submodule, include_ignored, visited)? {
+        if repository_has_recoverable_work_inner(&submodule, include_ignored, disposable, visited)?
+        {
             return Ok(true);
         }
     }
@@ -6563,13 +6773,45 @@ fn path_from_git_bytes(raw: &[u8]) -> Result<PathBuf> {
 /// volatile directory fields stay out of the fingerprint. Identity and type
 /// remain, which is what makes deleting the checkout, or replacing it with a
 /// file, observable from the outer worktree.
+/// What a path Git listed looks like once it is no longer there.
+///
+/// A reviewer building the project deletes and rewrites its output constantly,
+/// so a path can go between the listing that named it and the stat that
+/// measures it. Treating that as an unreadable worktree ended runs that had
+/// nothing wrong with them. The record stays in the snapshot rather than being
+/// dropped, so a path that vanishes cannot pass for one that was never there.
+fn vanished_untracked_file() -> UntrackedFile {
+    UntrackedFile {
+        kind: 0,
+        len: 0,
+        modified: None,
+        created: None,
+        readonly: false,
+        symlink_target: None,
+        #[cfg(unix)]
+        device: 0,
+        #[cfg(unix)]
+        inode: 0,
+        #[cfg(unix)]
+        mode: 0,
+        #[cfg(unix)]
+        change_seconds: 0,
+        #[cfg(unix)]
+        change_nanoseconds: 0,
+    }
+}
+
 fn nested_repository_fingerprint(path: &Path) -> Result<UntrackedFile> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|e| {
-        spar_err!(
-            "could not inspect the nested repository at {}: {e}",
-            path.display()
-        )
-    })?;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vanished_untracked_file()),
+        Err(e) => {
+            return Err(spar_err!(
+                "could not inspect the nested repository at {}: {e}",
+                path.display()
+            ))
+        }
+    };
     if !metadata.is_dir() {
         bail!(
             "git reported {} as a nested repository, but it is not a directory",
@@ -6613,8 +6855,16 @@ fn nested_repository_fingerprint(path: &Path) -> Result<UntrackedFile> {
 }
 
 fn ignored_file_fingerprint(path: &Path) -> Result<UntrackedFile> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|e| spar_err!("could not inspect untracked file {}: {e}", path.display()))?;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vanished_untracked_file()),
+        Err(e) => {
+            return Err(spar_err!(
+                "could not inspect untracked file {}: {e}",
+                path.display()
+            ))
+        }
+    };
     let kind = if metadata.file_type().is_symlink() {
         2
     } else if metadata.is_file() {
@@ -6626,9 +6876,18 @@ fn ignored_file_fingerprint(path: &Path) -> Result<UntrackedFile> {
         );
     };
     let symlink_target = if kind == 2 {
-        let target = std::fs::read_link(path)
-            .map_err(|e| spar_err!("could not read untracked symlink {}: {e}", path.display()))?;
-        Some(os_str_bytes(target.as_os_str())?)
+        match std::fs::read_link(path) {
+            Ok(target) => Some(os_str_bytes(target.as_os_str())?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(vanished_untracked_file())
+            }
+            Err(e) => {
+                return Err(spar_err!(
+                    "could not read untracked symlink {}: {e}",
+                    path.display()
+                ))
+            }
+        }
     } else {
         None
     };
@@ -7257,17 +7516,22 @@ mod tests {
         repo.release_review_worktree(903);
     }
 
+    /// The read is no longer what refuses: a file the call created and Git was
+    /// told to ignore is its own output. Removal still refuses, so the file is
+    /// there to look at, which is the part that mattered.
     #[test]
     fn an_ignored_review_file_is_retained_after_a_checked_read() {
         let (_fixture, repo, path, checkpoint) = review_fixture("checked-ignored", 904);
         std::fs::create_dir_all(path.join("generated")).unwrap();
         std::fs::write(path.join("generated/recovery.txt"), "recover me\n").unwrap();
 
+        repo.require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .expect("its own output is not a change");
         let error = repo
             .release_review_worktree_checked(904, &checkpoint)
             .unwrap_err();
 
-        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert!(error.to_string().contains("recoverable"), "{error}");
         assert_eq!(
             "recover me\n",
             std::fs::read_to_string(path.join("generated/recovery.txt")).unwrap()
@@ -7651,6 +7915,76 @@ mod tests {
 
     /// Add ignore rules the way SPAR does, without a tracked change the
     /// worktree would then be kept for.
+    /// The failure this whole rule was rewritten for: a reviewer ran the
+    /// project's binding generator to check a finding, and the lockfile it left
+    /// beside its own manifest matched no directory name spar knew.
+    #[test]
+    fn a_lockfile_a_generator_left_outside_build_output_is_the_calls_own_output() {
+        let (_fixture, repo, path, _initial) = review_fixture("generator-lockfile", 940);
+        exclude_paths(&repo, &["target/", "bindings/uniffi-bindgen/Cargo.lock"]);
+        let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+        std::fs::create_dir_all(path.join("bindings/uniffi-bindgen")).unwrap();
+        std::fs::write(
+            path.join("bindings/uniffi-bindgen/Cargo.lock"),
+            "# generated\n",
+        )
+        .unwrap();
+
+        repo.require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .expect("a path the project ignores is the call's own output");
+    }
+
+    #[test]
+    fn an_attribute_file_under_build_output_is_not_a_filter_change() {
+        let (_fixture, repo, path, _initial) = review_fixture("ignored-attributes", 941);
+        exclude_paths(&repo, &["target/"]);
+        let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+        std::fs::create_dir_all(path.join("target/package")).unwrap();
+        std::fs::write(path.join("target/package/.gitattributes"), "* -text\n").unwrap();
+
+        repo.require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .expect("an ignored attribute file governs only ignored paths");
+    }
+
+    /// Two reviewers share one checkout. The marker written when the first
+    /// one's answer was refused used to be a brand new untracked file in the
+    /// snapshot the second one was compared against.
+    #[test]
+    fn a_recovery_marker_is_not_a_change_to_the_worktree() {
+        let (_fixture, repo, path, _initial) = review_fixture("marker-snapshot", 942);
+        let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+        let _ = uncertain_worktree_change(&path, "an earlier call was refused");
+
+        repo.require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .expect("spar's own marker is not something a call did");
+    }
+
+    #[test]
+    fn a_path_that_vanishes_between_listing_and_stat_does_not_fail_the_probe() {
+        let (_fixture, _repo, path, _initial) = review_fixture("vanishing-path", 943);
+
+        let gone = ignored_file_fingerprint(&path.join("deleted-mid-build"))
+            .expect("a path a build removed is not an unreadable worktree");
+
+        assert_eq!(vanished_untracked_file(), gone);
+    }
+
+    /// A path that goes is still a path that was there. Dropping it from the
+    /// snapshot would let it pass for one the call never touched.
+    #[test]
+    fn a_vanished_path_is_not_recorded_as_absent() {
+        let (_fixture, repo, path, _initial) = review_fixture("vanished-not-absent", 944);
+        std::fs::write(path.join("notes.txt"), "before\n").unwrap();
+        let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+        std::fs::remove_file(path.join("notes.txt")).unwrap();
+
+        let error = repo
+            .require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+    }
+
     fn exclude_paths(repo: &Repo, lines: &[&str]) {
         use std::io::Write;
         let path = repo.root().join(".git").join("info").join("exclude");

@@ -336,7 +336,7 @@ impl IgnoredState {
             {
                 return false;
             }
-            !(is_generated_artifact(path) && self.disposable(path) && after.disposable(path))
+            !self.generated_move(after, path)
         })
     }
 
@@ -365,11 +365,28 @@ impl IgnoredState {
             {
                 return false;
             }
-            if is_generated_artifact(path) && self.disposable(path) && after.disposable(path) {
+            if self.generated_move(after, path) {
                 return false;
             }
             self.files.contains_key(path) || !after.is_ignored(path)
         })
+    }
+
+    /// Whether what happened at `path` between these two states is a build or
+    /// cache directory doing its job, rather than a change a person would miss.
+    ///
+    /// Removal counts, on either side. A compiler that keeps an incremental
+    /// cache does not only add and rewrite: it finalizes a new session
+    /// directory and deletes the one it superseded, lock file and all. A rule
+    /// that forgave creation and rewriting but not removal therefore passed the
+    /// first build in a fresh worktree and failed the second one, which is the
+    /// build a reviewer runs to check a finding. Two of these rules disagreeing
+    /// about the same directory is what cost the run: the read-only check
+    /// forgave the deleted session and the commit-side check called it
+    /// unrepresentable, so the work was already on a pull request when the run
+    /// ended. There is one rule now, and this is it.
+    fn generated_move(&self, after: &Self, path: &Path) -> bool {
+        is_generated_artifact(path) && self.disposable(path) && after.disposable(path)
     }
 
     /// Whether this state has nothing at `path` worth keeping: either the path
@@ -389,15 +406,18 @@ impl IgnoredState {
 struct GeneratedArtifacts {
     new_paths: BTreeSet<PathBuf>,
     changed_paths: BTreeSet<PathBuf>,
+    removed_paths: BTreeSet<PathBuf>,
 }
 
 impl GeneratedArtifacts {
-    fn left(&mut self, paths: Vec<PathBuf>) {
-        self.new_paths.extend(paths);
+    fn left(&mut self, allowed: AllowedArtifacts) {
+        self.new_paths.extend(allowed.present);
+        self.removed_paths.extend(allowed.removed);
     }
 
-    fn changed(&mut self, paths: Vec<PathBuf>) {
-        self.changed_paths.extend(paths);
+    fn changed(&mut self, allowed: AllowedArtifacts) {
+        self.changed_paths.extend(allowed.present);
+        self.removed_paths.extend(allowed.removed);
     }
 
     /// Said once, and not as a warning. The files stay out of the commit,
@@ -420,6 +440,32 @@ impl GeneratedArtifacts {
                 cwd.display()
             );
         }
+        if !self.removed_paths.is_empty() {
+            logdim!(
+                "the editing call removed {} generated artifact(s) under a known build or cache \
+                 directory in {}. Whatever wrote them writes them again.",
+                self.removed_paths.len(),
+                cwd.display()
+            );
+        }
+    }
+}
+
+/// Recognized build and cache output a check let through, split by whether it
+/// is still on disk, so the report can say what happened rather than call a
+/// deleted incremental session a file that was left behind.
+#[derive(Default)]
+struct AllowedArtifacts {
+    present: Vec<PathBuf>,
+    removed: Vec<PathBuf>,
+}
+
+impl AllowedArtifacts {
+    fn split(paths: Vec<PathBuf>, after: &IgnoredState) -> Self {
+        let (present, removed) = paths
+            .into_iter()
+            .partition(|path| after.files.contains_key(path));
+        Self { present, removed }
     }
 }
 
@@ -2361,7 +2407,7 @@ impl Repo {
         &self,
         cwd: &Path,
         baseline: &WorktreeBaseline,
-    ) -> Result<Vec<PathBuf>> {
+    ) -> Result<AllowedArtifacts> {
         self.check_new_ignored_files(cwd, baseline)
     }
 
@@ -2369,7 +2415,7 @@ impl Repo {
         &self,
         cwd: &Path,
         baseline: &WorktreeBaseline,
-    ) -> Result<Vec<PathBuf>> {
+    ) -> Result<AllowedArtifacts> {
         self.refuse_changed_attributes(cwd, baseline)?;
         let after = ignored_untracked_state(cwd).map_err(|e| {
             uncertain_worktree_change(
@@ -2384,13 +2430,13 @@ impl Repo {
         })?;
         let changed = baseline.ignored_untracked.changed_paths(&after);
         if changed.is_empty() {
-            return Ok(Vec::new());
+            return Ok(AllowedArtifacts::default());
         }
         let (generated, changed): (Vec<_>, Vec<_>) = changed
             .into_iter()
-            .partition(|path| after.is_ignored(path) && is_generated_artifact(path));
+            .partition(|path| baseline.ignored_untracked.generated_move(&after, path));
         if changed.is_empty() {
-            return Ok(generated);
+            return Ok(AllowedArtifacts::split(generated, &after));
         }
         let mut listed = changed
             .iter()
@@ -2430,7 +2476,7 @@ impl Repo {
         &self,
         cwd: &Path,
         baseline: &WorktreeBaseline,
-    ) -> Result<Vec<PathBuf>> {
+    ) -> Result<AllowedArtifacts> {
         self.check_changed_existing_untracked(cwd, baseline)
     }
 
@@ -2438,7 +2484,7 @@ impl Repo {
         &self,
         cwd: &Path,
         baseline: &WorktreeBaseline,
-    ) -> Result<Vec<PathBuf>> {
+    ) -> Result<AllowedArtifacts> {
         self.refuse_changed_attributes(cwd, baseline)?;
         let after = ignored_untracked_state(cwd).map_err(|e| {
             uncertain_worktree_change(
@@ -2453,15 +2499,13 @@ impl Repo {
         })?;
         let changed = baseline.ignored_untracked.changed_existing_paths(&after);
         if changed.is_empty() {
-            return Ok(Vec::new());
+            return Ok(AllowedArtifacts::default());
         }
-        let (generated, changed): (Vec<_>, Vec<_>) = changed.into_iter().partition(|path| {
-            baseline.ignored_untracked.is_ignored(path)
-                && after.is_ignored(path)
-                && is_generated_artifact(path)
-        });
+        let (generated, changed): (Vec<_>, Vec<_>) = changed
+            .into_iter()
+            .partition(|path| baseline.ignored_untracked.generated_move(&after, path));
         if changed.is_empty() {
-            return Ok(generated);
+            return Ok(AllowedArtifacts::split(generated, &after));
         }
         let mut listed = changed
             .iter()
@@ -7996,6 +8040,45 @@ mod tests {
         for line in lines {
             writeln!(file, "{line}").unwrap();
         }
+    }
+
+    #[test]
+    fn a_replaced_generated_session_does_not_stop_a_managed_commit() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("rebuilt-commit", 942);
+        exclude_paths(&repo, &["dist/"]);
+        std::fs::create_dir_all(path.join("dist/session-old")).unwrap();
+        std::fs::write(path.join("dist/session-old/dep-graph.bin"), "old\n").unwrap();
+        let baseline = repo.worktree_baseline(&path).unwrap();
+        std::fs::write(path.join("README.md"), "tracked change\n").unwrap();
+        std::fs::remove_dir_all(path.join("dist/session-old")).unwrap();
+        std::fs::create_dir_all(path.join("dist/session-new")).unwrap();
+        std::fs::write(path.join("dist/session-new/dep-graph.bin"), "new\n").unwrap();
+
+        assert!(repo
+            .commit_pending_changes(&path, &baseline, "change readme", "change readme")
+            .unwrap());
+        assert_eq!(
+            "tracked change\n",
+            std::fs::read_to_string(path.join("README.md")).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_rebuild_that_replaces_a_generated_session_does_not_stop_a_call() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("rebuilt-session", 941);
+        exclude_paths(&repo, &["dist/"]);
+        std::fs::create_dir_all(path.join("dist/session-old")).unwrap();
+        std::fs::write(path.join("dist/session-old/dep-graph.bin"), "old\n").unwrap();
+        std::fs::write(path.join("dist/session-old.lock"), "").unwrap();
+        let baseline = repo.worktree_baseline(&path).unwrap();
+        std::fs::remove_dir_all(path.join("dist/session-old")).unwrap();
+        std::fs::remove_file(path.join("dist/session-old.lock")).unwrap();
+        std::fs::create_dir_all(path.join("dist/session-new")).unwrap();
+        std::fs::write(path.join("dist/session-new/dep-graph.bin"), "new\n").unwrap();
+
+        repo.refuse_new_ignored_files(&path, &baseline).unwrap();
+        repo.refuse_changed_existing_untracked(&path, &baseline)
+            .unwrap();
     }
 
     #[test]

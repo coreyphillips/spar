@@ -147,6 +147,13 @@ the right thing whether 42 is an untouched issue, an issue that already has a
 pull request open, or a pull request. Omit the numbers and `run` takes every open
 issue while `resume` takes every open PR.
 
+Work already on a pull request goes first. Name a pull request alongside some
+issues and it is continued before triage runs, rather than after every issue has
+been through its own implement and review loop, because finishing what is in
+flight beats starting something new. Name both a pull request and the issue it
+closes and that is one piece of work, not two: the issue is dropped from the
+queue and the pull request carries it.
+
 ```bash
 spar run                    # triage every open issue, then work them in order
 spar run 42 51 60           # or name the ones you care about

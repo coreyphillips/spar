@@ -96,6 +96,28 @@ pub(crate) fn is_spar_marker(path: &Path) -> bool {
     name == EDITED_GIT_MARKER || name.starts_with(RECOVERY_MARKER_PREFIX)
 }
 
+/// Whether `path` is somewhere SPAR writes in the repository it is driving.
+///
+/// The markers are one part of it. The other is the run state under `.spar/`,
+/// which SPAR rewrites while a call it started is still running: recording the
+/// branches it created during a parallel triage is enough to make both agents
+/// look like they changed the tree they were told only to read. SPAR's own
+/// bookkeeping is not evidence about an agent, so it never enters the snapshot
+/// a call is compared against.
+///
+/// `.spar-worktrees/` is deliberately not here. A resident worktree enters the
+/// snapshot as one ignored entry so that another run's churn inside it does not
+/// disturb this baseline, while deleting the whole checkout still does.
+pub(crate) fn is_spar_own_path(path: &Path) -> bool {
+    if is_spar_marker(path) {
+        return true;
+    }
+    let Some(std::path::Component::Normal(name)) = path.components().next() else {
+        return false;
+    };
+    name == OsStr::new(STATE_DIR)
+}
+
 /// How many names one part of a split may be tried on before giving up. High
 /// enough that nobody reaches it by splitting the same pull request again, low
 /// enough that a repository where every name is taken says so rather than
@@ -340,8 +362,8 @@ impl IgnoredState {
         })
     }
 
-    /// Whether a read-only call left anything behind that is not its own
-    /// output.
+    /// What a read-only call left behind, split by whether it condemns the
+    /// answer.
     ///
     /// `changed_beyond_generated` answers this from a list of directory names,
     /// which is a guess about where a build writes. The repository already
@@ -351,25 +373,39 @@ impl IgnoredState {
     /// `target/`, and both agents lost an hour of work to a path Git had been
     /// told to disown.
     ///
-    /// Only creation is forgiven, and only of a path Git reports as ignored.
-    /// Rewriting or deleting something that was already there stays exactly as
-    /// fatal as before, because that is where a person's `.env` or saved log
-    /// lives, and an ordinary untracked file still fails, because a reviewer
-    /// was asked to keep its scratch out of the tree.
-    pub(crate) fn changed_beyond_ignored(&self, after: &Self) -> bool {
+    /// Forgiving only the creation of such a path was not enough, because the
+    /// call is not the only writer. A read-only call runs for minutes in the
+    /// primary checkout, which is a live desk: Finder rewrites `.DS_Store`, an
+    /// editor rewrites its own state, and a triage that asks two agents at once
+    /// compares both of them against that same directory. One ambient write
+    /// discarded two good answers and ended the run with nothing scheduled. So
+    /// a path the project ignores is out of scope however it moved, and what
+    /// remains fatal is what the call was actually asked about: the tracked
+    /// tree, and any ordinary untracked file, because a reviewer was told to
+    /// keep its scratch out of the worktree.
+    ///
+    /// Nothing is silent. A tolerated path that is not recognized build output
+    /// is named by the caller, so an agent that rewrote a person's `.env` is
+    /// reported rather than hidden. That is the trade this makes: the answer of
+    /// a call that never commits is worth more than the guarantee, and the
+    /// warning carries what the guarantee used to.
+    pub(crate) fn read_only_leavings(&self, after: &Self) -> ReadOnlyLeavings {
         let mut paths: BTreeSet<&PathBuf> = self.files.keys().collect();
         paths.extend(after.files.keys());
-        paths.into_iter().any(|path| {
+        let mut leavings = ReadOnlyLeavings::default();
+        for path in paths {
             if self.files.get(path) == after.files.get(path)
                 && self.is_ignored(path) == after.is_ignored(path)
             {
-                return false;
+                continue;
             }
-            if self.generated_move(after, path) {
-                return false;
+            if !self.disposable_move(after, path) {
+                leavings.condemning.push(path.clone());
+            } else if !is_generated_artifact(path) {
+                leavings.tolerated.push(path.clone());
             }
-            self.files.contains_key(path) || !after.is_ignored(path)
-        })
+        }
+        leavings
     }
 
     /// Whether what happened at `path` between these two states is a build or
@@ -386,7 +422,13 @@ impl IgnoredState {
     /// unrepresentable, so the work was already on a pull request when the run
     /// ended. There is one rule now, and this is it.
     fn generated_move(&self, after: &Self, path: &Path) -> bool {
-        is_generated_artifact(path) && self.disposable(path) && after.disposable(path)
+        is_generated_artifact(path) && self.disposable_move(after, path)
+    }
+
+    /// Whether neither state has anything at `path` worth keeping, so whatever
+    /// happened there took nothing with it.
+    fn disposable_move(&self, after: &Self, path: &Path) -> bool {
+        self.disposable(path) && after.disposable(path)
     }
 
     /// Whether this state has nothing at `path` worth keeping: either the path
@@ -394,6 +436,115 @@ impl IgnoredState {
     fn disposable(&self, path: &Path) -> bool {
         !self.files.contains_key(path) || self.is_ignored(path)
     }
+}
+
+impl GitState {
+    /// What moved between two states, said so a person can act on it.
+    ///
+    /// The guards that compare these used to report only that the worktree had
+    /// changed, which left the one question worth answering, which file, to a
+    /// `git status` run by hand against a tree that had moved on since.
+    pub(crate) fn describe_difference(&self, after: &Self) -> Option<String> {
+        let mut prefixes: BTreeSet<&PathBuf> = self.repositories.keys().collect();
+        prefixes.extend(after.repositories.keys());
+        let mut notes: Vec<String> = Vec::new();
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for prefix in prefixes {
+            let label = describe_repository(prefix);
+            match (
+                self.repositories.get(prefix),
+                after.repositories.get(prefix),
+            ) {
+                (None, Some(_)) => notes.push(format!("a repository appeared at {label}")),
+                (Some(_), None) => notes.push(format!("the repository at {label} is gone")),
+                (Some(before), Some(current)) => {
+                    if before.head != current.head {
+                        notes.push(format!("HEAD moved in {label}"));
+                    }
+                    if before.unsafe_index_flags != current.unsafe_index_flags {
+                        notes.push(format!("index flags changed in {label}"));
+                    }
+                    paths.extend(
+                        differing_keys(&before.gitlinks, &current.gitlinks)
+                            .chain(differing_keys(&before.tracked, &current.tracked))
+                            .map(|path| prefix.join(path)),
+                    );
+                }
+                (None, None) => {}
+            }
+        }
+        if !paths.is_empty() {
+            paths.sort();
+            paths.dedup();
+            notes.push(format!("tracked file(s) changed: {}", list_paths(&paths)));
+        }
+        (!notes.is_empty()).then(|| notes.join("; "))
+    }
+}
+
+/// Name a repository inside a state for a report. The root carries an empty
+/// prefix, and calling that "" helps nobody.
+fn describe_repository(prefix: &Path) -> String {
+    if prefix.as_os_str().is_empty() {
+        "the worktree".to_string()
+    } else {
+        format!("the submodule at {:?}", prefix.as_os_str())
+    }
+}
+
+/// The keys whose values differ between two maps, present on either side.
+fn differing_keys<'a, V: PartialEq>(
+    before: &'a BTreeMap<PathBuf, V>,
+    after: &'a BTreeMap<PathBuf, V>,
+) -> impl Iterator<Item = &'a PathBuf> {
+    let mut keys: BTreeSet<&'a PathBuf> = before.keys().collect();
+    keys.extend(after.keys());
+    keys.into_iter()
+        .filter(move |key| before.get(*key) != after.get(*key))
+}
+
+/// What a read-only call left in the untracked and ignored tree.
+///
+/// Split rather than reduced to a yes or no, because the two halves are
+/// answered differently: one ends the call, the other is said out loud and the
+/// answer is kept.
+#[derive(Default)]
+pub(crate) struct ReadOnlyLeavings {
+    /// Disposable on both sides, so out of scope for a call that only read.
+    /// Recognized build output is left out: rebuilding is what a reviewer was
+    /// asked to do, and nothing reports it today.
+    pub(crate) tolerated: Vec<PathBuf>,
+    /// Everything else. The answer does not survive these.
+    pub(crate) condemning: Vec<PathBuf>,
+}
+
+/// Put two accounts of what moved into one sentence, keeping whichever of them
+/// there is. Both guards that report a changed worktree ask the tracked tree
+/// and the untracked tree separately, and either can be the only answer.
+pub(crate) fn join_reasons(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (None, None) => None,
+        (Some(one), None) | (None, Some(one)) => Some(one),
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+    }
+}
+
+/// Name some paths for a person, without printing a build directory at them.
+///
+/// Every report of a path that stopped or was let through a call goes through
+/// this, so an error and the warning beside it read alike.
+pub(crate) fn list_paths(paths: &[PathBuf]) -> String {
+    const SHOWN: usize = 5;
+    let mut listed = paths
+        .iter()
+        .take(SHOWN)
+        .map(|path| format!("{:?}", path.as_os_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if paths.len() > SHOWN {
+        listed.push_str(&format!(", and {} more", paths.len() - SHOWN));
+    }
+    listed
 }
 
 /// Build output one commit attempt let through, gathered for a single report.
@@ -2369,21 +2520,37 @@ impl Repo {
                 ),
             )
         })?;
-        if git_state != checkpoint.git_state
-            || checkpoint
-                .ignored_untracked
-                .changed_beyond_ignored(&ignored)
-        {
-            return Err(uncertain_worktree_change(
-                cwd,
-                format!(
-                    "the {label} at {} changed during a read-only inspection. It was kept for \
-                     recovery.",
-                    cwd.display()
-                ),
-            ));
+        let leavings = checkpoint.ignored_untracked.read_only_leavings(&ignored);
+        // Said even when the inspection is accepted, for the same reason it is
+        // said on an agent call: a path the project ignores is out of scope,
+        // not unnoticed.
+        if !leavings.tolerated.is_empty() {
+            logwarn!(
+                "a read-only inspection left {} ignored file(s) changed in the {label} at {}: {}. \
+                 The inspection was accepted; the project ignores these paths.",
+                leavings.tolerated.len(),
+                cwd.display(),
+                list_paths(&leavings.tolerated)
+            );
         }
-        Ok(())
+        let tracked = checkpoint.git_state.describe_difference(&git_state);
+        let untracked = (!leavings.condemning.is_empty()).then(|| {
+            format!(
+                "untracked file(s) changed: {}",
+                list_paths(&leavings.condemning)
+            )
+        });
+        let Some(reason) = join_reasons(tracked, untracked) else {
+            return Ok(());
+        };
+        Err(uncertain_worktree_change(
+            cwd,
+            format!(
+                "the {label} at {} changed during a read-only inspection: {reason}. It was kept \
+                 for recovery.",
+                cwd.display()
+            ),
+        ))
     }
 
     /// Refuse to discard ignored files that appeared during a call.
@@ -2438,15 +2605,7 @@ impl Repo {
         if changed.is_empty() {
             return Ok(AllowedArtifacts::split(generated, &after));
         }
-        let mut listed = changed
-            .iter()
-            .take(5)
-            .map(|path| format!("{:?}", path.as_os_str()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        if changed.len() > 5 {
-            listed.push_str(&format!(", and {} more", changed.len() - 5));
-        }
+        let listed = list_paths(&changed);
         Err(uncertain_worktree_change(
             cwd,
             format!(
@@ -2507,15 +2666,7 @@ impl Repo {
         if changed.is_empty() {
             return Ok(AllowedArtifacts::split(generated, &after));
         }
-        let mut listed = changed
-            .iter()
-            .take(5)
-            .map(|path| format!("{:?}", path.as_os_str()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        if changed.len() > 5 {
-            listed.push_str(&format!(", and {} more", changed.len() - 5));
-        }
+        let listed = list_paths(&changed);
         Err(uncertain_worktree_change(
             cwd,
             format!(
@@ -2685,15 +2836,7 @@ impl Repo {
         if changed.is_empty() {
             return Ok(());
         }
-        let mut listed = changed
-            .iter()
-            .take(5)
-            .map(|path| format!("{:?}", path.as_os_str()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        if changed.len() > 5 {
-            listed.push_str(&format!(", and {} more", changed.len() - 5));
-        }
+        let listed = list_paths(&changed);
         Err(uncertain_worktree_change(
             cwd,
             format!(
@@ -2765,12 +2908,7 @@ impl Repo {
         artifacts.left(self.allow_generated_ignored_files(cwd, baseline)?);
         let changed_gitlinks = changed_staged_gitlinks(cwd)?;
         if !changed_gitlinks.is_empty() {
-            let listed = changed_gitlinks
-                .iter()
-                .take(5)
-                .map(|path| format!("{:?}", path.as_os_str()))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let listed = list_paths(&changed_gitlinks);
             bail!(
                 "the editing call added or changed a gitlink at {listed}. It was staged but not \
                  committed because the referenced repository objects might exist only inside \
@@ -5092,7 +5230,7 @@ fn collect_untracked_files(
     {
         let (relative, nested) = untracked_record(raw, "untracked")?;
         let from_root = prefix.join(&relative);
-        if is_spar_marker(&from_root) {
+        if is_spar_own_path(&from_root) {
             continue;
         }
         let absolute = root.join(&from_root);
@@ -5136,7 +5274,7 @@ fn collect_untracked_files(
     {
         let (relative, nested) = untracked_record(raw, "ignored")?;
         let from_root = prefix.join(relative);
-        if is_spar_marker(&from_root) {
+        if is_spar_own_path(&from_root) {
             continue;
         }
         if let std::collections::btree_map::Entry::Vacant(slot) = files.entry(from_root.clone()) {
@@ -7584,6 +7722,11 @@ mod tests {
     }
 
     #[test]
+    /// The checkpoint no longer refuses this: a path the project ignores is out
+    /// of scope for a call that only read. What keeps the file is the gate that
+    /// actually deletes the checkout, which refuses any ignored file outside a
+    /// known build directory. That is the check with the stake in it, and it is
+    /// the one that has to hold.
     fn a_preexisting_ignored_review_file_change_is_retained() {
         let (_fixture, repo, path, _initial) = review_fixture("changed-existing-ignored", 905);
         std::fs::create_dir_all(path.join("generated")).unwrap();
@@ -7596,7 +7739,8 @@ mod tests {
             .release_review_worktree_checked(905, &checkpoint)
             .unwrap_err();
 
-        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert!(error.to_string().contains("recoverable"), "{error}");
+        assert!(path.exists());
         assert_eq!("after!\n", std::fs::read_to_string(&ignored).unwrap());
         repo.release_review_worktree(905);
     }
@@ -8126,18 +8270,79 @@ mod tests {
     }
 
     #[test]
-    fn a_read_only_inspection_may_not_change_an_ignored_file_elsewhere() {
+    fn a_read_only_inspection_may_change_an_ignored_file_elsewhere() {
         let (_fixture, repo, path, _checkpoint) = review_fixture("inspect-local", 938);
         exclude_paths(&repo, &["dist/", ".env.local"]);
         std::fs::write(path.join(".env.local"), "TOKEN=before\n").unwrap();
         let checkpoint = repo.worktree_checkpoint(&path).unwrap();
         std::fs::write(path.join(".env.local"), "TOKEN=after\n").unwrap();
 
+        repo.require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .unwrap();
+    }
+
+    #[test]
+    fn a_read_only_inspection_may_delete_an_ignored_file_elsewhere() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("inspect-deleted", 939);
+        exclude_paths(&repo, &["dist/", ".env.local"]);
+        std::fs::write(path.join(".env.local"), "TOKEN=before\n").unwrap();
+        let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+        std::fs::remove_file(path.join(".env.local")).unwrap();
+
+        repo.require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .unwrap();
+    }
+
+    #[test]
+    fn a_read_only_inspection_may_not_change_an_ordinary_untracked_file() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("inspect-ordinary", 940);
+        exclude_paths(&repo, &["dist/"]);
+        std::fs::write(path.join("notes.md"), "before\n").unwrap();
+        let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+        std::fs::write(path.join("notes.md"), "after\n").unwrap();
+
         let error = repo
             .require_unchanged_worktree(&path, &checkpoint, "review worktree")
             .unwrap_err();
 
         assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert!(error.to_string().contains("notes.md"), "{error}");
+    }
+
+    #[test]
+    fn an_ignored_file_that_becomes_ordinary_stops_a_read_only_inspection() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("inspect-unignored", 941);
+        exclude_paths(&repo, &["dist/", "local.env"]);
+        std::fs::write(path.join("local.env"), "TOKEN=before\n").unwrap();
+        let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+        // Stop ignoring it, so the same bytes are now an ordinary untracked
+        // file. What a path is counts, not only whether it moved.
+        std::fs::write(
+            repo.root().join(".git").join("info").join("exclude"),
+            "dist/\n",
+        )
+        .unwrap();
+
+        let error = repo
+            .require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert!(error.to_string().contains("local.env"), "{error}");
+    }
+
+    #[test]
+    fn a_read_only_inspection_names_the_tracked_file_that_moved() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("inspect-tracked", 942);
+        let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+        std::fs::write(path.join("README.md"), "recover me\n").unwrap();
+
+        let error = repo
+            .require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert!(error.to_string().contains("README.md"), "{error}");
     }
 
     #[test]

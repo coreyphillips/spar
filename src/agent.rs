@@ -17,9 +17,9 @@ use crate::error::{ErrorKind, Result, SparError};
 use crate::jsonx;
 use crate::proc::{self, ExecOpts};
 use crate::repo::{
-    attribute_state, git_state, ignored_untracked_state, probe_again_on_failure, safe_git_state,
-    uncertain_worktree_change, AttributeState, GitState, IgnoredState,
-    EDITED_GIT_MARKER as GIT_MARKER_RECOVERY,
+    attribute_state, git_state, ignored_untracked_state, join_reasons, list_paths,
+    probe_again_on_failure, safe_git_state, uncertain_worktree_change, AttributeState, GitState,
+    IgnoredState, EDITED_GIT_MARKER as GIT_MARKER_RECOVERY,
 };
 use crate::{bail, log, logdim, logwarn, spar_err};
 
@@ -933,7 +933,9 @@ impl EditBaseline {
         })
     }
 
-    fn recovery_needed(&self, cwd: &Path, access: Access) -> Result<bool> {
+    /// What the call left behind, named, or `None` when the tree is where it
+    /// was. `Err` means the question could not be answered at all.
+    fn recovery_needed(&self, cwd: &Path, access: Access) -> Result<Option<String>> {
         if !self.git_entry.still_matches(cwd)? {
             return Err(uncertain_worktree_change(
                 cwd,
@@ -974,10 +976,33 @@ impl EditBaseline {
         // editing call is held to the stricter rule, because what it writes is
         // about to be staged.
         let untracked = match access {
-            Access::Read => self.ignored_untracked.changed_beyond_ignored(&ignored),
-            Access::Edit => self.ignored_untracked.changed_beyond_generated(&ignored),
+            Access::Read => {
+                let leavings = self.ignored_untracked.read_only_leavings(&ignored);
+                // Said even when the call is kept. This is the whole price of
+                // letting an ignored path move: somebody has to hear about it.
+                if !leavings.tolerated.is_empty() {
+                    logwarn!(
+                        "a read-only call left {} ignored file(s) changed in {}: {}. The answer \
+                         was kept; the project ignores these paths.",
+                        leavings.tolerated.len(),
+                        cwd.display(),
+                        list_paths(&leavings.tolerated)
+                    );
+                }
+                (!leavings.condemning.is_empty()).then(|| {
+                    format!(
+                        "untracked file(s) changed: {}",
+                        list_paths(&leavings.condemning)
+                    )
+                })
+            }
+            Access::Edit => self
+                .ignored_untracked
+                .changed_beyond_generated(&ignored)
+                .then(|| "untracked or ignored file(s) changed".to_string()),
         };
-        Ok(current != self.git_state || untracked)
+        let tracked = self.git_state.describe_difference(&current);
+        Ok(join_reasons(tracked, untracked))
     }
 }
 
@@ -1076,13 +1101,13 @@ fn recovery_error(
     }
     let baseline = baseline?;
     match baseline.recovery_needed(cwd, access) {
-        Ok(false) => None,
-        Ok(true) if access == Access::Edit => Some(changed_edit_failure(error)),
-        Ok(true) => Some(uncertain_worktree_change(
+        Ok(None) => None,
+        Ok(Some(_)) if access == Access::Edit => Some(changed_edit_failure(error)),
+        Ok(Some(reason)) => Some(uncertain_worktree_change(
             cwd,
             format!(
-                "{}\nA read-only call changed the worktree before it failed. Its answer was \
-                 discarded and the worktree was kept for recovery.",
+                "{}\nA read-only call changed the worktree before it failed: {reason}. Its \
+                 answer was discarded and the worktree was kept for recovery.",
                 error.message()
             ),
         )),
@@ -1127,11 +1152,13 @@ fn finish_call<T>(
         ));
     }
     match baseline.recovery_needed(cwd, access) {
-        Ok(false) => Ok(value),
-        Ok(true) => Err(uncertain_worktree_change(
+        Ok(None) => Ok(value),
+        Ok(Some(reason)) => Err(uncertain_worktree_change(
             cwd,
-            "a read-only call changed the worktree. Its answer was discarded and the worktree \
-             was kept for recovery.",
+            format!(
+                "a read-only call changed the worktree: {reason}. Its answer was discarded and \
+                 the worktree was kept for recovery."
+            ),
         )),
         Err(error) => Err(error),
     }
@@ -2519,7 +2546,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_that_rewrites_an_existing_ignored_file_elsewhere_is_discarded() {
+    fn a_read_that_rewrites_an_existing_ignored_file_elsewhere_is_kept() {
         let dir = built_repo("successful-read-existing-ignored");
         std::fs::write(dir.join("local.env"), "TOKEN=before\n").unwrap();
         let agent = Agent::with_bin(
@@ -2530,14 +2557,72 @@ mod tests {
             "/bin/sh",
         );
 
-        let err = agent.ask("read it", &dir, &Effort::default()).unwrap_err();
+        let answer = agent
+            .ask("read it", &dir, &Effort::default())
+            .expect("answer kept");
 
-        assert_eq!(ErrorKind::UncertainWrite, err.kind());
-        assert!(err.message().contains("read-only call"), "{err}");
+        assert_eq!("reviewed", answer.trim());
         assert_eq!(
             "TOKEN=after\n",
             std::fs::read_to_string(dir.join("local.env")).unwrap()
         );
+        assert!(
+            !std::fs::read_dir(&dir).unwrap().flatten().any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".spar-recovery-needed-"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_that_deletes_an_existing_ignored_file_is_kept() {
+        let dir = built_repo("successful-read-deleted-ignored");
+        std::fs::write(dir.join("local.env"), "TOKEN=before\n").unwrap();
+        let agent = Agent::with_bin(shell("reader", "rm local.env; echo reviewed"), "/bin/sh");
+
+        let answer = agent
+            .ask("read it", &dir, &Effort::default())
+            .expect("answer kept");
+
+        assert_eq!("reviewed", answer.trim());
+        assert!(!dir.join("local.env").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_that_rewrites_an_existing_ordinary_untracked_file_is_discarded() {
+        let dir = built_repo("successful-read-existing-ordinary");
+        std::fs::write(dir.join("notes.md"), "before\n").unwrap();
+        let agent = Agent::with_bin(
+            shell("reader", "printf 'after\n' > notes.md; echo reviewed"),
+            "/bin/sh",
+        );
+
+        let err = agent.ask("read it", &dir, &Effort::default()).unwrap_err();
+
+        assert_eq!(ErrorKind::UncertainWrite, err.kind());
+        assert!(err.message().contains("read-only call"), "{err}");
+        assert!(err.message().contains("notes.md"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_that_writes_under_spars_own_state_is_not_a_change() {
+        let dir = built_repo("successful-read-spar-state");
+        let agent = Agent::with_bin(
+            shell(
+                "reader",
+                "mkdir -p .spar/state; printf '[]' > .spar/state/spend.json; echo reviewed",
+            ),
+            "/bin/sh",
+        );
+
+        let answer = agent
+            .ask("read it", &dir, &Effort::default())
+            .expect("answer kept");
+
+        assert_eq!("reviewed", answer.trim());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2557,6 +2642,7 @@ mod tests {
 
         assert_eq!(ErrorKind::UncertainWrite, err.kind());
         assert!(err.message().contains("read-only call"), "{err}");
+        assert!(err.message().contains("README.md"), "{err}");
         assert_eq!(
             "recover me\n",
             std::fs::read_to_string(dir.join("README.md")).unwrap()

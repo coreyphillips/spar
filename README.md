@@ -1127,12 +1127,23 @@ read, they are left out of the commit, and they do not keep a finished worktree
 from being removed, since whatever wrote them writes them again.
 
 A call asked only to read is held to a rule of its own, because it has no commit
-to protect. Creating a file the project ignores never fails it, wherever that
-file sits, since the repository's ignore rules are the project's own account of
-what its build writes and a list of directory names can only ever approximate
-them. Rewriting or deleting an ignored file that was already there does fail it,
-and so does an ordinary untracked file or a repository nested in the output. On
-an editing call all of those still stop the commit and keep the worktree.
+to protect. A file the project ignores is out of scope however it moved, whether
+the call created it, rewrote it, or deleted it, since the repository's ignore
+rules are the project's own account of what its build writes and a list of
+directory names can only ever approximate them. What still fails such a call is
+what it was actually asked about: the tracked tree, an ordinary untracked file,
+or a repository nested in the output. On an editing call all of those still stop
+the commit and keep the worktree.
+
+The read-only rule is that wide because the call is not the only writer. Triage
+runs for minutes in your primary checkout, where Finder rewrites `.DS_Store` and
+an editor rewrites its own state, and it asks both agents at once against that
+same directory, so one ambient write used to discard two good answers and end the
+run with nothing scheduled. Nothing is silent, though: an ignored path that moved
+and is not recognized build output is named in a warning, and every error that
+does stop a call now names the paths that stopped it. spar leaves its own run
+state under `.spar/` out of the comparison entirely, since writing it mid-run is
+spar's doing rather than an agent's.
 
 Include `{schema}` or `{schema_file}` and spar uses the CLI's native structured
 output. This is worth doing rather than optional: without it spar asks for JSON

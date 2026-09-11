@@ -1250,7 +1250,7 @@ fn review_loop(
             }
         }
         repo.refuse_unrepresented_tracked_changes(&ctx.work_dir, &review_baseline)?;
-        repo.refuse_new_ignored_files(&ctx.work_dir, &review_baseline)?;
+        repo.refuse_read_only_leavings(&ctx.work_dir, &review_baseline)?;
         let review = review?;
         if repo.has_uncommitted_changes(&ctx.work_dir)? {
             bail!(
@@ -1687,7 +1687,7 @@ fn close_out(
         }
     }
     repo.refuse_unrepresented_tracked_changes(&ctx.work_dir, &closing_baseline)?;
-    repo.refuse_new_ignored_files(&ctx.work_dir, &closing_baseline)?;
+    repo.refuse_read_only_leavings(&ctx.work_dir, &closing_baseline)?;
     if repo.has_uncommitted_changes(&ctx.work_dir)? {
         bail!(
             "{}: {holder} left uncommitted files during the closing pass. They were kept at {} \

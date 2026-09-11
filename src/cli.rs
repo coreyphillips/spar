@@ -1,6 +1,6 @@
 //! The command line.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -32,8 +32,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
     about = "Two coding agents alternate implementing and reviewing GitHub issues.",
     long_about = "Two coding agents alternate implementing and reviewing GitHub issues until a \
                   pull request converges. Neither agent reviews its own most recent edit.\n\n\
-                  Arguments are issue numbers for `run` and `triage`, and pull request numbers \
-                  for `resume`, `review`, and `checkin`. `split` takes either. Omit them and \
+                  Arguments are issue numbers for `triage`, and pull request numbers \
+                  for `resume`, `review`, and `checkin`. `run` and `split` take either: `run` \
+                  continues any pull request given before it triages the issues, and drops an \
+                  issue whose pull request was given too. Omit them and \
                   spar takes everything open, up to --limit. `split` applies that limit once to \
                   issues and once to pull requests. `followup` takes none: it works the queue in \
                   .spar/followups.md, and an entry there has no number to name.",
@@ -623,22 +625,49 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let mut results = Vec::new();
             let mut stopped = Vec::new();
             let mut parked = Vec::new();
-            work_issues(
+
+            // Work already on a pull request is finished before any new work
+            // starts. These ran last, behind every named issue's full implement
+            // and review loop, so naming the pull request a previous run had
+            // opened looked exactly like spar refusing to touch it. They do not
+            // depend on triage either, so there is nothing to wait for.
+            let mut issues = sorted.issues.clone();
+            if !sorted.prs.is_empty() {
+                log!(
+                    "continuing {} pull request(s) before starting new work: {}",
+                    sorted.prs.len(),
+                    self::numbers(&sorted.prs)
+                );
+                let covered = issues_covered_by(&repo, &sorted.prs);
+                for (issue, pr) in covered.iter().filter(|(i, _)| issues.contains(i)) {
+                    log!(
+                        "#{issue} is what PR #{pr} closes, and both were given, so it is \
+                         continued there rather than implemented again"
+                    );
+                }
+                issues = issues_not_on_named_prs(&issues, &covered);
+                for number in &sorted.prs {
+                    results.push(review::resume_pr(&agents, &cfg, &repo, *number, None));
+                }
+            }
+
+            if let Err(e) = work_issues(
                 &agents,
                 &cfg,
                 &repo,
-                sorted.issues.clone(),
+                issues,
                 &plan_out,
                 &mut results,
                 &mut stopped,
                 &mut parked,
                 triage_flags.retriage,
-            )?;
-
-            // Reached even when a wave failed: these were named on the command
-            // line and do not depend on triage.
-            for number in sorted.prs {
-                results.push(review::resume_pr(&agents, &cfg, &repo, number, None));
+            ) {
+                // A pull request that already finished is not thrown away
+                // because the issue queue stopped afterwards.
+                if results.is_empty() {
+                    return Err(e);
+                }
+                stopped.push(format!("the issue queue stopped: {e}"));
             }
 
             if results.is_empty() {
@@ -1367,6 +1396,46 @@ fn classify(repo: &Repo, numbers: &[i64]) -> Result<Sorted> {
         );
     }
     Ok(sorted)
+}
+
+/// Which named issues a named pull request already carries, and which one.
+///
+/// Naming both an issue and the pull request that closes it is the ordinary way
+/// to say "finish this one". Working both would continue the same pull request
+/// twice, once from the list of pull requests and once from `run_nth_issue`,
+/// which finds the open pull request for an issue and continues it rather than
+/// implementing over the top.
+///
+/// A failed lookup drops nothing. Not knowing what a pull request closes is not
+/// evidence that it closes nothing, and skipping an issue on a guess is the
+/// worse mistake: continuing the same pull request twice is visible and wastes
+/// calls, while silently dropping an issue looks like spar ignored it.
+fn issues_covered_by(repo: &Repo, prs: &[i64]) -> BTreeMap<i64, i64> {
+    let mut covered = BTreeMap::new();
+    for number in prs {
+        match repo.pr_view(*number) {
+            Ok(view) => {
+                for issue in &view.closing_issues_references {
+                    covered.insert(issue.number, *number);
+                }
+            }
+            Err(e) => logwarn!(
+                "#{number}: could not read which issue(s) it closes, so none are skipped: {}",
+                e.last_line()
+            ),
+        }
+    }
+    covered
+}
+
+/// The named issues still worth triaging once the named pull requests have
+/// taken the ones they close.
+fn issues_not_on_named_prs(issues: &[i64], covered: &BTreeMap<i64, i64>) -> Vec<i64> {
+    issues
+        .iter()
+        .copied()
+        .filter(|issue| !covered.contains_key(issue))
+        .collect()
 }
 
 fn make_plan(
@@ -2901,6 +2970,50 @@ mod min_number_tests {
                 "{cmd}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod run_targets_tests {
+    use super::*;
+
+    fn covered(pairs: &[(i64, i64)]) -> BTreeMap<i64, i64> {
+        pairs.iter().copied().collect()
+    }
+
+    /// The run this comes from: `spar run 786 783 784 771`, where #786 is the
+    /// pull request an earlier run opened for #772. Naming it is how a person
+    /// says "finish this one", and it used to be worked last, behind three
+    /// issues' full implement and review loops.
+    #[test]
+    fn an_issue_its_named_pull_request_closes_is_not_worked_again() {
+        let kept = issues_not_on_named_prs(&[772, 783, 784], &covered(&[(772, 786)]));
+
+        assert_eq!(vec![783, 784], kept);
+    }
+
+    #[test]
+    fn an_issue_no_named_pull_request_closes_is_still_worked() {
+        let kept = issues_not_on_named_prs(&[783, 784, 771], &covered(&[(772, 786)]));
+
+        assert_eq!(vec![783, 784, 771], kept);
+    }
+
+    /// A pull request whose closing issues could not be read covers nothing,
+    /// so nothing is dropped on a guess.
+    #[test]
+    fn an_unreadable_pull_request_drops_no_issue() {
+        let kept = issues_not_on_named_prs(&[772, 783], &covered(&[]));
+
+        assert_eq!(vec![772, 783], kept);
+    }
+
+    /// One pull request can close several issues, and all of them belong to it.
+    #[test]
+    fn every_issue_one_pull_request_closes_is_taken_by_it() {
+        let kept = issues_not_on_named_prs(&[771, 772, 783], &covered(&[(771, 786), (772, 786)]));
+
+        assert_eq!(vec![783], kept);
     }
 }
 

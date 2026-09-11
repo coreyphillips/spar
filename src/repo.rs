@@ -2568,6 +2568,50 @@ impl Repo {
         self.check_new_ignored_files(cwd, baseline).map(drop)
     }
 
+    /// Hold a call that was asked only to read to the read-only rule, rather
+    /// than to the one a managed commit is held to.
+    ///
+    /// A review is judged twice: once by the guard inside the call, and again
+    /// here, before the round continues. Asking two different questions about
+    /// the same paths is what cost a run. A reviewer rebuilt a project whose
+    /// build output lands in `manager/public/assets/`, the guard inside the
+    /// call trusted the project's ignore file and kept a review that had taken
+    /// five minutes, and this check then called the very same files
+    /// unrepresentable and ended the round anyway. A managed commit is not in
+    /// question after a call that committed nothing, so the commit-side rule
+    /// has no business being applied to one. One rule, asked once.
+    pub(crate) fn refuse_read_only_leavings(
+        &self,
+        cwd: &Path,
+        baseline: &WorktreeBaseline,
+    ) -> Result<()> {
+        self.refuse_changed_attributes(cwd, baseline)?;
+        let after = ignored_untracked_state(cwd).map_err(|e| {
+            uncertain_worktree_change(
+                cwd,
+                format!(
+                    "could not verify untracked files in {} after a read-only call: {}. The \
+                     worktree was kept for recovery.",
+                    cwd.display(),
+                    e.last_line()
+                ),
+            )
+        })?;
+        let leavings = baseline.ignored_untracked.read_only_leavings(&after);
+        if leavings.condemning.is_empty() {
+            return Ok(());
+        }
+        Err(uncertain_worktree_change(
+            cwd,
+            format!(
+                "the read-only call left untracked file(s) in {} that the project does not \
+                 ignore: {}. The worktree was kept for recovery.",
+                cwd.display(),
+                list_paths(&leavings.condemning)
+            ),
+        ))
+    }
+
     /// The generated paths the check let through, for one report per attempt
     /// rather than one per check.
     fn allow_generated_ignored_files(
@@ -8238,6 +8282,43 @@ mod tests {
         repo.refuse_new_ignored_files(&path, &baseline).unwrap();
         repo.refuse_changed_existing_untracked(&path, &baseline)
             .unwrap();
+    }
+
+    /// The run this comes from: a reviewer rebuilt a project whose build output
+    /// lands in `manager/public/assets/`, which no directory list will ever
+    /// name. The guard inside the call kept the review. This check then called
+    /// the same thirteen files unrepresentable and ended the round, five
+    /// minutes of review thrown away over a path Git had been told to disown.
+    #[test]
+    fn a_read_only_call_may_rebuild_ignored_output_outside_the_directory_list() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("read-only-rebuild", 943);
+        exclude_paths(&repo, &["manager/public/assets/"]);
+        std::fs::create_dir_all(path.join("manager/public/assets")).unwrap();
+        let bundle = path.join("manager/public/assets/index-DPQ2vCfq.css");
+        std::fs::write(&bundle, "first build\n").unwrap();
+        let baseline = repo.worktree_baseline(&path).unwrap();
+        std::fs::write(&bundle, "second build\n").unwrap();
+        std::fs::write(path.join("manager/public/assets/index-ptLOWYCS.js"), "b\n").unwrap();
+
+        repo.refuse_read_only_leavings(&path, &baseline).unwrap();
+        // The commit-side rule still refuses it, which is exactly why a call
+        // that committed nothing must not be asked that question.
+        assert!(repo.refuse_new_ignored_files(&path, &baseline).is_err());
+    }
+
+    #[test]
+    fn a_read_only_call_may_not_leave_an_ordinary_untracked_file() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("read-only-scratch", 944);
+        exclude_paths(&repo, &["dist/"]);
+        let baseline = repo.worktree_baseline(&path).unwrap();
+        std::fs::write(path.join("scratch.md"), "notes\n").unwrap();
+
+        let error = repo
+            .refuse_read_only_leavings(&path, &baseline)
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert!(error.to_string().contains("scratch.md"), "{error}");
     }
 
     #[test]

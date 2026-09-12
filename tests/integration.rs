@@ -1862,6 +1862,23 @@ const BLOCKING_REVIEW: &str = r#"{"verdict":"changes_requested","next_action":"f
 #[cfg(unix)]
 #[test]
 fn custom_ignored_output_survives_edit_push_and_following_review() {
+    ignored_dependencies_survive_review(false, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn ignored_dependency_attributes_survive_an_author_response() {
+    ignored_dependencies_survive_review(true, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn ignored_artifacts_deleted_between_git_listings_do_not_stop_review() {
+    ignored_dependencies_survive_review(false, true);
+}
+
+#[cfg(unix)]
+fn ignored_dependencies_survive_review(author_responds: bool, race_output: bool) {
     let reviewer = format!(
         r#"#!/bin/sh
 set -eu
@@ -1870,6 +1887,8 @@ case "$1" in
     printf 'fixed\n' > feature.txt
     mkdir -p manager/public/assets
     printf 'bundle\n' > manager/public/assets/index-DUym-Rfj.js
+    mkdir -p manager/node_modules/http-proxy
+    printf 'package-lock.json binary\n' > manager/node_modules/http-proxy/.gitattributes
     printf '%s\n' '{{"summary":"Fix the branch","fixes":[]}}'
     ;;
 *) printf '%s\n' '{}' ;;
@@ -1882,12 +1901,35 @@ set -eu
 printf 'rebuilt bundle\n' > manager/public/assets/index-DUym-Rfj.js
 printf '%s\n' '{"verdict":"approve","next_action":"merge","summary":"Verified the fix.","findings":[]}'
 "#;
-    let (fx, bin, config, _) = failed_edit_fixture("custom-output-rounds", author, &reviewer);
+    let response = r#"#!/bin/sh
+set -eu
+printf 'fixed\n' > feature.txt
+mkdir -p manager/public/assets manager/node_modules/http-proxy
+printf 'rebuilt bundle\n' > manager/public/assets/index-DUym-Rfj.js
+printf 'package-lock.json binary\n' > manager/node_modules/http-proxy/.gitattributes
+printf '%s\n' '{"summary":"Fix the branch","dispositions":[{"title":"Fix the branch","file":"feature.txt","action":"fixed","reasoning":"Fixed the fixture.","new_issue_title":null,"new_issue_body":null}]}'
+"#;
+    let hand_back = format!(
+        r#"#!/bin/sh
+if [ "$(cat feature.txt)" = fixed ]; then
+    printf '%s\n' '{{"verdict":"approve","next_action":"merge","summary":"Verified the fix.","findings":[]}}'
+else
+    printf '%s\n' '{}'
+fi
+"#,
+        BLOCKING_REVIEW.replace("fix_myself", "hand_back")
+    );
+    let (author, reviewer) = if author_responds {
+        (response, hand_back.as_str())
+    } else {
+        (author, reviewer.as_str())
+    };
+    let (fx, bin, config, _) = failed_edit_fixture("custom-output-rounds", author, reviewer);
     git(&fx.work, &["checkout", "-q", "feature"]);
     commit(
         &fx.work,
         ".gitignore",
-        "manager/public/\n",
+        "manager/public/\nmanager/node_modules/\n",
         "Ignore custom output",
     );
     git(&fx.work, &["push", "-q", "origin", "feature"]);
@@ -1912,6 +1954,34 @@ esac
         &gh.replacen("#!/bin/sh\n", &format!("#!/bin/sh\n{head_query}"), 1),
     );
 
+    if race_output {
+        let real_git = Command::new("/bin/sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap();
+        assert!(real_git.status.success());
+        let real_git = String::from_utf8(real_git.stdout).unwrap();
+        let real_git = format!("'{}'", real_git.trim().replace('\'', "'\\''"));
+        let shim = r#"#!/bin/sh
+set -eu
+case "$*" in
+*"ls-files --others -z"|*"ls-files --others --exclude-standard -z")
+    artifact="manager/public/assets/transient-$$.js"
+    if REAL_GIT check-ignore -q "$artifact"; then
+        mkdir -p manager/public/assets
+        printf 'temporary build output\n' > "$artifact"
+        REAL_GIT "$@"
+        rm "$artifact"
+        printf 'triggered\n' > "$(dirname "$0")/race-triggered"
+        exit 0
+    fi
+    ;;
+esac
+exec REAL_GIT "$@"
+"#;
+        executable(&bin.join("git"), &shim.replace("REAL_GIT", &real_git));
+    }
+
     let (ok, out, err) = spar_with_path(
         &[
             "resume",
@@ -1926,6 +1996,12 @@ esac
     );
 
     assert!(ok, "{out}\n{err}");
+    if race_output {
+        assert!(
+            bin.join("race-triggered").exists(),
+            "the build race must run"
+        );
+    }
     assert!(out.contains("approved"), "{out}\n{err}");
     assert_ne!(before, pushed_head(&fx));
     let worktree = review_worktree(&fx);
@@ -1946,6 +2022,16 @@ esac
         "rebuilt bundle\n",
         std::fs::read_to_string(worktree.join("manager/public/assets/index-DUym-Rfj.js")).unwrap()
     );
+    assert!(git(
+        &worktree,
+        &["status", "--porcelain", "--untracked-files=all"]
+    )
+    .is_empty());
+    assert_eq!(
+        "package-lock.json binary\n",
+        std::fs::read_to_string(worktree.join("manager/node_modules/http-proxy/.gitattributes"))
+            .unwrap()
+    );
     assert!(!std::fs::read_dir(&worktree)
         .unwrap()
         .flatten()
@@ -1953,6 +2039,39 @@ esac
             .file_name()
             .to_string_lossy()
             .starts_with(".spar-recovery-needed-")));
+
+    // A later invocation must not fail because cleanup cannot delete the
+    // custom output it deliberately accepted in the preceding invocation.
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (resumed, _) = repo.worktree_for_pr(&pr(42, "feature")).unwrap();
+    assert_eq!(
+        resumed.canonicalize().unwrap(),
+        worktree.canonicalize().unwrap()
+    );
+    assert_eq!("fixed\n", git(&resumed, &["show", "HEAD:feature.txt"]));
+    assert!(!resumed
+        .join("manager/public/assets/index-DUym-Rfj.js")
+        .exists());
+    let retained = std::fs::read_dir(worktree.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("retained-pr-42-")
+        })
+        .expect("the previous checkout and ignored files remain recoverable")
+        .path();
+    assert_eq!(
+        "rebuilt bundle\n",
+        std::fs::read_to_string(retained.join("manager/public/assets/index-DUym-Rfj.js")).unwrap()
+    );
+    assert_eq!(
+        "package-lock.json binary\n",
+        std::fs::read_to_string(retained.join("manager/node_modules/http-proxy/.gitattributes"))
+            .unwrap()
+    );
 }
 
 #[cfg(unix)]
@@ -4276,6 +4395,56 @@ fn a_dirty_pr_worktree_is_not_rebuilt() {
         std::fs::read_to_string(path.join("README.md")).unwrap()
     );
     repo.release_pr_worktree(60);
+}
+
+#[test]
+fn ignored_output_does_not_hide_ordinary_untracked_pr_work() {
+    let fx = repo("noclobber-pr-untracked");
+    git(&fx.work, &["checkout", "-q", "-b", "feature-63"]);
+    commit(&fx.work, ".gitignore", "local-output/\n", "ignore output");
+    git(&fx.work, &["push", "-q", "-u", "origin", "feature-63"]);
+    git(&fx.work, &["checkout", "-q", "main"]);
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let view = pr(63, "feature-63");
+    let (path, _) = repo.worktree_for_pr(&view).unwrap();
+    std::fs::create_dir_all(path.join("local-output")).unwrap();
+    std::fs::write(path.join("local-output/cache"), "cache\n").unwrap();
+    std::fs::write(path.join("new-source.txt"), "recover me\n").unwrap();
+
+    let error = repo.worktree_for_pr(&view).unwrap_err().to_string();
+
+    assert!(error.contains("uncommitted changes"), "{error}");
+    assert_eq!("pr-63\n", git(&path, &["branch", "--show-current"]));
+    assert_eq!(
+        "recover me\n",
+        std::fs::read_to_string(path.join("new-source.txt")).unwrap()
+    );
+}
+
+#[test]
+fn a_failed_pr_worktree_move_preserves_the_original_branch_name() {
+    let fx = repo("locked-pr-output");
+    git(&fx.work, &["checkout", "-q", "-b", "feature-64"]);
+    commit(&fx.work, ".gitignore", "local-output/\n", "ignore output");
+    git(&fx.work, &["push", "-q", "-u", "origin", "feature-64"]);
+    git(&fx.work, &["checkout", "-q", "main"]);
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let view = pr(64, "feature-64");
+    let (path, _) = repo.worktree_for_pr(&view).unwrap();
+    std::fs::create_dir_all(path.join("local-output")).unwrap();
+    std::fs::write(path.join("local-output/cache"), "keep me\n").unwrap();
+    git(&fx.work, &["worktree", "lock", path.to_str().unwrap()]);
+
+    let error = repo.worktree_for_pr(&view).unwrap_err().to_string();
+
+    assert!(error.contains("could not retain"), "{error}");
+    assert_eq!("pr-64\n", git(&path, &["branch", "--show-current"]));
+    assert_eq!(
+        "keep me\n",
+        std::fs::read_to_string(path.join("local-output/cache")).unwrap()
+    );
+    git(&fx.work, &["worktree", "unlock", path.to_str().unwrap()]);
+    repo.worktree_for_pr(&view).unwrap();
 }
 
 #[test]

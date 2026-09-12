@@ -319,7 +319,10 @@ impl IgnoredState {
         paths.extend(after.files.keys().cloned());
         paths
             .into_iter()
-            .filter(|path| self.files.get(path) != after.files.get(path))
+            .filter(|path| {
+                self.files.get(path) != after.files.get(path)
+                    || self.is_ignored(path) != after.is_ignored(path)
+            })
             .collect()
     }
 
@@ -423,6 +426,15 @@ impl IgnoredState {
     /// ended. There is one rule now, and this is it.
     fn generated_move(&self, after: &Self, path: &Path) -> bool {
         is_generated_artifact(path) && self.disposable_move(after, path)
+    }
+
+    /// Successful edits may leave files ignored by the project outside the
+    /// commit. A nested checkout still needs recovery, even when ignored.
+    fn ignored_file_move(&self, after: &Self, path: &Path) -> bool {
+        self.disposable_move(after, path)
+            && [self, after]
+                .iter()
+                .all(|state| state.files.get(path).is_none_or(|file| file.kind != 3))
     }
 
     /// Whether neither state has anything at `path` worth keeping, so whatever
@@ -547,20 +559,20 @@ pub(crate) fn list_paths(paths: &[PathBuf]) -> String {
     listed
 }
 
-/// Build output one commit attempt let through, gathered for a single report.
+/// Ignored files one commit attempt let through, gathered for a single report.
 ///
 /// The checks that allow it run more than once per attempt, before staging,
 /// after staging, and again after the commit, because the tree could have moved
 /// under any of them. Reporting from inside each check said the same thing
 /// about the same files two and three times over.
 #[derive(Default)]
-struct GeneratedArtifacts {
+struct IgnoredArtifacts {
     new_paths: BTreeSet<PathBuf>,
     changed_paths: BTreeSet<PathBuf>,
     removed_paths: BTreeSet<PathBuf>,
 }
 
-impl GeneratedArtifacts {
+impl IgnoredArtifacts {
     fn left(&mut self, allowed: AllowedArtifacts) {
         self.new_paths.extend(allowed.present);
         self.removed_paths.extend(allowed.removed);
@@ -571,38 +583,28 @@ impl GeneratedArtifacts {
         self.removed_paths.extend(allowed.removed);
     }
 
-    /// Said once, and not as a warning. The files stay out of the commit,
-    /// whatever wrote them writes them again, and they no longer keep the
-    /// worktree from being removed.
+    /// Report paths without claiming ignored files are safe to delete.
     fn report(&self, cwd: &Path) {
-        if !self.new_paths.is_empty() {
+        let paths: BTreeSet<_> = self
+            .new_paths
+            .iter()
+            .chain(&self.changed_paths)
+            .chain(&self.removed_paths)
+            .cloned()
+            .collect();
+        if !paths.is_empty() {
             logdim!(
-                "the editing call left {} generated artifact(s) under a known build or cache \
-                 directory in {}. They are not part of the commit.",
-                self.new_paths.len(),
-                cwd.display()
-            );
-        }
-        if !self.changed_paths.is_empty() {
-            logdim!(
-                "the editing call changed {} existing generated artifact(s) under a known build \
-                 or cache directory in {}. They are not part of the commit.",
-                self.changed_paths.len(),
-                cwd.display()
-            );
-        }
-        if !self.removed_paths.is_empty() {
-            logdim!(
-                "the editing call removed {} generated artifact(s) under a known build or cache \
-                 directory in {}. Whatever wrote them writes them again.",
-                self.removed_paths.len(),
-                cwd.display()
+                "the editing call changed {} ignored file(s) in {}: {}. They are outside \
+                 the commit; cleanup checks them separately.",
+                paths.len(),
+                cwd.display(),
+                list_paths(&paths.into_iter().collect::<Vec<_>>())
             );
         }
     }
 }
 
-/// Recognized build and cache output a check let through, split by whether it
+/// Ignored files a check let through, split by whether each one
 /// is still on disk, so the report can say what happened rather than call a
 /// deleted incremental session a file that was left behind.
 #[derive(Default)]
@@ -2553,33 +2555,28 @@ impl Repo {
         ))
     }
 
-    /// Refuse to discard ignored files that appeared during a call.
-    ///
-    /// Call this when the call reported success but produced no commit-worthy
-    /// status. Existing ignored files are harmless because they are present in
-    /// `baseline`; only new paths stop cleanup, and recognized build and cache
-    /// output is not one of them. Running the project's tests is what a call is
-    /// asked to do, and whatever wrote that output writes it again.
+    /// Accept project-ignored files left by a successful editing call.
+    /// Ordinary untracked files must already be represented by the commit.
+    /// Acceptance does not authorize cleanup of the ignored files.
     pub(crate) fn refuse_new_ignored_files(
         &self,
         cwd: &Path,
         baseline: &WorktreeBaseline,
     ) -> Result<()> {
-        self.check_new_ignored_files(cwd, baseline).map(drop)
+        self.allow_ignored_files(cwd, baseline).map(drop)
     }
 
-    /// Hold a call that was asked only to read to the read-only rule, rather
-    /// than to the one a managed commit is held to.
-    ///
-    /// A review is judged twice: once by the guard inside the call, and again
-    /// here, before the round continues. Asking two different questions about
-    /// the same paths is what cost a run. A reviewer rebuilt a project whose
-    /// build output lands in `manager/public/assets/`, the guard inside the
-    /// call trusted the project's ignore file and kept a review that had taken
-    /// five minutes, and this check then called the very same files
-    /// unrepresentable and ended the round anyway. A managed commit is not in
-    /// question after a call that committed nothing, so the commit-side rule
-    /// has no business being applied to one. One rule, asked once.
+    /// Preserve unexpected output when the editing call did not finish.
+    pub(crate) fn refuse_failed_edit_leavings(
+        &self,
+        cwd: &Path,
+        baseline: &WorktreeBaseline,
+    ) -> Result<()> {
+        self.check_new_ignored_files(cwd, baseline, IgnoredState::generated_move)
+            .map(drop)
+    }
+
+    /// Reject ordinary untracked changes after a read-only call.
     pub(crate) fn refuse_read_only_leavings(
         &self,
         cwd: &Path,
@@ -2612,20 +2609,21 @@ impl Repo {
         ))
     }
 
-    /// The generated paths the check let through, for one report per attempt
+    /// The ignored paths the check let through, for one report per attempt
     /// rather than one per check.
-    fn allow_generated_ignored_files(
+    fn allow_ignored_files(
         &self,
         cwd: &Path,
         baseline: &WorktreeBaseline,
     ) -> Result<AllowedArtifacts> {
-        self.check_new_ignored_files(cwd, baseline)
+        self.check_new_ignored_files(cwd, baseline, IgnoredState::ignored_file_move)
     }
 
     fn check_new_ignored_files(
         &self,
         cwd: &Path,
         baseline: &WorktreeBaseline,
+        allowed_move: fn(&IgnoredState, &IgnoredState, &Path) -> bool,
     ) -> Result<AllowedArtifacts> {
         self.refuse_changed_attributes(cwd, baseline)?;
         let after = ignored_untracked_state(cwd).map_err(|e| {
@@ -2643,11 +2641,11 @@ impl Repo {
         if changed.is_empty() {
             return Ok(AllowedArtifacts::default());
         }
-        let (generated, changed): (Vec<_>, Vec<_>) = changed
+        let (ignored, changed): (Vec<_>, Vec<_>) = changed
             .into_iter()
-            .partition(|path| baseline.ignored_untracked.generated_move(&after, path));
+            .partition(|path| allowed_move(&baseline.ignored_untracked, &after, path));
         if changed.is_empty() {
-            return Ok(AllowedArtifacts::split(generated, &after));
+            return Ok(AllowedArtifacts::split(ignored, &after));
         }
         let listed = list_paths(&changed);
         Err(uncertain_worktree_change(
@@ -2663,9 +2661,8 @@ impl Repo {
 
     /// Existing untracked files belong to the checkout owner, even when a call
     /// also produces a valid tracked change. Refuse their modification or
-    /// deletion before accepting the tracked result. Rebuilt output is not that:
-    /// it is ignored on both sides and under a known build or cache directory,
-    /// which is where the command the call was asked to run puts it.
+    /// deletion before accepting the tracked result. Project-ignored files
+    /// stay outside the commit, wherever the project puts them.
     pub(crate) fn refuse_changed_existing_untracked(
         &self,
         cwd: &Path,
@@ -2675,7 +2672,7 @@ impl Repo {
             .map(drop)
     }
 
-    fn allow_changed_generated_artifacts(
+    fn allow_changed_ignored_artifacts(
         &self,
         cwd: &Path,
         baseline: &WorktreeBaseline,
@@ -2704,11 +2701,11 @@ impl Repo {
         if changed.is_empty() {
             return Ok(AllowedArtifacts::default());
         }
-        let (generated, changed): (Vec<_>, Vec<_>) = changed
+        let (ignored, changed): (Vec<_>, Vec<_>) = changed
             .into_iter()
-            .partition(|path| baseline.ignored_untracked.generated_move(&after, path));
+            .partition(|path| baseline.ignored_untracked.ignored_file_move(&after, path));
         if changed.is_empty() {
-            return Ok(AllowedArtifacts::split(generated, &after));
+            return Ok(AllowedArtifacts::split(ignored, &after));
         }
         let listed = list_paths(&changed);
         Err(uncertain_worktree_change(
@@ -2931,12 +2928,12 @@ impl Repo {
         preferred_subject: &str,
         fallback_subject: &str,
     ) -> Result<bool> {
-        let mut artifacts = GeneratedArtifacts::default();
+        let mut artifacts = IgnoredArtifacts::default();
         self.refuse_changed_attributes(cwd, baseline)?;
-        artifacts.changed(self.allow_changed_generated_artifacts(cwd, baseline)?);
+        artifacts.changed(self.allow_changed_ignored_artifacts(cwd, baseline)?);
         refuse_unsafe_index_flags(cwd)?;
         if !self.has_uncommitted_changes(cwd)? {
-            artifacts.left(self.allow_generated_ignored_files(cwd, baseline)?);
+            artifacts.left(self.allow_ignored_files(cwd, baseline)?);
             artifacts.report(cwd);
             return Ok(false);
         }
@@ -2947,9 +2944,9 @@ impl Repo {
                 e.last_line()
             ))
         })?;
-        // Ignored paths remain untracked after staging. Only known generated
-        // output may remain beside an otherwise complete managed commit.
-        artifacts.left(self.allow_generated_ignored_files(cwd, baseline)?);
+        // Git ignore rules decide which files stay outside the commit.
+        // Whether cleanup can delete them is a separate decision.
+        artifacts.left(self.allow_ignored_files(cwd, baseline)?);
         let changed_gitlinks = changed_staged_gitlinks(cwd)?;
         if !changed_gitlinks.is_empty() {
             let listed = list_paths(&changed_gitlinks);
@@ -2977,8 +2974,8 @@ impl Repo {
                 cwd.display()
             );
         }
-        artifacts.changed(self.allow_changed_generated_artifacts(cwd, baseline)?);
-        artifacts.left(self.allow_generated_ignored_files(cwd, baseline)?);
+        artifacts.changed(self.allow_changed_ignored_artifacts(cwd, baseline)?);
+        artifacts.left(self.allow_ignored_files(cwd, baseline)?);
         artifacts.report(cwd);
         Ok(true)
     }
@@ -8064,50 +8061,92 @@ mod tests {
     }
 
     #[test]
-    fn deleting_existing_ignored_work_stops_a_managed_commit() {
-        let (_fixture, repo, path, _checkpoint) = review_fixture("deleted-ignored", 912);
-        std::fs::create_dir_all(path.join("generated")).unwrap();
-        let ignored = path.join("generated/keep.txt");
-        std::fs::write(&ignored, "user data\n").unwrap();
+    fn a_managed_commit_accepts_a_custom_output_rebuild() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("custom-output", 912);
+        exclude_paths(&repo, &["manager/public/"]);
+        let output = path.join("manager/public/assets");
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(output.join("old.js"), "old bundle\n").unwrap();
+        std::fs::write(output.join("index.css"), "old styles\n").unwrap();
         let baseline = repo.worktree_baseline(&path).unwrap();
-        let before = test_git(&path, &["rev-parse", "HEAD"]);
         std::fs::write(path.join("README.md"), "tracked change\n").unwrap();
-        std::fs::remove_file(&ignored).unwrap();
+        std::fs::write(path.join("new-source.txt"), "new source\n").unwrap();
+        std::fs::remove_file(output.join("old.js")).unwrap();
+        std::fs::write(output.join("index.css"), "new styles\n").unwrap();
+        std::fs::write(output.join("index-DUym-Rfj.js"), "new bundle\n").unwrap();
 
-        let error = repo
+        assert!(repo
             .commit_pending_changes(&path, &baseline, "change readme", "change readme")
-            .unwrap_err();
+            .unwrap());
+        repo.refuse_new_ignored_files(&path, &baseline).unwrap();
+        repo.refuse_changed_existing_untracked(&path, &baseline)
+            .unwrap();
+        repo.refuse_unrepresented_tracked_changes(&path, &baseline)
+            .unwrap();
 
-        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
-        assert!(error.to_string().contains("existing untracked"), "{error}");
-        assert_eq!(before, test_git(&path, &["rev-parse", "HEAD"]));
         assert_eq!(
             "tracked change\n",
-            std::fs::read_to_string(path.join("README.md")).unwrap()
+            test_git(&path, &["show", "HEAD:README.md"])
         );
+        assert_eq!(
+            "new source\n",
+            test_git(&path, &["show", "HEAD:new-source.txt"])
+        );
+        assert!(test_git(
+            &path,
+            &[
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "HEAD",
+                "--",
+                "manager/public"
+            ]
+        )
+        .is_empty());
+        assert!(test_git(&path, &["status", "--porcelain"]).is_empty());
+        assert!(!output.join("old.js").exists());
+        assert_eq!(
+            "new styles\n",
+            std::fs::read_to_string(output.join("index.css")).unwrap()
+        );
+        assert!(repository_has_recoverable_work(&path, true).unwrap());
+        repo.release_review_worktree(912);
+        assert!(output.join("index-DUym-Rfj.js").exists());
     }
 
     #[test]
-    fn new_ignored_work_stops_a_managed_commit_with_tracked_changes() {
-        let (_fixture, repo, path, _checkpoint) = review_fixture("mixed-ignored", 926);
+    fn newly_ignoring_existing_untracked_work_does_not_allow_its_modification() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("newly-ignored", 926);
+        std::fs::write(path.join("notes.txt"), "original notes\n").unwrap();
         let baseline = repo.worktree_baseline(&path).unwrap();
-        let before = test_git(&path, &["rev-parse", "HEAD"]);
-        std::fs::write(path.join("README.md"), "tracked change\n").unwrap();
-        std::fs::create_dir_all(path.join("generated")).unwrap();
-        let ignored = path.join("generated/recovery.txt");
-        std::fs::write(&ignored, "keep me\n").unwrap();
+        std::fs::write(path.join(".gitignore"), "generated/\nnotes.txt\n").unwrap();
+        std::fs::write(path.join("notes.txt"), "overwritten notes\n").unwrap();
 
         let error = repo
-            .commit_pending_changes(&path, &baseline, "change readme", "change readme")
+            .commit_pending_changes(&path, &baseline, "change", "change")
             .unwrap_err();
 
         assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
-        assert!(error.to_string().contains("recovery.txt"), "{error}");
-        assert_eq!(before, test_git(&path, &["rev-parse", "HEAD"]));
-        assert_eq!("keep me\n", std::fs::read_to_string(&ignored).unwrap());
-        assert!(test_git(&path, &["status", "--porcelain"])
-            .lines()
-            .any(|line| line == "M  README.md"));
+        assert!(error.to_string().contains("notes.txt"), "{error}");
+    }
+
+    #[test]
+    fn a_new_ignored_nested_repository_stops_a_managed_commit() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("ignored-nested-edit", 927);
+        let baseline = repo.worktree_baseline(&path).unwrap();
+        let nested = path.join("generated/repro");
+        std::fs::create_dir_all(&nested).unwrap();
+        test_git(&nested, &["init"]);
+        std::fs::write(path.join("README.md"), "tracked change\n").unwrap();
+
+        let error = repo
+            .commit_pending_changes(&path, &baseline, "change", "change")
+            .unwrap_err();
+
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert!(error.to_string().contains("generated/repro"), "{error}");
+        assert!(nested.join(".git").exists());
     }
 
     #[test]
@@ -8416,9 +8455,7 @@ mod tests {
         std::fs::write(path.join("manager/public/assets/index-ptLOWYCS.js"), "b\n").unwrap();
 
         repo.refuse_read_only_leavings(&path, &baseline).unwrap();
-        // The commit-side rule still refuses it, which is exactly why a call
-        // that committed nothing must not be asked that question.
-        assert!(repo.refuse_new_ignored_files(&path, &baseline).is_err());
+        repo.refuse_new_ignored_files(&path, &baseline).unwrap();
     }
 
     #[test]
@@ -8437,7 +8474,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_ignored_file_outside_build_output_still_stops_a_call() {
+    fn a_new_ignored_file_is_accepted_but_still_keeps_the_worktree() {
         let (_fixture, repo, path, _checkpoint) = review_fixture("new-ignored-local", 940);
         exclude_paths(&repo, &["dist/", ".env.local"]);
         std::fs::create_dir_all(path.join("dist")).unwrap();
@@ -8445,10 +8482,8 @@ mod tests {
         std::fs::write(path.join("dist/index.js"), "a build\n").unwrap();
         std::fs::write(path.join(".env.local"), "TOKEN=x\n").unwrap();
 
-        let error = repo.refuse_new_ignored_files(&path, &baseline).unwrap_err();
-
-        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
-        assert!(error.to_string().contains(".env.local"), "{error}");
+        repo.refuse_new_ignored_files(&path, &baseline).unwrap();
+        assert!(repository_has_recoverable_work(&path, true).unwrap());
     }
 
     #[test]

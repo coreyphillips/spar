@@ -1092,7 +1092,7 @@ fn implement(
                     recovery.message()
                 )));
             }
-            match repo.refuse_new_ignored_files(work_dir, &worktree_baseline) {
+            match repo.refuse_failed_edit_leavings(work_dir, &worktree_baseline) {
                 Ok(()) => return Err(call),
                 Err(recovery) => {
                     return Err(crate::error::SparError::uncertain_write(format!(

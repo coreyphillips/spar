@@ -1457,7 +1457,7 @@ fn build_one(
                     disposable_head: None,
                 });
             }
-            if let Err(ignored) = repo.refuse_new_ignored_files(dir, &worktree_baseline) {
+            if let Err(ignored) = repo.refuse_failed_edit_leavings(dir, &worktree_baseline) {
                 return Ok(BuildOne::Halted {
                     reason: format!(
                         "{e}. The editing call also left ignored work or its ignored files could \

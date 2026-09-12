@@ -1971,7 +1971,7 @@ fn defer_clean_edit_error(
     if repo.has_uncommitted_changes(work_dir)? {
         return Err(error);
     }
-    repo.refuse_new_ignored_files(work_dir, baseline)?;
+    repo.refuse_failed_edit_leavings(work_dir, baseline)?;
     repo.refuse_unrepresented_tracked_changes(work_dir, baseline)?;
     Ok(error)
 }

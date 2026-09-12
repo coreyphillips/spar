@@ -5386,7 +5386,13 @@ fn collect_untracked_files(
     if !visited.insert(canonical.clone()) {
         bail!("submodule recursion revisited {}", canonical.display());
     }
-    let listed = run_git_bytes(repository, &["ls-files", "--others", "-z"])?;
+    // Classify ordinary paths in the listing itself. Listing every path here
+    // and marking ignored paths in a second query misclassifies build output
+    // deleted between queries as ordinary untracked work.
+    let listed = run_git_bytes(
+        repository,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )?;
     if !listed.is_empty() && !listed.ends_with(&[0]) {
         bail!(
             "git returned an unterminated untracked-file list for {}",

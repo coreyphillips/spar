@@ -1200,7 +1200,9 @@ commits. New non-ignored source files are staged; existing non-ignored untracked
 files remain protected. Ignored dependency checkouts also stay outside managed
 commits and remain protected from cleanup. Attribute-file checks use the same
 Git ignore rules, including nested ignore files, `.git/info/exclude`, and
-`core.excludesFile`.
+`core.excludesFile`. Ordinary untracked files are listed with those exclusions
+applied immediately, so a build deleting an ignored artifact during the scan
+cannot make it appear to be pending source work.
 
 Accepting an edit and deleting its worktree are separate decisions. Ordinary
 cleanup still retains ignored files outside recognized build and cache directories,

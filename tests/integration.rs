@@ -1862,17 +1862,23 @@ const BLOCKING_REVIEW: &str = r#"{"verdict":"changes_requested","next_action":"f
 #[cfg(unix)]
 #[test]
 fn custom_ignored_output_survives_edit_push_and_following_review() {
-    ignored_dependencies_survive_review(false);
+    ignored_dependencies_survive_review(false, false);
 }
 
 #[cfg(unix)]
 #[test]
 fn ignored_dependency_attributes_survive_an_author_response() {
-    ignored_dependencies_survive_review(true);
+    ignored_dependencies_survive_review(true, false);
 }
 
 #[cfg(unix)]
-fn ignored_dependencies_survive_review(author_responds: bool) {
+#[test]
+fn ignored_artifacts_deleted_between_git_listings_do_not_stop_review() {
+    ignored_dependencies_survive_review(false, true);
+}
+
+#[cfg(unix)]
+fn ignored_dependencies_survive_review(author_responds: bool, race_output: bool) {
     let reviewer = format!(
         r#"#!/bin/sh
 set -eu
@@ -1948,6 +1954,34 @@ esac
         &gh.replacen("#!/bin/sh\n", &format!("#!/bin/sh\n{head_query}"), 1),
     );
 
+    if race_output {
+        let real_git = Command::new("/bin/sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap();
+        assert!(real_git.status.success());
+        let real_git = String::from_utf8(real_git.stdout).unwrap();
+        let real_git = format!("'{}'", real_git.trim().replace('\'', "'\\''"));
+        let shim = r#"#!/bin/sh
+set -eu
+case "$*" in
+*"ls-files --others -z"|*"ls-files --others --exclude-standard -z")
+    artifact="manager/public/assets/transient-$$.js"
+    if REAL_GIT check-ignore -q "$artifact"; then
+        mkdir -p manager/public/assets
+        printf 'temporary build output\n' > "$artifact"
+        REAL_GIT "$@"
+        rm "$artifact"
+        printf 'triggered\n' > "$(dirname "$0")/race-triggered"
+        exit 0
+    fi
+    ;;
+esac
+exec REAL_GIT "$@"
+"#;
+        executable(&bin.join("git"), &shim.replace("REAL_GIT", &real_git));
+    }
+
     let (ok, out, err) = spar_with_path(
         &[
             "resume",
@@ -1962,6 +1996,12 @@ esac
     );
 
     assert!(ok, "{out}\n{err}");
+    if race_output {
+        assert!(
+            bin.join("race-triggered").exists(),
+            "the build race must run"
+        );
+    }
     assert!(out.contains("approved"), "{out}\n{err}");
     assert_ne!(before, pushed_head(&fx));
     let worktree = review_worktree(&fx);

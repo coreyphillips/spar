@@ -271,6 +271,8 @@ close       = "high"         # the closing merge safety pass
 screen      = "low"          # the follow-up screen, one call for the queue
 checkin     = "high"         # judging the comments other people left
 split       = "high"         # proposing and checking a split
+brainstorm  = "high"         # every brainstorm round: proposing, building on
+                             # and challenging, defending and ranking
 # round_1   = "ultra"        # read by any call above with no key of its own
 # rest      = "high"         # the same, for later rounds and the close
 

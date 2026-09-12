@@ -2191,6 +2191,219 @@ fn fake_commands(fx: &Fixture, screen_answer: &str, gh_body: &str) -> (PathBuf, 
     (config, path)
 }
 
+// ---------------------------------------------------------------------------
+// Brainstorming
+// ---------------------------------------------------------------------------
+
+/// Two agents that answer differently, and a `gh` of the test's choosing.
+#[cfg(unix)]
+fn brainstorm_commands(
+    fx: &Fixture,
+    a_answer: &str,
+    b_answer: &str,
+    gh_body: &str,
+) -> (PathBuf, String) {
+    let bin = fx.dir.join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let a = bin.join("agent-a");
+    let b = bin.join("agent-b");
+    executable(&a, &format!("#!/bin/sh\nprintf '%s\\n' '{a_answer}'\n"));
+    executable(&b, &format!("#!/bin/sh\nprintf '%s\\n' '{b_answer}'\n"));
+    executable(&bin.join("gh"), &format!("#!/bin/sh\n{gh_body}\n"));
+
+    let config = fx.dir.join("spar.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[agents.a]\ncommand = [{}]\n\n[agents.b]\ncommand = [{}]\n",
+            serde_json::to_string(a.to_str().unwrap()).unwrap(),
+            serde_json::to_string(b.to_str().unwrap()).unwrap(),
+        ),
+    )
+    .unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (config, path)
+}
+
+fn idea_json(title: &str, how: &str) -> String {
+    format!(
+        r#"{{"title":"{title}","combines":["one existing piece","another"],"how_it_works":"{how}","why_new":"The nearest thing is a plain escrow.","enables":"Something that was not possible.","risks":"It may not work.","first_experiment":"Try it on regtest."}}"#
+    )
+}
+
+/// One round, two agents, one idea each: the session lands in the state
+/// directory with both ideas in it and says who proposed which.
+#[cfg(unix)]
+#[test]
+fn brainstorm_writes_a_session_both_agents_contributed_to() {
+    let fx = repo("brainstorm");
+    let a = format!(
+        r#"{{"ideas":[{}]}}"#,
+        idea_json(
+            "Covenant templates for vaults",
+            "A template commits the spend path."
+        )
+    );
+    let b = format!(
+        r#"{{"ideas":[{}]}}"#,
+        idea_json(
+            "Mesh radio watchtowers",
+            "Penalty transactions travel over a mesh."
+        )
+    );
+    let (config, path) = brainstorm_commands(&fx, &a, &b, "exit 1");
+
+    let (ok, out, err) = spar_with_env(
+        &[
+            "brainstorm",
+            "--config",
+            config.to_str().unwrap(),
+            "--repo",
+            fx.work.to_str().unwrap(),
+            "--max-rounds",
+            "1",
+            "novel",
+            "uses",
+            "of",
+            "script",
+        ],
+        &fx.dir,
+        &[("PATH", path.as_str())],
+    );
+    assert!(ok, "{out}\n{err}");
+    assert!(
+        out.contains("2 ideas kept, 0 set aside, 1 round\n"),
+        "{out}"
+    );
+    assert!(out.contains("1. Covenant templates for vaults"), "{out}");
+    assert!(out.contains("2. Mesh radio watchtowers"), "{out}");
+
+    let dir = fx.work.join(".spar").join("brainstorms");
+    let files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(1, files.len(), "{files:?}");
+    let name = files[0].file_name().unwrap().to_str().unwrap();
+    assert!(name.ends_with("-novel-uses-of-script.md"), "{name}");
+    // The repository root is canonicalised when it is opened, and a temp
+    // directory on macOS is a symlink, so compare the real path.
+    let real = std::fs::canonicalize(&files[0]).unwrap();
+    assert!(
+        out.contains(&format!("written to {}", real.display())),
+        "{out}"
+    );
+
+    let text = std::fs::read_to_string(&files[0]).unwrap();
+    assert!(
+        text.starts_with("# Brainstorm: novel uses of script\n"),
+        "{text}"
+    );
+    assert!(text.contains("Agents: a, b\n"), "{text}");
+    assert!(
+        text.contains("\n## Covenant templates for vaults\n\nProposed by a.\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\n## Mesh radio watchtowers\n\nProposed by b.\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("### First experiment\nTry it on regtest.\n"),
+        "{text}"
+    );
+    // The state directory is spar's own, so the session does not show up as
+    // an untracked file in the repository it was written for.
+    assert_eq!("", git(&fx.work, &["status", "--porcelain"]));
+}
+
+/// Filing from a saved session runs no agent: the agents here would fail if
+/// called. Each idea becomes an issue, its body is the sections, and the line
+/// naming the agents never leaves the file.
+#[cfg(unix)]
+#[test]
+fn brainstorm_files_a_saved_session_without_calling_an_agent() {
+    let fx = repo("brainstorm-from");
+    let gh = r#"
+set -eu
+printf '%s
+' "$*" >> "$SPAR_FAKE_GH_LOG"
+case "$1 $2" in
+  "issue list") printf '%s
+' '[]' ;;
+  "issue create")
+    case "$*" in
+      *"First idea"*) printf '%s
+' 'https://github.com/example/project/issues/101' ;;
+      *"Second idea"*) printf '%s
+' 'https://github.com/example/project/issues/102' ;;
+      *) printf '%s
+' 'create failed' >&2; exit 1 ;;
+    esac
+    ;;
+  *) printf 'unexpected gh call: %s
+' "$*" >&2; exit 1 ;;
+esac
+"#;
+    let (config, path) = brainstorm_commands(&fx, "exit 1", "exit 1", gh);
+    let session = fx.dir.join("session.md");
+    std::fs::write(
+        &session,
+        "# Brainstorm: a subject\nDate: 2026-09-12 14:03 UTC\nAgents: a, b\nRounds: 3\n\n\
+         Also considered, and set aside:\n- Third idea: withdrawn after b's objection: exists\n\n\
+         <!-- spar:followup -->\n## First idea\n\nProposed by a. Challenged by b, defended by a.\n\n\
+         ### Combines\n- one piece\n- another\n\n### How it works\nLike this.\n\n\
+         ### Discussion\nObjection: exists already.\n\nReply: not with this piece.\n\n\
+         <!-- spar:followup -->\n## Second idea\n\nReached independently by a and b.\n\n\
+         ### Combines\n- a third piece\n\n### How it works\nLike that.\n",
+    )
+    .unwrap();
+    let calls = fx.dir.join("gh-calls.log");
+
+    let (ok, out, err) = spar_with_env(
+        &[
+            "brainstorm",
+            "--config",
+            config.to_str().unwrap(),
+            "--repo",
+            fx.work.to_str().unwrap(),
+            "--from",
+            session.to_str().unwrap(),
+            "--file-issues",
+        ],
+        &fx.dir,
+        &[
+            ("PATH", path.as_str()),
+            ("SPAR_FAKE_GH_LOG", calls.to_str().unwrap()),
+        ],
+    );
+    assert!(ok, "{out}\n{err}");
+    assert!(out.contains("filed #101: First idea"), "{out}");
+    assert!(out.contains("filed #102: Second idea"), "{out}");
+    assert!(
+        out.contains("writes: 2 attempted, 2 succeeded, 0 failed"),
+        "{out}"
+    );
+    let log = std::fs::read_to_string(calls).unwrap();
+    let creates: Vec<&str> = log
+        .lines()
+        .filter(|line| line.starts_with("issue create "))
+        .collect();
+    assert_eq!(2, creates.len(), "{log}");
+    // The body is one argument, so its lines follow the `issue create` line
+    // in the log. What was filed is the sections and the discussion, and
+    // nothing from the header or the provenance line.
+    assert!(log.contains("--body ### Combines"), "{log}");
+    assert!(log.contains("Reply: not with this piece."), "{log}");
+    assert!(!log.contains("Proposed by"), "{log}");
+    assert!(!log.contains("Reached independently"), "{log}");
+    assert!(!log.contains("Third idea"), "{log}");
+}
+
 /// An empty queue is a local no-op, and it has to say which file it looked in.
 /// Reaching gh to find that out would make the common case cost a round trip.
 #[test]
@@ -2754,7 +2967,15 @@ fn version_and_help_work_without_any_configuration() {
     let (ok, out, _) = spar(&["--help"], &dir);
     assert!(ok);
     for word in [
-        "run", "triage", "resume", "followup", "checkin", "init", "clean", "doctor",
+        "run",
+        "triage",
+        "resume",
+        "followup",
+        "checkin",
+        "brainstorm",
+        "init",
+        "clean",
+        "doctor",
     ] {
         assert!(out.contains(word), "{word} missing from help:\n{out}");
     }
@@ -5128,6 +5349,7 @@ fn every_config_option_is_documented_in_the_example() {
         screen: Some("low".into()),
         checkin: Some("high".into()),
         split: Some("high".into()),
+        brainstorm: Some("high".into()),
     }));
     // Per-agent options, which a preset normally supplies but a user may set.
     expected.extend(

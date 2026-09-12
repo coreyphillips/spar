@@ -762,6 +762,98 @@ pub struct AdjudicationDoc {
     pub verdicts: Vec<Adjudication>,
 }
 
+// ---------------------------------------------------------------------------
+// Brainstorming
+// ---------------------------------------------------------------------------
+
+/// One idea from a brainstorm: existing pieces, paired in a way that has not
+/// been done.
+///
+/// `combines` is the load bearing field. The premise of `spar brainstorm` is
+/// that the parts of an answer already exist and have not been put together, so
+/// an idea that cannot name its parts is a wish rather than a proposal, and
+/// `why_new` has to say what the nearest existing thing is rather than assert
+/// novelty.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Idea {
+    #[serde(default, deserialize_with = "de_string")]
+    pub title: String,
+    /// The existing techniques, primitives, results, or patterns this pairs.
+    #[serde(default, deserialize_with = "de_string_vec")]
+    pub combines: Vec<String>,
+    #[serde(default, deserialize_with = "de_string")]
+    pub how_it_works: String,
+    /// The nearest thing that already exists, and how this differs from it.
+    #[serde(default, deserialize_with = "de_string")]
+    pub why_new: String,
+    #[serde(default, deserialize_with = "de_string")]
+    pub enables: String,
+    #[serde(default, deserialize_with = "de_string")]
+    pub risks: String,
+    /// The cheapest thing that would show whether it works.
+    #[serde(default, deserialize_with = "de_string")]
+    pub first_experiment: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IdeasDoc {
+    #[serde(default)]
+    pub ideas: Vec<Idea>,
+}
+
+string_enum! {
+    /// What one agent does with an idea the other proposed.
+    pub enum CrossKind {
+        Build = "build" | "extend" | "improve" | "combine",
+        Challenge = "challenge" | "reject" | "exists" | "object",
+        Keep = "keep" | "agree" | "accept" | "fine",
+    }
+}
+
+/// One agent's ruling on an idea the *other* agent proposed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrossVerdict {
+    /// The number the idea was given in the list, so the ruling can be matched
+    /// back to it. Titles are not used for this: a model rewrites them.
+    #[serde(default, deserialize_with = "de_i64")]
+    pub idea: i64,
+    pub verdict: CrossKind,
+    #[serde(default, deserialize_with = "de_string")]
+    pub reason: String,
+    /// The revised idea, when the verdict is build.
+    #[serde(default)]
+    pub build: Option<Idea>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CrossDoc {
+    #[serde(default)]
+    pub verdicts: Vec<CrossVerdict>,
+}
+
+/// What the agent that proposed a challenged idea says to the objection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Defence {
+    #[serde(default, deserialize_with = "de_i64")]
+    pub idea: i64,
+    /// True to stand by it with specifics, false to withdraw it.
+    #[serde(deserialize_with = "de_bool")]
+    pub stands: bool,
+    #[serde(default, deserialize_with = "de_string")]
+    pub reply: String,
+}
+
+/// The last round's answer: defences for the agent's own challenged ideas, and
+/// its ranking of everything still standing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConvergeDoc {
+    #[serde(default)]
+    pub defences: Vec<Defence>,
+    /// Idea numbers, best first.
+    #[serde(default, deserialize_with = "de_i64_vec")]
+    pub ranking: Vec<i64>,
+}
+
 /// A finding after both reviewers have had their say.
 #[derive(Debug, Clone)]
 pub struct Judged {

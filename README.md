@@ -190,6 +190,14 @@ spar review 108             # review a PR without touching it, fork or not
 spar review 108 --dry-run   # print the review instead of posting it
 spar review                 # review every open PR
 
+spar brainstorm novel uses of Bitcoin Script for shared custody
+                            # both agents propose, build on and challenge each
+                            # other's ideas, then rank; written to a local file
+spar brainstorm             # read the repository and brainstorm ideas for it
+spar brainstorm --file-issues    # and file each kept idea as an issue
+spar brainstorm --from .spar/brainstorms/x.md --file-issues
+                            # file a saved session, edited or not, calling no agent
+
 spar resume                 # continue the loop on every open PR
 spar resume 108             # or name them
 spar resume 108 --next codex     # override whose turn it is
@@ -464,6 +472,63 @@ checkpoint to the current head.
 
 A PR with no spar state starts fresh, with the agent that did not implement
 taking the first review.
+
+## Brainstorming with the pair
+
+`spar brainstorm` rests on one premise: the pieces of an answer usually exist
+already, in the problem's own field or an adjacent one, and what is missing is
+the pairing. So the agents are not asked to invent. They are asked to take
+inventory of what exists and then to combine, and every idea has to name the
+pieces it pairs and the nearest thing that already does something like it.
+
+```bash
+spar brainstorm novel ways to use Bitcoin Script for shared custody
+spar brainstorm                       # read the repository, brainstorm for it
+spar brainstorm --ideas 8 --max-rounds 4
+spar brainstorm --out ideas.md        # somewhere you would commit
+spar brainstorm --file-issues         # file each kept idea as an issue
+spar brainstorm --from .spar/brainstorms/20260912-140307-novel-ways.md --file-issues
+```
+
+The subject is words, not a number, and none at all means the repository
+itself: the agents read it and propose things it could do, or do differently,
+that would matter to the people who use it. Open issues are listed in the
+prompt so what is already filed is not proposed again.
+
+Nothing is edited between rounds, so this is not the custody loop. It is the
+shape `spar review` uses, gated by `max_rounds`:
+
+1. **Diverge.** Both agents propose at the same time, neither seeing the
+   other. An idea both reach on their own is the strongest signal there is,
+   and it is marked as such and ranks first.
+2. **Cross.** Each reads only the ideas the other proposed and, for each,
+   builds on it with a further piece, challenges it by naming where it already
+   exists or why it cannot work, or keeps it. A build stands beside the
+   original as an idea of its own. With the default of three rounds this
+   happens once; more rounds repeat it.
+3. **Converge.** Whoever proposed a challenged idea defends it with specifics
+   or withdraws it, and both rank what is left. The order is the sum of the
+   two rankings, and an idea left out of a ranking scores last rather than
+   vanishing.
+
+Nothing here lets one agent overrule the other. An idea leaves the set only
+when its own proposer withdraws it or never answers the objection, and a
+challenge that was defended is kept with both sides of the argument under it.
+The first `--ideas` survive, five by default, and the rest are listed with the
+reason each was set aside.
+
+The session goes to `.spar/brainstorms/<date>-<subject>.md`, or wherever
+`--out` says. It is a header a person reads and then one entry per idea in the
+same shape as the follow-up queue: a title, what it combines, how it works, why
+it is new, what it enables, its risks, the first experiment, and the objection
+and reply where there was one. `spar followup --file` reads it too, so a
+brainstorm can be screened and worked like any other queue. Edit the file first
+if you like: `--from` files what it says, calls no agent, and the same duplicate
+search that guards every other filed issue applies. The agents' names stay in
+the file and never reach an issue.
+
+A brainstorm is read only, and it runs both agents in the repository root at
+once, the same way triage does. Commit or stash anything you care about first.
 
 ## Working the follow-up queue
 
@@ -1333,7 +1398,7 @@ Every review round is a repo-aware pass at the configured effort. A full ultra
 review of a three-line round-3 delta is money on fire, which is what
 `effort_schedule` exists to prevent. It has one key per kind of call, so a value
 means what its name says: `triage`, `implement`, `review_1`, `review_rest`,
-`respond`, `close`, `screen`, `checkin`, `split`. A call with no key set falls
+`respond`, `close`, `screen`, `checkin`, `split`, `brainstorm`. A call with no key set falls
 back to `round_1` or `rest`, which is what the schedule used to be, and then to
 the agent's own `effort`.
 
@@ -1362,6 +1427,9 @@ passes.
 and then the ordinary pipeline for each one it files. `spar checkin` is two
 calls per pull request, one to judge and one to check, and a third only when
 there is something to implement.
+
+`spar brainstorm` is two calls per round, so six at the default of three rounds
+and two with `--max-rounds 1`. Filing from a saved session costs nothing.
 
 ## Caveats
 

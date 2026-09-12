@@ -845,7 +845,7 @@ fn plural(n: usize) -> &'static str {
 }
 
 /// Run the same closure on every agent at once.
-fn concurrently<T, F>(agents: &[Agent], work: F) -> Vec<(String, Result<T>)>
+pub(crate) fn concurrently<T, F>(agents: &[Agent], work: F) -> Vec<(String, Result<T>)>
 where
     T: Send,
     F: Fn(&Agent) -> Result<T> + Sync,

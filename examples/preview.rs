@@ -7,12 +7,13 @@
 //! The model output below is deliberately as verbose as a real model gets. What
 //! prints is what a reviewer would actually read.
 
+use spar::brainstorm::{issue_body, Candidate, Standing};
 use spar::checkin::{checkin_comment, thread_reply, Settled};
 use spar::comments::{CommentKind, Pending};
 use spar::model::Ask;
 use spar::model::{
-    Dispute, Finding, Implementation, IssueRun, Judged, NextAction, ResponseDoc, Review, Severity,
-    SkippedItem, Standing, Verdict,
+    Dispute, Finding, Idea, Implementation, IssueRun, Judged, NextAction, ResponseDoc, Review,
+    Severity, SkippedItem, Standing as FindingStanding, Verdict,
 };
 use spar::review::{
     disposition_comment, outcome_comment, pr_body, review_comment, skip_comment, Ending,
@@ -254,7 +255,7 @@ fn main() {
         defence: None,
     };
     let mut disputed = judged(
-        Standing::Disputed,
+        FindingStanding::Disputed,
         "blocking",
         "Config loader swallows a parse error",
         "load_config discards the error from serde and returns a default.",
@@ -268,7 +269,7 @@ fn main() {
         verdict_comment(
             &[
                 judged(
-                    Standing::Corroborated,
+                    FindingStanding::Corroborated,
                     "blocking",
                     "Retry loop never terminates when max_attempts is unset",
                     "Both reviewers reproduced this: the guard on line 91 compares against \
@@ -277,7 +278,7 @@ fn main() {
                     "claude and codex",
                 ),
                 judged(
-                    Standing::Confirmed,
+                    FindingStanding::Confirmed,
                     "non-blocking",
                     "The request timeout is hard coded",
                     "Not a regression, the previous code had the same limitation.",
@@ -285,7 +286,7 @@ fn main() {
                     "codex",
                 ),
                 judged(
-                    Standing::Unverified,
+                    FindingStanding::Unverified,
                     "nit",
                     "Log line does not say how many attempts remain",
                     "Readability for whoever reads the logs at 3am.",
@@ -294,7 +295,7 @@ fn main() {
                 ),
                 disputed,
                 judged(
-                    Standing::Withdrawn,
+                    FindingStanding::Withdrawn,
                     "blocking",
                     "Off by one in the backoff",
                     "Withdrawn after the other reviewer pointed at the test that covers it.",
@@ -394,6 +395,43 @@ fn main() {
             .unwrap_or_else(|| "(nothing to say, so no comment is posted)".into())
     );
     println!("\n  (and a check-in with nothing outstanding posts no comment at all)");
+
+    rule("An idea filed from a brainstorm");
+    let idea = Candidate {
+        id: 1,
+        idea: Idea {
+            title: "Batch settlement with hash timelocks".into(),
+            combines: vec![
+                "hash time locked contracts".into(),
+                "batch auctions".into(),
+                "the OP_CHECKSEQUENCEVERIFY delay".into(),
+            ],
+            how_it_works: "Each trade posts a hash timelock, and one batch auction clears every \
+                           one of them at the deadline together, so the batch is the settlement."
+                .into(),
+            why_new: "The nearest thing is a plain escrow, which settles one trade at a time \
+                      and cannot net them against each other."
+                .into(),
+            enables: "Settling many trades in one transaction.".into(),
+            risks: "A fee spike at the deadline makes the batch uneconomic.".into(),
+            first_experiment: "Simulate ten trades on regtest and count the bytes.".into(),
+        },
+        proposers: vec!["claude".into()],
+        parent: None,
+        objection: Some((
+            "codex".into(),
+            "Coinjoin coordinators already batch settlement.".into(),
+        )),
+        defence: Some(
+            "A coordinator batches inputs, not conditional trades; nothing there clears a hash \
+             lock."
+                .into(),
+        ),
+        standing: Standing::Defended,
+        rank_sum: 3,
+    };
+    println!("{}", issue_body(&idea, &style));
+    println!("\n  (who proposed and who objected stays in the session file, never in the issue)");
 
     println!();
 }

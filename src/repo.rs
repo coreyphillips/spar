@@ -402,7 +402,7 @@ impl IgnoredState {
             {
                 continue;
             }
-            if !self.disposable_move(after, path) {
+            if !self.ignored_file_move(after, path) {
                 leavings.condemning.push(path.clone());
             } else if !is_generated_artifact(path) {
                 leavings.tolerated.push(path.clone());
@@ -428,9 +428,16 @@ impl IgnoredState {
         is_generated_artifact(path) && self.disposable_move(after, path)
     }
 
-    /// Successful edits use the same ignore policy as read-only calls.
-    /// Cleanup separately preserves ignored data, including nested checkouts.
+    /// Successful edits and read-only calls share an ignore policy. Spar's
+    /// resident worktrees belong to other runs, not to this call's output.
+    /// Cleanup separately preserves ignored data, including dependency clones.
     fn ignored_file_move(&self, after: &Self, path: &Path) -> bool {
+        if path.starts_with(WORKTREE_DIR)
+            && self.files.get(path).is_some_and(|file| file.kind == 3)
+            && self.files.get(path) != after.files.get(path)
+        {
+            return false;
+        }
         self.disposable_move(after, path)
     }
 
@@ -8896,8 +8903,16 @@ mod tests {
     fn deleting_a_resident_worktree_during_a_call_is_refused() {
         let (_fixture, repo, path, _checkpoint) = review_fixture("resident-deleted", 932);
         let baseline = repo.worktree_baseline(repo.root()).unwrap();
+        let checkpoint = repo.worktree_checkpoint(repo.root()).unwrap();
         std::fs::remove_dir_all(&path).unwrap();
 
+        let read_error = repo
+            .require_unchanged_worktree(repo.root(), &checkpoint, "main checkout")
+            .unwrap_err();
+        assert!(
+            read_error.to_string().contains("review-932"),
+            "{read_error}"
+        );
         let error = repo
             .refuse_new_ignored_files(repo.root(), &baseline)
             .unwrap_err();

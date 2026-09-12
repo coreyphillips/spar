@@ -2004,7 +2004,10 @@ esac
     // custom output it deliberately accepted in the preceding invocation.
     let repo = Repo::open(&fx.work, &cfg()).unwrap();
     let (resumed, _) = repo.worktree_for_pr(&pr(42, "feature")).unwrap();
-    assert_eq!(resumed.canonicalize().unwrap(), worktree.canonicalize().unwrap());
+    assert_eq!(
+        resumed.canonicalize().unwrap(),
+        worktree.canonicalize().unwrap()
+    );
     assert_eq!("fixed\n", git(&resumed, &["show", "HEAD:feature.txt"]));
     assert!(!resumed
         .join("manager/public/assets/index-DUym-Rfj.js")

@@ -1197,12 +1197,22 @@ files can be created, rebuilt, or removed without blocking a managed commit or
 a push. This includes custom output such as `manager/public/assets/`, not just
 common directories like `target/` and `dist/`. These files stay outside managed
 commits. New non-ignored source files are staged; existing non-ignored untracked
-files remain protected. Nested repositories still require recovery.
+files remain protected. Ignored dependency checkouts also stay outside managed
+commits and remain protected from cleanup. Attribute-file checks use the same
+Git ignore rules, including nested ignore files, `.git/info/exclude`, and
+`core.excludesFile`.
 
 Accepting an edit and deleting its worktree are separate decisions. Ordinary
 cleanup still retains ignored files outside recognized build and cache directories,
 so accepting custom output does not authorize deleting local data. Failed editing
 calls also keep their recovery checks before retry or fallback.
+
+When resuming a PR whose commits are already published and whose source is clean,
+custom ignored files do not prevent a fresh checkout. Spar moves the previous
+checkout and its branch to a unique `retained-pr-<number>-...` recovery name,
+preserving its files and reflog, then checks out the current PR head. It reports
+the retained path. Pending source edits and unpublished commits still require
+recovery before rebuilding.
 
 A call asked only to read likewise allows changes to project-ignored files.
 Tracked changes and ordinary untracked writes still fail that call.

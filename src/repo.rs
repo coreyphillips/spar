@@ -428,13 +428,10 @@ impl IgnoredState {
         is_generated_artifact(path) && self.disposable_move(after, path)
     }
 
-    /// Successful edits may leave files ignored by the project outside the
-    /// commit. A nested checkout still needs recovery, even when ignored.
+    /// Successful edits use the same ignore policy as read-only calls.
+    /// Cleanup separately preserves ignored data, including nested checkouts.
     fn ignored_file_move(&self, after: &Self, path: &Path) -> bool {
         self.disposable_move(after, path)
-            && [self, after]
-                .iter()
-                .all(|state| state.files.get(path).is_none_or(|file| file.kind != 3))
     }
 
     /// Whether neither state has anything at `path` worth keeping, so whatever
@@ -1809,6 +1806,7 @@ impl Repo {
                 );
             }
         }
+        self.retain_ignored_pr_worktree(&path, &local, pr.number)?;
         self.refuse_dirty_worktree(
             &path,
             &format!("worktree for PR #{}", pr.number),
@@ -1839,6 +1837,66 @@ impl Repo {
         self.git(&["worktree", "add", "-B", &local, &path_str, &start])?;
         self.record_branch(&local, "pr", pr.number);
         Ok((path, head))
+    }
+
+    /// A retry needs a fresh checkout, not permission to delete ignored data.
+    /// Keep that data and its branch when all commits are already published.
+    fn retain_ignored_pr_worktree(&self, path: &Path, branch: &str, number: i64) -> Result<()> {
+        if !path.is_dir() || !self.worktree_belongs_to_repo(path)? {
+            return Ok(());
+        }
+        let current =
+            self.git_at_without_automation(path, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+        if current.trim() != branch
+            || self.has_uncommitted_changes(path)?
+            || !has_untracked_work_worth_keeping(path, Disposable::BuildOutput)?
+        {
+            return Ok(());
+        }
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let (name, retained) = loop {
+            let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+            let name = format!("retained-pr-{number}-{}-{serial}", std::process::id());
+            let retained = self.worktree_path(&name);
+            if !retained
+                .try_exists()
+                .map_err(|e| spar_err!("could not inspect {}: {e}", retained.display()))?
+                && !self.exact_ref_exists_checked(&self.root, &format!("refs/heads/{name}"))?
+            {
+                break (name, retained);
+            }
+        };
+        // Neither command overwrites an existing destination. The branch rename
+        // preserves its reflog, and the worktree move preserves every file.
+        self.git_at_without_automation(path, &["branch", "-m", branch, &name])?;
+        if let Err(error) = self.git_at_without_automation(
+            &self.root,
+            &[
+                "worktree",
+                "move",
+                &path.display().to_string(),
+                &retained.display().to_string(),
+            ],
+        ) {
+            // A locked worktree or one with submodules cannot always be moved.
+            // Restore the branch name so a failed move does not strand a retry.
+            let rollback =
+                self.git_at_without_automation(&self.root, &["branch", "-m", &name, branch]);
+            let detail = rollback
+                .err()
+                .map(|e| format!(" Branch name recovery also failed: {}", e.last_line()))
+                .unwrap_or_default();
+            bail!(
+                "could not retain the PR checkout at {}: {}. Its files were kept.{detail}",
+                retained.display(),
+                error.last_line()
+            );
+        }
+        logdim!(
+            "retained ignored files and branch {name} at {}; preparing a fresh PR checkout",
+            retained.display()
+        );
+        Ok(())
     }
 
     /// Check a pull request's head out read only, detached, with no branch.
@@ -5184,30 +5242,7 @@ fn collect_attribute_files(
     // ever staged or compared as tracked content, so it cannot reach a managed
     // commit. Capturing it meant `cargo package` or `npm ci` writing one into
     // its own output ended a read-only call outright.
-    let untracked = run_git_bytes(
-        repository,
-        &[
-            "ls-files",
-            "--others",
-            "--exclude-standard",
-            "-z",
-            "--",
-            ".gitattributes",
-            ":(glob)**/.gitattributes",
-        ],
-    )?;
-    if !untracked.is_empty() && !untracked.ends_with(&[0]) {
-        bail!(
-            "git returned an unterminated attribute-file listing for {}",
-            repository.display()
-        );
-    }
-    for raw in untracked
-        .split(|byte| *byte == 0)
-        .filter(|record| !record.is_empty())
-    {
-        paths.insert(safe_git_path(raw, "attribute")?);
-    }
+    paths.extend(untracked_attribute_paths(repository)?);
     for path in paths {
         let from_root = prefix.join(&path);
         let state = attribute_file_fingerprint(&root.join(&from_root))?;
@@ -5551,10 +5586,9 @@ fn index_entries(cwd: &Path) -> Result<Vec<IndexEntry>> {
     Ok(entries)
 }
 
-fn attributes_may_be_modified(cwd: &Path) -> Result<bool> {
-    // Match attribute_state: dependency attributes under ignored output do
-    // not make the source tree dirty after a managed commit.
-    let untracked = run_git_bytes(
+/// Share Git's complete ignore policy between call checkpoints and handoffs.
+fn untracked_attribute_paths(cwd: &Path) -> Result<Vec<PathBuf>> {
+    let listed = run_git_bytes(
         cwd,
         &[
             "ls-files",
@@ -5566,7 +5600,21 @@ fn attributes_may_be_modified(cwd: &Path) -> Result<bool> {
             ":(glob)**/.gitattributes",
         ],
     )?;
-    if !untracked.is_empty() {
+    if !listed.is_empty() && !listed.ends_with(&[0]) {
+        bail!(
+            "git returned an unterminated attribute-file listing for {}",
+            cwd.display()
+        );
+    }
+    listed
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .map(|raw| safe_git_path(raw, "attribute"))
+        .collect()
+}
+
+fn attributes_may_be_modified(cwd: &Path) -> Result<bool> {
+    if !untracked_attribute_paths(cwd)?.is_empty() {
         return Ok(true);
     }
 
@@ -8135,7 +8183,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_ignored_nested_repository_stops_a_managed_commit() {
+    fn a_new_ignored_nested_repository_allows_a_commit_but_is_preserved() {
         let (_fixture, repo, path, _checkpoint) = review_fixture("ignored-nested-edit", 927);
         let baseline = repo.worktree_baseline(&path).unwrap();
         let nested = path.join("generated/repro");
@@ -8143,12 +8191,12 @@ mod tests {
         test_git(&nested, &["init"]);
         std::fs::write(path.join("README.md"), "tracked change\n").unwrap();
 
-        let error = repo
+        assert!(repo
             .commit_pending_changes(&path, &baseline, "change", "change")
-            .unwrap_err();
-
-        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
-        assert!(error.to_string().contains("generated/repro"), "{error}");
+            .unwrap());
+        assert!(!repo.has_uncommitted_changes(&path).unwrap());
+        assert!(repository_has_recoverable_work(&path, true).unwrap());
+        repo.release_review_worktree(927);
         assert!(nested.join(".git").exists());
     }
 
@@ -8314,9 +8362,98 @@ mod tests {
     #[test]
     fn ordinary_untracked_attributes_still_count_as_uncommitted_work() {
         let (_fixture, repo, path, _initial) = review_fixture("ordinary-attributes", 942);
-        std::fs::write(path.join(".gitattributes"), "* -text\n").unwrap();
+        std::fs::create_dir_all(path.join("source")).unwrap();
+        std::fs::write(path.join("source/.gitattributes"), "* -text\n").unwrap();
 
         assert!(repo.has_uncommitted_changes(&path).unwrap());
+    }
+
+    #[test]
+    fn all_standard_ignore_sources_allow_artifact_changes_and_preserve_data() {
+        for source in ["repository", "nested", "local", "global"] {
+            let (_fixture, repo, path, _initial) = review_fixture(source, 945);
+            std::fs::create_dir_all(path.join("manager")).unwrap();
+            match source {
+                "repository" => {
+                    std::fs::write(path.join(".gitignore"), "generated/\nmanager/scratch/\n")
+                        .unwrap();
+                    test_git(&path, &["add", ".gitignore"]);
+                    test_git(&path, &["commit", "-m", "ignore artifacts"]);
+                }
+                "nested" => {
+                    std::fs::write(path.join("manager/.gitignore"), "scratch/\n").unwrap();
+                    test_git(&path, &["add", "manager/.gitignore"]);
+                    test_git(&path, &["commit", "-m", "ignore artifacts"]);
+                }
+                "local" => exclude_paths(&repo, &["manager/scratch/"]),
+                "global" => {
+                    let excludes = repo.root().parent().unwrap().join("global-ignore");
+                    std::fs::write(&excludes, "manager/scratch/\n").unwrap();
+                    test_git(
+                        &path,
+                        &["config", "core.excludesFile", excludes.to_str().unwrap()],
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let output = path.join("manager/scratch");
+            std::fs::create_dir_all(&output).unwrap();
+            std::fs::write(output.join(".env.local"), "LOCAL=value\n").unwrap();
+            std::fs::write(output.join(".DS_Store"), "old metadata").unwrap();
+            let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+            std::fs::write(output.join(".env.local"), "LOCAL=updated\n").unwrap();
+            std::fs::remove_file(output.join(".DS_Store")).unwrap();
+            for file in [
+                ".gitattributes",
+                "Cargo.lock",
+                "font.woff2",
+                "bundle.js",
+                "cache.db",
+            ] {
+                std::fs::write(output.join(file), "generated\n").unwrap();
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink("bundle.js", output.join("bundle-link")).unwrap();
+            let nested = output.join("dependency");
+            std::fs::create_dir_all(&nested).unwrap();
+            test_git(&nested, &["init"]);
+            repo.require_unchanged_worktree(&path, &checkpoint, "review worktree")
+                .unwrap_or_else(|error| panic!("{source}: {error}"));
+            assert!(!repo.has_uncommitted_changes(&path).unwrap(), "{source}");
+
+            let baseline = repo.worktree_baseline(&path).unwrap();
+            std::fs::write(path.join("README.md"), "source fix\n").unwrap();
+            std::fs::write(output.join("bundle.js"), "rebuilt\n").unwrap();
+            std::fs::remove_file(output.join("Cargo.lock")).unwrap();
+            std::fs::write(output.join("new-lock.json"), "{}\n").unwrap();
+            std::fs::write(nested.join("uncommitted.txt"), "dependency output\n").unwrap();
+            assert!(repo
+                .commit_pending_changes(&path, &baseline, "fix source", "fix source")
+                .unwrap_or_else(|error| panic!("{source}: {error}")));
+            assert!(!repo.has_uncommitted_changes(&path).unwrap(), "{source}");
+            assert!(test_git(
+                &path,
+                &[
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
+                    "HEAD",
+                    "--",
+                    "manager/scratch"
+                ]
+            )
+            .is_empty());
+            assert!(
+                repository_has_recoverable_work(&path, true).unwrap(),
+                "{source}"
+            );
+            repo.release_review_worktree(945);
+            assert_eq!(
+                "LOCAL=updated\n",
+                std::fs::read_to_string(output.join(".env.local")).unwrap()
+            );
+            assert!(nested.join(".git").exists(), "{source}");
+        }
     }
 
     /// Two reviewers share one checkout. The marker written when the first

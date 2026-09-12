@@ -1999,6 +1999,36 @@ esac
             .file_name()
             .to_string_lossy()
             .starts_with(".spar-recovery-needed-")));
+
+    // A later invocation must not fail because cleanup cannot delete the
+    // custom output it deliberately accepted in the preceding invocation.
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let (resumed, _) = repo.worktree_for_pr(&pr(42, "feature")).unwrap();
+    assert_eq!(resumed.canonicalize().unwrap(), worktree.canonicalize().unwrap());
+    assert_eq!("fixed\n", git(&resumed, &["show", "HEAD:feature.txt"]));
+    assert!(!resumed
+        .join("manager/public/assets/index-DUym-Rfj.js")
+        .exists());
+    let retained = std::fs::read_dir(worktree.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("retained-pr-42-")
+        })
+        .expect("the previous checkout and ignored files remain recoverable")
+        .path();
+    assert_eq!(
+        "rebuilt bundle\n",
+        std::fs::read_to_string(retained.join("manager/public/assets/index-DUym-Rfj.js")).unwrap()
+    );
+    assert_eq!(
+        "package-lock.json binary\n",
+        std::fs::read_to_string(retained.join("manager/node_modules/http-proxy/.gitattributes"))
+            .unwrap()
+    );
 }
 
 #[cfg(unix)]
@@ -4322,6 +4352,56 @@ fn a_dirty_pr_worktree_is_not_rebuilt() {
         std::fs::read_to_string(path.join("README.md")).unwrap()
     );
     repo.release_pr_worktree(60);
+}
+
+#[test]
+fn ignored_output_does_not_hide_ordinary_untracked_pr_work() {
+    let fx = repo("noclobber-pr-untracked");
+    git(&fx.work, &["checkout", "-q", "-b", "feature-63"]);
+    commit(&fx.work, ".gitignore", "local-output/\n", "ignore output");
+    git(&fx.work, &["push", "-q", "-u", "origin", "feature-63"]);
+    git(&fx.work, &["checkout", "-q", "main"]);
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let view = pr(63, "feature-63");
+    let (path, _) = repo.worktree_for_pr(&view).unwrap();
+    std::fs::create_dir_all(path.join("local-output")).unwrap();
+    std::fs::write(path.join("local-output/cache"), "cache\n").unwrap();
+    std::fs::write(path.join("new-source.txt"), "recover me\n").unwrap();
+
+    let error = repo.worktree_for_pr(&view).unwrap_err().to_string();
+
+    assert!(error.contains("uncommitted changes"), "{error}");
+    assert_eq!("pr-63\n", git(&path, &["branch", "--show-current"]));
+    assert_eq!(
+        "recover me\n",
+        std::fs::read_to_string(path.join("new-source.txt")).unwrap()
+    );
+}
+
+#[test]
+fn a_failed_pr_worktree_move_preserves_the_original_branch_name() {
+    let fx = repo("locked-pr-output");
+    git(&fx.work, &["checkout", "-q", "-b", "feature-64"]);
+    commit(&fx.work, ".gitignore", "local-output/\n", "ignore output");
+    git(&fx.work, &["push", "-q", "-u", "origin", "feature-64"]);
+    git(&fx.work, &["checkout", "-q", "main"]);
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let view = pr(64, "feature-64");
+    let (path, _) = repo.worktree_for_pr(&view).unwrap();
+    std::fs::create_dir_all(path.join("local-output")).unwrap();
+    std::fs::write(path.join("local-output/cache"), "keep me\n").unwrap();
+    git(&fx.work, &["worktree", "lock", path.to_str().unwrap()]);
+
+    let error = repo.worktree_for_pr(&view).unwrap_err().to_string();
+
+    assert!(error.contains("could not retain"), "{error}");
+    assert_eq!("pr-64\n", git(&path, &["branch", "--show-current"]));
+    assert_eq!(
+        "keep me\n",
+        std::fs::read_to_string(path.join("local-output/cache")).unwrap()
+    );
+    git(&fx.work, &["worktree", "unlock", path.to_str().unwrap()]);
+    repo.worktree_for_pr(&view).unwrap();
 }
 
 #[test]

@@ -5552,11 +5552,14 @@ fn index_entries(cwd: &Path) -> Result<Vec<IndexEntry>> {
 }
 
 fn attributes_may_be_modified(cwd: &Path) -> Result<bool> {
+    // Match attribute_state: dependency attributes under ignored output do
+    // not make the source tree dirty after a managed commit.
     let untracked = run_git_bytes(
         cwd,
         &[
             "ls-files",
             "--others",
+            "--exclude-standard",
             "-z",
             "--",
             ".gitattributes",
@@ -8302,6 +8305,18 @@ mod tests {
 
         repo.require_unchanged_worktree(&path, &checkpoint, "review worktree")
             .expect("an ignored attribute file governs only ignored paths");
+        assert!(
+            !repo.has_uncommitted_changes(&path).unwrap(),
+            "ignored dependency attributes must not stop the next review"
+        );
+    }
+
+    #[test]
+    fn ordinary_untracked_attributes_still_count_as_uncommitted_work() {
+        let (_fixture, repo, path, _initial) = review_fixture("ordinary-attributes", 942);
+        std::fs::write(path.join(".gitattributes"), "* -text\n").unwrap();
+
+        assert!(repo.has_uncommitted_changes(&path).unwrap());
     }
 
     /// Two reviewers share one checkout. The marker written when the first

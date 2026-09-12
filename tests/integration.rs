@@ -1862,6 +1862,17 @@ const BLOCKING_REVIEW: &str = r#"{"verdict":"changes_requested","next_action":"f
 #[cfg(unix)]
 #[test]
 fn custom_ignored_output_survives_edit_push_and_following_review() {
+    ignored_dependencies_survive_review(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn ignored_dependency_attributes_survive_an_author_response() {
+    ignored_dependencies_survive_review(true);
+}
+
+#[cfg(unix)]
+fn ignored_dependencies_survive_review(author_responds: bool) {
     let reviewer = format!(
         r#"#!/bin/sh
 set -eu
@@ -1870,6 +1881,8 @@ case "$1" in
     printf 'fixed\n' > feature.txt
     mkdir -p manager/public/assets
     printf 'bundle\n' > manager/public/assets/index-DUym-Rfj.js
+    mkdir -p manager/node_modules/http-proxy
+    printf 'package-lock.json binary\n' > manager/node_modules/http-proxy/.gitattributes
     printf '%s\n' '{{"summary":"Fix the branch","fixes":[]}}'
     ;;
 *) printf '%s\n' '{}' ;;
@@ -1882,12 +1895,35 @@ set -eu
 printf 'rebuilt bundle\n' > manager/public/assets/index-DUym-Rfj.js
 printf '%s\n' '{"verdict":"approve","next_action":"merge","summary":"Verified the fix.","findings":[]}'
 "#;
-    let (fx, bin, config, _) = failed_edit_fixture("custom-output-rounds", author, &reviewer);
+    let response = r#"#!/bin/sh
+set -eu
+printf 'fixed\n' > feature.txt
+mkdir -p manager/public/assets manager/node_modules/http-proxy
+printf 'rebuilt bundle\n' > manager/public/assets/index-DUym-Rfj.js
+printf 'package-lock.json binary\n' > manager/node_modules/http-proxy/.gitattributes
+printf '%s\n' '{"summary":"Fix the branch","dispositions":[{"title":"Fix the branch","file":"feature.txt","action":"fixed","reasoning":"Fixed the fixture.","new_issue_title":null,"new_issue_body":null}]}'
+"#;
+    let hand_back = format!(
+        r#"#!/bin/sh
+if [ "$(cat feature.txt)" = fixed ]; then
+    printf '%s\n' '{{"verdict":"approve","next_action":"merge","summary":"Verified the fix.","findings":[]}}'
+else
+    printf '%s\n' '{}'
+fi
+"#,
+        BLOCKING_REVIEW.replace("fix_myself", "hand_back")
+    );
+    let (author, reviewer) = if author_responds {
+        (response, hand_back.as_str())
+    } else {
+        (author, reviewer.as_str())
+    };
+    let (fx, bin, config, _) = failed_edit_fixture("custom-output-rounds", author, reviewer);
     git(&fx.work, &["checkout", "-q", "feature"]);
     commit(
         &fx.work,
         ".gitignore",
-        "manager/public/\n",
+        "manager/public/\nmanager/node_modules/\n",
         "Ignore custom output",
     );
     git(&fx.work, &["push", "-q", "origin", "feature"]);
@@ -1945,6 +1981,16 @@ esac
     assert_eq!(
         "rebuilt bundle\n",
         std::fs::read_to_string(worktree.join("manager/public/assets/index-DUym-Rfj.js")).unwrap()
+    );
+    assert!(git(
+        &worktree,
+        &["status", "--porcelain", "--untracked-files=all"]
+    )
+    .is_empty());
+    assert_eq!(
+        "package-lock.json binary\n",
+        std::fs::read_to_string(worktree.join("manager/node_modules/http-proxy/.gitattributes"))
+            .unwrap()
     );
     assert!(!std::fs::read_dir(&worktree)
         .unwrap()

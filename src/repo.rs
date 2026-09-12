@@ -4147,6 +4147,79 @@ impl Repo {
         }
     }
 
+    /// The worktree that has `branch` checked out, if one does.
+    fn worktree_holding(&self, branch: &str) -> Option<PathBuf> {
+        let listed = self
+            .git_at(Some(&self.root), &["worktree", "list", "--porcelain"])
+            .ok()?;
+        let wanted = format!("branch refs/heads/{branch}");
+        let mut current: Option<PathBuf> = None;
+        for line in listed.lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                current = Some(PathBuf::from(path));
+            } else if line == wanted {
+                return current;
+            }
+        }
+        None
+    }
+
+    /// Finish the local cleanup a merge could not.
+    ///
+    /// `gh pr merge --delete-branch` gives up on the local branch whenever any
+    /// worktree has it checked out, which is the ordinary state rather than an
+    /// odd one: `spar run` opens the pull request from
+    /// `.spar-worktrees/issue-N` and leaves the checkout there, and the merge
+    /// usually happens in a later `spar resume` working somewhere else. The
+    /// next run's sweep tidied it, so nothing was ever lost, but the run that
+    /// did the merge reported a failure about a branch nobody will touch again
+    /// and left a checkout for the next run to explain.
+    ///
+    /// Held to the same rules the sweep uses, because they are the rules that
+    /// decide whether anything would be lost: a branch spar recorded creating,
+    /// a worktree of spar's own with no recoverable work in it, and a tip some
+    /// surviving ref preserves. Anything else is left exactly where it is.
+    fn finish_merged_branch_cleanup(&self, number: i64) -> Option<String> {
+        let branch = self.pr_view(number).ok()?.head_ref_name;
+        if branch.is_empty() || !self.known_branches().contains_key(&branch) {
+            return None;
+        }
+        let mut released = None;
+        if let Some(path) = self.worktree_holding(&branch) {
+            if !path.starts_with(self.root.join(WORKTREE_DIR)) {
+                return None;
+            }
+            if !matches!(
+                self.has_recoverable_work(&path, Disposable::BuildOutput),
+                Ok(false)
+            ) {
+                return None;
+            }
+            match self.remove_worktree_at(&path) {
+                Ok(true) => released = Some(path),
+                _ => return None,
+            }
+        }
+        match self.delete_branch_if_safe(&branch) {
+            Ok(true) => {
+                self.forget_branch(&branch);
+                Some(match released {
+                    Some(path) => format!(
+                        " The worktree at {} was released and branch {branch} deleted.",
+                        path.display()
+                    ),
+                    None => format!(" Branch {branch} was deleted."),
+                })
+            }
+            _ => released.map(|path| {
+                format!(
+                    " The worktree at {} was released, but branch {branch} was kept.",
+                    path.display()
+                )
+            }),
+        }
+    }
+
     /// `gh pr merge --delete-branch` exits non-zero when it cannot delete the
     /// local branch, which happens *after* the merge has already landed.
     /// Treating that as a failure reports work as lost when it is not.
@@ -4156,8 +4229,11 @@ impl Repo {
             Ok(_) => Ok(()),
             Err(e) => {
                 if self.pr_state(number) == "MERGED" {
+                    let finished = self
+                        .finish_merged_branch_cleanup(number)
+                        .unwrap_or_default();
                     logdim!(
-                        "PR #{number} merged; branch cleanup did not finish: {}",
+                        "PR #{number} merged; branch cleanup did not finish: {}{finished}",
                         e.last_line()
                     );
                     Ok(())
@@ -4181,8 +4257,11 @@ impl Repo {
             Ok(_) => Ok(()),
             Err(e) => {
                 if self.pr_state(number) == "MERGED" {
+                    let finished = self
+                        .finish_merged_branch_cleanup(number)
+                        .unwrap_or_default();
                     logdim!(
-                        "PR #{number} merged; branch cleanup did not finish: {}",
+                        "PR #{number} merged; branch cleanup did not finish: {}{finished}",
                         e.last_line()
                     );
                     Ok(())
@@ -8289,6 +8368,34 @@ mod tests {
     /// name. The guard inside the call kept the review. This check then called
     /// the same thirteen files unrepresentable and ended the round, five
     /// minutes of review thrown away over a path Git had been told to disown.
+    /// The run this comes from: `gh pr merge --delete-branch` could not delete
+    /// `issue-784` because `.spar-worktrees/issue-784`, left by the run that
+    /// opened the pull request, still had it checked out.
+    #[test]
+    fn the_worktree_holding_a_branch_is_found_by_its_branch_name() {
+        let (_fixture, repo, _path, _checkpoint) = review_fixture("holding", 950);
+        let held = repo.root().join(WORKTREE_DIR).join("issue-950");
+        std::fs::create_dir_all(held.parent().unwrap()).unwrap();
+        test_git(
+            repo.root(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "issue-950",
+                held.to_str().unwrap(),
+                "main",
+            ],
+        );
+
+        let found = repo
+            .worktree_holding("issue-950")
+            .expect("the branch is checked out somewhere");
+
+        assert!(found.ends_with("issue-950"), "{}", found.display());
+        assert_eq!(None, repo.worktree_holding("issue-951"));
+    }
+
     #[test]
     fn a_read_only_call_may_rebuild_ignored_output_outside_the_directory_list() {
         let (_fixture, repo, path, _checkpoint) = review_fixture("read-only-rebuild", 943);

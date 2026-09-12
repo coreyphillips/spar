@@ -1509,6 +1509,10 @@ fn review_loop(
                 }
             }
             if let Some(response) = response {
+                // One set of marks across both passes, so a disposition the
+                // optional pass is about to handle is not reported as unplaced
+                // by the blocking one.
+                let mut used = vec![false; response.dispositions.len()];
                 let unresolved = apply_dispositions(
                     repo,
                     cfg,
@@ -1521,6 +1525,7 @@ fn review_loop(
                     ctx.pr_number,
                     &author_name,
                     editor.is_some(),
+                    &mut used,
                 );
                 remove_findings(&mut open_findings, &blocking);
                 extend_findings(&mut open_findings, &unresolved);
@@ -1531,7 +1536,9 @@ fn review_loop(
                     &review.findings,
                     state,
                     ctx.subject,
+                    &mut used,
                 );
+                warn_unplaced_dispositions(&response, &used);
             }
         }
 
@@ -2748,12 +2755,12 @@ fn apply_dispositions(
     pr_number: i64,
     author: &str,
     committed: bool,
+    used: &mut [bool],
 ) -> Vec<Finding> {
     let mut fixed = Vec::new();
     let mut refuted = Vec::new();
     let mut filed = Vec::new();
     let mut unresolved = Vec::new();
-    let mut used = vec![false; response.dispositions.len()];
 
     for source in blocking {
         let (index, d) = match matching_disposition(source, blocking, &response.dispositions) {
@@ -2905,16 +2912,6 @@ fn apply_dispositions(
                     unresolved.push(source.clone());
                 }
             }
-        }
-    }
-
-    for (index, disposition) in response.dispositions.iter().enumerate() {
-        if !used[index] {
-            logwarn!(
-                "ignoring an unmatched or duplicate disposition for '{}' ({})",
-                disposition.title,
-                disposition.file
-            );
         }
     }
 
@@ -4043,6 +4040,29 @@ fn optional_block(findings: &[Finding]) -> String {
 /// points never gated anything and they still do not. A fix takes the point off
 /// the list a person is handed at the end, since it is answered; a decline or a
 /// refutation leaves it exactly where it was.
+/// Say what neither pass could place, once both have had their turn.
+///
+/// This used to be the tail of `apply_dispositions`, which matches only the
+/// blocking findings. The author is handed the non-blocking ones too, under a
+/// header that asks it to fix the small ones and decline the rest with a
+/// reason, so every optional answer it gave as instructed was announced as
+/// unmatched and then quietly handled by `apply_optional_dispositions` on the
+/// next line. The warning was reporting spar's own reading order.
+///
+/// What is left after both passes is worth saying: an answer to a point nobody
+/// raised, or a second answer to one already settled.
+fn warn_unplaced_dispositions(response: &ResponseDoc, used: &[bool]) {
+    for (index, disposition) in response.dispositions.iter().enumerate() {
+        if !used[index] {
+            logwarn!(
+                "ignoring an unmatched or duplicate disposition for '{}' ({})",
+                disposition.title,
+                disposition.file
+            );
+        }
+    }
+}
+
 fn apply_optional_dispositions(
     repo: &Repo,
     cfg: &Config,
@@ -4050,6 +4070,7 @@ fn apply_optional_dispositions(
     findings: &[Finding],
     state: &mut IssueRun,
     subject: i64,
+    used: &mut [bool],
 ) {
     let optional = optional_findings(findings);
     if optional.is_empty() {
@@ -4057,10 +4078,17 @@ fn apply_optional_dispositions(
     }
     let mut fixed = 0usize;
     for finding in &optional {
-        let Ok((_, disposition)) = matching_disposition(finding, &optional, &response.dispositions)
+        let Ok((index, disposition)) =
+            matching_disposition(finding, &optional, &response.dispositions)
         else {
             continue;
         };
+        // A disposition a blocking finding already took is not also this
+        // finding's answer, however alike the two are worded.
+        if used[index] {
+            continue;
+        }
+        used[index] = true;
         let unique = unique_stable_finding(&optional, finding);
         match disposition.action {
             Action::Fixed => {
@@ -4874,6 +4902,63 @@ mod tests {
             matching_disposition(&ios, &findings, &answers),
             Err("no matching disposition")
         ));
+    }
+
+    /// The warning this removes: the author is handed the non-blocking findings
+    /// under a header asking it to fix the small ones and decline the rest with
+    /// a reason, so an answer to one is the author doing as it was told. The
+    /// blocking pass cannot place it, and used to say so, one line before the
+    /// optional pass placed it.
+    #[test]
+    fn an_answer_to_an_optional_finding_is_placed_by_the_optional_pass() {
+        let blocker = finding("blocking", "Unbounded loop", "d", "src/x.rs", true);
+        let optional = finding(
+            "non-blocking",
+            "Storage failures are reported as a successful state update",
+            "d",
+            "src/wallet/index.ts",
+            true,
+        );
+        let answers = [
+            disposition("Unbounded loop", "src/x.rs", Action::Fixed),
+            disposition(
+                "Storage failures are reported as a successful state update",
+                "src/wallet/index.ts",
+                Action::Refuted,
+            ),
+        ];
+        let mut used = vec![false; answers.len()];
+
+        let blocking = [blocker];
+        let (index, _) = matching_disposition(&blocking[0], &blocking, &answers).unwrap();
+        used[index] = true;
+
+        let optionals = [optional];
+        let (index, _) = matching_disposition(&optionals[0], &optionals, &answers).unwrap();
+        assert!(!used[index], "the blocking pass must not have taken it");
+        used[index] = true;
+
+        assert!(used.iter().all(|placed| *placed), "both were placed");
+    }
+
+    /// And the warning still means something. An answer to a point nobody
+    /// raised is placed by neither pass.
+    #[test]
+    fn an_answer_to_a_point_nobody_raised_stays_unplaced() {
+        let blocking = [finding("blocking", "Unbounded loop", "d", "src/x.rs", true)];
+        let answers = [
+            disposition("Unbounded loop", "src/x.rs", Action::Fixed),
+            disposition("Something nobody said", "src/z.rs", Action::Refuted),
+        ];
+        let mut used = vec![false; answers.len()];
+
+        let (index, _) = matching_disposition(&blocking[0], &blocking, &answers).unwrap();
+        used[index] = true;
+
+        let optionals = optional_findings(&blocking);
+        assert!(optionals.is_empty());
+
+        assert_eq!(vec![false], vec![used[1]], "the stray answer is unplaced");
     }
 
     #[test]

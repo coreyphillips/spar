@@ -1192,21 +1192,20 @@ custom editing command that commits before its report fails has its clean,
 forward-moving commit published and review custody checkpointed before spar
 returns the error. A reset or rewritten tip is kept for recovery. A failed
 initial implementation that already made durable commits can continue from
-them. Ignored files outside known build and cache directories stop the commit
-because they may be required work. Recognized test and build artifacts, such as
-files under `target/` or `dist/`, are treated the same way everywhere: writing
-or rewriting them never fails a call, whether it was asked to edit or only to
-read, they are left out of the commit, and they do not keep a finished worktree
-from being removed, since whatever wrote them writes them again.
+them. Successful editing calls honor the project's Git ignore rules: ignored
+files can be created, rebuilt, or removed without blocking a managed commit or
+a push. This includes custom output such as `manager/public/assets/`, not just
+common directories like `target/` and `dist/`. These files stay outside managed
+commits. New non-ignored source files are staged; existing non-ignored untracked
+files remain protected. Nested repositories still require recovery.
 
-A call asked only to read is held to a rule of its own, because it has no commit
-to protect. A file the project ignores is out of scope however it moved, whether
-the call created it, rewrote it, or deleted it, since the repository's ignore
-rules are the project's own account of what its build writes and a list of
-directory names can only ever approximate them. What still fails such a call is
-what it was actually asked about: the tracked tree, an ordinary untracked file,
-or a repository nested in the output. On an editing call all of those still stop
-the commit and keep the worktree.
+Accepting an edit and deleting its worktree are separate decisions. Ordinary
+cleanup still retains ignored files outside recognized build and cache directories,
+so accepting custom output does not authorize deleting local data. Failed editing
+calls also keep their recovery checks before retry or fallback.
+
+A call asked only to read likewise allows changes to project-ignored files.
+Tracked changes and ordinary untracked writes still fail that call.
 
 The read-only rule is that wide because the call is not the only writer. Triage
 runs for minutes in your primary checkout, where Finder rewrites `.DS_Store` and

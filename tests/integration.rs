@@ -1861,6 +1861,102 @@ const BLOCKING_REVIEW: &str = r#"{"verdict":"changes_requested","next_action":"f
 
 #[cfg(unix)]
 #[test]
+fn custom_ignored_output_survives_edit_push_and_following_review() {
+    let reviewer = format!(
+        r#"#!/bin/sh
+set -eu
+case "$1" in
+*"chose to fix the blocking findings yourself"*)
+    printf 'fixed\n' > feature.txt
+    mkdir -p manager/public/assets
+    printf 'bundle\n' > manager/public/assets/index-DUym-Rfj.js
+    printf '%s\n' '{{"summary":"Fix the branch","fixes":[]}}'
+    ;;
+*) printf '%s\n' '{}' ;;
+esac
+"#,
+        BLOCKING_REVIEW
+    );
+    let author = r#"#!/bin/sh
+set -eu
+printf 'rebuilt bundle\n' > manager/public/assets/index-DUym-Rfj.js
+printf '%s\n' '{"verdict":"approve","next_action":"merge","summary":"Verified the fix.","findings":[]}'
+"#;
+    let (fx, bin, config, _) = failed_edit_fixture("custom-output-rounds", author, &reviewer);
+    git(&fx.work, &["checkout", "-q", "feature"]);
+    commit(
+        &fx.work,
+        ".gitignore",
+        "manager/public/\n",
+        "Ignore custom output",
+    );
+    git(&fx.work, &["push", "-q", "origin", "feature"]);
+    git(&fx.work, &["checkout", "-q", "main"]);
+    let before = pushed_head(&fx);
+    let settings = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("max_rounds = 1", "max_rounds = 2");
+    std::fs::write(&config, settings).unwrap();
+    let gh_path = bin.join("gh");
+    let gh = std::fs::read_to_string(&gh_path).unwrap();
+    let head_query = r#"case "$*" in
+*"--json headRefOid"*)
+    head=$(git ls-remote origin refs/heads/feature | cut -f1)
+    printf '{"headRefOid":"%s"}\n' "$head"
+    exit 0
+    ;;
+esac
+"#;
+    executable(
+        &gh_path,
+        &gh.replacen("#!/bin/sh\n", &format!("#!/bin/sh\n{head_query}"), 1),
+    );
+
+    let (ok, out, err) = spar_with_path(
+        &[
+            "resume",
+            "42",
+            "--config",
+            config.to_str().unwrap(),
+            "--repo",
+            fx.work.to_str().unwrap(),
+        ],
+        &fx.dir,
+        &bin,
+    );
+
+    assert!(ok, "{out}\n{err}");
+    assert!(out.contains("approved"), "{out}\n{err}");
+    assert_ne!(before, pushed_head(&fx));
+    let worktree = review_worktree(&fx);
+    assert_eq!("fixed\n", git(&worktree, &["show", "HEAD:feature.txt"]));
+    assert!(git(
+        &worktree,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "HEAD",
+            "--",
+            "manager/public/"
+        ]
+    )
+    .is_empty());
+    assert_eq!(
+        "rebuilt bundle\n",
+        std::fs::read_to_string(worktree.join("manager/public/assets/index-DUym-Rfj.js")).unwrap()
+    );
+    assert!(!std::fs::read_dir(&worktree)
+        .unwrap()
+        .flatten()
+        .any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".spar-recovery-needed-")));
+}
+
+#[cfg(unix)]
+#[test]
 fn a_failed_self_fix_publishes_its_clean_commit() {
     let reviewer = format!(
         r#"#!/bin/sh
@@ -4399,7 +4495,7 @@ fn an_editing_call_cannot_select_a_new_parent_side_git_filter() {
 }
 
 #[test]
-fn an_ignored_only_success_is_kept_instead_of_treated_as_no_work() {
+fn an_ignored_only_success_is_accepted_without_discarding_the_files() {
     let fx = repo("ignored-only-edit");
     commit(
         &fx.work,
@@ -4442,12 +4538,7 @@ fn an_ignored_only_success_is_kept_instead_of_treated_as_no_work() {
     let state = run_issue(&agents, &config, &repo, &item, &issue);
     let path = fx.work.join(".spar-worktrees").join("issue-75");
 
-    assert_eq!(Status::Error, state.status);
-    assert!(
-        state.notes.iter().any(|note| note.contains("ignored file")),
-        "{:?}",
-        state.notes
-    );
+    assert_eq!(Status::Abandoned, state.status);
     assert_eq!(
         "keep me\n",
         std::fs::read_to_string(path.join("generated/fixture.txt")).unwrap()
@@ -4466,12 +4557,12 @@ fn an_ignored_only_success_is_kept_instead_of_treated_as_no_work() {
 }
 
 #[test]
-fn tracked_and_ignored_edits_stop_before_a_managed_commit() {
+fn tracked_and_ignored_edits_are_committed_without_the_ignored_files() {
     let fx = repo("tracked-and-ignored-edit");
     commit(
         &fx.work,
         ".gitignore",
-        "generated/\n",
+        "manager/public/assets/\n",
         "ignore generated files",
     );
     git(&fx.work, &["push", "-q", "origin", "main"]);
@@ -4479,8 +4570,8 @@ fn tracked_and_ignored_edits_stop_before_a_managed_commit() {
     let mut config = cfg();
     let answer = r#"{"summary":"changed it","problem":"","changes":[],"testing":[],"notes":""}"#;
     let script = format!(
-        "printf 'tracked change\\n' > README.md; mkdir -p generated; \
-         printf 'keep me\\n' > generated/fixture.txt; printf '%s\\n' '{answer}'"
+        "printf 'tracked change\\n' > README.md; mkdir -p manager/public/assets; \
+         printf 'keep me\\n' > manager/public/assets/fixture.txt; printf '%s\\n' '{answer}'"
     );
     config.agents[0].command = vec![
         CommandPart::One("/bin/sh".into()),
@@ -4510,39 +4601,41 @@ fn tracked_and_ignored_edits_stop_before_a_managed_commit() {
     let path = fx.work.join(".spar-worktrees").join("issue-81");
 
     assert_eq!(Status::Error, state.status);
-    assert!(
-        state
-            .notes
-            .iter()
-            .any(|note| note.contains("generated/fixture.txt")),
-        "{:?}",
-        state.notes
-    );
-    assert_eq!(
-        git(&path, &["rev-parse", "HEAD"]),
-        git(&path, &["rev-parse", "origin/main"])
-    );
+    assert_eq!("changed it\n", git(&path, &["log", "-1", "--format=%s"]));
+    assert!(!git(&fx.work, &["ls-remote", "--heads", "origin", "issue-81"]).is_empty());
+    assert!(git(
+        &path,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "HEAD",
+            "--",
+            "manager/public/assets/"
+        ]
+    )
+    .is_empty());
     assert_eq!(
         "tracked change\n",
         std::fs::read_to_string(path.join("README.md")).unwrap()
     );
     assert_eq!(
         "keep me\n",
-        std::fs::read_to_string(path.join("generated/fixture.txt")).unwrap()
+        std::fs::read_to_string(path.join("manager/public/assets/fixture.txt")).unwrap()
     );
-    assert!(!git(&path, &["status", "--porcelain"]).is_empty());
+    assert!(git(&path, &["status", "--porcelain"]).is_empty());
     let retry = repo.worktree_add(81, "main").unwrap_err().to_string();
-    assert!(retry.contains("ignored files"), "{retry}");
+    assert!(retry.contains("origin/issue-81"), "{retry}");
     repo.worktree_remove(81);
 }
 
 #[test]
-fn a_direct_commit_with_ignored_output_stops_before_push() {
+fn a_direct_commit_with_ignored_output_reaches_push() {
     let fx = repo("direct-commit-and-ignored-edit");
     commit(
         &fx.work,
         ".gitignore",
-        "generated/\n",
+        "manager/public/assets/\n",
         "ignore generated files",
     );
     git(&fx.work, &["push", "-q", "origin", "main"]);
@@ -4551,8 +4644,8 @@ fn a_direct_commit_with_ignored_output_stops_before_push() {
     let answer = r#"{"summary":"changed it","problem":"","changes":[],"testing":[],"notes":""}"#;
     let script = format!(
         "printf 'tracked change\\n' > README.md; git add README.md; \
-         git commit -q -m 'direct change'; mkdir -p generated; \
-         printf 'keep me\\n' > generated/fixture.txt; printf '%s\\n' '{answer}'"
+         git commit -q -m 'direct change'; mkdir -p manager/public/assets; \
+         printf 'keep me\\n' > manager/public/assets/fixture.txt; printf '%s\\n' '{answer}'"
     );
     config.agents[0].command = vec![
         CommandPart::One("/bin/sh".into()),
@@ -4582,25 +4675,17 @@ fn a_direct_commit_with_ignored_output_stops_before_push() {
     let path = fx.work.join(".spar-worktrees").join("issue-82");
 
     assert_eq!(Status::Error, state.status);
-    assert!(
-        state
-            .notes
-            .iter()
-            .any(|note| note.contains("generated/fixture.txt")),
-        "{:?}",
-        state.notes
-    );
     assert_eq!("direct change\n", git(&path, &["log", "-1", "--format=%s"]));
     assert_eq!(
         "keep me\n",
-        std::fs::read_to_string(path.join("generated/fixture.txt")).unwrap()
+        std::fs::read_to_string(path.join("manager/public/assets/fixture.txt")).unwrap()
     );
-    assert!(git(&fx.work, &["ls-remote", "--heads", "origin", "issue-82"]).is_empty());
+    assert!(!git(&fx.work, &["ls-remote", "--heads", "origin", "issue-82"]).is_empty());
     let retry = repo.worktree_add(82, "main").unwrap_err().to_string();
-    assert!(retry.contains("local branch issue-82"), "{retry}");
+    assert!(retry.contains("origin/issue-82"), "{retry}");
     assert_eq!(
         "keep me\n",
-        std::fs::read_to_string(path.join("generated/fixture.txt")).unwrap()
+        std::fs::read_to_string(path.join("manager/public/assets/fixture.txt")).unwrap()
     );
     repo.worktree_remove(82);
 }
@@ -4725,12 +4810,7 @@ fn a_decline_that_created_an_ignored_file_keeps_the_worktree() {
     let state = run_issue(&agents, &config, &repo, &item, &issue);
     let path = fx.work.join(".spar-worktrees").join("issue-77");
 
-    assert_eq!(Status::Error, state.status);
-    assert!(
-        state.notes.iter().any(|note| note.contains("ignored file")),
-        "{:?}",
-        state.notes
-    );
+    assert_eq!(Status::Abandoned, state.status);
     assert_eq!(
         "keep me\n",
         std::fs::read_to_string(path.join("generated/fixture.txt")).unwrap()

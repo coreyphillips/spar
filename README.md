@@ -490,10 +490,11 @@ spar brainstorm --file-issues         # file each kept idea as an issue
 spar brainstorm --from .spar/brainstorms/20260912-140307-novel-ways.md --file-issues
 ```
 
-The subject is words, not a number, and none at all means the repository
-itself: the agents read it and propose things it could do, or do differently,
-that would matter to the people who use it. Open issues are listed in the
-prompt so what is already filed is not proposed again.
+The subject is words, not a number, and needs no quotes. A word that starts
+with a hyphen goes after `--`. None at all means the repository itself: the
+agents read it and propose things it could do, or do differently, that would
+matter to the people who use it. Open issues are listed in the prompt so what
+is already filed is not proposed again.
 
 Nothing is edited between rounds, so this is not the custody loop. It is the
 shape `spar review` uses, gated by `max_rounds`:

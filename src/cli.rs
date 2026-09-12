@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 
 use crate::agent::{self, Agent};
+use crate::brainstorm;
 use crate::checkin;
 use crate::config::{self, Config};
 use crate::error::Result;
@@ -38,7 +39,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
                   issue whose pull request was given too. Omit them and \
                   spar takes everything open, up to --limit. `split` applies that limit once to \
                   issues and once to pull requests. `followup` takes none: it works the queue in \
-                  .spar/followups.md, and an entry there has no number to name.",
+                  .spar/followups.md, and an entry there has no number to name. `brainstorm` \
+                  takes words rather than numbers: the subject to brainstorm, or nothing to \
+                  brainstorm the repository itself.",
     max_term_width = 96
 )]
 pub struct Cli {
@@ -176,6 +179,48 @@ pub enum Command {
         /// cross-checking, 2 adds it, 3 adds a rebuttal on what they dispute.
         #[arg(long)]
         max_rounds: Option<u32>,
+    },
+
+    /// Brainstorm novel ways to reach a goal, by pairing pieces that exist.
+    ///
+    /// The premise is that the parts of an answer usually exist already and
+    /// have not been put together. Both agents take inventory of what exists
+    /// and propose independently, then each builds on or challenges what only
+    /// the other proposed, then what was challenged is defended or withdrawn
+    /// and both rank what is left. The session is written to a local file.
+    /// With no subject, the agents read the repository and brainstorm for it.
+    ///
+    /// Takes words, not numbers. --limit, --min-number, and --base do nothing
+    /// here.
+    Brainstorm {
+        /// The subject, in as many words as it takes. Omit to brainstorm the
+        /// repository itself.
+        topic: Vec<String>,
+        #[command(flatten)]
+        common: Common,
+        /// Rounds. 1 is two independent proposals with nothing cross-checked,
+        /// 2 adds the ranking, 3 puts a round of building and challenging
+        /// between them, and more adds further rounds of that.
+        #[arg(long)]
+        max_rounds: Option<u32>,
+        /// How many ideas to keep. The rest are listed with why they went.
+        #[arg(long, default_value_t = 5, value_name = "N")]
+        ideas: usize,
+        /// Write the session here instead of under .spar/brainstorms/.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// File each kept idea as an issue, or add it to one that covers it.
+        #[arg(long)]
+        file_issues: bool,
+        /// File the ideas in a saved session instead of running one. Edit the
+        /// file first; what is filed is what it says.
+        #[arg(
+            long,
+            value_name = "PATH",
+            requires = "file_issues",
+            conflicts_with = "out"
+        )]
+        from: Option<PathBuf>,
     },
 
     /// Break an issue or a pull request into smaller ones.
@@ -407,6 +452,24 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
             Ok(report(&results, &cfg, &repo))
         }
+
+        Command::Brainstorm {
+            topic,
+            common,
+            max_rounds,
+            ideas,
+            out,
+            file_issues,
+            from,
+        } => cmd_brainstorm(
+            topic,
+            &common,
+            max_rounds,
+            ideas,
+            out,
+            file_issues,
+            from.as_deref(),
+        ),
 
         Command::Checkin {
             items,
@@ -1622,6 +1685,78 @@ fn cmd_post(
     Ok(i32::from(failed).max(report_writes(&repo)))
 }
 
+/// Run a brainstorm, or file the ideas from a saved one.
+///
+/// `--from` builds no agents and makes no calls, like `post`: the file is the
+/// whole input, and a person may have edited it, which is the point of the
+/// two step path.
+#[allow(clippy::too_many_arguments)]
+fn cmd_brainstorm(
+    topic: Vec<String>,
+    common: &Common,
+    max_rounds: Option<u32>,
+    ideas: usize,
+    out: Option<PathBuf>,
+    file_issues: bool,
+    from: Option<&Path>,
+) -> Result<i32> {
+    if ideas == 0 {
+        bail!("--ideas must be at least 1");
+    }
+    if let Some(path) = from {
+        let cfg = config::load(common.config.as_deref())?;
+        let repo = Repo::open(&common.repo, &cfg)?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| spar_err!("could not read {}: {e}", path.display()))?;
+        let entries = brainstorm::parse_session(&text);
+        if entries.is_empty() {
+            bail!(
+                "no ideas in {}: an idea is a `## ` heading with its sections under it",
+                path.display()
+            );
+        }
+        log!(
+            "filing {} idea{} from {}",
+            entries.len(),
+            if entries.len() == 1 { "" } else { "s" },
+            path.display()
+        );
+        brainstorm::file_ideas(&repo, &entries);
+        return Ok(report_writes(&repo));
+    }
+
+    let overrides = Overrides {
+        max_rounds,
+        ..Overrides::default()
+    };
+    let (cfg, repo, agents) = prepare(common, Some(overrides))?;
+    let joined = topic.join(" ").trim().to_string();
+    let session = brainstorm::Session {
+        topic: (!joined.is_empty()).then_some(joined),
+        budget: cfg.loop_cfg.max_rounds,
+        wanted: ideas,
+    };
+    let now = brainstorm::now_secs();
+    let outcome = brainstorm::run(&agents, &cfg, &repo, &session)?;
+    let path = out.unwrap_or_else(|| brainstorm::default_path(&repo, &session, now));
+    let text = brainstorm::render_session(&outcome, &brainstorm::date_line(now), &repo.style);
+    crate::repo::write_text_atomic(&path, &text)?;
+    brainstorm::print_summary(&outcome, &path);
+    if file_issues {
+        println!();
+        brainstorm::file_ideas(&repo, &brainstorm::issue_entries(&outcome, &repo.style));
+    }
+
+    let spent = spend::taken();
+    if let Err(e) = repo.record_spend(&spent) {
+        logdim!("could not record what this run spent: {e}");
+    }
+    if let Some(summary) = spend::summary(&spent) {
+        println!("\n{summary}");
+    }
+    Ok(report_writes(&repo))
+}
+
 /// Append the settings a config does not mention, commented out.
 ///
 /// Append only by design. Rewriting somebody's config to insert options would
@@ -1874,6 +2009,7 @@ fn settings_block(first_implementor: &str) -> String {
         "# screen      = \"low\"    # the follow-up screen, one call for the queue\n",
         "# checkin     = \"high\"   # judging comments other people left\n",
         "# split       = \"high\"   # proposing and checking a split\n",
+        "# brainstorm  = \"high\"   # every brainstorm round\n",
         "# round_1     = \"high\"   # read by any call above with no key set\n",
         "# rest        = \"low\"    # the same, for later rounds and the close\n\n",
     ));
@@ -2557,6 +2693,7 @@ review_1 = \"ultra\"
             vec!["spar", "followup"],
             vec!["spar", "checkin"],
             vec!["spar", "split"],
+            vec!["spar", "brainstorm"],
             vec!["spar", "clean"],
             vec!["spar", "doctor"],
         ] {
@@ -2569,6 +2706,7 @@ review_1 = \"ultra\"
                 | Command::Resume { common, .. }
                 | Command::Followup { common, .. }
                 | Command::Split { common, .. }
+                | Command::Brainstorm { common, .. }
                 | Command::Checkin { common, .. } => common.config,
                 Command::Clean { config, .. } | Command::Doctor { config } => config,
                 other => panic!("{other:?}"),
@@ -2630,6 +2768,14 @@ review_1 = \"ultra\"
                 "--instructions",
                 "Do not wait for CI.",
             ],
+            vec![
+                "spar",
+                "brainstorm",
+                "a",
+                "subject",
+                "--instructions",
+                "Do not wait for CI.",
+            ],
         ] {
             let parsed = Cli::parse_from(&argv);
             let common = match parsed.command {
@@ -2639,6 +2785,7 @@ review_1 = \"ultra\"
                 | Command::Review { common, .. }
                 | Command::Followup { common, .. }
                 | Command::Split { common, .. }
+                | Command::Brainstorm { common, .. }
                 | Command::Checkin { common, .. } => common,
                 other => panic!("{other:?}"),
             };
@@ -2668,6 +2815,57 @@ review_1 = \"ultra\"
         assert!(Cli::try_parse_from(["spar", "resume", "--close-skipped"]).is_err());
         assert!(Cli::try_parse_from(["spar", "review", "--close-skipped"]).is_err());
         assert!(Cli::try_parse_from(["spar", "triage", "--close-skipped"]).is_err());
+    }
+
+    /// The subject is prose, so it is taken as words rather than one quoted
+    /// string, and none at all means the repository itself.
+    #[test]
+    fn brainstorm_takes_words_or_nothing() {
+        match Cli::parse_from(["spar", "brainstorm", "novel", "uses", "of", "script"]).command {
+            Command::Brainstorm { topic, ideas, .. } => {
+                assert_eq!(vec!["novel", "uses", "of", "script"], topic);
+                assert_eq!(5, ideas);
+            }
+            other => panic!("{other:?}"),
+        }
+        match Cli::parse_from(["spar", "brainstorm", "--ideas", "3", "--max-rounds", "2"]).command {
+            Command::Brainstorm {
+                topic,
+                ideas,
+                max_rounds,
+                ..
+            } => {
+                assert!(topic.is_empty());
+                assert_eq!(3, ideas);
+                assert_eq!(Some(2), max_rounds);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `--from` files what a saved session says and runs nothing, so it means
+    /// nothing without `--file-issues`, and there is no session to write with
+    /// `--out`.
+    #[test]
+    fn filing_from_a_saved_session_needs_file_issues_and_writes_no_session() {
+        assert!(Cli::try_parse_from(["spar", "brainstorm", "--from", "s.md"]).is_err());
+        assert!(
+            Cli::try_parse_from(["spar", "brainstorm", "--from", "s.md", "--file-issues"]).is_ok()
+        );
+        assert!(Cli::try_parse_from([
+            "spar",
+            "brainstorm",
+            "--from",
+            "s.md",
+            "--file-issues",
+            "--out",
+            "t.md"
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["spar", "brainstorm", "x", "--out", "t.md", "--file-issues"])
+                .is_ok()
+        );
     }
 
     /// An entry in the follow-up queue has no number and its title is prose, so

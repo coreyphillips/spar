@@ -632,6 +632,143 @@ pub fn own_fix() -> Value {
     })
 }
 
+/// One idea's shape, shared by the diverge answer and a cross round's build.
+///
+/// `combines` is required and described at length because it is the whole
+/// method: an idea that cannot name the existing pieces it pairs is a wish.
+fn idea() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "One line naming the idea by what it does, not by its ingredients. It becomes a heading, and may become an issue title."
+            },
+            "combines": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "The existing techniques, primitives, results, tools, or patterns this idea pairs, one per entry, each named specifically enough to look up. At least two. This is the whole method: the pieces exist already and the pairing is what is new."
+            },
+            "how_it_works": {
+                "type": "string",
+                "description": "The mechanism, concretely enough that somebody could start on it. A paragraph, not a pitch."
+            },
+            "why_new": {
+                "type": "string",
+                "description": "The nearest thing that already exists, named, and what this does that it does not. If you cannot name a nearest thing, look harder before claiming there is none."
+            },
+            "enables": {
+                "type": "string",
+                "description": "What becomes possible that was not, in one or two sentences."
+            },
+            "risks": {
+                "type": "string",
+                "description": "What would make it fail, honestly. The reader decides whether to try it on this."
+            },
+            "first_experiment": {
+                "type": "string",
+                "description": "The cheapest thing that would show whether it works: a prototype, a calculation, a query, a conversation with somebody who would know."
+            }
+        },
+        "required": ["title", "combines", "how_it_works", "why_new", "enables", "risks", "first_experiment"]
+    })
+}
+
+pub fn brainstorm_ideas() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "ideas": {
+                "type": "array",
+                "items": idea(),
+                "description": "The ideas, best first. Each pairs existing pieces in a way that has not been done."
+            }
+        },
+        "required": ["ideas"]
+    })
+}
+
+/// A cross round: one agent ruling on ideas the other proposed.
+///
+/// Matched back by number rather than title, for the reason the screen schema
+/// carries an entry number: a model rewrites titles.
+pub fn brainstorm_cross() -> Value {
+    let mut build = idea();
+    build["type"] = json!(["object", "null"]);
+    build["description"] = json!("The revised idea in full when the verdict is build, naming everything it combines including the new piece. Null for any other verdict.");
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "verdicts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "idea": {
+                            "type": "integer",
+                            "description": "The number the idea was given in the list above. Copy it exactly, so the ruling can be matched back to the idea it is about."
+                        },
+                        "verdict": {
+                            "type": "string",
+                            "enum": ["build", "challenge", "keep"],
+                            "description": "build: you can see a further piece that completes it or makes it stronger, and you have written the revised idea in build. challenge: it already exists and you can name where, or it cannot work and you can say why. keep: real and new as far as you can tell, nothing to add."
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "For challenge, the thing that already exists or the reason it cannot work, specifically: the proposer answers this with specifics. For build, what the new piece adds. For keep, one sentence or empty."
+                        },
+                        "build": build
+                    },
+                    "required": ["idea", "verdict", "reason", "build"]
+                }
+            }
+        },
+        "required": ["verdicts"]
+    })
+}
+
+/// The last round: defend or withdraw what was challenged, and rank the rest.
+pub fn brainstorm_converge() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "defences": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "idea": {
+                            "type": "integer",
+                            "description": "The number of an idea you proposed that was challenged. One entry per challenged idea of yours, and none for anything else."
+                        },
+                        "stands": {
+                            "type": "boolean",
+                            "description": "True only if you can give the specific evidence that settles the objection in reply. False withdraws the idea, which is the right answer when the objection is correct."
+                        },
+                        "reply": {
+                            "type": "string",
+                            "description": "The evidence when it stands: the prior art that does not actually do this, the mechanism the objection missed, the number that makes it work. One sentence when it does not."
+                        }
+                    },
+                    "required": ["idea", "stands", "reply"]
+                }
+            },
+            "ranking": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "Every idea number that is not withdrawn, best first, including your own and the ones you challenged. Novelty and feasibility together: an idea nobody has done that could be tried this month beats a moonshot, and a moonshot beats a small improvement on something that exists."
+            }
+        },
+        "required": ["defences", "ranking"]
+    })
+}
+
 pub fn all() -> Vec<(&'static str, Value)> {
     vec![
         ("triage", triage()),
@@ -646,6 +783,9 @@ pub fn all() -> Vec<(&'static str, Value)> {
         ("split_screen", split_screen()),
         ("split_proposal", split_proposal()),
         ("split_check", split_check()),
+        ("brainstorm_ideas", brainstorm_ideas()),
+        ("brainstorm_cross", brainstorm_cross()),
+        ("brainstorm_converge", brainstorm_converge()),
     ]
 }
 

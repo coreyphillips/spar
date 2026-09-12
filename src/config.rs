@@ -330,6 +330,9 @@ pub enum Call {
     Checkin(u32),
     /// A split call: the proposer is round 1, the checker round 2.
     Split(u32),
+    /// A brainstorm round: both agents diverge in round 1, cross in the
+    /// middle rounds, and converge in the last.
+    Brainstorm(u32),
 }
 
 impl Call {
@@ -345,6 +348,7 @@ impl Call {
             Call::Screen => "screen",
             Call::Checkin(_) => "checkin",
             Call::Split(_) => "split",
+            Call::Brainstorm(_) => "brainstorm",
         }
     }
 
@@ -354,13 +358,13 @@ impl Call {
         match self {
             Call::Triage | Call::Implement | Call::Screen => 1,
             Call::Review(round) | Call::Respond(round) => round,
-            Call::Checkin(round) | Call::Split(round) => round,
+            Call::Checkin(round) | Call::Split(round) | Call::Brainstorm(round) => round,
             Call::Close => 2,
         }
     }
 
     /// Every kind, for `doctor` to check a configuration against.
-    pub fn every() -> [Call; 9] {
+    pub fn every() -> [Call; 10] {
         [
             Call::Triage,
             Call::Implement,
@@ -371,6 +375,7 @@ impl Call {
             Call::Screen,
             Call::Checkin(1),
             Call::Split(1),
+            Call::Brainstorm(1),
         ]
     }
 }
@@ -397,6 +402,10 @@ pub struct EffortSchedule {
     pub screen: Option<String>,
     pub checkin: Option<String>,
     pub split: Option<String>,
+    /// Every brainstorm round. Diverging is the deep call and the later rounds
+    /// answer narrower questions, but they read the same key: a brainstorm is
+    /// cheap next to a run, and one word for it is enough.
+    pub brainstorm: Option<String>,
 }
 
 impl EffortSchedule {
@@ -411,6 +420,7 @@ impl EffortSchedule {
             "close" => &self.close,
             "screen" => &self.screen,
             "checkin" => &self.checkin,
+            "brainstorm" => &self.brainstorm,
             _ => &self.split,
         };
         value.clone().filter(|s| !s.trim().is_empty())
@@ -1006,6 +1016,7 @@ pub fn known_options() -> Vec<OptionInfo> {
             screen: Some("low".into()),
             checkin: Some("high".into()),
             split: Some("high".into()),
+            brainstorm: Some("high".into()),
         },
     ));
     out

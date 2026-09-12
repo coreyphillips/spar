@@ -4281,6 +4281,14 @@ impl Repo {
         self.root.join(STATE_DIR).join("followups.md")
     }
 
+    /// Where `spar brainstorm` writes a session unless told otherwise.
+    ///
+    /// Under the state directory, so it is kept out of the repository's own
+    /// `git status`; `--out` puts one somewhere a person would commit.
+    pub fn brainstorms_dir(&self) -> PathBuf {
+        self.root.join(STATE_DIR).join("brainstorms")
+    }
+
     /// What `spar followup` already dealt with, kept beside the queue.
     ///
     /// Two jobs. It is what stops `append_local_followup` re-recording a

@@ -6,6 +6,7 @@
 //! and the disagreements are the useful part.
 
 pub mod agent;
+pub mod brainstorm;
 pub mod checkin;
 pub mod cli;
 pub mod comments;

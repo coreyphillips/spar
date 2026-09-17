@@ -18,8 +18,8 @@ use crate::jsonx;
 use crate::proc::{self, ExecOpts};
 use crate::repo::{
     attribute_state, git_state, ignored_untracked_state, join_reasons, list_paths,
-    probe_again_on_failure, safe_git_state, uncertain_worktree_change, AttributeState, GitState,
-    IgnoredState, EDITED_GIT_MARKER as GIT_MARKER_RECOVERY,
+    note_ignored_leavings, probe_again_on_failure, safe_git_state, uncertain_worktree_change,
+    AttributeState, GitState, IgnoredState, EDITED_GIT_MARKER as GIT_MARKER_RECOVERY,
 };
 use crate::{bail, log, logdim, logwarn, spar_err};
 
@@ -978,17 +978,9 @@ impl EditBaseline {
         let untracked = match access {
             Access::Read => {
                 let leavings = self.ignored_untracked.read_only_leavings(&ignored);
-                // Said even when the call is kept. This is the whole price of
-                // letting an ignored path move: somebody has to hear about it.
-                if !leavings.tolerated.is_empty() {
-                    logwarn!(
-                        "a read-only call left {} ignored file(s) changed in {}: {}. The answer \
-                         was kept; the project ignores these paths.",
-                        leavings.tolerated.len(),
-                        cwd.display(),
-                        list_paths(&leavings.tolerated)
-                    );
-                }
+                // Said even when the call is kept, though not as a warning and
+                // not once per call. `note_ignored_leavings` carries why.
+                note_ignored_leavings(cwd, "call", &leavings.tolerated);
                 (!leavings.condemning.is_empty()).then(|| {
                     format!(
                         "untracked file(s) changed: {}",
@@ -1001,7 +993,17 @@ impl EditBaseline {
                 .changed_beyond_generated(&ignored)
                 .then(|| "untracked or ignored file(s) changed".to_string()),
         };
-        let tracked = self.git_state.describe_difference(&current);
+        // A read-only call answers for what it wrote, not for the branch
+        // moving under it while it read. Only in a primary checkout, the one a
+        // person and their editor also work in: a linked worktree is spar's
+        // own, so nothing there moves HEAD but the call itself, and a reviewer
+        // that quietly committed is exactly what this check is for.
+        let tracked = match (access, &self.git_entry) {
+            (Access::Read, GitEntry::Directory(_)) => {
+                self.git_state.read_only_difference(&current, cwd)
+            }
+            _ => self.git_state.describe_difference(&current),
+        };
         Ok(join_reasons(tracked, untracked))
     }
 }
@@ -2469,6 +2471,86 @@ mod tests {
             .to_string_lossy()
             .starts_with(".spar-recovery-needed-")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repository whose `main` is one fast forward behind `advanced`, so a
+    /// merge inside it moves HEAD and rewrites tracked files without dirtying
+    /// anything, which is what a person pulling beside a run looks like.
+    fn behind_repo(name: &str) -> PathBuf {
+        let dir = committed_repo(name);
+        git_at(&dir, &["checkout", "-q", "-b", "advanced"]);
+        std::fs::write(dir.join("README.md"), "moved on\n").unwrap();
+        std::fs::write(dir.join("CHANGELOG.md"), "new file\n").unwrap();
+        git_at(&dir, &["add", "README.md", "CHANGELOG.md"]);
+        git_at(&dir, &["commit", "-q", "-m", "advance"]);
+        git_at(&dir, &["checkout", "-q", "main"]);
+        dir
+    }
+
+    #[test]
+    fn a_read_survives_the_branch_moving_under_it() {
+        let dir = behind_repo("read-branch-moved");
+        let agent = Agent::with_bin(
+            shell("reader", "git merge -q --ff-only advanced; echo reviewed"),
+            "/bin/sh",
+        );
+
+        let answer = agent.ask("read it", &dir, &Effort::default()).unwrap();
+
+        assert_eq!("reviewed", answer.trim());
+        assert_eq!(
+            "moved on\n",
+            std::fs::read_to_string(dir.join("README.md")).unwrap()
+        );
+        assert!(
+            !std::fs::read_dir(&dir).unwrap().flatten().any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".spar-recovery-needed-"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_that_writes_while_the_branch_moves_is_still_discarded() {
+        let dir = behind_repo("read-branch-moved-and-written");
+        let agent = Agent::with_bin(
+            shell(
+                "reader",
+                "git merge -q --ff-only advanced; printf 'and mine\n' >> README.md; echo reviewed",
+            ),
+            "/bin/sh",
+        );
+
+        let err = agent.ask("read it", &dir, &Effort::default()).unwrap_err();
+
+        assert_eq!(ErrorKind::UncertainWrite, err.kind());
+        assert!(err.message().contains("read-only call"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_in_a_linked_worktree_still_answers_for_a_moved_head() {
+        let (root, main, linked, _) = linked_worktree("read-worktree-commit");
+        let agent = Agent::with_bin(
+            shell(
+                "reader",
+                "printf 'mine\n' > README.md; git add -A; git commit -q -m mine; echo reviewed",
+            ),
+            "/bin/sh",
+        );
+
+        let err = agent
+            .ask("read it", &linked, &Effort::default())
+            .unwrap_err();
+
+        assert_eq!(ErrorKind::UncertainWrite, err.kind());
+        assert!(err.message().contains("read-only call"), "{err}");
+        git_at(
+            &main,
+            &["worktree", "remove", "--force", linked.to_str().unwrap()],
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A repository that ignores build output, with one build already in it.

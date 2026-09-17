@@ -496,6 +496,129 @@ impl GitState {
         }
         (!notes.is_empty()).then(|| notes.join("; "))
     }
+
+    /// The tracked half of what a read-only call left behind, with a checkout
+    /// that moved under the call reported rather than held against it.
+    pub(crate) fn read_only_difference(&self, after: &Self, cwd: &Path) -> Option<String> {
+        let difference = self.describe_difference(after)?;
+        let Some(moved) = self.moved_wholesale(after) else {
+            return Some(difference);
+        };
+        // Once, however many calls were reading when it happened: two triage
+        // agents share the checkout and would otherwise both report the move.
+        if said_once("moved", cwd, &moved) {
+            logwarn!(
+                "the checkout at {} moved while a read-only call was reading it: {moved}. The \
+                 answer was kept, and it describes the tree as it stood before the move.",
+                cwd.display()
+            );
+        }
+        None
+    }
+
+    /// Whether every difference between these two states is the checkout moving
+    /// as a whole rather than the call writing into it.
+    ///
+    /// The primary checkout is a live desk and a read-only call reads it for
+    /// minutes. A person or their editor pulls, the branch fast forwards, and
+    /// every file that arrived with it now differs from the snapshot taken
+    /// before the call. Holding the call to that snapshot threw away two good
+    /// triage answers and ended a run with nothing scheduled, over a change the
+    /// call had no part in.
+    ///
+    /// The index tells the two apart. A call that wrote leaves a path
+    /// disagreeing with the index, staged or unstaged, and leaves HEAD where it
+    /// was. A checkout that moved rewrote the index and the worktree together,
+    /// so every path it touched agrees with the index, and it moved HEAD to say
+    /// so. Anything else, a tracked file that changed while HEAD stood still
+    /// most of all, is the call's to answer for.
+    fn moved_wholesale(&self, after: &Self) -> Option<String> {
+        let mut prefixes: BTreeSet<&PathBuf> = self.repositories.keys().collect();
+        prefixes.extend(after.repositories.keys());
+        let mut notes: Vec<String> = Vec::new();
+        for prefix in prefixes {
+            // A repository that appeared or vanished is not a checkout moving.
+            let before = self.repositories.get(prefix)?;
+            let current = after.repositories.get(prefix)?;
+            if before.unsafe_index_flags != current.unsafe_index_flags
+                || before.gitlinks != current.gitlinks
+            {
+                return None;
+            }
+            let moved: Vec<&PathBuf> = differing_keys(&before.tracked, &current.tracked).collect();
+            if before.head == current.head {
+                if moved.is_empty() {
+                    continue;
+                }
+                return None;
+            }
+            if !moved.iter().all(|path| {
+                checked_out(before.tracked.get(*path)) && checked_out(current.tracked.get(*path))
+            }) {
+                return None;
+            }
+            let label = describe_repository(prefix);
+            notes.push(match moved.len() {
+                0 => format!("HEAD moved in {label}"),
+                count => format!("HEAD moved in {label}, carrying {count} tracked file(s)"),
+            });
+        }
+        (!notes.is_empty()).then(|| notes.join("; "))
+    }
+}
+
+/// Whether a tracked path holds exactly what the index says it holds, so
+/// nothing there is staged or left unstaged.
+///
+/// A path the index no longer lists counts as checked out: only an index
+/// operation drops one, and a file left in the worktree after that is an
+/// ordinary untracked file, which the untracked half of the same check has.
+fn checked_out(entry: Option<&TrackedEntry>) -> bool {
+    entry.is_none_or(|entry| {
+        entry
+            .worktree
+            .as_ref()
+            .is_some_and(|file| file.raw_oid == entry.index_oid && file.mode == entry.index_mode)
+    })
+}
+
+/// Say what a call left among paths the project ignores, once per run for a
+/// given set of them.
+///
+/// The project's own ignore rules put these outside what the call was asked
+/// about, so this is a note about the desk the call ran on rather than a
+/// finding about the call. Said as a warning on every call, it became the
+/// loudest thing in the log of every run in a checkout with an editor open in
+/// it: `.DS_Store` twice per triage, and again for each review. It still names
+/// the paths, so an agent that rewrote a person's `.env` is reported rather
+/// than hidden.
+pub(crate) fn note_ignored_leavings(cwd: &Path, what: &str, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+    let named = list_paths(paths);
+    if !said_once("ignored", cwd, &named) {
+        return;
+    }
+    logdim!(
+        "a read-only {what} left {} ignored file(s) changed in {}: {named}. It was kept; the \
+         project ignores these paths.",
+        paths.len(),
+        cwd.display()
+    );
+}
+
+/// Whether this run has yet to say this about this directory.
+///
+/// A run reads the same checkout dozens of times, and the ambient facts about
+/// it, an editor's own files moving and a branch advancing under the reader,
+/// are true for every one of those calls. Said once they are context; said
+/// each time they are the log.
+fn said_once(topic: &str, cwd: &Path, detail: &str) -> bool {
+    static SAID: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    SAID.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(format!("{topic}\0{}\0{detail}", cwd.display()))
 }
 
 /// Name a repository inside a state for a report. The root carries an empty
@@ -2591,15 +2714,7 @@ impl Repo {
         // Said even when the inspection is accepted, for the same reason it is
         // said on an agent call: a path the project ignores is out of scope,
         // not unnoticed.
-        if !leavings.tolerated.is_empty() {
-            logwarn!(
-                "a read-only inspection left {} ignored file(s) changed in the {label} at {}: {}. \
-                 The inspection was accepted; the project ignores these paths.",
-                leavings.tolerated.len(),
-                cwd.display(),
-                list_paths(&leavings.tolerated)
-            );
-        }
+        note_ignored_leavings(cwd, "inspection", &leavings.tolerated);
         let tracked = checkpoint.git_state.describe_difference(&git_state);
         let untracked = (!leavings.condemning.is_empty()).then(|| {
             format!(

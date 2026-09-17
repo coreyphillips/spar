@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "spar-cli"
-version = "0.4.10"
+version = "0.4.11"
 dependencies = [
  "clap",
  "libc",

@@ -957,21 +957,29 @@ fn work_issues(
     while let Some(mut wave) = queue.pop_front() {
         wave.numbers.retain(|n| !handled.contains(n));
         if !retriage {
+            // One line in the progress log, however many are waiting. Both
+            // sides of the disagreement are already in the report at the end,
+            // and a decision a person has not made yet does not become more
+            // readable for being argued at them twice per run.
+            let mut still_waiting: Vec<i64> = Vec::new();
             wave.numbers.retain(|n| {
                 let Some(known) = waiting.get(n) else {
                     return true;
                 };
-                log!(
-                    "#{n} was contested on an earlier run and is waiting on you: {}. Pass \
-                     --retriage to ask again.",
-                    positions_of(known)
-                );
+                still_waiting.push(*n);
                 parked.push(format!(
                     "#{n} contested and parked for you: {}",
                     positions_of(known)
                 ));
                 false
             });
+            if !still_waiting.is_empty() {
+                log!(
+                    "{} contested on an earlier run and waiting on you. Pass --retriage to ask \
+                     again.",
+                    numbers(&still_waiting)
+                );
+            }
         }
         if wave.numbers.is_empty() {
             continue;

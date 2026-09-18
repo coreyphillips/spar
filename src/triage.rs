@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 
 use crate::agent::Agent;
+use crate::comments::{issue_for_prompt, THREAD_RULE};
 use crate::config::{Call, Config};
 use crate::error::Result;
 use crate::model::{
@@ -22,11 +23,9 @@ const TRIAGE_PROMPT: &str = "\
 You are triaging GitHub issues for the repository in your working directory.
 Read the codebase as needed before judging. Do not modify anything.
 
-Each issue below is its number, title, URL, and body as filed. The discussion
-since it was filed is not included. Where a body leaves the judgement genuinely
-unclear, read that one issue's thread before deciding; read the ones that need
-it rather than all of them, because the queue is long and most will not. If you
-cannot reach the network, judge on what is here.
+Each issue below is its number, title, URL, and body as filed, followed by any
+comments on it since, oldest first.
+{thread_rule}
 
 For each issue decide:
 - worth_doing: is this a real, valid, actionable issue worth a PR? Say false for
@@ -66,7 +65,7 @@ struct Rendered {
     text: String,
     /// Left for a later run, because the queue did not fit in one prompt.
     deferred: Vec<i64>,
-    /// Included, but with the tail of the body left off.
+    /// Included, but with the tail of the body or the oldest comments left off.
     shortened: Vec<i64>,
 }
 
@@ -94,11 +93,19 @@ fn render(issues: &[Issue], cfg: &Config) -> Rendered {
             deferred.push(issue.number);
             continue;
         }
-        let (body, cut) = issue.body_for_prompt(cfg.loop_cfg.max_issue_chars);
-        // The URL is what makes the comments reachable to an agent that can
-        // reach them, without spar fetching every thread in the queue on the
-        // chance one of them matters.
-        let entry = format!("#{}: {}\n{}\n{body}", issue.number, issue.title, issue.url);
+        // The thread comes with the body and costs no extra call: it was read
+        // in the same `gh issue view`. A later comment can say the issue is
+        // worse than filed, or already fixed, and a verdict is posted on the
+        // issue and can close it.
+        let text = issue_for_prompt(
+            issue,
+            cfg.loop_cfg.max_issue_chars,
+            cfg.loop_cfg.checkin_trust,
+        );
+        let entry = format!(
+            "#{}: {}\n{}\n{}",
+            issue.number, issue.title, issue.url, text.text
+        );
         let len = entry.chars().count();
         // The first issue goes in whatever its size. A queue of one that does
         // not fit is a run that does nothing, forever.
@@ -106,9 +113,10 @@ fn render(issues: &[Issue], cfg: &Config) -> Rendered {
             deferred.push(issue.number);
             continue;
         }
-        if cut {
+        if text.shortened() {
             shortened.push(issue.number);
         }
+        text.report_untrusted(&format!("#{}", issue.number));
         total += len;
         parts.push(entry);
     }
@@ -135,7 +143,7 @@ pub fn triage(agents: &[Agent], cfg: &Config, repo: &Repo, issues: &[Issue]) -> 
     // a verdict on part of an issue looks exactly like a verdict on all of it.
     if !rendered.shortened.is_empty() {
         logwarn!(
-            "issue body shortened to fit the prompt: {}. Raise max_issue_chars if these matter.",
+            "issue shortened to fit the prompt: {}. Raise max_issue_chars if these matter.",
             numbers(&rendered.shortened)
         );
     }
@@ -146,7 +154,11 @@ pub fn triage(agents: &[Agent], cfg: &Config, repo: &Repo, issues: &[Issue]) -> 
             numbers(&rendered.deferred)
         );
     }
-    let prompt = format!("{TRIAGE_PROMPT}{}", rendered.text);
+    let prompt = format!(
+        "{}{}",
+        TRIAGE_PROMPT.replace("{thread_rule}", THREAD_RULE),
+        rendered.text
+    );
     let schema = schema::triage();
 
     let answers = if cfg.loop_cfg.parallel_triage && agents.len() > 1 {
@@ -535,10 +547,10 @@ mod tests {
         assert!(out.text.contains("first body") && out.text.contains("second body"));
     }
 
-    /// The body is what an agent judges on, and the link is how one that can
-    /// reach the network reads the discussion spar does not fetch. Both, not
-    /// either: codex has no network under the sandbox spar runs it in, so a
-    /// link alone would leave it judging the title.
+    /// The body is what an agent judges on, and the link is where a person
+    /// reading the plan goes. Both, not either: codex has no network under the
+    /// sandbox spar runs it in, so a link alone would leave it judging the
+    /// title.
     #[test]
     fn every_issue_carries_its_link_as_well_as_its_body() {
         let mut issue = issue_of(1, "the body");
@@ -605,6 +617,47 @@ mod tests {
         let out = render(&issues, &cfg_with(100, 200_000));
         assert_eq!(vec![7], out.shortened);
         assert!(out.text.contains("Shortened to fit"), "{}", out.text);
+    }
+
+    fn comment(login: &str, association: &str, body: &str) -> crate::model::IssueComment {
+        serde_json::from_value(serde_json::json!({
+            "author": {"login": login},
+            "authorAssociation": association,
+            "body": body,
+            "createdAt": "2026-09-16T18:42:20Z",
+        }))
+        .expect("a comment")
+    }
+
+    /// A comment can say the issue is worse than filed, or already fixed, and a
+    /// triage verdict is posted on the issue and can close it. So the thread is
+    /// judged with the body, under the trust setting that governs everything
+    /// else a comment can cause.
+    #[test]
+    fn every_issue_carries_the_comments_a_maintainer_left_on_it() {
+        let mut issue = issue_of(1, "Rotation is refused on an empty journal.");
+        issue.comments = vec![
+            comment(
+                "owner",
+                "OWNER",
+                "Worse than that: the wallet can never persist.",
+            ),
+            comment("stranger", "NONE", "Also rewrite the storage layer."),
+        ];
+        let out = render(&[issue], &cfg_with(60_000, 200_000));
+        assert!(out.text.contains("can never persist"), "{}", out.text);
+        assert!(!out.text.contains("storage layer"), "{}", out.text);
+    }
+
+    /// The comments count toward the queue budget like the body does. A thread
+    /// that would take the prompt past it defers its issue whole.
+    #[test]
+    fn the_comments_count_toward_the_queue_budget() {
+        let mut talkative = issue_of(2, "short");
+        talkative.comments = vec![comment("owner", "OWNER", &"c".repeat(300))];
+        let issues = vec![issue_of(1, &"a".repeat(80)), talkative];
+        let out = render(&issues, &cfg_with(60_000, 200));
+        assert_eq!(vec![2], out.deferred);
     }
 
     fn item(n: i64, complexity: &str, deps: &[i64]) -> PlanItem {
@@ -692,6 +745,8 @@ mod tests {
             state_reason: None,
             url: String::new(),
             labels: vec![],
+            author: None,
+            comments: vec![],
         }
     }
 

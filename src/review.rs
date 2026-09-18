@@ -21,6 +21,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::agent::{self, Agent};
+use crate::comments::{issue_for_prompt, THREAD_RULE};
 use crate::config::{Call, Config, Drafts, Followups, PrComments};
 use crate::error::{ErrorKind, Result, SparError};
 use crate::jsonx::{exact_finding_key as finding_key, finding_file, stable_finding_key};
@@ -45,9 +46,8 @@ URL: {url}
 
 {body}
 
-That is the issue body as filed. The discussion since is not included, so read
-the thread at the URL above if the body leaves anything open. If you cannot
-reach the network, work from what is here.
+That is the issue as filed, followed by any comments on it since, oldest first.
+{thread_rule}
 
 Do the work and run the relevant tests. Leave the changes uncommitted. Do not
 commit, push, open a PR, or merge; the harness validates and commits the working
@@ -769,13 +769,13 @@ fn implement_and_review(
     // correctly judged worth doing on its whole text, then built from the first
     // few thousand characters of it, raises confidence without raising
     // fidelity.
-    let (body, shortened) = issue.body_for_prompt(cfg.loop_cfg.max_issue_chars);
-    if shortened {
-        logwarn!(
-            "#{number}: the issue body was shortened to fit the prompt. Raise max_issue_chars if \
-             the rest matters."
-        );
-    }
+    let issue_text = issue_for_prompt(
+        issue,
+        cfg.loop_cfg.max_issue_chars,
+        cfg.loop_cfg.checkin_trust,
+    );
+    issue_text.report(&format!("#{number}"));
+    let body = issue_text.text;
     let prompt = implement_prompt(number, &item.title, &issue.url, &body);
     let worktree_baseline = repo.worktree_baseline(work_dir)?;
     let answer: Result<Implementation> = implementor.edit_json(
@@ -1087,14 +1087,13 @@ fn resume_inner(
         });
     let (issue_body, issue_url) = match &issue {
         Some(issue) => {
-            let (body, shortened) = issue.body_for_prompt(cfg.loop_cfg.max_issue_chars);
-            if shortened {
-                logwarn!(
-                    "PR #{pr_number}: the issue body was shortened to fit the prompt. Raise \
-                     max_issue_chars if the rest matters."
-                );
-            }
-            (body, issue.url.clone())
+            let text = issue_for_prompt(
+                issue,
+                cfg.loop_cfg.max_issue_chars,
+                cfg.loop_cfg.checkin_trust,
+            );
+            text.report(&format!("PR #{pr_number}"));
+            (text.text, issue.url.clone())
         }
         None => (String::new(), String::new()),
     };
@@ -3742,13 +3741,14 @@ fn review_prompt(
 
 /// What the implementor is asked, with the issue in front of it.
 ///
-/// The body is passed rather than only the link, because one of the two agents
-/// cannot follow a link: codex runs under `-s workspace-write`, which has no
-/// network at all, so a URL alone would leave it judging the title. The link is
-/// there for the agent that can follow it, and for the comments spar does not
-/// fetch.
+/// The body and its comments are passed rather than only the link, because one
+/// of the two agents cannot follow a link: codex runs under `-s workspace-write`,
+/// which has no network at all, so a URL alone would leave it judging the title.
+/// And an agent that can follow it has no reason to when the body reads as
+/// complete, which is exactly when a comment that superseded it matters most.
 fn implement_prompt(number: i64, title: &str, url: &str, body: &str) -> String {
     IMPLEMENT_PROMPT
+        .replace("{thread_rule}", THREAD_RULE)
         .replace("{number}", &number.to_string())
         .replace("{title}", title)
         .replace("{url}", url)
@@ -3993,18 +3993,23 @@ pub fn skip_comment(item: &SkippedItem, style: &Style) -> String {
 ///
 /// A link is not a substitute: codex runs under `-s workspace-write`, which has
 /// no network, which is the reason the implement prompt carries the body rather
-/// than a link. The same reason applies here.
-pub(crate) fn context_block(number: i64, url: &str, issue_body: &str, pr_body: &str) -> String {
+/// than a link. The same reason applies here, and to the comments under the
+/// issue: a reviewer judging against a body that a later comment superseded
+/// passes a change that does what was first asked and not what is asked now.
+///
+/// `issue_text` is the body and its comments as `issue_for_prompt` renders them.
+pub(crate) fn context_block(number: i64, url: &str, issue_text: &str, pr_body: &str) -> String {
     let mut out = String::new();
-    let body = issue_body.trim();
+    let body = issue_text.trim();
     if !body.is_empty() {
         out.push_str(&format!("\nIssue #{number} as filed"));
         if !url.trim().is_empty() {
             out.push_str(&format!(", at {}", url.trim()));
         }
         out.push_str(&format!(
-            ":\n\n{body}\n\nThat is the issue body as filed. The discussion since is not \
-             included.\n"
+            ":\n\n{body}\n\nThat is the issue as filed, followed by any comments on it since, \
+             oldest first. {}\n",
+            THREAD_RULE.replace('\n', " ")
         ));
     }
     let claim = pr_body.trim();
@@ -5701,9 +5706,10 @@ mod tests {
         assert!(context.contains("Honour Retry-After"), "{context}");
         assert!(context.contains("issues/42"), "{context}");
         assert!(
-            context.contains("discussion since is not included"),
+            context.contains("followed by any comments on it since"),
             "{context}"
         );
+        assert!(context.contains("the later one wins"), "{context}");
         assert!(context.contains("Ran the 429 test"), "{context}");
         assert!(
             context.contains("claim to check"),
@@ -5966,10 +5972,13 @@ mod tests {
         assert!(!prompt.contains('{'), "{prompt}");
     }
 
-    /// An agent that cannot reach the link is told what it is missing, so it
-    /// works from the body rather than assuming the body is everything.
+    /// A body that reads as complete gives no hint that a comment superseded
+    /// it, so the prompt says the comments follow it and that a later one wins.
+    /// beignet#862 was filed with a cause and a suggested fix, and its comments
+    /// then found the wallet could never persist a channel again and retitled
+    /// it. Built from the body alone, the change fixes the first half.
     #[test]
-    fn the_prompt_says_the_discussion_is_not_included() {
+    fn the_prompt_says_a_later_comment_can_change_what_was_asked() {
         let prompt = implement_prompt(1, "t", "u", "b");
         // Flattened, so the assertion does not turn on where the prompt wraps.
         let lower = prompt
@@ -5977,11 +5986,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ")
             .to_lowercase();
-        assert!(
-            lower.contains("discussion since is not included"),
-            "{prompt}"
-        );
-        assert!(lower.contains("cannot reach the network"), "{prompt}");
+        assert!(lower.contains("followed by any comments"), "{prompt}");
+        assert!(lower.contains("the later one wins"), "{prompt}");
+        assert!(lower.contains("a comment from spar"), "{prompt}");
+        assert!(!prompt.contains('{'), "{prompt}");
     }
 
     /// A fully reported implementation, for the body tests.

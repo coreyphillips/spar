@@ -2970,6 +2970,111 @@ exit 64
     );
 }
 
+/// The thread under an issue reaches the agents that judge it, read in the
+/// same `gh issue view` as the body.
+///
+/// beignet#862 was filed with a cause and a suggested fix, then its owner
+/// commented that the wallet could never persist a channel again and retitled
+/// it. An agent handed the body alone judges the first half, and codex, which
+/// has no network, could not have followed a link to the rest. A stranger's
+/// comment on the same issue stays out under the default trust setting.
+#[cfg(unix)]
+#[test]
+fn triage_reads_the_comments_a_maintainer_left_on_the_issue() {
+    let fx = repo("issue-thread");
+    let answer = r#"{"issues":[{"issue":42,"worth_doing":true,"tracker":false,"reason":"worth it","complexity":"s","depends_on":[],"risk":"low"}]}"#;
+    let gh = r#"
+set -eu
+printf '%s\n' "$*" >> "$SPAR_FAKE_GH_LOG"
+if [ "$1" = repo ] && [ "$2" = view ]; then
+  printf '%s\n' '{"name":"project"}'
+  exit 0
+fi
+if [ "$1" = issue ] && [ "$2" = view ]; then
+  printf '%s\n' '{"number":42,"title":"Rotation refused on an empty journal","body":"The watermark is never written.","labels":[],"state":"OPEN","url":"https://github.com/example/project/issues/42","author":{"login":"owner"},"comments":[{"author":{"login":"owner"},"authorAssociation":"OWNER","body":"Worse: the wallet can never persist a channel again.","createdAt":"2026-09-16T18:42:20Z","isMinimized":false},{"author":{"login":"stranger"},"authorAssociation":"NONE","body":"Also rewrite the storage layer.","createdAt":"2026-09-17T09:00:00Z","isMinimized":false}]}'
+  exit 0
+fi
+if [ "$1" = issue ] && [ "$2" = list ]; then
+  printf '%s\n' '[]'
+  exit 0
+fi
+if [ "$1" = pr ] && [ "$2" = list ]; then
+  printf '%s\n' '[]'
+  exit 0
+fi
+if [ "$1" = api ]; then
+  printf '%s\n' 'issue'
+  exit 0
+fi
+printf 'unexpected gh call: %s\n' "$*" >&2
+exit 64
+"#;
+    let (config, path) = fake_commands(&fx, answer, gh);
+    let agent = fx.dir.join("fake-bin").join("judge");
+    executable(
+        &agent,
+        &format!(
+            "#!/bin/sh\nfor last; do :; done\nprintf '%s\\n' \"$last\" >> \"$SPAR_FAKE_PROMPTS\"\nprintf '%s\\n' '{answer}'\n"
+        ),
+    );
+    let command = serde_json::to_string(agent.to_str().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "[agents.a]\ncommand = [{command}, \"{{prompt}}\"]\n\n\
+             [agents.b]\ncommand = [{command}, \"{{prompt}}\"]\n"
+        ),
+    )
+    .unwrap();
+    let calls = fx.dir.join("gh-calls.log");
+    let prompts = fx.dir.join("prompts.log");
+    let plan = fx.dir.join("plan.json");
+
+    let (ok, out, err) = spar_with_env(
+        &[
+            "triage",
+            "42",
+            "--plan-out",
+            plan.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--repo",
+            fx.work.to_str().unwrap(),
+        ],
+        &fx.dir,
+        &[
+            ("PATH", path.as_str()),
+            ("SPAR_FAKE_GH_LOG", calls.to_str().unwrap()),
+            ("SPAR_FAKE_PROMPTS", prompts.to_str().unwrap()),
+        ],
+    );
+
+    assert!(ok, "{out}\n{err}");
+    let calls = std::fs::read_to_string(calls).unwrap();
+    assert!(
+        calls.contains(
+            "issue view 42 --json number,title,body,labels,state,stateReason,url,author,comments"
+        ),
+        "the thread has to come in the same call as the body:\n{calls}"
+    );
+    let prompts = std::fs::read_to_string(prompts).unwrap();
+    assert!(
+        prompts
+            .contains("----- comment from @owner (OWNER), who filed the issue, 2026-09-16 -----"),
+        "{prompts}"
+    );
+    assert!(
+        prompts.contains("can never persist a channel again"),
+        "{prompts}"
+    );
+    assert!(prompts.contains("the later one wins"), "{prompts}");
+    assert!(!prompts.contains("storage layer"), "{prompts}");
+    assert!(
+        (out.clone() + &err).contains("@stranger"),
+        "a comment passed over must be named in the log:\n{out}\n{err}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn tracker_reread_failure_is_counted_before_nothing_is_scheduled() {
@@ -4531,6 +4636,8 @@ fn a_failing_check_stops_the_push_and_keeps_the_worktree() {
         state_reason: None,
         url: "https://example.invalid/issues/71".into(),
         labels: Vec::new(),
+        author: None,
+        comments: Vec::new(),
     };
 
     let state = run_issue(&agents, &config, &repo, &item, &issue);
@@ -4584,6 +4691,8 @@ fn a_structured_implementation_is_committed_before_review() {
         state_reason: None,
         url: "https://example.invalid/issues/70".into(),
         labels: Vec::new(),
+        author: None,
+        comments: Vec::new(),
     };
 
     let state = run_issue(&agents, &config, &repo, &item, &issue);
@@ -4637,6 +4746,8 @@ fn an_editing_call_cannot_select_a_new_parent_side_git_filter() {
         state_reason: None,
         url: "https://example.invalid/issues/74".into(),
         labels: Vec::new(),
+        author: None,
+        comments: Vec::new(),
     };
 
     let state = run_issue(&agents, &config, &repo, &item, &issue);
@@ -4702,6 +4813,8 @@ fn an_ignored_only_success_is_accepted_without_discarding_the_files() {
         state_reason: None,
         url: "https://example.invalid/issues/75".into(),
         labels: Vec::new(),
+        author: None,
+        comments: Vec::new(),
     };
 
     let state = run_issue(&agents, &config, &repo, &item, &issue);
@@ -4764,6 +4877,8 @@ fn tracked_and_ignored_edits_are_committed_without_the_ignored_files() {
         state_reason: None,
         url: "https://example.invalid/issues/81".into(),
         labels: Vec::new(),
+        author: None,
+        comments: Vec::new(),
     };
 
     let state = run_issue(&agents, &config, &repo, &item, &issue);
@@ -4838,6 +4953,8 @@ fn a_direct_commit_with_ignored_output_reaches_push() {
         state_reason: None,
         url: "https://example.invalid/issues/82".into(),
         labels: Vec::new(),
+        author: None,
+        comments: Vec::new(),
     };
 
     let state = run_issue(&agents, &config, &repo, &item, &issue);
@@ -4899,6 +5016,8 @@ fn ignored_build_artifacts_do_not_stop_a_managed_commit_or_push() {
         state_reason: None,
         url: "https://example.invalid/issues/83".into(),
         labels: Vec::new(),
+        author: None,
+        comments: Vec::new(),
     };
 
     let state = run_issue(&agents, &config, &repo, &item, &issue);
@@ -4974,6 +5093,8 @@ fn a_decline_that_created_an_ignored_file_keeps_the_worktree() {
         state_reason: None,
         url: "https://example.invalid/issues/77".into(),
         labels: Vec::new(),
+        author: None,
+        comments: Vec::new(),
     };
 
     let state = run_issue(&agents, &config, &repo, &item, &issue);
@@ -5017,6 +5138,8 @@ fn a_failed_implementation_keeps_its_files_and_diagnostic() {
         state_reason: None,
         url: "https://example.invalid/issues/73".into(),
         labels: Vec::new(),
+        author: None,
+        comments: Vec::new(),
     };
 
     let state = run_issue(&agents, &config, &repo, &item, &issue);
@@ -5070,6 +5193,8 @@ fn a_failed_implementation_with_a_clean_commit_continues_to_review() {
         state_reason: None,
         url: "https://example.invalid/issues/80".into(),
         labels: Vec::new(),
+        author: None,
+        comments: Vec::new(),
     };
 
     let state = run_issue(&agents, &config, &repo, &item, &issue);
@@ -5121,6 +5246,8 @@ fn a_recovery_commit_in_the_shared_checkout_is_not_reset() {
         state_reason: None,
         url: "https://example.invalid/issues/71".into(),
         labels: Vec::new(),
+        author: None,
+        comments: Vec::new(),
     };
 
     let state = run_issue(&agents, &config, &repo, &item, &issue);
@@ -5169,6 +5296,8 @@ fn an_off_checkout_issue_branch_with_recovery_commits_is_not_reset() {
         state_reason: None,
         url: "https://example.invalid/issues/78".into(),
         labels: Vec::new(),
+        author: None,
+        comments: Vec::new(),
     };
 
     let state = run_issue(&agents, &config, &repo, &item, &issue);
@@ -5219,6 +5348,8 @@ fn a_pull_request_head_allows_an_off_checkout_issue_branch_to_reset() {
         state_reason: None,
         url: "https://example.invalid/issues/79".into(),
         labels: Vec::new(),
+        author: None,
+        comments: Vec::new(),
     };
 
     let state = run_issue(&agents, &config, &repo, &item, &issue);
@@ -5276,6 +5407,8 @@ fn a_pr_head_lets_the_shared_checkout_advance_after_the_pr_closes() {
         state_reason: None,
         url: "https://example.invalid/issues/75".into(),
         labels: Vec::new(),
+        author: None,
+        comments: Vec::new(),
     };
 
     let state = run_issue(&agents, &config, &repo, &item, &issue);
@@ -5331,6 +5464,8 @@ fn a_managed_edit_in_the_shared_checkout_is_kept_uncommitted() {
         state_reason: None,
         url: "https://example.invalid/issues/76".into(),
         labels: Vec::new(),
+        author: None,
+        comments: Vec::new(),
     };
 
     let state = run_issue(&agents, &config, &repo, &item, &issue);

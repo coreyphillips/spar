@@ -1773,6 +1773,8 @@ Write the parts like this:
             state_reason: reason.map(str::to_string),
             url: String::new(),
             labels: Vec::new(),
+            author: None,
+            comments: Vec::new(),
         };
 
         assert!(matches!(

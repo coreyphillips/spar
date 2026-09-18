@@ -202,7 +202,9 @@ instructions      = ""       # extra instructions handed to both agents with
                              # --instructions to add to this for one run; it
                              # adds rather than replaces, so a flag cannot
                              # silence the standing set by accident.
-max_issue_chars   = 60000    # most of ONE issue body that reaches a prompt.
+max_issue_chars   = 60000    # most of ONE issue, its body and the comments
+                             # on it, that reaches a prompt. Past it the oldest
+                             # comments go first, then the body's tail.
                              # Sized so nothing a person wrote is ever cut. It
                              # was 2000 for triage and 6000 for implement, and
                              # silent: an agent handed half an issue judges and
@@ -211,10 +213,14 @@ max_issue_chars   = 60000    # most of ONE issue body that reaches a prompt.
                              # log and in the prompt, and never lands mid line
                              # or inside a code fence.
 checkin_trust     = "write"  # write | anyone. Whose comments `spar checkin`
-                             # will act on. Answering is for everybody; making
-                             # a change means a commit pushed to somebody's
-                             # branch because a stranger typed a sentence, so
-                             # by default only somebody GitHub says can write
+                             # will act on, and whose comments under an issue
+                             # reach the prompts that implement, triage, and
+                             # review it. The person who filed an issue is
+                             # always read under it, since they wrote the body.
+                             # Answering is for everybody; making a change
+                             # means a commit pushed to somebody's branch
+                             # because a stranger typed a sentence, so by
+                             # default only somebody GitHub says can write
                              # here can cause one. Note that on a repository
                              # you do not own, the author of a pull request is
                              # a CONTRIBUTOR on their own PR, so "anyone" is
@@ -241,8 +247,8 @@ max_checkin_comments = 20    # most unanswered comments spar answers on one
                              # pull request in a run. A backstop against a long
                              # argument being read back to somebody, not a
                              # target.
-max_triage_chars  = 200000   # most every issue body TOGETHER may add to one
-                             # triage prompt. Triage reads the whole queue at
+max_triage_chars  = 200000   # most every issue TOGETHER, bodies and comments,
+                             # may add to one triage prompt. Triage reads the whole queue at
                              # once, so the queue is the only unbounded thing
                              # here. Past this, whole issues wait for the next
                              # run rather than every issue losing its tail: a

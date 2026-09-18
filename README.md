@@ -702,7 +702,9 @@ output is a `git push`, so it is worth saying exactly what the layers are.
   repository you do not own, the author of a pull request is a `CONTRIBUTOR` on
   their own PR, so set `checkin_trust = "anyone"` or pass `--any-author` if you
   are answering your own contributors. Every comment the gate holds back is
-  named in the log, so the setting is never silent.
+  named in the log, so the setting is never silent. The same setting decides
+  whose comments under an issue reach the prompts that implement, triage, and
+  review it.
 - **Both agents have to agree.** A second opinion that never arrived is not
   agreement: if the checking agent and its fallback both fail, nothing is
   implemented that run. Disagreement always resolves toward saying something
@@ -1095,12 +1097,26 @@ labelled as the author's own account of the change, which is a claim to check
 rather than a statement of fact. A reviewer asked whether the change resolves
 the issue cannot answer that from a title.
 
-The issue's URL goes with the body, not instead of it. Comments are not fetched,
-so an agent that can reach the network is told where the discussion is and asked
-to read it when a body leaves something open. It is not a substitute for the
-text: codex runs under `-s workspace-write`, which has no network at all, so a
-link alone would leave it judging the title. Both agents are also told the
-discussion is not included, so neither treats the body as the whole story.
+The comments under the issue go with the body, read in the same `gh issue view`.
+A body is written once, and the thread is where somebody narrows it, widens it,
+or finds the real defect under the one they filed. A body that reads as complete
+gives no hint that a comment superseded it, so an agent left to follow a link
+has no reason to. The comments follow the body oldest first, each headed with
+who wrote it and when, and every prompt that carries an issue says a later
+comment can change what was asked. The body and its comments share
+`max_issue_chars`, and past it the oldest comments go first.
+
+What a comment says can become a commit, so `checkin_trust` decides whose are
+read, exactly as it does for `spar checkin`: by default somebody GitHub says can
+write to the repository, and always the person who filed the issue, since they
+wrote the body. Anybody passed over is named in the log. spar's own comments are
+carried, because one can be a finding a review added to an issue that already
+covered it, and headed as spar's so no agent takes one for somebody deciding what
+was asked.
+
+The URL goes with the text, not instead of it: codex runs under
+`-s workspace-write`, which has no network at all, so a link alone would leave it
+judging the title.
 
 **Two agents that are secretly one.** Config keys are arbitrary, so `alpha` and
 `beta` can both be Claude on the same model. spar compares the resolved binary

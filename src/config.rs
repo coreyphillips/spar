@@ -265,7 +265,8 @@ impl StateStore {
     }
 }
 
-/// Whose comments `spar checkin` will act on.
+/// Whose comments `spar checkin` will act on, and whose comments under an issue
+/// reach a prompt.
 ///
 /// The default is not timidity. Acting on a comment means a commit pushed to a
 /// branch because somebody typed a sentence, and `authorAssociation` is one
@@ -570,7 +571,8 @@ pub struct LoopCfg {
     /// header they arrive under: they change how the work is done, never what
     /// was asked for or the shape of the answer.
     pub instructions: String,
-    /// The most of one issue body that reaches a prompt.
+    /// The most of one issue, its body and the comments on it, that reaches a
+    /// prompt. Past it the oldest comments go first, then the body's tail.
     ///
     /// Sized so that no issue a person wrote is ever cut. It was 2000 for
     /// triage and 6000 for implement, silently, and both were small enough to
@@ -578,7 +580,8 @@ pub struct LoopCfg {
     /// implements the half it saw and has no way to know the rest existed.
     /// When this does fire it is said out loud, in the log and in the prompt.
     pub max_issue_chars: usize,
-    /// The most every issue body together may add to one triage prompt.
+    /// The most every issue together, bodies and comments, may add to one
+    /// triage prompt.
     ///
     /// Triage reads the whole queue at once, so the only unbounded thing here
     /// is the queue. Past this, whole issues are left for the next run rather
@@ -586,7 +589,12 @@ pub struct LoopCfg {
     /// can close it, so judging one on part of its body is worse than not
     /// reaching it yet.
     pub max_triage_chars: usize,
-    /// Whose comments `spar checkin` will act on.
+    /// Whose comments `spar checkin` will act on, and whose comments under an
+    /// issue reach the prompts that implement, triage, and review it.
+    ///
+    /// One setting, because both are the same question: whether what somebody
+    /// typed can become a commit. The person who filed an issue is read under
+    /// it whatever this says, since they wrote the body.
     pub checkin_trust: Trust,
     /// Mark a review thread resolved when spar made the change it asked for.
     ///

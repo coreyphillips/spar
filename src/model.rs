@@ -1196,6 +1196,45 @@ pub struct Label {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct Author {
+    #[serde(default)]
+    pub login: String,
+}
+
+/// A login, never empty. A deleted account is null on GitHub and becomes
+/// `ghost`, which no trust setting but `anyone` will act on.
+pub fn login_of(author: Option<&Author>) -> &str {
+    match author.map(|a| a.login.trim()) {
+        Some(login) if !login.is_empty() => login,
+        _ => "ghost",
+    }
+}
+
+/// One top level comment on an issue, as `gh issue view --json comments`
+/// returns it, oldest first.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueComment {
+    /// Null when the account was deleted.
+    #[serde(default)]
+    pub author: Option<Author>,
+    #[serde(default)]
+    pub author_association: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub is_minimized: bool,
+}
+
+impl IssueComment {
+    pub fn login(&self) -> &str {
+        login_of(self.author.as_ref())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Issue {
     pub number: i64,
@@ -1218,6 +1257,13 @@ pub struct Issue {
     pub url: String,
     #[serde(default)]
     pub labels: Vec<Label>,
+    /// Who filed it. None when the field was not asked for.
+    #[serde(default)]
+    pub author: Option<Author>,
+    /// What was said on it since it was filed. Empty when the field was not
+    /// asked for, which a listing of the whole queue never does.
+    #[serde(default)]
+    pub comments: Vec<IssueComment>,
 }
 
 impl Issue {

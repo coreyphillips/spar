@@ -200,8 +200,13 @@ fn run_phases(
     let linked = pr.closing_issues_references.first().map(|r| r.number);
     let (issue_body, issue_url) = match linked.map(|n| repo.read_issue(n)) {
         Some(Ok(issue)) => {
-            let (body, _) = issue.body_for_prompt(cfg.loop_cfg.max_issue_chars);
-            (body, issue.url)
+            let text = crate::comments::issue_for_prompt(
+                &issue,
+                cfg.loop_cfg.max_issue_chars,
+                cfg.loop_cfg.checkin_trust,
+            );
+            text.report(&format!("PR #{}", pr.number));
+            (text.text, issue.url)
         }
         Some(Err(e)) => {
             logdim!("could not read the linked issue for PR #{}: {e}", pr.number);

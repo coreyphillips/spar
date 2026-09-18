@@ -25,6 +25,15 @@ use crate::style::{self, Style};
 use crate::textsim;
 use crate::{bail, logdim, logwarn, spar_err};
 
+/// What is read of one issue that is about to reach a prompt.
+///
+/// The comments come in the same call. The body is what somebody wrote once,
+/// and the thread is where they narrowed it, widened it, or found the real
+/// defect under the one they filed. Linking to the thread instead left that to
+/// an agent that had to guess the body was out of date, and codex, which has no
+/// network, could not follow the link at all.
+const ISSUE_FIELDS: &str = "number,title,body,labels,state,stateReason,url,author,comments";
+
 /// gh returns newest first, so its `--limit` cannot be used to take the lowest
 /// numbered items: it would slice the newest N and then sorting that slice
 /// silently drops the older ones. Fetch a generous page, sort, then truncate.
@@ -3617,13 +3626,7 @@ impl Repo {
     /// closed is an answer and the empty case cannot arise.
     pub fn read_issue(&self, number: i64) -> Result<Issue> {
         let text = self
-            .gh(&[
-                "issue",
-                "view",
-                &number.to_string(),
-                "--json",
-                "number,title,body,labels,state,stateReason,url",
-            ])
+            .gh(&["issue", "view", &number.to_string(), "--json", ISSUE_FIELDS])
             .map_err(|e| spar_err!("could not read issue #{number}: {}", e.last_line()))?;
         serde_json::from_str(&text)
             .map_err(|e| spar_err!("unexpected shape for issue #{number}: {e}"))
@@ -3633,13 +3636,7 @@ impl Repo {
         let mut issues = Vec::new();
         for number in numbers {
             let text = self
-                .gh(&[
-                    "issue",
-                    "view",
-                    &number.to_string(),
-                    "--json",
-                    "number,title,body,labels,state,stateReason,url",
-                ])
+                .gh(&["issue", "view", &number.to_string(), "--json", ISSUE_FIELDS])
                 .map_err(|e| spar_err!("could not read issue #{number}: {}", e.last_line()))?;
             let issue: Issue = serde_json::from_str(&text)
                 .map_err(|e| spar_err!("unexpected shape for issue #{number}: {e}"))?;

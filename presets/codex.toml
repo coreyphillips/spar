@@ -14,7 +14,10 @@ command = [
 ]
 output = "jsonl"
 message_path = "item.text"
+# ChatGPT 26.924 moved the CLI into codex-cli/bin. The older location stays for
+# anybody who has not updated the app yet.
 search_paths = [
+  "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin",
   "/Applications/ChatGPT.app/Contents/Resources",
   "~/.codex/bin",
   "/opt/homebrew/bin",

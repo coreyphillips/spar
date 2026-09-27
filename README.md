@@ -1131,7 +1131,7 @@ which is worse than no review at all.
 ```
   missing  aider
   found    claude     /Users/you/.local/bin/claude
-  found    codex      /Applications/ChatGPT.app/Contents/Resources/codex
+  found    codex      /Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex
   found    cursor     /Users/you/.local/bin/cursor-agent
   missing  gemini
 
@@ -1462,10 +1462,12 @@ and two with `--max-rounds 1`. Filing from a saved session costs nothing.
 ## Caveats
 
 On macOS the Codex CLI usually lives inside `ChatGPT.app`, currently an alpha
-build, so its path and flags will drift. That location is only one entry in the
-preset's `search_paths`, not an assumption: PATH wins, `SPAR_CODEX_BIN`
-overrides everything, and a miss reports every location tried rather than
-degrading quietly.
+build, so its path and flags will drift. The path already has: the app moved the
+CLI from `Contents/Resources/codex` to `Contents/Resources/codex-cli/bin/codex`,
+and the preset looks in both. Those are only entries in the preset's
+`search_paths`, not assumptions: PATH wins, `SPAR_CODEX_BIN` overrides
+everything, and a miss reports every location tried rather than degrading
+quietly.
 
 Triage runs both agents concurrently in the repo root. They are told to read
 only, but they are real agent CLIs with write permissions. Commit or stash

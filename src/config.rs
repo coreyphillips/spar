@@ -1329,6 +1329,24 @@ model = "gpt-5.6-sol"
         assert!(!spec.message_match.is_empty());
     }
 
+    /// ChatGPT 26.924 moved the bundled CLI from `Resources/codex` to
+    /// `Resources/codex-cli/bin/codex`. An app not yet updated still has the
+    /// old one, so both are searched, the current layout first.
+    #[test]
+    fn codex_preset_looks_where_either_chatgpt_layout_keeps_the_cli() {
+        let spec = build_spec(
+            "codex",
+            &parse_document("preset = \"codex\"", "test").unwrap(),
+        )
+        .unwrap();
+        let at = |path: &str| spec.search_paths.iter().position(|p| p == path);
+        let current = at("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin");
+        let older = at("/Applications/ChatGPT.app/Contents/Resources");
+        assert!(current.is_some(), "{:?}", spec.search_paths);
+        assert!(older.is_some(), "{:?}", spec.search_paths);
+        assert!(current < older, "{:?}", spec.search_paths);
+    }
+
     #[test]
     fn agent_order_follows_declaration_order() {
         let cfg = parse(TWO_AGENTS).unwrap();

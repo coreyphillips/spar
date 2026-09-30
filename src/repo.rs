@@ -795,6 +795,15 @@ fn is_generated_artifact(path: &Path) -> bool {
     })
 }
 
+/// Files the desktop writes into any folder a person opens.
+///
+/// Finder drops `.DS_Store` into every directory it shows, so a finished
+/// worktree someone once looked at in Finder held nothing but these, and
+/// `spar clean` kept every one of them as if it were work.
+fn is_desktop_metadata(path: &Path) -> bool {
+    path.file_name() == Some(OsStr::new(".DS_Store"))
+}
+
 fn merge_pr_args<'a>(
     number: &'a str,
     expected_head: Option<&'a str>,
@@ -6848,6 +6857,9 @@ fn has_recoverable_worktree_admin_state(cwd: &Path) -> Result<bool> {
         return Ok(true);
     }
 
+    // `FETCH_HEAD` only names what a `git fetch` in this worktree brought
+    // down. The objects live in the shared store and the next fetch rewrites
+    // it, so an agent that fetched once must not keep the checkout forever.
     for entry in std::fs::read_dir(&git_dir)
         .map_err(|e| spar_err!("could not inspect {}: {e}", git_dir.display()))?
     {
@@ -6858,6 +6870,7 @@ fn has_recoverable_worktree_admin_state(cwd: &Path) -> Result<bool> {
                 "HEAD"
                     | "ORIG_HEAD"
                     | "COMMIT_EDITMSG"
+                    | "FETCH_HEAD"
                     | "commondir"
                     | "gitdir"
                     | "index"
@@ -7096,7 +7109,10 @@ fn has_untracked_work_worth_keeping(cwd: &Path, disposable: Disposable) -> Resul
         if nested {
             return Ok(true);
         }
-        if disposable == Disposable::BuildOutput && !is_generated_artifact(&path) {
+        if disposable == Disposable::BuildOutput
+            && !is_generated_artifact(&path)
+            && !is_desktop_metadata(&path)
+        {
             return Ok(true);
         }
     }
@@ -7813,6 +7829,14 @@ mod tests {
             "generated/required-fixture.txt"
         )));
         assert!(!is_generated_artifact(Path::new("local.env")));
+    }
+
+    #[test]
+    fn only_finder_state_files_are_desktop_metadata() {
+        assert!(is_desktop_metadata(Path::new(".DS_Store")));
+        assert!(is_desktop_metadata(Path::new("src/tests/.DS_Store")));
+        assert!(!is_desktop_metadata(Path::new(".DS_Store.bak")));
+        assert!(!is_desktop_metadata(Path::new(".DS_Store/notes.md")));
     }
 
     struct ReviewFixture {
@@ -8864,6 +8888,42 @@ mod tests {
 
         assert!(!repository_has_recoverable_work(&path, true).unwrap());
         repo.release_review_worktree(933);
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn finder_metadata_alone_does_not_keep_a_worktree() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("finder-metadata", 937);
+        exclude_paths(&repo, &[".DS_Store"]);
+        std::fs::create_dir_all(path.join("src")).unwrap();
+        std::fs::write(path.join(".DS_Store"), "finder state\n").unwrap();
+        std::fs::write(path.join("src/.DS_Store"), "finder state\n").unwrap();
+
+        assert!(!repository_has_recoverable_work(&path, true).unwrap());
+        repo.release_review_worktree(937);
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_fetch_record_alone_does_not_keep_a_worktree() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("fetch-record", 938);
+        let raw = PathBuf::from(test_git(&path, &["rev-parse", "--git-dir"]).trim());
+        let git_dir = if raw.is_absolute() {
+            raw
+        } else {
+            path.join(raw)
+        };
+        let head = test_git(&path, &["rev-parse", "HEAD"]);
+        std::fs::write(
+            git_dir.join("FETCH_HEAD"),
+            format!("{}\t\tbranch 'main' of origin\n", head.trim()),
+        )
+        .unwrap();
+
+        assert!(!repository_has_recoverable_work(&path, true).unwrap());
+        repo.release_review_worktree(938);
 
         assert!(!path.exists());
     }

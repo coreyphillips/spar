@@ -27,8 +27,9 @@ search_paths = [
 
 # Hints for `spar init`. Never validated against, only written as comments.
 #
-# Codex enumerates neither set in its help. The effort list is its own enum, in
-# its own order, read out of the binary. The models were read out of the binary
+# Codex enumerates neither set in its help. The effort list is its own enum,
+# read out of the binary, in its own order except that high goes first so it is
+# what `spar init` suggests. The models were read out of the binary
 # too, and that is what made this list incomplete: gpt-5.3-codex-spark is not a
 # string in the binary at all. It arrives in the model list the server hands the
 # CLI, cached at ~/.codex/models_cache.json, which is the better place to look.
@@ -41,8 +42,8 @@ search_paths = [
 # general one, which makes it the one entry on this list worth naming under
 # [agents.codex.fallback]: a stand in for a weekly limit has to draw on a
 # different pool than the model that just hit it.
-models = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-pro", "gpt-5.5", "gpt-5.3-codex-spark"]
-efforts = ["ultra", "max", "xhigh", "high", "medium", "low", "minimal", "none"]
+models = ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-pro", "gpt-5.5", "gpt-5.3-codex-spark"]
+efforts = ["high", "ultra", "max", "xhigh", "medium", "low", "minimal", "none"]
 options_note = "Codex lists neither set in its help. ~/.codex/models_cache.json is what your account is currently offered, and effort is passed through as -c model_reasoning_effort=..."
 
 [message_match]

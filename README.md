@@ -207,6 +207,16 @@ spar run 42 --quiet         # suppress progress; warnings and errors still print
 
 `--quiet` works before or after the subcommand.
 
+`spar run` and `spar followup` print a progress line each time an item
+finishes, so a long run says how far along it is:
+
+```
+spar: [########............] 2 of 5 done, #123 approved, 3 left, 1h12m elapsed
+```
+
+The total starts with any pull requests being continued, grows once triage has
+said which issues get worked, and grows again when a wave of follow-ups joins.
+
 With no numbers given, spar takes the 20 lowest numbered open items. It says
 which ones it picked, and says so explicitly when there were more than the cap
 rather than quietly truncating. Raise it with `--limit`.

@@ -17,6 +17,7 @@ pub mod jsonx;
 pub mod logging;
 pub mod model;
 pub mod proc;
+pub mod progress;
 pub mod repo;
 pub mod review;
 pub mod review_only;

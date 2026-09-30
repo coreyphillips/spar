@@ -151,7 +151,7 @@ pub fn for_subject(calls: &[Spent], subject: i64) -> Option<String> {
 }
 
 /// Wall time as somebody reads it, rather than as a float.
-fn clock(taken: Duration) -> String {
+pub(crate) fn clock(taken: Duration) -> String {
     let seconds = taken.as_secs();
     if seconds < 90 {
         return format!("{seconds}s");

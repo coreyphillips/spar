@@ -14,6 +14,7 @@ use crate::error::Result;
 use crate::followups;
 use crate::model::{Issue, IssueRun, ItemKind, Plan, PlanItem, Status};
 use crate::proc::{self, ExecOpts};
+use crate::progress::Progress;
 use crate::repo::{Repo, WriteSummary};
 use crate::review;
 use crate::review_only;
@@ -688,6 +689,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let mut results = Vec::new();
             let mut stopped = Vec::new();
             let mut parked = Vec::new();
+            let mut progress = Progress::new(sorted.prs.len());
 
             // Work already on a pull request is finished before any new work
             // starts. These ran last, behind every named issue's full implement
@@ -710,7 +712,9 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 }
                 issues = issues_not_on_named_prs(&issues, &covered);
                 for number in &sorted.prs {
-                    results.push(review::resume_pr(&agents, &cfg, &repo, *number, None));
+                    let run = review::resume_pr(&agents, &cfg, &repo, *number, None);
+                    progress.finished(&run);
+                    results.push(run);
                 }
             }
 
@@ -723,6 +727,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 &mut results,
                 &mut stopped,
                 &mut parked,
+                &mut progress,
                 triage_flags.retriage,
             ) {
                 // A pull request that already finished is not thrown away
@@ -771,6 +776,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let mut results = Vec::new();
             let mut stopped = Vec::new();
             let mut parked = Vec::new();
+            let mut progress = Progress::new(0);
             work_issues(
                 &agents,
                 &cfg,
@@ -780,6 +786,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 &mut results,
                 &mut stopped,
                 &mut parked,
+                &mut progress,
                 triage_flags.retriage,
             )?;
             if results.is_empty() {
@@ -926,6 +933,7 @@ fn work_issues(
     results: &mut Vec<IssueRun>,
     stopped: &mut Vec<String>,
     parked: &mut Vec<String>,
+    progress: &mut Progress,
     retriage: bool,
 ) -> Result<()> {
     // Issues a previous run's triage disagreed about. They are waiting on a
@@ -1077,6 +1085,12 @@ fn work_issues(
             }
         }
 
+        progress.add(
+            plan.order
+                .iter()
+                .filter(|item| fetched.iter().any(|i| i.number == item.issue))
+                .count(),
+        );
         let before = results.len();
         for item in &plan.order {
             let Some(issue) = fetched.iter().find(|i| i.number == item.issue) else {
@@ -1087,6 +1101,7 @@ fn work_issues(
                 let mut held = IssueRun::new(item.issue, item.title.clone());
                 held.status = Status::Pending;
                 held.notes.push(why);
+                progress.finished(&held);
                 results.push(held);
                 continue;
             }
@@ -1095,6 +1110,7 @@ fn work_issues(
             if run.status == Status::Merged {
                 landed.insert(item.issue);
             }
+            progress.finished(&run);
             results.push(run);
         }
 

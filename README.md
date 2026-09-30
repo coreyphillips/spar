@@ -1141,13 +1141,13 @@ wrote spar.toml
 ```toml
 [agents.claude]
 preset = "claude"
-model  = "fable"        # omit to use the CLI's own default
+model  = "opus"         # omit to use the CLI's own default
 effort = "high"
 
 [agents.codex]
 preset = "codex"
-model  = "gpt-5.6-sol"
-effort = "ultra"
+model  = "gpt-6.1-sol"
+effort = "high"
 
 [loop]
 max_rounds        = 3       # custody rounds, or review-only phases
@@ -1158,7 +1158,7 @@ worktrees         = true
 
 [loop.effort_schedule]
 triage      = "low"         # both agents, over the whole queue
-review_1    = "ultra"       # the deep pass
+review_1    = "high"        # the deep pass
 review_rest = "high"        # later rounds and the closing pass
 
 [style]
@@ -1278,7 +1278,7 @@ Give an agent a stand in and the call goes there instead.
 ```toml
 [agents.codex]
 preset = "codex"
-model  = "gpt-5.6-sol"
+model  = "gpt-6.1-sol"
 
 [agents.codex.fallback]
 preset = "cursor"

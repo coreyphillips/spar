@@ -3724,6 +3724,28 @@ impl Repo {
         serde_json::from_str(&text).map_err(|e| spar_err!("unexpected shape for PR #{number}: {e}"))
     }
 
+    /// Whether `login` is in a team, named `org/slug` as gh gives a team in
+    /// `reviewRequests`. GitHub answers 404 for a team the login is not in, and
+    /// a team the viewer is in is one it can always see. None when GitHub did
+    /// not answer either way.
+    pub fn team_has_member(&self, team: &str, login: &str) -> Option<bool> {
+        // A team asked for a review belongs to the repository's own owner.
+        let (org, slug) = team.split_once('/').unwrap_or(("{owner}", team));
+        if slug.is_empty() || login.is_empty() {
+            return None;
+        }
+        let path = format!("orgs/{org}/teams/{slug}/memberships/{login}");
+        let resp = self.gh_api_raw(&path, &[]).ok()?;
+        match resp.status {
+            200 => {
+                let body: Value = serde_json::from_str(&resp.body).ok()?;
+                Some(body.get("state")?.as_str()? == "active")
+            }
+            404 => Some(false),
+            _ => None,
+        }
+    }
+
     /// How many commits lie between two SHAs, when GitHub will say.
     pub fn commits_between(&self, from: &str, to: &str) -> Option<u64> {
         if from.is_empty() || to.is_empty() {

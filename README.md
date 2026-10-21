@@ -824,15 +824,21 @@ and spar polls them with a conditional request: when nothing changed GitHub
 answers `304 Not Modified`, which costs nothing against the rate limit, and spar
 obeys the interval GitHub asks for. But a push raises no notification for a
 reviewer, so every `sweep` seconds spar lists the open pull requests and compares
-each head with the commit its review record holds. Notifications are never
-raised for your own actions, which is also why spar's own comments never wake it.
+each head with the commit its review record holds. Your own actions raise no new
+notification, but they can still move a thread you are part of, and a thread
+keeps the reason it was first raised for. A thread that began as a review request
+is therefore called one again when spar's own review moves it, so spar checks the
+pull request: a review request counts only while it is still open, to you by name
+or to a team you are in. A team request asks GitHub whether you are in the team,
+which takes the `read:org` scope `gh auth login` asks for, and a team GitHub will
+not answer for counts as asking you.
 
 What an event leads to is a table, not a judgement:
 
 - A pull request spar has reviewed, written by somebody else, that moved or got a
   reply gets a **second look**: the earlier points ruled on, what landed since
-  reviewed, and a verdict. A review request on it that arrives with nothing new
-  gets a mechanical comment saying so, and no agent call.
+  reviewed, and a verdict. A review request still open on it that arrives with
+  nothing new gets a mechanical comment saying so, and no agent call.
 - A pull request spar has not reviewed, written by somebody else, where your
   review was requested or that was assigned to you gets a review with a verdict,
   under `on_review_requested` and `on_assigned`. A mention on it gets a review

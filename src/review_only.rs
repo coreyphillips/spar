@@ -771,7 +771,7 @@ fn finish(
         return Ok(());
     }
     let posted = if reviewed.opts.verdict {
-        repo.submit_review(pr.number, verdict, &comment)
+        repo.submit_review(pr.number, verdict, &comment, reviewed.head)
     } else {
         repo.comment_pr(pr.number, &comment)
     };
@@ -1446,6 +1446,12 @@ fn recheck_phases(
             style::title(&e.recorded.title, &repo.style)
         ));
     }
+    for e in rechecked.iter().filter(|e| e.contested()) {
+        state.notes.push(format!(
+            "{} is still disputed, which is your call",
+            style::title(&e.recorded.title, &repo.style)
+        ));
+    }
     for j in judged.iter().filter(|j| j.standing == Standing::Disputed) {
         state.disputes.push(crate::model::Dispute {
             title: style::title(&j.finding.title, &repo.style),
@@ -1461,7 +1467,7 @@ fn recheck_phases(
         save_unposted(repo, pr.number, &body, look.mode.dry_run);
         return Ok(());
     }
-    match repo.submit_review(pr.number, verdict, &body) {
+    match repo.submit_review(pr.number, verdict, &body, look.head) {
         Ok(()) => {
             log!(
                 "PR #{}: second look posted, {}",
@@ -1628,9 +1634,17 @@ impl Rechecked {
         matches!(self.resolution, Resolution::Open(_))
     }
 
-    /// Still open, blocking, and in scope: the only earlier points that gate.
+    /// Still open, blocking, in scope, and counted by both: the only earlier
+    /// points that gate.
     fn gates(&self) -> bool {
-        self.is_open() && self.recorded.blocks()
+        self.is_open() && self.recorded.blocks() && self.recorded.standing.counts()
+    }
+
+    /// Still open, blocking, and still disputed. The first look handed it to a
+    /// person rather than requesting changes over it, and staying open does not
+    /// settle the dispute, so a second look hands it over the same way.
+    fn contested(&self) -> bool {
+        self.is_open() && self.recorded.blocks() && self.recorded.standing == Standing::Disputed
     }
 }
 
@@ -1713,18 +1727,20 @@ fn open_reason(per: &[(&str, &RecheckRuling)], who: &str, ruling: &RecheckRuling
     }
 }
 
-/// The verdict a second look earns, derived and never asked. Changes are
-/// requested while an earlier blocking point stays open or a new one both
-/// reviewers count has appeared; nothing is said when the only thing short of
-/// approval is a new blocking finding the two dispute; otherwise it approves.
+/// The verdict a second look earns, derived and never asked, by the same rule
+/// as a first look. Changes are requested while an earlier blocking point both
+/// reviewers counted stays open or a new one both count has appeared; nothing
+/// is said when the only thing short of approval is a blocking point the two
+/// dispute, earlier or new; otherwise it approves.
 pub(crate) fn recheck_verdict(earlier: &[Rechecked], judged: &[Judged]) -> Option<ReviewVerdict> {
     let open_blocking = earlier.iter().any(Rechecked::gates);
     let new_blocking = judged
         .iter()
         .any(|j| j.finding.blocks() && j.standing.counts());
-    let contested = judged
-        .iter()
-        .any(|j| j.finding.blocks() && j.standing == Standing::Disputed);
+    let contested = earlier.iter().any(Rechecked::contested)
+        || judged
+            .iter()
+            .any(|j| j.finding.blocks() && j.standing == Standing::Disputed);
     if open_blocking || new_blocking {
         Some(ReviewVerdict::RequestChanges)
     } else if contested {
@@ -1764,10 +1780,11 @@ pub fn recheck_comment(
             .iter()
             .filter(|j| j.finding.blocks() && j.standing.counts())
             .count();
-    let contested = judged
-        .iter()
-        .filter(|j| j.finding.blocks() && j.standing == Standing::Disputed)
-        .count();
+    let contested = earlier.iter().filter(|e| e.contested()).count()
+        + judged
+            .iter()
+            .filter(|j| j.finding.blocks() && j.standing == Standing::Disputed)
+            .count();
     first.push(' ');
     first.push_str(&if blocking == 0 && contested == 0 {
         "Nothing blocking remains.".to_string()
@@ -2678,6 +2695,57 @@ mod recheck_tests {
         assert_eq!(
             Some(ReviewVerdict::Approve),
             recheck_verdict(&earlier, &withdrawn)
+        );
+    }
+
+    /// A blocker the first look handed to a person as disputed became a formal
+    /// change request on the next look, after any push at all, because the
+    /// reviewer that raised it keeps it open.
+    #[test]
+    fn an_earlier_disputed_blocker_that_stays_open_posts_no_verdict_as_on_a_first_look() {
+        let disputed = recorded(
+            Severity::Blocking,
+            "Maybe a leak",
+            "src/pool.rs:12",
+            Standing::Disputed,
+        );
+        let rechecked = reconcile(
+            std::slice::from_ref(&disputed),
+            &rulings(
+                vec![ruling(1, Ruling::Open, "still leaks")],
+                vec![ruling(1, Ruling::Rebutted, "never did")],
+            ),
+            &["a", "b"],
+        );
+        assert!(rechecked[0].is_open());
+        assert_eq!(None, recheck_verdict(&rechecked, &[]));
+        assert_eq!(
+            review_verdict(&[judged(
+                Severity::Blocking,
+                "Maybe a leak",
+                Standing::Disputed
+            )]),
+            recheck_verdict(&rechecked, &[]),
+            "the same rule as a first look"
+        );
+        let body = recheck_comment(
+            &delta(&["abc1234 unrelated"]),
+            &rechecked,
+            &[],
+            &Style::default(),
+            2,
+        );
+        assert!(
+            body.contains("1 blocking finding the reviewers disagree about."),
+            "{body}"
+        );
+
+        // Something both count still requests changes beside it.
+        let mut both = vec![open(one_blocker().remove(0))];
+        both.extend(rechecked);
+        assert_eq!(
+            Some(ReviewVerdict::RequestChanges),
+            recheck_verdict(&both, &[])
         );
     }
 

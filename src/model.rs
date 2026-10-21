@@ -130,11 +130,11 @@ string_enum! {
 }
 
 impl ReviewVerdict {
-    /// The `gh pr review` flag that submits it.
-    pub fn gh_flag(self) -> &'static str {
+    /// The `event` the reviews API submits it as.
+    pub fn api_event(self) -> &'static str {
         match self {
-            ReviewVerdict::Approve => "--approve",
-            ReviewVerdict::RequestChanges => "--request-changes",
+            ReviewVerdict::Approve => "APPROVE",
+            ReviewVerdict::RequestChanges => "REQUEST_CHANGES",
         }
     }
 
@@ -1907,7 +1907,7 @@ mod review_record_tests {
         let doc: RecheckDoc =
             serde_json::from_str(r#"{"summary":"","rulings":[],"findings":[]}"#).unwrap();
         assert!(doc.rulings.is_empty());
-        assert_eq!("--approve", ReviewVerdict::Approve.gh_flag());
+        assert_eq!("APPROVE", ReviewVerdict::Approve.api_event());
         assert_eq!("changes requested", ReviewVerdict::RequestChanges.words());
     }
 }

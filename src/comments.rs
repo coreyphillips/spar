@@ -295,25 +295,10 @@ impl Repo {
     }
 
     /// Submitted review bodies. There is no thread to reply into, so these can
-    /// only ever be answered with a comment on the pull request.
-    ///
-    /// A PENDING review was never submitted and nobody else can see it. A
-    /// DISMISSED one has been withdrawn. An empty body is every approval that
-    /// came with only inline comments, which the threads already carry.
+    /// only ever be answered with a comment on the pull request. Nothing when
+    /// they cannot be read.
     pub fn pr_reviews(&self, number: i64) -> Vec<Value> {
-        self.try_pr_reviews(number)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| {
-                let state = r
-                    .get("state")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_uppercase();
-                let body = r.get("body").and_then(Value::as_str).unwrap_or("");
-                !matches!(state.as_str(), "PENDING" | "DISMISSED") && !body.trim().is_empty()
-            })
-            .collect()
+        submitted_with_a_body(self.try_pr_reviews(number).unwrap_or_default())
     }
 
     /// Every submitted review, unfiltered, and an error when GitHub could not
@@ -329,6 +314,12 @@ impl Repo {
     pub fn pr_review_comments(&self, number: i64) -> Vec<Value> {
         let path = format!("repos/{{owner}}/{{repo}}/pulls/{number}/comments");
         parse_comment_pages(&self.gh_try(&["api", "--paginate", &path]))
+    }
+
+    /// The same, and an error when GitHub could not be read.
+    pub fn try_pr_review_comments(&self, number: i64) -> Result<Vec<Value>> {
+        let path = format!("repos/{{owner}}/{{repo}}/pulls/{number}/comments");
+        crate::repo::try_parse_comment_pages(&self.gh(&["api", "--paginate", &path])?)
     }
 
     /// Reply inside an inline review thread.
@@ -776,12 +767,39 @@ pub fn said_in_threads(threads: &[RawThread], viewer: &str, since: &str) -> Vec<
     out
 }
 
+/// Reviews somebody can see that say something. A PENDING review was never
+/// submitted and nobody else can see it. A DISMISSED one has been withdrawn. An
+/// empty body is every approval that came with only inline comments, which the
+/// threads already carry.
+fn submitted_with_a_body(reviews: Vec<Value>) -> Vec<Value> {
+    reviews
+        .into_iter()
+        .filter(|r| {
+            let state = r
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_uppercase();
+            let body = r.get("body").and_then(Value::as_str).unwrap_or("");
+            !matches!(state.as_str(), "PENDING" | "DISMISSED") && !body.trim().is_empty()
+        })
+        .collect()
+}
+
 /// Everything others said on a pull request after `since`, oldest first.
+///
+/// Every read here is an error when it fails, never an empty answer. Nothing
+/// said is how a second look decides there is nothing new, so a comments read
+/// that failed would settle a reply as never made, after its notification was
+/// already read past.
 pub fn said_since(repo: &Repo, number: i64, since: &str) -> Result<Vec<Said>> {
     let viewer = repo.viewer_login()?.to_string();
-    let (threads, _degraded) = threads_or_rest(repo, number);
+    let threads = match repo.review_threads(number) {
+        Ok(threads) => threads,
+        Err(_) => threads_from_rest(&repo.try_pr_review_comments(number)?),
+    };
     let mut out = said_in_threads(&threads, &viewer, since);
-    for review in repo.pr_reviews(number) {
+    for review in submitted_with_a_body(repo.try_pr_reviews(number)?) {
         if let Some((_, p)) = loose_comment(&review, "review", CommentKind::ReviewSummary, &viewer)
         {
             if later_than(&p.at, since) {
@@ -789,7 +807,7 @@ pub fn said_since(repo: &Repo, number: i64, since: &str) -> Result<Vec<Said>> {
             }
         }
     }
-    for comment in repo.issue_comments(number) {
+    for comment in repo.try_issue_comments(number)? {
         // Another spar's comment is a review, not a response to this one.
         let body = comment.get("body").and_then(Value::as_str).unwrap_or("");
         if crate::repo::is_spar_comment(body) {

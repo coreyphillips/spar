@@ -6330,11 +6330,25 @@ case "$1 $2" in
   "api --paginate") printf '%s\n' '[]' ;;
   "api graphql") printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[]}}}}}}}}}}' ;;
   "api repos/{{owner}}/{{repo}}/issues/{number}") printf 'pr\n' ;;
-  "pr review") : ;;
+  "api -X") : ;;
   "pr comment") : ;;
   *) printf 'unexpected gh call: %s\n' "$*" >&2; exit 64 ;;
 esac"#
     )
+}
+
+/// The reviews API call that submits `event` on `commit`, as the fake gh logs
+/// it, up to where the body begins. The commit is the point: a review that
+/// names none is attached to whatever the head is when it arrives.
+fn review_post(number: i64, commit: &str, event: &str) -> String {
+    format!(
+        "api -X POST repos/{{owner}}/{{repo}}/pulls/{number}/reviews -f commit_id={commit} -f \
+         event={event} -f body="
+    )
+}
+
+fn submitted_a_review(log: &str) -> bool {
+    log.contains("/reviews -f commit_id=")
 }
 
 const CLEAN_REVIEW: &str =
@@ -6403,9 +6417,10 @@ fn review_with_verdict_submits_a_formal_approval_and_leaves_a_record() {
 
     assert!(ok, "{out}");
     assert!(
-        log.contains(
-            "pr review 5 --approve --body Two independent reviews, nothing blocking a merge."
-        ),
+        log.contains(&format!(
+            "{}Two independent reviews, nothing blocking a merge.",
+            review_post(5, &head, "APPROVE")
+        )),
         "{log}"
     );
     assert!(!log.contains("pr comment"), "{log}");
@@ -6436,7 +6451,10 @@ fn review_with_verdict_requests_changes_on_a_blocking_finding_and_records_it() {
 
     assert!(ok, "{out}");
     assert!(
-        log.contains("pr review 5 --request-changes --body Two independent reviews."),
+        log.contains(&format!(
+            "{}Two independent reviews.",
+            review_post(5, &head, "REQUEST_CHANGES")
+        )),
         "{log}"
     );
     assert!(
@@ -6477,10 +6495,13 @@ fn review_with_verdict_on_your_own_pull_request_posts_a_comment() {
 
     assert!(ok, "{out}");
     assert!(
-        log.contains("pr review 5 --comment --body Verdict: approve.\n\nTwo independent reviews"),
+        log.contains(&format!(
+            "{}Verdict: approve.\n\nTwo independent reviews",
+            review_post(5, &head, "COMMENT")
+        )),
         "{log}"
     );
-    assert!(!log.contains("--approve"), "{log}");
+    assert!(!log.contains("event=APPROVE"), "{log}");
 }
 
 /// Without --verdict nothing changes: a comment, as before, and now a record.
@@ -6504,7 +6525,7 @@ fn a_plain_review_still_comments_and_now_leaves_a_record() {
         log.contains("pr comment 5 --body Two independent reviews"),
         "{log}"
     );
-    assert!(!log.contains("pr review"), "{log}");
+    assert!(!submitted_a_review(&log), "{log}");
     let record = read_record(&fx, 5);
     assert!(record.posted);
     assert_eq!(None, record.verdict);
@@ -6555,7 +6576,10 @@ fn a_recheck_rules_on_the_earlier_points_and_approves_when_both_say_fixed() {
 
     assert!(ok, "{out}");
     assert!(
-        log.contains("pr review 9 --approve --body Rechecked after 1 new commit ("),
+        log.contains(&format!(
+            "{}Rechecked after 1 new commit (",
+            review_post(9, &after, "APPROVE")
+        )),
         "{log}"
     );
     assert!(log.contains("). Nothing blocking remains."), "{log}");
@@ -6596,7 +6620,10 @@ fn a_recheck_keeps_a_point_open_when_one_reviewer_still_sees_it() {
 
     assert!(ok, "{out}");
     assert!(
-        log.contains("pr review 9 --request-changes --body Rechecked after 1 new commit ("),
+        log.contains(&format!(
+            "{}Rechecked after 1 new commit (",
+            review_post(9, &after, "REQUEST_CHANGES")
+        )),
         "{log}"
     );
     assert!(log.contains("One point still blocks a merge."), "{log}");
@@ -6641,7 +6668,7 @@ fn a_recheck_with_nothing_new_runs_no_agent_and_reports_clean() {
     assert!(ok, "{out}");
     assert!(out.contains("#9     clean"), "{out}");
     assert!(out.contains("nothing changed since the review at"), "{out}");
-    assert!(!log.contains("pr review"), "{log}");
+    assert!(!submitted_a_review(&log), "{log}");
     assert!(!log.contains("pr comment"), "{log}");
     assert_eq!(0, read_record(&fx, 9).rechecks);
 }
@@ -6670,7 +6697,10 @@ fn a_recheck_without_a_posted_review_on_record_reviews_afresh() {
     assert!(ok, "{out}");
     assert!(out.contains("never posted"), "{out}");
     assert!(
-        log.contains("pr review 9 --approve --body Two independent reviews"),
+        log.contains(&format!(
+            "{}Two independent reviews",
+            review_post(9, &head, "APPROVE")
+        )),
         "{log}"
     );
     assert!(read_record(&fx, 9).posted);
@@ -6684,14 +6714,32 @@ fn a_recheck_without_a_posted_review_on_record_reviews_afresh() {
 /// when that file exists and are a 304 otherwise, the sweep reads
 /// `$SPAR_FAKE_PRS`, and pull request `number` is open at `head`, written by
 /// `author`, with nothing said on it.
+///
+/// Switches for the ways GitHub fails or surprises: `$SPAR_FAKE_NOTIFY_PAGE2`
+/// is a second page of notifications, and `SPAR_FAKE_PAGE2_FAILS=1` makes it
+/// a 500; `SPAR_FAKE_REVIEW_FAILS=1` refuses a submitted review;
+/// `SPAR_FAKE_COMMENTS_FAIL=1` fails the read of the pull request's comments;
+/// `SPAR_FAKE_ISSUE_STATE` is issue 42's state; and `$SPAR_FAKE_LINKED` is the
+/// list a linked pull request is looked for in.
 fn listen_gh(number: i64, head: &str, author: &str, state: &str) -> String {
     format!(
         r#"set -eu
 printf '%s\n' "$*" >> "$SPAR_FAKE_GH_LOG"
 case "$*" in
+  *notifications?page=2*)
+    if [ "${{SPAR_FAKE_PAGE2_FAILS:-}}" = 1 ]; then
+      printf 'HTTP/2.0 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{{"message":"Server Error"}}\n'
+    else
+      printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n'
+      cat "$SPAR_FAKE_NOTIFY_PAGE2"
+    fi ;;
   *notifications*)
     if [ -f "${{SPAR_FAKE_NOTIFY:-/nonexistent}}" ]; then
-      printf 'HTTP/2.0 200 OK\r\nX-Poll-Interval: 60\r\nLast-Modified: Tue, 20 Oct 2026 10:00:00 GMT\r\nContent-Type: application/json\r\n\r\n'
+      printf 'HTTP/2.0 200 OK\r\nX-Poll-Interval: 60\r\nLast-Modified: Tue, 20 Oct 2026 10:00:00 GMT\r\n'
+      if [ -f "${{SPAR_FAKE_NOTIFY_PAGE2:-/nonexistent}}" ]; then
+        printf 'Link: <https://api.github.com/repos/example/project/notifications?page=2>; rel="next"\r\n'
+      fi
+      printf 'Content-Type: application/json\r\n\r\n'
       cat "$SPAR_FAKE_NOTIFY"
     elif [ "${{SPAR_FAKE_POLL_FAILS:-}}" = 1 ]; then
       printf 'gh: API rate limit exceeded for viewer\n' >&2
@@ -6703,6 +6751,8 @@ case "$*" in
   "api user --jq .login") printf 'viewer\n' ;;
   "repo view --json nameWithOwner --jq .nameWithOwner") printf 'example/project\n' ;;
   "pr list --state open --limit 500 --json number,title,headRefOid,"*) cat "$SPAR_FAKE_PRS" ;;
+  "pr list --state open --limit 500 --json number,url,title,baseRefName,closingIssuesReferences")
+    if [ -f "${{SPAR_FAKE_LINKED:-/nonexistent}}" ]; then cat "$SPAR_FAKE_LINKED"; else printf '[]\n'; fi ;;
   "pr list "*) printf '[]\n' ;;
   "pr view {number} --json number,title,headRefOid,"*) printf '%s\n' '{{"number":{number},"title":"PR {number}","headRefOid":"{head}","updatedAt":"2026-10-20T10:00:00Z","author":{{"login":"{author}"}},"isDraft":false,"isCrossRepository":false,"reviewRequests":[],"assignees":[],"state":"{state}"}}' ;;
   "pr view {number} --json author") printf '%s\n' '{{"author":{{"login":"{author}"}}}}' ;;
@@ -6710,11 +6760,15 @@ case "$*" in
   "pr view {number} "*) printf '%s\n' '{{"number":{number},"url":"https://github.com/example/project/pull/{number}","title":"PR {number}","body":"","headRefName":"feature-{number}","baseRefName":"main","state":"{state}","closingIssuesReferences":[],"isCrossRepository":false}}' ;;
   "api repos/{{owner}}/{{repo}}/issues/{number} --jq"*) printf 'pr\n' ;;
   "api repos/{{owner}}/{{repo}}/issues/42 --jq"*) printf 'issue\n' ;;
-  "issue view 42 "*) printf '%s\n' '{{"number":42,"title":"Retry smarter","body":"please","labels":[],"state":"OPEN","url":"https://github.com/example/project/issues/42","author":{{"login":"bob"}},"comments":[]}}' ;;
+  "issue view 42 "*) printf '{{"number":42,"title":"Retry smarter","body":"please","labels":[],"state":"%s","url":"https://github.com/example/project/issues/42","author":{{"login":"bob"}},"comments":[]}}\n' "${{SPAR_FAKE_ISSUE_STATE:-OPEN}}" ;;
   "api repos/{{owner}}/{{repo}}/compare/"*) printf '3\n' ;;
+  "api --paginate repos/{{owner}}/{{repo}}/issues/{number}/comments")
+    if [ "${{SPAR_FAKE_COMMENTS_FAIL:-}}" = 1 ]; then printf 'gh: HTTP 502: Bad Gateway\n' >&2; exit 1; fi
+    printf '[]\n' ;;
   "api --paginate "*) printf '[]\n' ;;
   "api graphql "*) printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[]}}}}}}}}}}' ;;
-  "pr review "*) : ;;
+  "api -X POST repos/{{owner}}/{{repo}}/pulls/{number}/reviews "*)
+    if [ "${{SPAR_FAKE_REVIEW_FAILS:-}}" = 1 ]; then printf 'gh: Unprocessable Entity (HTTP 422)\n' >&2; exit 1; fi ;;
   "pr comment "*) : ;;
   *) printf 'unexpected gh call: %s\n' "$*" >&2; exit 64 ;;
 esac"#
@@ -6815,15 +6869,34 @@ impl Listening {
 
     /// `spar listen <args>`: success, stdout and stderr together, the gh log.
     fn run(&self, args: &[&str]) -> (bool, String, String) {
+        self.run_with(args, &[])
+    }
+
+    /// The same, with more of the environment set.
+    fn run_with(&self, args: &[&str], extra: &[(&str, &str)]) -> (bool, String, String) {
         let mut argv = vec!["listen"];
         argv.extend_from_slice(args);
         argv.extend_from_slice(&["--config", self.config.to_str().unwrap(), "--repo"]);
         argv.push(self.fx.work.to_str().unwrap());
         let env = self.env();
-        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let mut env: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        env.extend_from_slice(extra);
         let (ok, stdout, stderr) = spar_with_env(&argv, &self.fx.dir, &env);
         let log = std::fs::read_to_string(&self.gh_log).unwrap_or_default();
         (ok, format!("{stdout}\n{stderr}"), log)
+    }
+
+    /// Add to the config, a table at a time.
+    fn configure(&self, toml: &str) {
+        let mut config = std::fs::read_to_string(&self.config).unwrap();
+        config.push('\n');
+        config.push_str(toml);
+        std::fs::write(&self.config, config).unwrap();
+    }
+
+    fn listen_json_exists(&self) -> bool {
+        self.fx.work.join(".spar/state/listen.json").exists()
     }
 
     fn agent_calls(&self) -> usize {
@@ -6860,7 +6933,7 @@ fn listen_once_with_nothing_new_calls_no_agent_and_writes_nothing() {
         "{out}"
     );
     assert_eq!(0, l.agent_calls(), "{out}");
-    assert!(!log.contains("pr review"), "{log}");
+    assert!(!submitted_a_review(&log), "{log}");
     assert!(!log.contains("pr comment"), "{log}");
     assert!(log.contains("api -i repos/{owner}/{repo}/notifications?participating=true&all=true&per_page=100&since="), "{log}");
     let state = l.state();
@@ -6873,11 +6946,22 @@ fn listen_once_with_nothing_new_calls_no_agent_and_writes_nothing() {
 }
 
 /// Every event and what it would trigger, and nothing triggered: the way to
-/// see what listen would do before letting it.
+/// see what listen would do before letting it. Nothing consumed either: a dry
+/// run used to write listen.json, and the real run after it found nothing to
+/// do for anything the dry run had shown.
 #[test]
 #[cfg(unix)]
 fn listen_once_dry_run_names_what_each_event_would_trigger_and_triggers_nothing() {
-    let l = Listening::refusing("listendry", &listen_gh(7, "aaa", "alice", "OPEN"));
+    let l = Listening::new(
+        "listendry",
+        ONE_BLOCKER_REVIEW,
+        ONE_BLOCKER_REVIEW,
+        &listen_gh(7, "aaa", "alice", "OPEN"),
+    );
+    git(
+        &l.fx.work,
+        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
+    );
     l.with_prs(&[sweep_row(7, "aaa", "alice")]);
     l.with_notifications(&[
         notification("1", "review_requested", "PullRequest", 7),
@@ -6898,26 +6982,22 @@ fn listen_once_dry_run_names_what_each_event_would_trigger_and_triggers_nothing(
         "{out}"
     );
     assert_eq!(0, l.agent_calls(), "{out}");
-    let state = l.state();
-    assert_eq!(
-        2,
-        state["seen"].as_object().map(|s| s.len()).unwrap_or(0),
-        "{state}"
-    );
+    assert!(!l.listen_json_exists(), "a dry run wrote listen.json");
+
+    // What the dry run showed is what the real run does.
+    let (ok, out, log) = l.run(&["--once"]);
+    assert!(ok, "{out}");
     assert!(
-        state["pending"].as_object().is_some_and(|p| p.is_empty()),
-        "{state}"
+        out.contains("#7: about to review it after a review request"),
+        "{out}"
     );
-    // The threads are older than the start, so the watermark, which began at
-    // the start, stays where it was.
-    assert!(
-        state["watermark"].as_str().unwrap_or("") > "2026-10-20T10:02:00Z",
-        "{state}"
-    );
+    assert!(submitted_a_review(&log), "{log}");
+    assert_eq!(2, l.agent_calls(), "{out}");
 }
 
 /// A push raises no notification for a reviewer, so the sweep is what notices
-/// a reviewed pull request moving. Seen once: the second run knows the head.
+/// a reviewed pull request moving. A dry run keeps nothing, so a second one
+/// sees the same push; a real run is what moves past it.
 #[test]
 #[cfg(unix)]
 fn listen_once_dry_run_notices_a_reviewed_pull_request_whose_head_moved() {
@@ -6925,24 +7005,20 @@ fn listen_once_dry_run_notices_a_reviewed_pull_request_whose_head_moved() {
     write_record(&l.fx, 108, &blocking_record("aaa"));
     l.with_prs(&[sweep_row(108, "bbb", "alice")]);
 
-    let (ok, out, _) = l.run(&["--once", "--dry-run"]);
-    assert!(ok, "{out}");
-    assert!(
-        out.contains("#108: head moved aaa to bbb, 3 new commits since the review"),
-        "{out}"
-    );
-    assert!(
-        out.contains("#108: would take a second look after a push"),
-        "{out}"
-    );
-
-    let (ok, out, _) = l.run(&["--once", "--dry-run"]);
-    assert!(ok, "{out}");
-    assert!(
-        !out.contains("head moved"),
-        "the same push was reported twice:\n{out}"
-    );
+    for _ in 0..2 {
+        let (ok, out, _) = l.run(&["--once", "--dry-run"]);
+        assert!(ok, "{out}");
+        assert!(
+            out.contains("#108: head moved aaa to bbb, 3 new commits since the review"),
+            "{out}"
+        );
+        assert!(
+            out.contains("#108: would take a second look after a push"),
+            "{out}"
+        );
+    }
     assert_eq!(0, l.agent_calls());
+    assert!(!l.listen_json_exists());
 }
 
 /// The first real dispatch: a review request becomes a review with a verdict.
@@ -6959,6 +7035,7 @@ fn listen_once_with_a_review_request_reviews_the_pr_with_a_verdict() {
         &l.fx.work,
         &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
     );
+    let head = git(&l.fx.work, &["rev-parse", "HEAD"]).trim().to_string();
     l.with_prs(&[sweep_row(7, "aaa", "alice")]);
     l.with_notifications(&[notification("1", "review_requested", "PullRequest", 7)]);
 
@@ -6970,7 +7047,10 @@ fn listen_once_with_a_review_request_reviews_the_pr_with_a_verdict() {
         "{out}"
     );
     assert!(
-        log.contains("pr review 7 --request-changes --body Two independent reviews."),
+        log.contains(&format!(
+            "{}Two independent reviews.",
+            review_post(7, &head, "REQUEST_CHANGES")
+        )),
         "{log}"
     );
     assert_eq!(2, l.agent_calls(), "{out}");
@@ -7032,8 +7112,12 @@ fn listen_once_rechecks_a_reviewed_pull_request_that_moved_and_approves() {
         out.contains("#7: about to take a second look after a push"),
         "{out}"
     );
+    let head = git(&l.fx.work, &["rev-parse", "HEAD"]).trim().to_string();
     assert!(
-        log.contains("pr review 7 --approve --body Rechecked after 1 new commit ("),
+        log.contains(&format!(
+            "{}Rechecked after 1 new commit (",
+            review_post(7, &head, "APPROVE")
+        )),
         "{log}"
     );
     let record = read_record(&l.fx, 7);
@@ -7048,30 +7132,401 @@ fn listen_once_rechecks_a_reviewed_pull_request_that_moved_and_approves() {
     assert_eq!(2, l.agent_calls(), "{out}");
 }
 
+/// A lock file is not a lock: one left behind by a listener that died, even
+/// naming a pid that is alive now, as a reboot can arrange, holds nothing.
 #[test]
 #[cfg(unix)]
-fn listen_refuses_a_second_listener_on_the_same_checkout() {
+fn listen_takes_over_a_lock_file_nobody_holds() {
     let l = Listening::refusing("listenlock", &listen_gh(7, "aaa", "alice", "OPEN"));
     let dir = l.fx.work.join(".spar/state");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("listen.lock"),
         format!(
-            r#"{{"pid":{},"started":"2026-10-20T10:00:00Z","touched":{}}}"#,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
+            r#"{{"pid":{},"started":"2026-10-20T10:00:00Z"}}"#,
+            std::process::id()
         ),
     )
     .unwrap();
 
     let (ok, out, _) = l.run(&["--once"]);
 
-    assert!(!ok);
+    assert!(ok, "{out}");
+    assert!(!out.contains("already watching"), "{out}");
+    assert!(!l.lock_exists());
+}
+
+/// A listener started with `settle = 0` and `listen`, whose agents sleep, so
+/// it is in the middle of reviewing #7 for as long as the test needs. Returns
+/// the child and the agent's pid.
+#[cfg(unix)]
+fn busy_listener(l: &Listening, listen: &str) -> (std::process::Child, u32) {
+    git(
+        &l.fx.work,
+        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
+    );
+    let pid_file = l.fx.dir.join("agent.pid");
+    let sleeper = format!(
+        "#!/bin/sh\necho $$ > \"{}\"\nsleep 300\n",
+        pid_file.display()
+    );
+    let bin = l.fx.dir.join("fake-bin");
+    executable(&bin.join("agent-a"), &sleeper);
+    executable(&bin.join("agent-b"), &sleeper);
+    l.configure(&format!("[listen]\nsettle = 0\n{listen}"));
+    l.with_prs(&[sweep_row(7, "aaa", "alice")]);
+    l.with_notifications(&[notification("1", "review_requested", "PullRequest", 7)]);
+
+    let mut command = Command::new(SPAR_BIN);
+    command
+        .args([
+            "listen",
+            "--config",
+            l.config.to_str().unwrap(),
+            "--repo",
+            l.fx.work.to_str().unwrap(),
+        ])
+        .current_dir(&l.fx.dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for (k, v) in &l.env() {
+        command.env(k, v);
+    }
+    let mut child = command.spawn().expect("spar listen starts");
+    let started = std::time::Instant::now();
+    while !pid_file.exists() {
+        if started.elapsed() > std::time::Duration::from_secs(20) {
+            let _ = child.kill();
+            panic!("the agent never started");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let agent: u32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    (child, agent)
+}
+
+#[cfg(unix)]
+fn alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// The lock used to count as stale once its owner had not touched it for a
+/// while, and the owner touched it once a tick, never during a dispatch. A
+/// review longer than fifteen minutes let a second listener in, which reviewed
+/// the same pull request in the same worktree and deleted the first one's lock
+/// on its way out. Held is now held, for as long as the listener lives.
+#[test]
+#[cfg(unix)]
+fn a_second_listener_is_refused_while_the_first_is_in_the_middle_of_a_review() {
+    let l = Listening::refusing("listenbusy", &listen_gh(7, "aaa", "alice", "OPEN"));
+    // Short timings, so the old rule's fifteen minutes is three seconds, and
+    // a wait past them.
+    let (mut first, agent) = busy_listener(&l, "interval = 1\nsweep = 1\n");
+    std::thread::sleep(std::time::Duration::from_secs(4));
+
+    let (ok, out, _) = l.run(&["--once", "--dry-run"]);
+    let refused_while_alive = alive(agent);
+    let lock_kept = l.lock_exists();
+    let _ = Command::new("kill")
+        .args(["-INT", &first.id().to_string()])
+        .status();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while first.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = first.kill();
+            panic!("the first listener did not stop on Ctrl-C");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    assert!(!ok, "{out}");
     assert!(out.contains("already watching this checkout"), "{out}");
-    assert!(l.lock_exists(), "somebody else's lock was removed");
+    assert!(out.contains(&format!("pid {}", first.id())), "{out}");
+    assert!(!out.contains("would review it"), "{out}");
+    assert!(refused_while_alive, "the first listener's agent had gone");
+    assert!(
+        lock_kept,
+        "the refused listener removed the first one's lock"
+    );
+    assert!(!l.lock_exists(), "the first listener left its lock behind");
+}
+
+/// A pull request whose posted review at one commit is followed by a push,
+/// with the fake gh reporting the new head. Returns the listener and the head
+/// after the push.
+#[cfg(unix)]
+fn moved_since_its_review(tag: &str, a: &str, b: &str) -> (Listening, String) {
+    let l = Listening::new(tag, a, b, &listen_gh(7, "unknown", "alice", "OPEN"));
+    git(
+        &l.fx.work,
+        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
+    );
+    let before = git(&l.fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    write_record(&l.fx, 7, &blocking_record(&before));
+    commit(&l.fx.work, "file.txt", "bounded\n", "check the bound");
+    git(
+        &l.fx.work,
+        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
+    );
+    let after = git(&l.fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    executable(
+        &l.fx.dir.join("fake-bin").join("gh"),
+        &format!("#!/bin/sh\n{}\n", listen_gh(7, &after, "alice", "OPEN")),
+    );
+    l.with_prs(&[sweep_row(7, &after, "alice")]);
+    (l, after)
+}
+
+/// A review GitHub refused has not happened. The listener used to clear its
+/// trigger anyway, because the run reported its findings as reviewed, and the
+/// review request was never acted on again.
+#[test]
+#[cfg(unix)]
+fn listen_keeps_a_review_it_could_not_post_for_another_try() {
+    let l = Listening::new(
+        "listenunposted",
+        ONE_BLOCKER_REVIEW,
+        ONE_BLOCKER_REVIEW,
+        &listen_gh(7, "aaa", "alice", "OPEN"),
+    );
+    git(
+        &l.fx.work,
+        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
+    );
+    l.with_prs(&[sweep_row(7, "aaa", "alice")]);
+    l.with_notifications(&[notification("1", "review_requested", "PullRequest", 7)]);
+
+    let (ok, out, _) = l.run_with(&["--once"], &[("SPAR_FAKE_REVIEW_FAILS", "1")]);
+
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("#7: not everything it wrote reached GitHub, so it runs again in 15m00s"),
+        "{out}"
+    );
+    let state = l.state();
+    assert!(state["pending"]["7"].is_object(), "{state}");
+    assert_eq!(1, state["items"]["7"]["failures"], "{state}");
+    assert!(!read_record(&l.fx, 7).posted);
+}
+
+/// A second look that could not post left the old record in place, and the
+/// listener took that record's commit for the head, so every sweep raised the
+/// same push again and ran both reviewers again, with no cap that counted it.
+#[test]
+#[cfg(unix)]
+fn a_second_look_that_could_not_post_waits_to_try_again_rather_than_every_sweep() {
+    let (l, after) = moved_since_its_review("listenrecheckfail", RECHECK_FIXED, RECHECK_FIXED);
+
+    let (ok, out, _) = l.run_with(&["--once"], &[("SPAR_FAKE_REVIEW_FAILS", "1")]);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("#7: about to take a second look after a push"),
+        "{out}"
+    );
+    assert_eq!(2, l.agent_calls(), "{out}");
+
+    for _ in 0..2 {
+        let (_, out, _) = l.run_with(&["--once"], &[("SPAR_FAKE_REVIEW_FAILS", "1")]);
+        assert!(!out.contains("head moved"), "{out}");
+        assert!(!out.contains("about to take a second look"), "{out}");
+    }
+    assert_eq!(2, l.agent_calls());
+    let state = l.state();
+    assert_eq!(after, state["items"]["7"]["head"], "{state}");
+    assert!(state["pending"]["7"].is_object(), "{state}");
+    assert_eq!(0, read_record(&l.fx, 7).rechecks);
+}
+
+/// With `pr_comments = "none"` a second look posts nothing by design and
+/// leaves the record alone, which made it the same loop as a failed post.
+#[test]
+#[cfg(unix)]
+fn a_second_look_that_posts_nothing_by_design_is_not_raised_again() {
+    let (l, _) = moved_since_its_review("listenrechecksilent", RECHECK_FIXED, RECHECK_FIXED);
+    l.configure("[style]\npr_comments = \"none\"\n");
+
+    let (ok, out, log) = l.run(&["--once"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("pr_comments is none, nothing posted"), "{out}");
+    assert!(!submitted_a_review(&log), "{log}");
+    assert_eq!(2, l.agent_calls(), "{out}");
+
+    let (ok, out, _) = l.run(&["--once"]);
+    assert!(ok, "{out}");
+    assert!(!out.contains("head moved"), "{out}");
+    assert_eq!(2, l.agent_calls(), "{out}");
+}
+
+/// `spar listen 42` acts on #42 and nothing else. Work a run over the whole
+/// repository left pending in listen.json, and the items it was watching, used
+/// to be dispatched and admitted by a run that named something else.
+#[test]
+#[cfg(unix)]
+fn a_named_watch_leaves_unrelated_saved_work_alone() {
+    let l = Listening::refusing("listennamedonly", &listen_gh(7, "aaa", "alice", "OPEN"));
+    let dir = l.fx.work.join(".spar/state");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("listen.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "version": 1,
+            "watermark": "2026-10-20T00:00:00Z",
+            "items": {"7": {"kind": "pr", "head": "aaa"}},
+            "pending": {"7": {
+                "kind": "pr",
+                "first_seen": 0,
+                "last_seen": 0,
+                "triggers": ["review_requested"]
+            }},
+            "swept_once": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    l.with_notifications(&[notification("1", "comment", "PullRequest", 7)]);
+
+    let (ok, out, _) = l.run(&["42", "--once", "--dry-run"]);
+
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("listening to example/project for #42"),
+        "{out}"
+    );
+    assert!(!out.contains("#7"), "{out}");
+}
+
+/// A named issue left the watch only when a notification about it arrived,
+/// and an issue the viewer never took part in can close without one, so the
+/// listener waited for it forever.
+#[test]
+#[cfg(unix)]
+fn listen_exits_when_a_named_issue_closes_without_a_notification() {
+    let l = Listening::refusing("listenissueclosed", &listen_gh(7, "aaa", "alice", "OPEN"));
+
+    let (ok, out, _) = l.run_with(&["42"], &[("SPAR_FAKE_ISSUE_STATE", "CLOSED")]);
+
+    assert!(ok, "{out}");
+    assert!(out.contains("#42: closed, no longer watched"), "{out}");
+    assert!(
+        out.contains("every named item is closed, nothing left to watch"),
+        "{out}"
+    );
+}
+
+/// A mention on an issue rechecked its pull request with none of that pull
+/// request's guards, so the cap that stopped the pull request's own second
+/// look did not stop this one.
+#[test]
+#[cfg(unix)]
+fn an_issue_mention_does_not_recheck_a_pull_request_past_its_cap() {
+    let l = Listening::refusing("listenissuecap", &listen_gh(7, "aaa", "alice", "OPEN"));
+    write_record(&l.fx, 7, &blocking_record("0000000"));
+    l.configure("[listen]\nmax_rechecks = 0\n");
+    l.with_prs(&[sweep_row(7, "aaa", "alice")]);
+    let linked = l.fx.dir.join("linked.json");
+    std::fs::write(
+        &linked,
+        r#"[{"number":7,"url":"https://github.com/example/project/pull/7","title":"PR 7","baseRefName":"main","closingIssuesReferences":[{"number":42}]}]"#,
+    )
+    .unwrap();
+    l.with_notifications(&[notification("1", "mention", "Issue", 42)]);
+
+    let (ok, out, _) = l.run_with(
+        &["--once"],
+        &[("SPAR_FAKE_LINKED", linked.to_str().unwrap())],
+    );
+
+    assert!(ok, "{out}");
+    assert!(
+        out.contains(
+            "#42: its pull request #7 was rechecked 0 times already; run `spar review 7` to look \
+             again"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("about to take a second look"), "{out}");
+    assert_eq!(0, l.agent_calls(), "{out}");
+}
+
+/// A poll is all or nothing. A second page that failed used to be skipped
+/// while the first page's threads were read and the watermark moved past
+/// them, and GitHub, asked for what changed since, never returned the older
+/// threads on the page that failed.
+#[test]
+#[cfg(unix)]
+fn a_poll_whose_second_page_fails_reads_nothing_and_the_next_poll_reads_both() {
+    let l = Listening::refusing("listenpages", &listen_gh(7, "aaa", "alice", "OPEN"));
+    l.with_notifications(&[notification("2", "mention", "Issue", 42)]);
+    let page2 = l.fx.dir.join("notify-2.json");
+    std::fs::write(
+        &page2,
+        format!("[{}]\n", notification("1", "comment", "PullRequest", 7)),
+    )
+    .unwrap();
+    let page2 = page2.to_str().unwrap();
+
+    let (ok, out, _) = l.run_with(
+        &["--once"],
+        &[
+            ("SPAR_FAKE_NOTIFY_PAGE2", page2),
+            ("SPAR_FAKE_PAGE2_FAILS", "1"),
+        ],
+    );
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("could not read notifications: HTTP 500: Server Error"),
+        "{out}"
+    );
+    assert!(!out.contains("#42: mentioned"), "{out}");
+    let state = l.state();
+    assert!(
+        state["seen"].as_object().is_some_and(|s| s.is_empty()),
+        "{state}"
+    );
+    assert!(state["last_modified"].is_null(), "{state}");
+
+    let (ok, out, _) = l.run_with(&["--once"], &[("SPAR_FAKE_NOTIFY_PAGE2", page2)]);
+    assert!(ok, "{out}");
+    assert!(out.contains("#42: mentioned"), "{out}");
+    assert!(out.contains("#7: somebody commented"), "{out}");
+    assert_eq!(
+        2,
+        l.state()["seen"].as_object().map(|s| s.len()).unwrap_or(0)
+    );
+}
+
+/// After a reply, a comments read that failed was taken for nobody having
+/// said anything, so the second look reported nothing changed, and the reply,
+/// already read past, was never looked at again.
+#[test]
+#[cfg(unix)]
+fn a_reply_whose_comments_cannot_be_read_is_kept_for_another_try() {
+    let l = Listening::refusing("listenreplyfail", &listen_gh(7, "aaa", "alice", "OPEN"));
+    write_record(&l.fx, 7, &blocking_record("aaa"));
+    l.with_prs(&[sweep_row(7, "aaa", "alice")]);
+    l.with_notifications(&[notification("1", "comment", "PullRequest", 7)]);
+
+    let (ok, out, _) = l.run_with(&["--once"], &[("SPAR_FAKE_COMMENTS_FAIL", "1")]);
+
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("#7: about to take a second look after a reply"),
+        "{out}"
+    );
+    assert!(!out.contains("nothing changed since the review"), "{out}");
+    let state = l.state();
+    assert!(state["pending"]["7"].is_object(), "{state}");
+    assert_eq!(1, state["items"]["7"]["failures"], "{state}");
+    assert_eq!(0, l.agent_calls(), "{out}");
 }
 
 /// Named items end the listener when they are done, so `spar listen 7` is a

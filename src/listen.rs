@@ -20,7 +20,8 @@
 //! `[listen]` settings, so it can be read and tested on its own.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -41,8 +42,9 @@ use crate::{bail, log, logdim, logwarn, spar_err};
 const FLOOR_SECS: u64 = 15;
 /// A `seen` entry older than this is forgotten.
 const SEEN_FOR_SECS: u64 = 7 * 86_400;
-/// Most notification pages read in one poll.
-const MAX_PAGES: usize = 5;
+/// Most notification pages read in one poll. A poll is all or nothing, so one
+/// with more than this fails, and says how to start from later.
+const MAX_PAGES: usize = 50;
 /// Failed dispatches of one item before it is left alone until it changes.
 const MAX_FAILURES: u32 = 5;
 
@@ -424,10 +426,13 @@ pub fn events_from_sweep(
     let mut out = Vec::new();
     let mut present: BTreeSet<i64> = BTreeSet::new();
     for row in rows {
+        // Present before the floor is applied: a pull request below it is
+        // still open, and one a notification put on the watch is not closed
+        // just because the sweep does not act on it.
+        present.insert(row.number);
         if row.number < min_number && !named.contains(&row.number) {
             continue;
         }
-        present.insert(row.number);
         let watched = state.watched(row.number, ItemKind::Pr);
         if !row.title.is_empty() {
             watched.title = row.title.clone();
@@ -572,11 +577,25 @@ pub fn due(p: &Pending, now: u64, cfg: &ListenCfg, once: bool) -> bool {
         || now.saturating_sub(p.first_seen) >= cfg.max_wait
 }
 
-/// When the earliest pending item becomes due.
-pub fn next_due(pending: &BTreeMap<i64, Pending>, cfg: &ListenCfg) -> Option<u64> {
-    pending
-        .values()
-        .map(|p| (p.last_seen + cfg.settle).min(p.first_seen + cfg.max_wait))
+/// When the earliest pending item this run acts on becomes due and is past
+/// any wait a failure put on it. Leaving the wait out woke the loop every
+/// second until it ended.
+pub fn next_due(
+    state: &ListenState,
+    cfg: &ListenCfg,
+    acts_on: &dyn Fn(i64) -> bool,
+) -> Option<u64> {
+    state
+        .pending
+        .iter()
+        .filter(|(n, _)| acts_on(**n))
+        .map(|(n, p)| {
+            let settled = (p.last_seen + cfg.settle).min(p.first_seen + cfg.max_wait);
+            state
+                .items
+                .get(n)
+                .map_or(settled, |w| settled.max(w.retry_after))
+        })
         .min()
 }
 
@@ -589,8 +608,9 @@ pub enum Action {
     Review,
     /// `spar checkin`, with or without the power to push.
     Checkin { reply_only: bool },
-    /// Rechecked as often as the config allows; a person runs `spar review`.
-    Capped,
+    /// This pull request was rechecked as often as the config allows; a person
+    /// runs `spar review`. An issue names its pull request.
+    Capped(i64),
     /// Custody state and no review record: `spar resume` owns it.
     BelongsToResume,
     /// Closed or merged: forget it.
@@ -608,7 +628,7 @@ impl Action {
             Action::Review => "review it".to_string(),
             Action::Checkin { reply_only: false } => "check in on it".to_string(),
             Action::Checkin { reply_only: true } => "answer the comments on it".to_string(),
-            Action::Capped | Action::BelongsToResume => "leave it".to_string(),
+            Action::Capped(_) | Action::BelongsToResume => "leave it".to_string(),
             Action::Drop => "drop it".to_string(),
             Action::Ignore(_) => "ignore it".to_string(),
         }
@@ -629,6 +649,8 @@ pub struct Facts {
     pub number: i64,
     pub named: bool,
     pub open: bool,
+    /// For an issue, this and `recheck_capped` are about its linked pull
+    /// request, since that is what a second look on its behalf would be at.
     pub author_is_viewer: bool,
     /// A review record the author has seen.
     pub has_posted_record: bool,
@@ -657,9 +679,13 @@ pub fn plan(p: &Pending, f: &Facts, cfg: &ListenCfg) -> Action {
             if !asked {
                 return Action::Ignore("nothing on the issue asked for spar");
             }
+            // The pull request's own guards hold whichever way its second look
+            // was asked for, or a mention on the issue would be a way round them.
             match f.linked_pr_with_record {
-                Some(pr) => Action::Recheck(pr),
                 None => Action::Ignore("an issue with no reviewed pull request"),
+                Some(_) if f.author_is_viewer => Action::Ignore("its pull request is your own"),
+                Some(pr) if f.recheck_capped => Action::Capped(pr),
+                Some(pr) => Action::Recheck(pr),
             }
         }
         ItemKind::Pr => {
@@ -683,7 +709,7 @@ pub fn plan(p: &Pending, f: &Facts, cfg: &ListenCfg) -> Action {
             }
             if f.has_posted_record {
                 return if f.recheck_capped {
-                    Action::Capped
+                    Action::Capped(f.number)
                 } else {
                     Action::Recheck(f.number)
                 };
@@ -767,108 +793,131 @@ impl Backoff {
 // The lock
 // ---------------------------------------------------------------------------
 
+/// Who holds the lock, for the message a second listener prints. The lock
+/// itself is not in here.
 #[derive(Debug, Serialize, Deserialize)]
 struct LockFile {
     pid: u32,
     started: String,
-    touched: u64,
 }
 
-/// One listener per checkout. Two would read the same events and run the
-/// same reviews twice.
+/// One listener per checkout. Two would read the same events, run the same
+/// reviews twice, and rebuild the worktree the other's agents are reading.
+///
+/// On unix the lock is the operating system's, on the open file, rather than
+/// the file being there. It is held exactly as long as the process lives,
+/// however long one review takes, so nothing has to keep it fresh, and a
+/// listener that died holds nothing, even after a reboot hands its pid to
+/// something else.
 #[derive(Debug)]
 struct Lock {
     path: PathBuf,
+    /// Open for the lock's lifetime: closing it is what releases the lock.
+    _file: File,
 }
 
 impl Lock {
-    fn acquire(repo: &Repo, stale_after: u64, now: u64) -> Result<Lock> {
-        Lock::at(repo.listen_lock_path(), stale_after, now)
+    fn acquire(repo: &Repo, now: u64) -> Result<Lock> {
+        Lock::at(repo.listen_lock_path(), now)
     }
 
-    fn at(path: PathBuf, stale_after: u64, now: u64) -> Result<Lock> {
+    fn at(path: PathBuf, now: u64) -> Result<Lock> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        for attempt in 0..2 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(file) => {
-                    serde_json::to_writer_pretty(
-                        file,
-                        &LockFile {
-                            pid: std::process::id(),
-                            started: clock::rfc3339(now),
-                            touched: now,
-                        },
-                    )?;
-                    return Ok(Lock { path });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let held: Option<LockFile> = std::fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|text| serde_json::from_str(&text).ok());
-                    let stale = held.as_ref().is_none_or(|h| {
-                        !alive(h.pid) || now.saturating_sub(h.touched) > stale_after
-                    });
-                    if stale && attempt == 0 {
-                        let _ = std::fs::remove_file(&path);
-                        continue;
+        // A listener that exits removes the file while it still holds it, so
+        // the file opened here can be one that was unlinked a moment ago.
+        // Locking that would lock a file nobody else can find, hence the check
+        // that the path still names the file locked, and another try if not.
+        for _ in 0..3 {
+            let Some(mut file) = open_locked(&path)? else {
+                let pid = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<LockFile>(&text).ok())
+                    .map(|h| h.pid.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                bail!(
+                    "another `spar listen` (pid {pid}) is already watching this checkout. \
+                     Stop it first.{}",
+                    if cfg!(unix) {
+                        String::new()
+                    } else {
+                        format!(" If that process is gone, delete {}.", path.display())
                     }
-                    let pid = held
-                        .map(|h| h.pid.to_string())
-                        .unwrap_or_else(|| "unknown".into());
-                    bail!(
-                        "another `spar listen` (pid {pid}) is already watching this checkout. \
-                         Stop it first, or delete {} if that process is gone.",
-                        path.display()
-                    );
-                }
-                Err(e) => return Err(e.into()),
+                );
+            };
+            if !same_file(&file, &path) {
+                continue;
             }
+            file.set_len(0)?;
+            serde_json::to_writer_pretty(
+                &mut file,
+                &LockFile {
+                    pid: std::process::id(),
+                    started: clock::rfc3339(now),
+                },
+            )?;
+            return Ok(Lock { path, _file: file });
         }
         bail!("could not take the listen lock at {}", path.display())
-    }
-
-    fn touch(&self, now: u64) {
-        let _ = crate::repo::write_json_atomic(
-            &self.path,
-            &LockFile {
-                pid: std::process::id(),
-                started: clock::rfc3339(now),
-                touched: now,
-            },
-        );
     }
 }
 
 impl Drop for Lock {
     fn drop(&mut self) {
+        // Removed while still held, which is what `same_file` relies on. The
+        // file closes, and the lock goes with it, after this returns.
         let _ = std::fs::remove_file(&self.path);
     }
 }
 
+/// The lock file, opened and locked, or None when another process holds it.
 #[cfg(unix)]
-fn alive(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    if pid <= 0 {
-        return false;
+fn open_locked(path: &Path) -> Result<Option<File>> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
     }
-    // Signal zero checks for the process without touching it. EPERM means it
-    // is there and somebody else's.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(None)
+    } else {
+        Err(e.into())
     }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Without an advisory lock to hand, the file being there is the lock, and one
+/// left by a listener that died has to be deleted by hand.
+#[cfg(not(unix))]
+fn open_locked(path: &Path) -> Result<Option<File>> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(unix)]
+fn same_file(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(open), Ok(named)) => open.dev() == named.dev() && open.ino() == named.ino(),
+        _ => false,
+    }
 }
 
 #[cfg(not(unix))]
-fn alive(_pid: u32) -> bool {
+fn same_file(_file: &File, _path: &Path) -> bool {
     true
 }
 
@@ -902,70 +951,115 @@ fn poll(repo: &Repo, cfg: &ListenCfg, state: &mut ListenState, now: u64) -> Poll
     let interval = poll_interval(cfg, resp.headers.get("x-poll-interval").map(String::as_str));
     match resp.status {
         304 => Polled::Nothing(interval),
-        200 => {
-            state.last_modified = resp
-                .headers
-                .get("last-modified")
-                .or_else(|| resp.headers.get("date"))
-                .cloned();
-            let mut threads: Vec<Thread> = match serde_json::from_str(&resp.body) {
-                Ok(threads) => threads,
-                Err(e) => return Polled::Failed(format!("unexpected notification data: {e}")),
-            };
-            let mut next = next_link(&resp.headers);
-            let mut pages = 1;
-            while let Some(url) = next.take() {
-                if pages >= MAX_PAGES {
-                    break;
-                }
-                match repo.gh_api_raw(&url, &[]) {
-                    Ok(more) if more.status == 200 => {
-                        if let Ok(page) = serde_json::from_str::<Vec<Thread>>(&more.body) {
-                            threads.extend(page);
-                        }
-                        next = next_link(&more.headers);
-                        pages += 1;
-                    }
-                    _ => break,
-                }
+        200 => match every_page(repo, &resp, &state.watermark, now) {
+            Ok(threads) => {
+                // Only once every page is in, or the next poll's 304 would
+                // answer for pages this one never read.
+                state.last_modified = resp
+                    .headers
+                    .get("last-modified")
+                    .or_else(|| resp.headers.get("date"))
+                    .cloned();
+                Polled::Threads(threads, interval)
             }
-            Polled::Threads(threads, interval)
-        }
-        401 => Polled::Failed("gh is not authenticated; run `gh auth status`".into()),
-        403 | 429 => match rate_limit_wait(&resp, now) {
-            Some(wait) => Polled::RateLimited(wait),
-            None => Polled::Failed(status_message(&resp)),
+            Err(failed) => failed,
         },
-        _ => Polled::Failed(status_message(&resp)),
+        401 => Polled::Failed("gh is not authenticated; run `gh auth status`".into()),
+        _ => refused(&resp, now),
     }
 }
 
-/// The rows a sweep looks at: every open pull request, or the named ones.
+/// What a failed answer means: a wait for a rate limit, a failure otherwise.
+fn refused(resp: &ApiResponse, now: u64) -> Polled {
+    match rate_limit_wait(resp, now) {
+        Some(wait) => Polled::RateLimited(wait),
+        None => Polled::Failed(status_message(resp)),
+    }
+}
+
+/// Every page of one poll, or what stopped it.
+///
+/// All or nothing. Notifications come newest first, so a page that was not
+/// read holds threads older than every one that was, and moving the watermark
+/// past the ones read would lose the rest for good. A poll that cannot read
+/// them all changes nothing and is tried again.
+fn every_page(
+    repo: &Repo,
+    first: &ApiResponse,
+    watermark: &str,
+    now: u64,
+) -> std::result::Result<Vec<Thread>, Polled> {
+    let unexpected =
+        |e: serde_json::Error| Polled::Failed(format!("unexpected notification data: {e}"));
+    let mut threads: Vec<Thread> = serde_json::from_str(&first.body).map_err(unexpected)?;
+    let mut next = next_link(&first.headers);
+    let mut pages = 1;
+    while let Some(url) = next.take() {
+        if pages >= MAX_PAGES {
+            return Err(Polled::Failed(format!(
+                "more than {MAX_PAGES} pages of notifications since {watermark}. Run once with \
+                 --since, like --since 1d, to start from later and skip the rest"
+            )));
+        }
+        let more = repo
+            .gh_api_raw(&url, &[])
+            .map_err(|e| Polled::Failed(e.last_line().to_string()))?;
+        if more.status != 200 {
+            return Err(refused(&more, now));
+        }
+        threads.extend(serde_json::from_str::<Vec<Thread>>(&more.body).map_err(unexpected)?);
+        next = next_link(&more.headers);
+        pages += 1;
+    }
+    Ok(threads)
+}
+
+/// What one sweep read.
+#[derive(Default)]
+struct Swept {
+    rows: Vec<PrSweepRow>,
+    /// Named issues that are no longer open.
+    closed_issues: Vec<i64>,
+}
+
+/// The rows a sweep looks at: every open pull request, or the named ones
+/// still watched.
 fn sweep_rows(
     repo: &Repo,
     cfg: &Config,
+    repo_mode: bool,
     named_prs: &[i64],
     named_issues: &[i64],
-    state: &mut ListenState,
-) -> Result<Vec<PrSweepRow>> {
-    if named_prs.is_empty() && named_issues.is_empty() {
-        return repo.sweep_open_prs();
+    state: &ListenState,
+) -> Result<Swept> {
+    if repo_mode {
+        return Ok(Swept {
+            rows: repo.sweep_open_prs()?,
+            closed_issues: Vec::new(),
+        });
     }
-    let mut rows = Vec::new();
-    for number in named_prs {
-        rows.push(repo.sweep_pr(*number)?);
+    let watched = |n: &&i64| state.items.contains_key(*n);
+    let mut swept = Swept::default();
+    for number in named_prs.iter().filter(watched) {
+        swept.rows.push(repo.sweep_pr(*number)?);
     }
-    for issue in named_issues {
+    for issue in named_issues.iter().filter(watched) {
+        // Read here, because a notification is not a promise: an issue the
+        // viewer never took part in can close without one, and the listener
+        // would wait for it forever.
+        if !repo.read_issue(*issue)?.state.eq_ignore_ascii_case("OPEN") {
+            swept.closed_issues.push(*issue);
+            continue;
+        }
         // A named issue's open pull request joins the watch once spar has
         // reviewed it, so a push there is a second look.
         if let Ok(Some(pr)) = repo.try_open_pr_for_issue(*issue, cfg.base_branch()) {
             if repo.read_review_record(pr.number).is_some_and(|r| r.posted) {
-                state.watched(pr.number, ItemKind::Pr);
-                rows.push(repo.sweep_pr(pr.number)?);
+                swept.rows.push(repo.sweep_pr(pr.number)?);
             }
         }
     }
-    Ok(rows)
+    Ok(swept)
 }
 
 fn facts(repo: &Repo, cfg: &Config, number: i64, kind: ItemKind, named: bool) -> Result<Facts> {
@@ -1000,18 +1094,34 @@ fn facts(repo: &Repo, cfg: &Config, number: i64, kind: ItemKind, named: bool) ->
                 .try_open_pr_for_issue(number, cfg.base_branch())
                 .ok()
                 .flatten()
-                .map(|pr| pr.number)
-                .filter(|pr| repo.read_review_record(*pr).is_some_and(|r| r.posted));
+                .and_then(|pr| {
+                    repo.read_review_record(pr.number)
+                        .filter(|r| r.posted)
+                        .map(|r| (pr.number, r))
+                });
+            // What the pull request's own row of the table would check.
+            let (author_is_viewer, recheck_capped) = match &linked {
+                Some((pr, record)) => {
+                    let row = repo.sweep_pr(*pr)?;
+                    (
+                        row.author
+                            .as_ref()
+                            .is_some_and(|a| crate::comments::same_login(&a.login, &viewer)),
+                        record.rechecks >= cfg.listen.max_rechecks,
+                    )
+                }
+                None => (false, false),
+            };
             Ok(Facts {
                 number,
                 named,
                 open: issue.state.eq_ignore_ascii_case("OPEN"),
-                author_is_viewer: false,
+                author_is_viewer,
                 has_posted_record: false,
-                recheck_capped: false,
+                recheck_capped,
                 has_custody_state: false,
                 below_floor,
-                linked_pr_with_record: linked,
+                linked_pr_with_record: linked.map(|(pr, _)| pr),
             })
         }
     }
@@ -1129,8 +1239,7 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
         );
     }
     let now = clock::now_secs();
-    let stale_after = 3 * cfg.listen.interval.max(cfg.listen.sweep);
-    let lock = Lock::acquire(repo, stale_after, now)?;
+    let lock = Lock::acquire(repo, now)?;
     let viewer = repo.viewer_login()?.to_string();
     let name = repo
         .repo_name()
@@ -1148,6 +1257,18 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
         }
     }
     let repo_mode = named.is_empty();
+    // What this run may act on, in numbers mode: what was named, and the pull
+    // requests of named issues as the sweep finds them. Anything else in
+    // listen.json, pending work included, is left for a run over the
+    // repository.
+    let mut watching: BTreeSet<i64> = named.clone();
+    // A dry run changes nothing, listen.json included, so what it previewed is
+    // still there for the real run after it.
+    let save = |state: &ListenState| {
+        if !opts.dry_run {
+            write_state(repo, state);
+        }
+    };
 
     let mut state = read_state(repo);
     if state.watermark.is_empty() || opts.since.is_some() {
@@ -1228,9 +1349,23 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
         }
 
         if now >= next_sweep {
-            match sweep_rows(repo, cfg, &named_prs, &named_issues, &mut state) {
-                Ok(rows) => {
+            match sweep_rows(repo, cfg, repo_mode, &named_prs, &named_issues, &state) {
+                Ok(Swept {
+                    rows,
+                    closed_issues,
+                }) => {
                     backoff.recovered();
+                    if !repo_mode {
+                        watching.extend(rows.iter().map(|r| r.number));
+                    }
+                    events.extend(closed_issues.into_iter().map(|number| Event {
+                        number,
+                        kind: ItemKind::Issue,
+                        trigger: Trigger::Closed,
+                        who: None,
+                        head: None,
+                        commits: None,
+                    }));
                     let record_head = |n: i64| {
                         repo.read_review_record(n)
                             .filter(|r| r.posted)
@@ -1264,16 +1399,12 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
             }
         }
 
-        // Events are merged with no filter by number: in numbers mode the
-        // table drops what was not named, after the watermark has moved past
-        // it, so a thread about something else is read once and never again.
+        // In numbers mode an event about anything not watched is dropped here,
+        // after the watermark has moved past it, so a thread about something
+        // else is read once and never again.
         for event in &events {
-            if !repo_mode && !named.contains(&event.number) {
-                // Unless it is the pull request of a named issue, which the
-                // sweep put on the watch.
-                if !state.items.contains_key(&event.number) {
-                    continue;
-                }
+            if !repo_mode && !watching.contains(&event.number) {
+                continue;
             }
             if event.trigger != Trigger::Closed && event.who.is_none() {
                 // Nothing to look up cheaply here; the actor comes with the
@@ -1290,14 +1421,14 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
             state.watched(event.number, event.kind);
             merge(&mut state.pending, event, now);
         }
-        write_state(repo, &state);
-        lock.touch(now);
+        save(&state);
 
         let due_now: Vec<i64> = state
             .pending
             .iter()
             .filter(|(n, p)| {
-                due(p, now, &cfg.listen, opts.once)
+                (repo_mode || watching.contains(n))
+                    && due(p, now, &cfg.listen, opts.once)
                     && state.items.get(n).is_none_or(|w| w.retry_after <= now)
             })
             .map(|(n, _)| *n)
@@ -1315,7 +1446,7 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                     w.retry_after = now + dispatch_backoff_secs(w.failures);
                     logwarn!("#{number}: could not read it: {}", e.last_line());
                     tick_failed = true;
-                    write_state(repo, &state);
+                    save(&state);
                     continue;
                 }
             };
@@ -1330,12 +1461,17 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                     state.items.remove(&number);
                     state.pending.remove(&number);
                 }
-                Action::Capped => {
+                Action::Capped(pr) => {
                     let w = state.watched(number, p.kind);
                     if !w.said_capped {
+                        let what = if *pr == number {
+                            "rechecked".to_string()
+                        } else {
+                            format!("its pull request #{pr} was rechecked")
+                        };
                         log!(
-                            "#{number}: rechecked {} time{} already; run `spar review {number}` to \
-                             look again",
+                            "#{number}: {what} {} time{} already; run `spar review {pr}` to look \
+                             again",
                             cfg.listen.max_rechecks,
                             plural(cfg.listen.max_rechecks as usize)
                         );
@@ -1365,6 +1501,12 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                             action.phrase(number),
                             p.because()
                         );
+                        let acted_on = match action {
+                            Action::Recheck(pr) => *pr,
+                            _ => number,
+                        };
+                        let record_before = repo.read_review_record(acted_on);
+                        let failed_before = repo.write_summary().failed;
                         let run = dispatch(agents, cfg, repo, action, number, &p);
                         dispatches += 1;
                         let spent = spend::drain();
@@ -1374,27 +1516,45 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                         crate::cli::print_outcome(&run, &spent);
                         if proc::interrupted() {
                             log!("interrupted while working on #{number}; its worktree was kept");
-                            write_state(repo, &state);
+                            save(&state);
                             break;
                         }
-                        let acted_on = match action {
-                            Action::Recheck(pr) => *pr,
-                            _ => number,
-                        };
-                        if let Some(head) = repo.read_review_record(acted_on).map(|r| r.head) {
-                            // The commit spar just read is not news to the
-                            // next sweep.
-                            state.watched(acted_on, ItemKind::Pr).head = Some(head);
+                        // The commit spar just read is not news to the next
+                        // sweep. Only a record this dispatch wrote says which
+                        // that was: one it left alone holds an older commit,
+                        // and taking that for the head would raise the same
+                        // push again on every sweep.
+                        let record_after = repo.read_review_record(acted_on);
+                        if record_after != record_before {
+                            if let Some(record) = record_after {
+                                state.watched(acted_on, ItemKind::Pr).head = Some(record.head);
+                            }
                         }
+                        // A review GitHub never received has not happened,
+                        // whatever its findings say, and clearing its trigger
+                        // would lose it for good.
+                        let unposted = repo.write_summary().failed > failed_before;
                         let w = state.watched(number, p.kind);
-                        if run.status == Status::Error {
+                        if run.status == Status::Error || unposted {
                             w.failures += 1;
-                            w.retry_after = now + dispatch_backoff_secs(w.failures);
+                            let wait = dispatch_backoff_secs(w.failures);
+                            // From now rather than the start of the tick, which
+                            // a long review leaves far behind.
+                            w.retry_after = clock::now_secs() + wait;
                             if w.failures >= MAX_FAILURES {
                                 logwarn!("#{number}: giving up on it until it changes again");
                                 state.pending.remove(&number);
-                            } else if let Some(p) = state.pending.get_mut(&number) {
-                                p.first_seen = now;
+                            } else {
+                                if unposted {
+                                    logwarn!(
+                                        "#{number}: not everything it wrote reached GitHub, so it \
+                                         runs again in {}",
+                                        spend::clock(Duration::from_secs(wait))
+                                    );
+                                }
+                                if let Some(p) = state.pending.get_mut(&number) {
+                                    p.first_seen = now;
+                                }
                             }
                             tick_failed = true;
                         } else {
@@ -1407,7 +1567,7 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                 }
                 _ => {}
             }
-            write_state(repo, &state);
+            save(&state);
         }
         if proc::interrupted() {
             break Ending::Interrupted;
@@ -1425,12 +1585,13 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
         if now.saturating_sub(last_prune) >= 3600 {
             prune_seen(&mut state, now);
             last_prune = now;
-            write_state(repo, &state);
+            save(&state);
         }
 
+        let acts_on = |n: i64| repo_mode || watching.contains(&n);
         let next = [next_poll, next_sweep]
             .into_iter()
-            .chain(next_due(&state.pending, &cfg.listen))
+            .chain(next_due(&state, &cfg.listen, &acts_on))
             .min()
             .unwrap_or(now + FLOOR_SECS);
         let wait = next.saturating_sub(clock::now_secs()).clamp(1, 3600);
@@ -1439,7 +1600,7 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
         }
     };
 
-    write_state(repo, &state);
+    save(&state);
     drop(lock);
     log!(
         "listened for {}: {events_seen} event{}, {dispatches} dispatch{}",
@@ -1903,6 +2064,45 @@ mod tests {
         assert!(!state.items.contains_key(&4));
     }
 
+    /// A notification puts a pull request below the floor on the watch, and
+    /// the sweep, which skips it, used to call it closed.
+    #[test]
+    fn a_pull_request_below_the_floor_that_is_still_open_is_not_called_closed() {
+        let mut state = ListenState::default();
+        state.watched(4, ItemKind::Pr);
+        let events = events_from_sweep(
+            &[
+                row(4, "new", "alice", "OPEN"),
+                row(500, "new", "alice", "OPEN"),
+            ],
+            "me",
+            &mut state,
+            &BTreeSet::new(),
+            480,
+            &no_record,
+            true,
+        );
+        assert!(
+            events.iter().all(|e| e.trigger != Trigger::Closed),
+            "{events:?}"
+        );
+        let gone = events_from_sweep(
+            &[row(500, "new", "alice", "OPEN")],
+            "me",
+            &mut state,
+            &BTreeSet::new(),
+            480,
+            &no_record,
+            true,
+        );
+        assert_eq!(
+            vec![(4, Trigger::Closed)],
+            gone.iter()
+                .map(|e| (e.number, e.trigger))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn the_first_sweep_caps_pending_rechecks_at_the_limit_and_counts_the_rest() {
         let push = |n: i64| Event {
@@ -2079,13 +2279,50 @@ mod tests {
             ..open_pr()
         };
         assert_eq!(
-            Action::Capped,
+            Action::Capped(7),
             plan(
                 &pending(ItemKind::Pr, &[Trigger::Pushed], 0),
                 &capped,
                 &cfg()
             )
         );
+    }
+
+    /// The issue route used to recheck its pull request unconditionally, so a
+    /// mention on the issue went round the cap and the own pull request rule
+    /// both.
+    #[test]
+    fn an_issue_mention_keeps_to_its_pull_requests_cap_and_owner() {
+        let linked = Facts {
+            number: 42,
+            open: true,
+            linked_pr_with_record: Some(108),
+            ..Default::default()
+        };
+        let capped = Facts {
+            recheck_capped: true,
+            ..linked.clone()
+        };
+        assert_eq!(
+            Action::Capped(108),
+            plan(
+                &pending(ItemKind::Issue, &[Trigger::Mentioned], 0),
+                &capped,
+                &cfg()
+            )
+        );
+        let own = Facts {
+            author_is_viewer: true,
+            ..linked
+        };
+        assert!(matches!(
+            plan(
+                &pending(ItemKind::Issue, &[Trigger::Mentioned], 0),
+                &own,
+                &cfg()
+            ),
+            Action::Ignore(_)
+        ));
     }
 
     #[test]
@@ -2242,8 +2479,22 @@ mod tests {
         assert_eq!(Some("ccc".to_string()), p.head_to);
         assert_eq!(vec!["alice".to_string()], p.who);
         assert_eq!("a push and a reply", p.because());
-        assert_eq!(Some(1060 + c.settle), next_due(&pending, &c));
-        assert_eq!(None, next_due(&BTreeMap::new(), &c));
+        let mut state = ListenState {
+            pending,
+            ..Default::default()
+        };
+        let all = |_: i64| true;
+        assert_eq!(Some(1060 + c.settle), next_due(&state, &c, &all));
+        assert_eq!(None, next_due(&ListenState::default(), &c, &all));
+
+        // Waiting out a failure is not being due, or the loop wakes every
+        // second until the wait ends.
+        state.watched(7, ItemKind::Pr).retry_after = 5000;
+        assert_eq!(Some(1100 + c.settle), next_due(&state, &c, &all));
+        state.watched(8, ItemKind::Pr).retry_after = 6000;
+        assert_eq!(Some(5000), next_due(&state, &c, &all));
+        // Nor is something this run does not act on.
+        assert_eq!(Some(6000), next_due(&state, &c, &|n| n == 8));
     }
 
     // -- durations, state, backoff ------------------------------------------------------
@@ -2329,7 +2580,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_live_listener_refuses_a_second_one_and_a_dead_pid_is_replaced() {
+    fn a_held_lock_refuses_a_second_listener_however_old_and_a_left_file_is_taken_over() {
         let dir = std::env::temp_dir().join(format!(
             "spar-listen-lock-{}-{}",
             std::process::id(),
@@ -2338,45 +2589,30 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("listen.lock");
 
-        let held = Lock::at(path.clone(), 900, 1000).expect("first lock");
-        let err = Lock::at(path.clone(), 900, 1000).unwrap_err().to_string();
-        assert!(err.contains("already watching"), "{err}");
-        assert!(err.contains(&std::process::id().to_string()), "{err}");
+        // Held is held, however long ago it was taken: nothing has to keep a
+        // lock fresh while one review runs for an hour.
+        let held = Lock::at(path.clone(), 1000).expect("first lock");
+        for now in [1000, 1000 + 86_400] {
+            let err = Lock::at(path.clone(), now).unwrap_err().to_string();
+            assert!(err.contains("already watching"), "{err}");
+            assert!(err.contains(&std::process::id().to_string()), "{err}");
+        }
+        assert!(path.exists(), "a refused listener leaves the lock alone");
         drop(held);
         assert!(!path.exists(), "dropping the lock removes the file");
 
-        // A lock left by a process that is gone is taken over.
-        let child = std::process::Command::new("true").spawn().unwrap();
-        let dead = child.id();
-        let mut child = child;
-        child.wait().unwrap();
-        std::fs::write(
-            &path,
-            serde_json::to_string(&LockFile {
-                pid: dead,
-                started: "x".into(),
-                touched: 1000,
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        let taken = Lock::at(path.clone(), 900, 1000).expect("a dead pid is replaced");
-        drop(taken);
-
-        // So is one whose owner stopped touching it long ago, whoever it was.
+        // A file a listener left behind, even one naming a pid that is alive,
+        // as a reboot can arrange, holds nothing.
         std::fs::write(
             &path,
             serde_json::to_string(&LockFile {
                 pid: std::process::id(),
                 started: "x".into(),
-                touched: 1000,
             })
             .unwrap(),
         )
         .unwrap();
-        let err = Lock::at(path.clone(), 900, 1500).unwrap_err().to_string();
-        assert!(err.contains("already watching"), "{err}");
-        let taken = Lock::at(path.clone(), 900, 5000).expect("a stale lock is replaced");
+        let taken = Lock::at(path.clone(), 1000).expect("a left file is taken over");
         drop(taken);
         let _ = std::fs::remove_dir_all(&dir);
     }

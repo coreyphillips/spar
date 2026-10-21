@@ -939,15 +939,25 @@ pub(crate) fn state_file_number(name: &str) -> Option<i64> {
         .and_then(|digits| digits.parse().ok())
 }
 
-/// Whether the viewer has already submitted a review with exactly this body.
-fn has_viewer_review(reviews: &[Value], viewer: &str, body: &str) -> bool {
+/// Whether the viewer has already submitted this review: exactly this body, on
+/// this commit, and still standing. A clean review reads the same on every
+/// commit, so a body alone would take an approval of an older commit for this
+/// one; and a dismissed review was withdrawn, so it is not this one either.
+fn has_viewer_review(reviews: &[Value], viewer: &str, body: &str, commit: &str) -> bool {
     reviews.iter().any(|review| {
+        let field = |name: &str| review.get(name).and_then(Value::as_str).unwrap_or("");
+        let standing = !matches!(
+            field("state").to_uppercase().as_str(),
+            "DISMISSED" | "PENDING"
+        );
         review
             .get("user")
             .and_then(|u| u.get("login"))
             .and_then(Value::as_str)
             .is_some_and(|login| crate::comments::same_login(login, viewer))
-            && review.get("body").and_then(Value::as_str) == Some(body)
+            && field("body") == body
+            && field("commit_id").eq_ignore_ascii_case(commit)
+            && standing
     })
 }
 
@@ -955,11 +965,12 @@ fn reconcile_review_post(
     number: i64,
     body: &str,
     viewer: &str,
+    commit: &str,
     post_error: crate::error::SparError,
     reviews: Result<Vec<Value>>,
 ) -> Result<()> {
     match reviews {
-        Ok(reviews) if has_viewer_review(&reviews, viewer, body) => Ok(()),
+        Ok(reviews) if has_viewer_review(&reviews, viewer, body, commit) => Ok(()),
         Ok(_) => Err(post_error),
         Err(read_error) => Err(crate::error::SparError::uncertain_write(format!(
             "could not submit a review on #{number}. {} The result could not be verified: {}",
@@ -4138,11 +4149,17 @@ impl Repo {
     /// Mirrors `comment_pr` step for step: the style gate, the signature, a
     /// duplicate check against the viewer's own reviews, the write, and a read
     /// back on failure so an unverifiable write is reported as one.
+    ///
+    /// `commit` is the commit the reviewers read. GitHub attaches a review
+    /// that names no commit to whatever the head is when it arrives, so a push
+    /// made while a review ran would otherwise receive an approval nobody
+    /// gave it. `gh pr review` cannot name one, hence the REST call.
     pub fn submit_review(
         &self,
         number: i64,
         verdict: Option<crate::model::ReviewVerdict>,
         body: &str,
+        commit: &str,
     ) -> Result<()> {
         let own = match verdict {
             Some(_) => self.record_failed_write(self.pr_is_own(number))?,
@@ -4155,20 +4172,34 @@ impl Repo {
         let body = signed(&self.record_failed_write(self.clean(&text))?);
         let viewer = self.record_failed_write(self.viewer_login())?.to_string();
         let reviews = self.record_failed_write(self.try_pr_reviews(number))?;
-        if has_viewer_review(&reviews, &viewer, &body) {
+        if has_viewer_review(&reviews, &viewer, &body, commit) {
             return Ok(());
         }
-        let flag = match (verdict, own) {
-            (Some(v), false) => v.gh_flag(),
-            _ => "--comment",
+        let event = match (verdict, own) {
+            (Some(v), false) => v.api_event(),
+            _ => "COMMENT",
         };
-        let posted = self.gh(&["pr", "review", &number.to_string(), flag, "--body", &body]);
+        let path = format!("repos/{{owner}}/{{repo}}/pulls/{number}/reviews");
+        let posted = self.gh(&[
+            "api",
+            "-X",
+            "POST",
+            &path,
+            "-f",
+            &format!("commit_id={commit}"),
+            "-f",
+            &format!("event={event}"),
+            "-f",
+            &format!("body={body}"),
+            "--silent",
+        ]);
         let result = match posted {
             Ok(_) => Ok(()),
             Err(post_error) => reconcile_review_post(
                 number,
                 &body,
                 &viewer,
+                commit,
                 post_error,
                 self.try_pr_reviews(number),
             ),
@@ -10132,12 +10163,27 @@ mod review_record_tests {
     #[test]
     fn a_review_the_viewer_already_submitted_with_the_same_body_is_not_sent_again() {
         let reviews = vec![
-            json!({"user": {"login": "Me"}, "body": "the body"}),
-            json!({"user": {"login": "alice"}, "body": "other"}),
+            json!({"user": {"login": "Me"}, "body": "the body", "commit_id": "AAA", "state": "APPROVED"}),
+            json!({"user": {"login": "alice"}, "body": "other", "commit_id": "aaa", "state": "COMMENTED"}),
         ];
-        assert!(has_viewer_review(&reviews, "me", "the body"));
-        assert!(!has_viewer_review(&reviews, "me", "other"));
-        assert!(!has_viewer_review(&reviews, "alice", "the body"));
+        assert!(has_viewer_review(&reviews, "me", "the body", "aaa"));
+        assert!(!has_viewer_review(&reviews, "me", "other", "aaa"));
+        assert!(!has_viewer_review(&reviews, "alice", "the body", "aaa"));
+    }
+
+    /// A clean review says the same thing on every commit. Taking the approval
+    /// of an older commit for this one left the new head unapproved while the
+    /// record said it was.
+    #[test]
+    fn the_same_body_on_another_commit_or_dismissed_is_a_review_still_to_send() {
+        let older = vec![
+            json!({"user": {"login": "me"}, "body": "the body", "commit_id": "aaa", "state": "APPROVED"}),
+        ];
+        assert!(!has_viewer_review(&older, "me", "the body", "bbb"));
+        let dismissed = vec![
+            json!({"user": {"login": "me"}, "body": "the body", "commit_id": "bbb", "state": "DISMISSED"}),
+        ];
+        assert!(!has_viewer_review(&dismissed, "me", "the body", "bbb"));
     }
 
     #[test]
@@ -10163,17 +10209,19 @@ mod review_record_tests {
 
     #[test]
     fn a_failed_review_submission_that_landed_is_reconciled_as_success() {
-        let landed = vec![json!({"user": {"login": "me"}, "body": "the body"})];
+        let landed = vec![json!({"user": {"login": "me"}, "body": "the body", "commit_id": "aaa"})];
         let error = crate::error::SparError::call_failed("gh: boom");
-        assert!(reconcile_review_post(5, "the body", "me", error.clone(), Ok(landed)).is_ok());
+        assert!(
+            reconcile_review_post(5, "the body", "me", "aaa", error.clone(), Ok(landed)).is_ok()
+        );
 
-        let missing = vec![json!({"user": {"login": "me"}, "body": "older"})];
-        let err =
-            reconcile_review_post(5, "the body", "me", error.clone(), Ok(missing)).unwrap_err();
+        let missing = vec![json!({"user": {"login": "me"}, "body": "older", "commit_id": "aaa"})];
+        let err = reconcile_review_post(5, "the body", "me", "aaa", error.clone(), Ok(missing))
+            .unwrap_err();
         assert_eq!(crate::error::ErrorKind::CallFailed, err.kind());
 
         let unreadable = Err(crate::error::SparError::new("no network"));
-        let err = reconcile_review_post(5, "the body", "me", error, unreadable).unwrap_err();
+        let err = reconcile_review_post(5, "the body", "me", "aaa", error, unreadable).unwrap_err();
         assert_eq!(crate::error::ErrorKind::UncertainWrite, err.kind());
         assert!(err.to_string().contains("could not be verified"), "{err}");
     }

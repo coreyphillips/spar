@@ -480,9 +480,11 @@ spar review 108 --verdict   # approve, or request changes, as GitHub shows them
 The verdict is derived from the findings and never asked of a model: approve
 when nothing blocks, request changes when a blocking finding both reviewers count
 stands, and a plain review comment with no verdict when the only thing short of
-approval is a blocking finding the two dispute, which is yours to settle. GitHub
-refuses an approval from the account that opened the pull request, so on your
-own the verdict travels as words in a comment.
+approval is a blocking finding the two dispute, which is yours to settle. The
+review names the commit the reviewers read, so a push that lands while it runs
+gets no approval nobody gave it. GitHub refuses an approval from the account
+that opened the pull request, so on your own the verdict travels as words in a
+comment.
 
 Every review now leaves a record under `.spar/state/review-N.json`: the commit it
 read, when it began, and the points it raised with how well each was attested.
@@ -500,7 +502,9 @@ rebutted by a quoted reply, or open, and review only the commits that landed
 since for anything new. A point is closed only when both close it; one reviewer
 still seeing it keeps it open and says so; a reviewer that did not answer closes
 nothing. New findings go through the same cross-check as a first review. The
-verdict follows the same rule as `--verdict`, and the comment leads with the
+verdict follows the same rule as `--verdict`, earlier points included: a blocker
+the first look left disputed is still yours to settle, not a change request,
+for as long as it stays open. The comment leads with the
 commits it read, then what was addressed, what is still open, what is new, and
 what the two disagree about. A branch rewritten since the review is said as
 such, and every earlier point is verified from scratch. The record is rewritten
@@ -841,7 +845,9 @@ What an event leads to is a table, not a judgement:
 - A pull request in the custody loop's hands, with `.spar/state/pr-N.json` and
   no review record, is left to `spar resume`, and the log says so once.
 - A mention on an issue is logged and left alone, unless the issue has an open
-  pull request spar reviewed, in which case that pull request gets a second look.
+  pull request spar reviewed, in which case that pull request gets a second look
+  on the same terms as its own: none once it has had `max_rechecks`, and none
+  when it is yours.
 - Anything closed or merged is dropped. Anything below `min_number` is ignored
   unless you named it.
 
@@ -858,14 +864,17 @@ With numbers, `spar listen 108 42` watches only those: a named pull request is
 rechecked when it moves or is replied to, reviewed on the first thing that
 happens to it if spar never reviewed it, and the command exits once every named
 item is closed. A named issue is watched through its open pull request, when spar
-has reviewed one.
+has reviewed one. Nothing else is acted on, including work a listener over the
+whole repository left pending, which stays for the next one.
 
 `--once` does one poll and one sweep, acts on whatever is due without waiting
 for it to settle, and exits non-zero if a poll or a sweep failed, so cron can run
 it instead of a resident process. Only one listener may watch a checkout at a
-time; a second refuses, naming the first's pid, and a lock left by a process that
-is gone is taken over. Between runs the listener keeps where it got to in
-`.spar/state/listen.json`, so stopping and starting it loses no event.
+time; a second refuses, naming the first's pid, for as long as the first is
+running, however long one review takes. A lock left by a process that is gone
+holds nothing. Between runs the listener keeps where it got to in
+`.spar/state/listen.json`, so stopping and starting it loses no event. A dry run
+writes none of it, so the run after one acts on everything it showed.
 
 Ctrl-C stops it. An agent call in flight is stopped rather than left running,
 the item is reported as interrupted with its worktree kept, and spar exits 130. A
@@ -873,7 +882,11 @@ second Ctrl-C ends it at once.
 
 A `gh` failure, a network drop or a rate limit does not end the listener: it
 backs off, a minute doubling to fifteen for an ordinary failure and until the
-limit resets for a rate limit, says so once, and says when `gh` answers again.
+limit resets for a rate limit, says so once, and says when `gh` answers again. A
+poll is all or nothing: one that cannot read every page of notifications moves
+past none of them. A review or second look that fails, or that GitHub would not
+take, is tried again after a quarter of an hour, doubling, and after five
+failures it is left until something new happens to it.
 
 ## Splitting something too big to work in one piece
 

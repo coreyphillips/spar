@@ -510,6 +510,13 @@ what the two disagree about. A branch rewritten since the review is said as
 such, and every earlier point is verified from scratch. The record is rewritten
 afterwards, so the next look starts from this one.
 
+A review or second look reads a head only once the pull request and its branch
+agree on it. GitHub moves a pull request to a pushed commit some time after the
+push, sometimes minutes, and until then it names the commit before. A look that
+finds the head moved again by the time it is ready to post does not post: what
+it wrote is saved for `spar post`, no record is written, and the run ends
+`moved` so the next look reads the new head.
+
 This is also the cheapest way to adopt spar. No agent writes a feature from
 scratch; it only reviews what already exists.
 
@@ -892,7 +899,11 @@ limit resets for a rate limit, says so once, and says when `gh` answers again. A
 poll is all or nothing: one that cannot read every page of notifications moves
 past none of them. A review or second look that fails, or that GitHub would not
 take, is tried again after a quarter of an hour, doubling, and after five
-failures it is left until something new happens to it.
+failures it is left until something new happens to it. One that ended `moved`
+is tried again once the push settles, under the same five. Left is not
+forgotten: what the item was waiting on, a review request say, comes back with
+the next thing that happens to it, so a first review held up by GitHub lagging
+behind a push runs when the push shows.
 
 ## Splitting something too big to work in one piece
 

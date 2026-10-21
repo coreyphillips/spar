@@ -208,6 +208,12 @@ pub struct Watched {
     pub said_resume: bool,
     #[serde(default)]
     pub last_dispatched: Option<u64>,
+    /// What a pending item was waiting on when the listener gave up on it.
+    /// Giving up waits for the item to change, and on a pull request spar has
+    /// not reviewed that change is often a push alone, which leads nowhere, so
+    /// the reasons come back with it.
+    #[serde(default)]
+    pub held: BTreeSet<Trigger>,
 }
 
 impl Watched {
@@ -224,6 +230,7 @@ impl Watched {
             said_capped: false,
             said_resume: false,
             last_dispatched: None,
+            held: BTreeSet::new(),
         }
     }
 }
@@ -257,6 +264,25 @@ impl ListenState {
         self.items
             .entry(number)
             .or_insert_with(|| Watched::new(kind))
+    }
+
+    /// Fold an event into what is pending for its item, with whatever the
+    /// item was waiting on when the listener last gave up on it.
+    fn note(&mut self, event: &Event, now: u64) {
+        let held = std::mem::take(&mut self.watched(event.number, event.kind).held);
+        merge(&mut self.pending, event, now);
+        if let Some(p) = self.pending.get_mut(&event.number) {
+            p.triggers.extend(held);
+        }
+    }
+
+    /// Stop trying an item until it changes again, holding what it was
+    /// waiting on. A requested first review that GitHub's lag behind a push
+    /// kept stopping is still requested when that push shows.
+    fn give_up(&mut self, number: i64, kind: ItemKind) {
+        if let Some(p) = self.pending.remove(&number) {
+            self.watched(number, kind).held.extend(p.triggers);
+        }
     }
 }
 
@@ -803,6 +829,17 @@ pub fn backoff_secs(failures: u32) -> u64 {
 /// A quarter of an hour, doubling, to six hours.
 pub fn dispatch_backoff_secs(failures: u32) -> u64 {
     (900u64 << failures.saturating_sub(1).min(10)).min(6 * 3600)
+}
+
+/// How long an item whose dispatch did not finish waits to run again. A head
+/// that moved under it is GitHub or the author rather than a failure, so the
+/// next look starts once the push settles. Anything else backs off.
+pub fn retry_wait(moved: bool, failures: u32, cfg: &ListenCfg) -> u64 {
+    if moved {
+        cfg.settle.max(FLOOR_SECS)
+    } else {
+        dispatch_backoff_secs(failures)
+    }
 }
 
 /// What a `gh` failure is retried after, said loudly once and quietly after.
@@ -1476,8 +1513,7 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                 state.pending.remove(&event.number);
                 continue;
             }
-            state.watched(event.number, event.kind);
-            merge(&mut state.pending, event, now);
+            state.note(event, now);
         }
         save(&state);
 
@@ -1602,17 +1638,28 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                         // would lose it for good.
                         let unposted = repo.write_summary().failed > failed_before;
                         let w = state.watched(number, p.kind);
-                        if run.status == Status::Error || unposted {
+                        // Nothing posted because the head moved under it: the
+                        // pending item stays, and the next look reads the new
+                        // head.
+                        let moved = run.status == Status::Moved && !unposted;
+                        if run.status == Status::Error || moved || unposted {
                             w.failures += 1;
-                            let wait = dispatch_backoff_secs(w.failures);
+                            let wait = retry_wait(moved, w.failures, &cfg.listen);
                             // From now rather than the start of the tick, which
                             // a long review leaves far behind.
                             w.retry_after = clock::now_secs() + wait;
-                            if w.failures >= MAX_FAILURES {
+                            let gave_up = w.failures >= MAX_FAILURES;
+                            if gave_up {
                                 logwarn!("#{number}: giving up on it until it changes again");
-                                state.pending.remove(&number);
+                                state.give_up(number, p.kind);
                             } else {
-                                if unposted {
+                                if moved {
+                                    log!(
+                                        "#{number}: its head moved while spar read it, so it runs \
+                                         again on the new head in {}",
+                                        spend::clock(Duration::from_secs(wait))
+                                    );
+                                } else if unposted {
                                     logwarn!(
                                         "#{number}: not everything it wrote reached GitHub, so it \
                                          runs again in {}",
@@ -1623,7 +1670,11 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                                     p.first_seen = now;
                                 }
                             }
-                            tick_failed = true;
+                            // A moved head failed nothing: it is still pending,
+                            // and the next `--once` reads the new head.
+                            if !moved || gave_up {
+                                tick_failed = true;
+                            }
                         } else {
                             w.failures = 0;
                             w.retry_after = 0;
@@ -2752,6 +2803,77 @@ mod tests {
         assert_eq!(900, dispatch_backoff_secs(1));
         assert_eq!(3600, dispatch_backoff_secs(3));
         assert_eq!(6 * 3600, dispatch_backoff_secs(9));
+    }
+
+    /// A pull request can sit minutes behind its branch. A look that stops
+    /// for that, or for a push while it ran, goes again once the push settles,
+    /// not a quarter of an hour later and doubling.
+    #[test]
+    fn a_head_that_moved_runs_again_once_it_settles_and_a_failure_backs_off() {
+        let c = cfg();
+        for failures in [1, 2, 4] {
+            assert_eq!(c.settle, retry_wait(true, failures, &c));
+            assert_eq!(
+                dispatch_backoff_secs(failures),
+                retry_wait(false, failures, &c)
+            );
+        }
+        let quick = ListenCfg { settle: 1, ..cfg() };
+        assert_eq!(FLOOR_SECS, retry_wait(true, 1, &quick));
+    }
+
+    /// A first review given up on while GitHub lagged came back as the push
+    /// alone once GitHub caught up, and a push to a pull request spar has not
+    /// reviewed is ignored, so the request was lost for good.
+    #[test]
+    fn giving_up_holds_what_the_item_was_waiting_on_until_it_changes() {
+        let mut state = ListenState::default();
+        let asked = Event {
+            number: 7,
+            kind: ItemKind::Pr,
+            trigger: Trigger::ReviewRequested,
+            who: None,
+            head: None,
+            commits: None,
+            from_thread: true,
+        };
+        state.note(&asked, 0);
+        state.give_up(7, ItemKind::Pr);
+        assert!(state.pending.is_empty(), "{state:?}");
+        assert_eq!(
+            [Trigger::ReviewRequested]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            state.items[&7].held
+        );
+
+        let shown = Event {
+            trigger: Trigger::Pushed,
+            head: Some(("aaa".into(), "bbb".into())),
+            from_thread: false,
+            ..asked.clone()
+        };
+        state.note(&shown, 600);
+        let p = &state.pending[&7];
+        assert_eq!(
+            [Trigger::Pushed, Trigger::ReviewRequested]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            p.triggers
+        );
+        assert!(state.items[&7].held.is_empty(), "{state:?}");
+        let asked_now = Facts {
+            review_pending: true,
+            ..open_pr()
+        };
+        assert_eq!(Action::Review, plan(p, &asked_now, &cfg()));
+        // Brought back once, not on every change after.
+        state.pending.clear();
+        state.note(&shown, 700);
+        assert_eq!(
+            [Trigger::Pushed].into_iter().collect::<BTreeSet<_>>(),
+            state.pending[&7].triggers
+        );
     }
 
     #[test]

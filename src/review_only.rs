@@ -40,8 +40,9 @@ use crate::config::{Call, Config, PrComments};
 use crate::error::{ErrorKind, Result};
 use crate::jsonx::exact_finding_key as finding_key;
 use crate::model::{
-    AdjudicationDoc, Finding, IssueRun, Judged, PrView, RecheckDoc, RecheckRuling, RecordedFinding,
-    Review, ReviewRecord, ReviewVerdict, Ruling, Severity, Standing, Status, REVIEW_RECORD_VERSION,
+    AdjudicationDoc, Finding, IssueRun, Judged, LiveHead, PrView, RecheckDoc, RecheckRuling,
+    RecordedFinding, Review, ReviewRecord, ReviewVerdict, Ruling, Severity, Standing, Status,
+    REVIEW_RECORD_VERSION,
 };
 use crate::repo::{Repo, WorktreeCheckpoint};
 use crate::style::{self, Style};
@@ -186,11 +187,22 @@ fn review_inner(
     let mut state = IssueRun::new(pr_number, pr.title.clone());
     state.pr = Some(pr.url.clone());
 
+    // Until GitHub catches up with a push, refs/pull/N/head is the commit
+    // before it, and a review there is a review of code already changed.
+    let live = repo.live_head(&pr)?;
+    let Some(settled) = live.settled() else {
+        return Ok(moved_run(state, behind_note(&pr, &live)));
+    };
+
     // The record keeps when the review began rather than when it posted, so a
     // reply made while a long review ran still counts as new on the next look.
     let started = clock::now_secs();
     let work_dir = repo.worktree_for_pr_head(pr_number)?;
     let head = repo.head_oid_checked(&work_dir)?;
+    if !head.eq_ignore_ascii_case(settled) {
+        let note = checkout_note(pr_number, settled, &head);
+        return put_away(repo, pr_number, &work_dir, state, note);
+    }
     let checkpoint = repo.worktree_checkpoint(&work_dir)?;
     let outcome = run_phases(
         agents,
@@ -766,14 +778,20 @@ fn finish(
     let silent = dry_run || repo.style.pr_comments == PrComments::None;
     if silent {
         println!("\n{comment}\n");
-        save_unposted(repo, pr.number, &comment, dry_run);
+        save_unposted(repo, pr.number, &comment, held_because(dry_run));
         record(state, false);
         return Ok(());
     }
-    let posted = if reviewed.opts.verdict {
-        repo.submit_review(pr.number, verdict, &comment, reviewed.head)
-    } else {
-        repo.comment_pr(pr.number, &comment)
+    let posted = match repo.record_failed_write(moved_since(repo, pr, reviewed.head)) {
+        Ok(Some(now)) => {
+            hold_back(repo, state, pr.number, &comment, reviewed.head, &now);
+            return Ok(());
+        }
+        Ok(None) if reviewed.opts.verdict => {
+            repo.submit_review(pr.number, verdict, &comment, reviewed.head)
+        }
+        Ok(None) => repo.comment_pr(pr.number, &comment),
+        Err(e) => Err(e),
     };
     match posted {
         Ok(()) => {
@@ -810,13 +828,100 @@ fn posted_as(formal: bool, verdict: Option<ReviewVerdict>) -> &'static str {
     }
 }
 
-/// Print and save what would have been posted, and say where it went.
-fn save_unposted(repo: &Repo, number: i64, text: &str, dry_run: bool) {
-    let why = if dry_run {
+/// Why a review was printed rather than posted.
+fn held_because(dry_run: bool) -> &'static str {
+    if dry_run {
         "dry run"
     } else {
         "pr_comments is none"
-    };
+    }
+}
+
+/// Where the head is just before a look posts, when it is no longer the one
+/// the look read. A look takes minutes, and a push in that time makes its
+/// verdict one about a commit the author has already moved past.
+fn moved_since(repo: &Repo, pr: &PrView, reviewed: &str) -> Result<Option<String>> {
+    let live = repo.live_head(pr)?;
+    Ok(live.moved_from(reviewed).map(str::to_string))
+}
+
+/// A finished look whose head moved: kept off the pull request, saved here,
+/// and left for the next look to do on the new head. No record is written, so
+/// that look starts from the last one that was posted.
+fn hold_back(
+    repo: &Repo,
+    state: &mut IssueRun,
+    number: i64,
+    body: &str,
+    reviewed: &str,
+    now: &str,
+) {
+    let note = moved_note(reviewed, now);
+    log!("PR #{number}: {note}");
+    state.status = Status::Moved;
+    state.notes.insert(0, note);
+    save_unposted(repo, number, body, "the head moved");
+}
+
+/// A look that stops before any agent runs, because the head it would read is
+/// not the one the pull request is at.
+fn moved_run(mut state: IssueRun, note: String) -> IssueRun {
+    log!("PR #{}: {note}", state.issue);
+    state.status = Status::Moved;
+    state.notes.push(note);
+    state
+}
+
+/// A checkout that is not at the head the pull request settled on, removed
+/// before anything reads it.
+fn put_away(
+    repo: &Repo,
+    number: i64,
+    work_dir: &Path,
+    state: IssueRun,
+    note: String,
+) -> Result<IssueRun> {
+    let checkpoint = repo.worktree_checkpoint(work_dir)?;
+    if let Err(e) = repo.release_review_worktree_checked(number, &checkpoint) {
+        logwarn!("PR #{number}: {e}");
+    }
+    Ok(moved_run(state, note))
+}
+
+fn short(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
+}
+
+fn behind_note(pr: &PrView, live: &LiveHead) -> String {
+    format!(
+        "GitHub has not caught up with the push to {} yet: the pull request says {}, the branch \
+         is at {}, so nothing was read",
+        pr.head_ref_name.trim(),
+        short(&live.pull),
+        short(live.branch.as_deref().unwrap_or_default())
+    )
+}
+
+fn checkout_note(number: i64, settled: &str, head: &str) -> String {
+    format!(
+        "refs/pull/{number}/head gave {} where the pull request says {}, so nothing was read",
+        short(head),
+        short(settled)
+    )
+}
+
+fn moved_note(reviewed: &str, now: &str) -> String {
+    format!(
+        "the head moved from {} to {} while it was being read, so the review of {} was not \
+         posted",
+        short(reviewed),
+        short(now),
+        short(reviewed)
+    )
+}
+
+/// Print and save what would have been posted, and say where it went.
+fn save_unposted(repo: &Repo, number: i64, text: &str, why: &str) {
     match repo.save_pending_comment(number, text) {
         Ok(path) => log!(
             "{why}, nothing posted. Saved to {}. Post it with `spar post {number}`, or edit that \
@@ -1157,8 +1262,13 @@ fn recheck_inner(
     state.pr = Some(pr.url.clone());
 
     // gh and git only, before any agent runs: a second look that has nothing
-    // new to read costs nothing.
-    let current = repo.pr_head_oid(pr_number)?;
+    // new to read costs nothing. The branch is asked as well as the pull
+    // request, which names the commit before a push until GitHub catches up
+    // with it, and that read as no new commit.
+    let live = repo.live_head(&pr)?;
+    let Some(current) = live.settled() else {
+        return Ok(moved_run(state, behind_note(&pr, &live)));
+    };
     let moved = !current.eq_ignore_ascii_case(&record.head);
     let said = comments::said_since(repo, pr_number, &record.reviewed_at)?;
     if !moved && said.is_empty() {
@@ -1174,6 +1284,10 @@ fn recheck_inner(
     let base = base_of(cfg, &pr);
     let work_dir = repo.worktree_for_pr_head(pr_number)?;
     let head = repo.head_oid_checked(&work_dir)?;
+    if !head.eq_ignore_ascii_case(current) {
+        let note = checkout_note(pr_number, current, &head);
+        return put_away(repo, pr_number, &work_dir, state, note);
+    }
     // Before the checkpoint: finding the recorded commit may fetch it.
     let delta = delta_since(repo, &work_dir, &record.head);
     let checkpoint = repo.worktree_checkpoint(&work_dir)?;
@@ -1485,10 +1599,18 @@ fn recheck_phases(
     let silent = look.mode.dry_run || repo.style.pr_comments == PrComments::None;
     if silent {
         println!("\n{body}\n");
-        save_unposted(repo, pr.number, &body, look.mode.dry_run);
+        save_unposted(repo, pr.number, &body, held_because(look.mode.dry_run));
         return Ok(());
     }
-    match repo.submit_review(pr.number, verdict, &body, look.head) {
+    let posted = match repo.record_failed_write(moved_since(repo, pr, look.head)) {
+        Ok(Some(now)) => {
+            hold_back(repo, state, pr.number, &body, look.head, &now);
+            return Ok(());
+        }
+        Ok(None) => repo.submit_review(pr.number, verdict, &body, look.head),
+        Err(e) => Err(e),
+    };
+    match posted {
         Ok(()) => {
             log!(
                 "PR #{}: second look posted, {}",
@@ -3057,6 +3179,39 @@ mod recheck_tests {
         for text in [RECHECK_PROMPT, RESPONSES_RULE] {
             assert!(style::violations(text, &style).is_empty(), "{text}");
         }
+    }
+
+    /// What a look that stopped for a moving head says names both commits
+    /// short, so the line in the terminal can be checked against GitHub.
+    #[test]
+    fn a_look_stopped_by_a_moving_head_names_both_commits() {
+        let reviewed = "fb3a7ab968922371f4fc0f572a07d770067a5110";
+        let pushed = "2d5e2b51fc7c065b28fa0b4cc732b4a838c30863";
+        let live = LiveHead {
+            pull: reviewed.into(),
+            branch: Some(pushed.into()),
+        };
+        let style = Style::default();
+        let notes = [
+            behind_note(&pr(), &live),
+            checkout_note(9, pushed, reviewed),
+            moved_note(reviewed, pushed),
+        ];
+        for note in &notes {
+            assert!(
+                note.contains("fb3a7ab") && note.contains("2d5e2b5"),
+                "{note}"
+            );
+            assert!(!note.contains(reviewed) && !note.contains(pushed), "{note}");
+            assert!(!note.contains('\n'), "{note}");
+            assert!(style::violations(note, &style).is_empty(), "{note}");
+        }
+        assert!(notes[0].contains("push to retry"), "{}", notes[0]);
+        assert!(
+            notes[2].ends_with("the review of fb3a7ab was not posted"),
+            "{}",
+            notes[2]
+        );
     }
 
     #[test]

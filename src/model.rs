@@ -221,6 +221,10 @@ string_enum! {
         Split = "split",
         /// Split: read, and left as one piece.
         Whole = "whole",
+        /// Review only: the head moved while it was read, or GitHub had not
+        /// caught up with a push yet, so nothing was posted. It runs again on
+        /// the new head.
+        Moved = "moved",
     }
 }
 
@@ -1650,6 +1654,41 @@ impl PrView {
     }
 }
 
+/// Where a pull request's head stands right now, asked two ways.
+///
+/// GitHub moves a pull request to a pushed commit some time after the push,
+/// usually seconds and sometimes minutes, and until then `headRefOid` and
+/// `refs/pull/N/head` both name the commit before it. The branch itself moves
+/// with the push. A look that trusted the pull request alone read the commit
+/// before a push, and by the time it posted its verdict was two pushes old.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveHead {
+    /// The head GitHub's pull request names.
+    pub pull: String,
+    /// Where the branch is, for a branch in this repository. None for a fork,
+    /// whose branch `origin` does not have.
+    pub branch: Option<String>,
+}
+
+impl LiveHead {
+    /// The head, once the pull request and its branch agree on it.
+    pub fn settled(&self) -> Option<&str> {
+        match &self.branch {
+            Some(branch) if !branch.eq_ignore_ascii_case(&self.pull) => None,
+            _ => Some(&self.pull),
+        }
+    }
+
+    /// The newer head when either differs from the one a look read. The
+    /// branch is asked first, since it moves before the pull request does.
+    pub fn moved_from(&self, reviewed: &str) -> Option<&str> {
+        self.branch
+            .as_deref()
+            .filter(|branch| !branch.eq_ignore_ascii_case(reviewed))
+            .or_else(|| (!self.pull.eq_ignore_ascii_case(reviewed)).then_some(self.pull.as_str()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1772,6 +1811,57 @@ mod tests {
         let text = serde_json::to_string(&run).unwrap();
         let back: IssueRun = serde_json::from_str(&text).unwrap();
         assert_eq!(Status::Pending, back.status);
+    }
+
+    /// Nothing was posted, so a script that runs `spar review` has something
+    /// to try again.
+    #[test]
+    fn a_look_whose_head_moved_did_not_do_its_job() {
+        let mut run = IssueRun::new(4, "t");
+        run.status = Status::Moved;
+        assert!(!run.succeeded());
+        let text = serde_json::to_string(&run).unwrap();
+        assert!(text.contains("\"moved\""), "{text}");
+        let back: IssueRun = serde_json::from_str(&text).unwrap();
+        assert_eq!(Status::Moved, back.status);
+    }
+
+    fn live(pull: &str, branch: Option<&str>) -> LiveHead {
+        LiveHead {
+            pull: pull.into(),
+            branch: branch.map(String::from),
+        }
+    }
+
+    /// A branch can be at the pushed commit for minutes while its pull request
+    /// still names the one before.
+    #[test]
+    fn a_head_is_settled_only_once_the_pull_request_has_caught_up_with_its_branch() {
+        assert_eq!(None, live("fb3a7ab", Some("2d5e2b5")).settled());
+        assert_eq!(Some("2d5e2b5"), live("2d5e2b5", Some("2d5e2b5")).settled());
+        assert_eq!(Some("2d5e2b5"), live("2d5e2b5", Some("2D5E2B5")).settled());
+        // A fork's branch is not on origin, so the pull request is all there is.
+        assert_eq!(Some("fb3a7ab"), live("fb3a7ab", None).settled());
+    }
+
+    #[test]
+    fn a_head_moved_from_the_reviewed_one_names_the_newer_commit() {
+        assert_eq!(None, live("fb3a7ab", Some("fb3a7ab")).moved_from("fb3a7ab"));
+        assert_eq!(None, live("FB3A7AB", None).moved_from("fb3a7ab"));
+        // The branch moves first, so it is the newer of the two.
+        assert_eq!(
+            Some("c493635"),
+            live("2d5e2b5", Some("c493635")).moved_from("fb3a7ab")
+        );
+        assert_eq!(
+            Some("c493635"),
+            live("fb3a7ab", Some("c493635")).moved_from("fb3a7ab")
+        );
+        assert_eq!(Some("2d5e2b5"), live("2d5e2b5", None).moved_from("fb3a7ab"));
+        assert_eq!(
+            Some("2d5e2b5"),
+            live("2d5e2b5", Some("fb3a7ab")).moved_from("fb3a7ab")
+        );
     }
 }
 

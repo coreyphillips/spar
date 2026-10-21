@@ -474,7 +474,11 @@ pub fn events_from_sweep(
             .review_requests
             .iter()
             .any(|l| crate::comments::same_login(&l.login, viewer));
-        if asked && !watched.requested_noticed {
+        // Reviewing clears a request, so a request seen again later is the
+        // author asking again and is news.
+        if !asked {
+            watched.requested_noticed = false;
+        } else if !watched.requested_noticed {
             watched.requested_noticed = true;
             out.push(Event {
                 number: row.number,
@@ -660,6 +664,20 @@ pub struct Facts {
     pub below_floor: bool,
     /// For an issue: its open pull request, when spar reviewed that.
     pub linked_pr_with_record: Option<i64>,
+    /// The pull request asks the viewer for a review right now, or asks a
+    /// team the viewer may be in.
+    pub review_pending: bool,
+}
+
+/// A notification's reason is the one its thread was first raised for and it
+/// never changes, so a thread that began as a review request says so on every
+/// later update, spar's own review among them. What the pull request says now
+/// decides: when nobody is asking any more, the update is only something
+/// happening on a thread the viewer is part of.
+pub fn settle(p: &mut Pending, f: &Facts) {
+    if p.kind == ItemKind::Pr && !f.review_pending && p.triggers.remove(&Trigger::ReviewRequested) {
+        p.triggers.insert(Trigger::Replied);
+    }
 }
 
 /// The dispatch table.
@@ -1086,6 +1104,12 @@ fn facts(repo: &Repo, cfg: &Config, number: i64, kind: ItemKind, named: bool) ->
                 has_custody_state: repo.state_path(number).exists(),
                 below_floor,
                 linked_pr_with_record: None,
+                // A team entry has no login, and whether the viewer is in the
+                // team is not something the row says.
+                review_pending: row
+                    .review_requests
+                    .iter()
+                    .any(|l| l.login.is_empty() || crate::comments::same_login(&l.login, &viewer)),
             })
         }
         ItemKind::Issue => {
@@ -1122,6 +1146,7 @@ fn facts(repo: &Repo, cfg: &Config, number: i64, kind: ItemKind, named: bool) ->
                 has_custody_state: false,
                 below_floor,
                 linked_pr_with_record: linked.map(|(pr, _)| pr),
+                review_pending: false,
             })
         }
     }
@@ -1434,7 +1459,7 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
             .map(|(n, _)| *n)
             .collect();
         for number in due_now {
-            let Some(p) = state.pending.get(&number).cloned() else {
+            let Some(mut p) = state.pending.get(&number).cloned() else {
                 continue;
             };
             let named_item = named.contains(&number);
@@ -1450,6 +1475,7 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                     continue;
                 }
             };
+            settle(&mut p, &f);
             let action = plan(&p, &f, &cfg.listen);
             match &action {
                 Action::Ignore(why) => {
@@ -1988,6 +2014,36 @@ mod tests {
     }
 
     #[test]
+    fn a_sweep_notices_a_review_requested_again_after_a_review() {
+        let mut state = ListenState::default();
+        let mut asked = row(7, "aaa", "alice", "OPEN");
+        asked.review_requests = vec![Login { login: "me".into() }];
+        let asked = [asked];
+        let reviewed = [row(7, "aaa", "alice", "OPEN")];
+        let mut sweep = |rows: &[PrSweepRow]| -> Vec<Trigger> {
+            events_from_sweep(
+                rows,
+                "me",
+                &mut state,
+                &BTreeSet::new(),
+                0,
+                &no_record,
+                true,
+            )
+            .iter()
+            .map(|e| e.trigger)
+            .collect()
+        };
+        assert_eq!(vec![Trigger::ReviewRequested], sweep(&asked));
+        // The review cleared the request.
+        assert!(sweep(&reviewed).is_empty());
+        assert!(sweep(&reviewed).is_empty());
+        // The author asked again.
+        assert_eq!(vec![Trigger::ReviewRequested], sweep(&asked));
+        assert!(sweep(&asked).is_empty());
+    }
+
+    #[test]
     fn a_sweep_drops_a_pull_request_that_closed_or_vanished() {
         let mut state = ListenState::default();
         let named = BTreeSet::new();
@@ -2128,6 +2184,50 @@ mod tests {
     }
 
     // -- the table -------------------------------------------------------------------
+
+    #[test]
+    fn a_review_request_nobody_is_still_making_is_only_an_update() {
+        // react-native-pubky#45: the thread began as a review request, so
+        // GitHub kept calling it one when spar's own approval updated it.
+        let threads = [thread(
+            "1",
+            "review_requested",
+            "PullRequest",
+            7,
+            "2026-10-21T14:51:16Z",
+        )];
+        let events = events_from_threads(&threads, &mut ListenState::default());
+        let mut waiting = BTreeMap::new();
+        for e in &events {
+            merge(&mut waiting, e, 0);
+        }
+        let reviewed = Facts {
+            has_posted_record: true,
+            ..open_pr()
+        };
+        let mut p = waiting.remove(&7).expect("pending");
+        settle(&mut p, &reviewed);
+        assert_eq!(
+            [Trigger::Replied].into_iter().collect::<BTreeSet<_>>(),
+            p.triggers
+        );
+        assert_eq!(Action::Recheck(7), plan(&p, &reviewed, &cfg()));
+
+        // On a pull request spar never reviewed it is not a reason to start.
+        let mut p = pending(ItemKind::Pr, &[Trigger::ReviewRequested], 0);
+        settle(&mut p, &open_pr());
+        assert!(matches!(plan(&p, &open_pr(), &cfg()), Action::Ignore(_)));
+
+        // A request still standing is left as it is.
+        let asked = Facts {
+            review_pending: true,
+            ..open_pr()
+        };
+        let mut p = pending(ItemKind::Pr, &[Trigger::ReviewRequested], 0);
+        settle(&mut p, &asked);
+        assert!(p.triggers.contains(&Trigger::ReviewRequested));
+        assert_eq!(Action::Review, plan(&p, &asked, &cfg()));
+    }
 
     #[test]
     fn a_push_or_a_reply_on_a_reviewed_pull_request_is_a_recheck() {

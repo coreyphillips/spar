@@ -5734,7 +5734,9 @@ fn every_config_option_is_documented_in_the_example() {
         checkin: Some("high".into()),
         split: Some("high".into()),
         brainstorm: Some("high".into()),
+        recheck: Some("low".into()),
     }));
+    expected.extend(keys_of(&spar::config::ListenCfg::default()));
     // Per-agent options, which a preset normally supplies but a user may set.
     expected.extend(
         [

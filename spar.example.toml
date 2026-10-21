@@ -280,8 +280,45 @@ checkin     = "high"         # judging the comments other people left
 split       = "high"         # proposing and checking a split
 brainstorm  = "high"         # every brainstorm round: proposing, building on
                              # and challenging, defending and ranking
+recheck     = "high"         # a second look at a reviewed pull request after
+                             # commits or replies: rulings on the earlier
+                             # points, and a review of what is new
 # round_1   = "ultra"        # read by any call above with no key of its own
 # rest      = "high"         # the same, for later rounds and the close
+
+# What `spar listen` watches for and what it does about it. Waiting is gh
+# polling alone and spends no agent calls; only a review, a recheck or an
+# answer does. The README's "Listening for what happens next" says what
+# triggers what.
+[listen]
+interval            = 60       # seconds between polls of GitHub's notifications
+                               # for the repository. GitHub says how often it
+                               # will answer, and the larger of the two is used.
+                               # A poll that finds nothing costs nothing against
+                               # the rate limit.
+sweep               = 300      # seconds between sweeps of the open pull
+                               # requests. A push raises no notification for a
+                               # reviewer, so the sweep is what notices a
+                               # reviewed pull request moving.
+settle              = 120      # quiet seconds before an item is acted on, so a
+                               # push and three replies cost one recheck
+max_wait            = 900      # act anyway after this long, even if the
+                               # activity continues
+max_rechecks        = 5        # second looks one pull request gets before a
+                               # person has to run `spar review` on it again.
+                               # 0 turns automatic rechecks off.
+on_review_requested = "review" # a pull request somebody asked you to review:
+                               # review | ignore
+on_assigned         = "review" # a pull request assigned to you: review | ignore
+on_own_pr           = "checkin"
+                               # activity on a pull request you authored, which
+                               # the same account cannot approve. checkin may
+                               # push a change both agents agree on, behind
+                               # checkin_trust; reply answers in words only;
+                               # ignore does nothing.
+verdicts            = true     # a review `spar listen` starts approves or
+                               # requests changes rather than commenting. A
+                               # recheck always does.
 
 [style]
 ban_em_dash        = true

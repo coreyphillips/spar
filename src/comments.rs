@@ -301,8 +301,8 @@ impl Repo {
     /// DISMISSED one has been withdrawn. An empty body is every approval that
     /// came with only inline comments, which the threads already carry.
     pub fn pr_reviews(&self, number: i64) -> Vec<Value> {
-        let path = format!("repos/{{owner}}/{{repo}}/pulls/{number}/reviews");
-        parse_comment_pages(&self.gh_try(&["api", "--paginate", &path]))
+        self.try_pr_reviews(number)
+            .unwrap_or_default()
             .into_iter()
             .filter(|r| {
                 let state = r
@@ -314,6 +314,14 @@ impl Repo {
                 !matches!(state.as_str(), "PENDING" | "DISMISSED") && !body.trim().is_empty()
             })
             .collect()
+    }
+
+    /// Every submitted review, unfiltered, and an error when GitHub could not
+    /// be read. The duplicate check before a verdict is posted needs to tell
+    /// "no reviews" from "no answer".
+    pub fn try_pr_reviews(&self, number: i64) -> Result<Vec<Value>> {
+        let path = format!("repos/{{owner}}/{{repo}}/pulls/{number}/reviews");
+        crate::repo::try_parse_comment_pages(&self.gh(&["api", "--paginate", &path])?)
     }
 
     /// Inline comments without their threads. The fallback for a host where the
@@ -576,19 +584,9 @@ pub fn gather(repo: &Repo, number: i64, pr: bool, seen: &Answered) -> Result<Gat
 
     // -- inline threads ---------------------------------------------------
     let threads = if pr {
-        match repo.review_threads(number) {
-            Ok(threads) => threads,
-            Err(e) => {
-                out.degraded = true;
-                crate::logging::warn(format!(
-                    "could not read whether a thread is resolved on #{number}: {}\nFalling back \
-                     to the comments endpoint: a thread you resolved by hand will still be read, \
-                     and nothing will be resolved on this run.",
-                    e.last_line()
-                ));
-                threads_from_rest(&repo.pr_review_comments(number))
-            }
-        }
+        let (threads, degraded) = threads_or_rest(repo, number);
+        out.degraded = degraded;
+        threads
     } else {
         Vec::new()
     };
@@ -681,6 +679,129 @@ pub fn gather(repo: &Repo, number: i64, pr: bool, seen: &Answered) -> Result<Gat
         out.pending.push(p);
     }
 
+    Ok(out)
+}
+
+/// The review threads, or the inline comments rebuilt into threads when the
+/// GraphQL read fails. True in the second case: nothing is resolved on a
+/// degraded run, since whether a thread is resolved was never read.
+fn threads_or_rest(repo: &Repo, number: i64) -> (Vec<RawThread>, bool) {
+    match repo.review_threads(number) {
+        Ok(threads) => (threads, false),
+        Err(e) => {
+            crate::logging::warn(format!(
+                "could not read whether a thread is resolved on #{number}: {}\nFalling back \
+                 to the comments endpoint: a thread you resolved by hand will still be read, \
+                 and nothing will be resolved on this run.",
+                e.last_line()
+            ));
+            (threads_from_rest(&repo.pr_review_comments(number)), true)
+        }
+    }
+}
+
+/// Something somebody other than the viewer said on a pull request after a
+/// given time: a message in a review thread, a review body, or a comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Said {
+    /// "review thread", "resolved review thread", "review", or "comment".
+    pub what: &'static str,
+    pub author: String,
+    pub association: String,
+    /// `created_at` of the newest message by others, GitHub's own string.
+    pub at: String,
+    pub url: String,
+    pub file: Option<String>,
+    pub line: Option<i64>,
+    /// The whole thread oldest first, each message attributed, for a thread;
+    /// the one body, attributed, otherwise.
+    pub body: String,
+}
+
+impl Said {
+    fn from_pending(what: &'static str, p: Pending) -> Self {
+        Self {
+            what,
+            author: p.author,
+            association: p.association,
+            at: p.at,
+            url: p.url,
+            file: p.file,
+            line: p.line,
+            body: p.body,
+        }
+    }
+}
+
+/// Strictly after, in GitHub's fixed width UTC form. Anything malformed is not
+/// after: the fail safe direction for a trigger is silence, as it is for
+/// `answered_after`.
+pub fn later_than(at: &str, since: &str) -> bool {
+    at.len() >= 20 && since.len() >= 20 && at > since
+}
+
+/// What the threads hold that others said after `since`. Resolved threads are
+/// included: an author who replied "fixed in abc1234" and resolved the thread
+/// has said exactly the thing a second look exists to check.
+pub fn said_in_threads(threads: &[RawThread], viewer: &str, since: &str) -> Vec<Said> {
+    let mut out = Vec::new();
+    for thread in threads {
+        let live: Vec<&RawComment> = thread
+            .comments
+            .nodes
+            .iter()
+            .filter(|c| c.is_live())
+            .collect();
+        let Some(newest) = live
+            .iter()
+            .rfind(|c| !same_login(c.login(), viewer) && later_than(&c.created_at, since))
+        else {
+            continue;
+        };
+        out.push(Said {
+            what: if thread.is_resolved {
+                "resolved review thread"
+            } else {
+                "review thread"
+            },
+            author: newest.login().to_string(),
+            association: newest.author_association.clone(),
+            at: newest.created_at.clone(),
+            url: newest.url.clone(),
+            file: thread.path.clone(),
+            line: thread.line,
+            body: transcript(&live),
+        });
+    }
+    out
+}
+
+/// Everything others said on a pull request after `since`, oldest first.
+pub fn said_since(repo: &Repo, number: i64, since: &str) -> Result<Vec<Said>> {
+    let viewer = repo.viewer_login()?.to_string();
+    let (threads, _degraded) = threads_or_rest(repo, number);
+    let mut out = said_in_threads(&threads, &viewer, since);
+    for review in repo.pr_reviews(number) {
+        if let Some((_, p)) = loose_comment(&review, "review", CommentKind::ReviewSummary, &viewer)
+        {
+            if later_than(&p.at, since) {
+                out.push(Said::from_pending("review", p));
+            }
+        }
+    }
+    for comment in repo.issue_comments(number) {
+        // Another spar's comment is a review, not a response to this one.
+        let body = comment.get("body").and_then(Value::as_str).unwrap_or("");
+        if crate::repo::is_spar_comment(body) {
+            continue;
+        }
+        if let Some((_, p)) = loose_comment(&comment, "comment", CommentKind::TopLevel, &viewer) {
+            if later_than(&p.at, since) {
+                out.push(Said::from_pending("comment", p));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.at.cmp(&b.at));
     Ok(out)
 }
 
@@ -1628,5 +1749,86 @@ mod issue_thread_tests {
             "{}",
             text.text
         );
+    }
+}
+
+#[cfg(test)]
+mod said_since_tests {
+    use super::*;
+
+    fn message(login: &str, body: &str, at: &str) -> RawComment {
+        RawComment {
+            id: format!("{login}-{at}"),
+            body: body.into(),
+            created_at: at.into(),
+            author: Some(Author {
+                login: login.into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn thread(resolved: bool, messages: Vec<RawComment>) -> RawThread {
+        RawThread {
+            id: "T1".into(),
+            is_resolved: resolved,
+            path: Some("src/net.rs".into()),
+            line: Some(88),
+            comments: ThreadComments {
+                total_count: messages.len(),
+                nodes: messages,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn later_than_compares_github_timestamps_as_strings_and_is_silent_on_junk() {
+        assert!(later_than("2026-10-20T11:00:00Z", "2026-10-20T10:59:59Z"));
+        assert!(!later_than("2026-10-20T10:59:59Z", "2026-10-20T10:59:59Z"));
+        assert!(!later_than("2026-10-20T10:00:00Z", "2026-10-20T10:59:59Z"));
+        assert!(!later_than("", "2026-10-20T10:59:59Z"));
+        assert!(!later_than("2026-10-20T11:00:00Z", ""));
+        assert!(!later_than("yesterday", "2026-10-20T10:59:59Z"));
+    }
+
+    #[test]
+    fn said_since_keeps_a_resolved_thread_with_a_reply_after_the_time() {
+        let threads = vec![
+            thread(
+                true,
+                vec![
+                    message("me", "this never terminates", "2026-10-20T09:00:00Z"),
+                    message("alice", "fixed in abc1234", "2026-10-20T11:00:00Z"),
+                ],
+            ),
+            thread(
+                false,
+                vec![
+                    message("me", "older point", "2026-10-20T09:00:00Z"),
+                    message("alice", "answered long ago", "2026-10-20T09:30:00Z"),
+                ],
+            ),
+            thread(
+                false,
+                vec![
+                    message("alice", "a question", "2026-10-20T11:30:00Z"),
+                    message("me", "my own reply", "2026-10-20T11:40:00Z"),
+                ],
+            ),
+        ];
+        let out = said_in_threads(&threads, "ME", "2026-10-20T10:00:00Z");
+        assert_eq!(2, out.len(), "{out:?}");
+        assert_eq!("resolved review thread", out[0].what);
+        assert_eq!("alice", out[0].author);
+        assert_eq!("2026-10-20T11:00:00Z", out[0].at);
+        assert_eq!(Some("src/net.rs".to_string()), out[0].file);
+        assert_eq!(Some(88), out[0].line);
+        assert_eq!(
+            "@me: this never terminates\n\n@alice: fixed in abc1234",
+            out[0].body
+        );
+        assert_eq!("review thread", out[1].what);
+        assert_eq!("2026-10-20T11:30:00Z", out[1].at);
     }
 }

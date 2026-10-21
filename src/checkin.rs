@@ -314,7 +314,9 @@ pub fn may_resolve(item: &Settled, posted: bool, mode: &Mode) -> bool {
 /// anything before or after it: a model reading the prompt sees a marker line
 /// in all of those, so all of them are stripped out of quoted text.
 static FENCE_LINE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)[-\x{2010}-\x{2015}\x{2212}]{3,}\s*(?:end\s+)?comment\b")
+    Regex::new(
+        r"(?i)[-\x{2010}-\x{2015}\x{2212}]{3,}\s*(?:end\s+)?(?:comment|review|resolved|commits|pull request)\b",
+    )
         .expect("fence line pattern")
 });
 
@@ -407,6 +409,17 @@ impl Fence {
             strip_fence_lines(&p.body).trim(),
             self.close(&format!("comment {}", p.ref_id))
         )
+    }
+}
+
+impl Fence {
+    /// Quote one response under a head line spar composed, for the prompt that
+    /// hands a second look what people said since the review. The head is
+    /// stripped and flattened like a comment's, since the path in it is the
+    /// author's.
+    pub(crate) fn quote(&self, head: &str, body: &str) -> String {
+        let head = strip_fence_lines(head).replace('\n', " ");
+        self.wrap(&head, body.trim())
     }
 }
 

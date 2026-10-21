@@ -15,6 +15,7 @@ pub mod config;
 pub mod error;
 pub mod followups;
 pub mod jsonx;
+pub mod listen;
 pub mod logging;
 pub mod model;
 pub mod proc;

@@ -18,7 +18,7 @@ use spar::model::{
 use spar::review::{
     disposition_comment, outcome_comment, pr_body, review_comment, skip_comment, Ending,
 };
-use spar::review_only::verdict_comment;
+use spar::review_only::{recheck_comment, verdict_comment, Delta, Rechecked, Resolution};
 use spar::style::Style;
 
 fn finding(severity: &str, title: &str, detail: &str, file: &str, in_scope: bool) -> Finding {
@@ -304,6 +304,90 @@ fn main() {
                 ),
             ],
             &style
+        )
+    );
+
+    rule("A second look at that pull request, after the author pushed (spar review --recheck)");
+    let recorded = |severity: &str, title: &str, detail: &str, file: &str, standing| {
+        spar::model::RecordedFinding {
+            title: title.into(),
+            file: file.into(),
+            severity: Severity::parse_lenient(severity).expect("severity"),
+            detail: detail.into(),
+            in_scope: true,
+            raised_by: "claude and codex".into(),
+            standing,
+            counterpoint: None,
+            defence: None,
+        }
+    };
+    println!(
+        "{}",
+        recheck_comment(
+            &Delta {
+                from: "0123abcdef".into(),
+                commits: vec![
+                    "a1b2c3d check for None before comparing attempts".into(),
+                    "e4f5a6b make the request timeout configurable".into(),
+                ],
+                rewritten: false,
+            },
+            &[
+                Rechecked {
+                    recorded: recorded(
+                        "blocking",
+                        "Retry loop never terminates when max_attempts is unset",
+                        "The guard on line 91 compares against Some(0) rather than checking for None.",
+                        "src/net.rs:88",
+                        FindingStanding::Corroborated,
+                    ),
+                    resolution: Resolution::Fixed(
+                        "src/net.rs:91 now matches on None first, and the 429 test that used to \
+                         hang passes in 0.3s when run with cargo test retry"
+                            .into(),
+                    ),
+                },
+                Rechecked {
+                    recorded: recorded(
+                        "non-blocking",
+                        "The request timeout is hard coded",
+                        "Not a regression, the previous code had the same limitation.",
+                        "src/net.rs:44",
+                        FindingStanding::Confirmed,
+                    ),
+                    resolution: Resolution::Rebutted(
+                        "the author's reply is right that the timeout comes from the caller's \
+                         Client builder since e4f5a6b, so there is nothing left to make configurable \
+                         here"
+                            .into(),
+                    ),
+                },
+                Rechecked {
+                    recorded: recorded(
+                        "blocking",
+                        "Config loader swallows a parse error",
+                        "load_config discards the error from serde and returns a default.",
+                        "src/config.rs:210",
+                        FindingStanding::Confirmed,
+                    ),
+                    resolution: Resolution::Open(
+                        "codex still sees it: load_config still returns Default on a parse error, \
+                         and nothing upstream validates the file first"
+                            .into(),
+                    ),
+                },
+            ],
+            &[judged(
+                FindingStanding::Corroborated,
+                "non-blocking",
+                "The new None branch logs at error level on every retry",
+                "Each retry now writes an error line, so a flaky upstream fills the log with \
+                 errors for a request that succeeds on the third try.",
+                "src/net.rs:93",
+                "claude and codex",
+            )],
+            &style,
+            2
         )
     );
 

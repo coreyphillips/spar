@@ -3293,6 +3293,7 @@ fn version_and_help_work_without_any_configuration() {
         "followup",
         "checkin",
         "brainstorm",
+        "listen",
         "init",
         "clean",
         "doctor",
@@ -6305,4 +6306,918 @@ fn a_branch_with_no_commits_of_its_own_lists_nothing() {
     assert!(spar::review::from_commits(&repo, &fx.work, "main")
         .changes
         .is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Verdicts and second looks
+// ---------------------------------------------------------------------------
+
+/// A fake `gh` for a review of pull request `number` whose head GitHub reports
+/// as `head` and whose author is `author`. Reviews, comments and threads are
+/// all empty, and a submitted review or comment is accepted and logged.
+fn review_gh(number: i64, head: &str, author: &str) -> String {
+    format!(
+        r#"set -eu
+printf '%s\n' "$*" >> "$SPAR_FAKE_GH_LOG"
+case "$1 $2" in
+  "pr view")
+    case "$*" in
+      *"--json author") printf '%s\n' '{{"author":{{"login":"{author}"}}}}' ;;
+      *"--json headRefOid") printf '%s\n' '{{"headRefOid":"{head}"}}' ;;
+      *) printf '%s\n' '{{"number":{number},"url":"https://github.com/example/project/pull/{number}","title":"PR {number}","body":"","headRefName":"feature-{number}","baseRefName":"main","state":"OPEN","closingIssuesReferences":[],"isCrossRepository":false}}' ;;
+    esac ;;
+  "api user") printf '%s\n' 'viewer' ;;
+  "api --paginate") printf '%s\n' '[]' ;;
+  "api graphql") printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[]}}}}}}}}}}' ;;
+  "api repos/{{owner}}/{{repo}}/issues/{number}") printf 'pr\n' ;;
+  "pr review") : ;;
+  "pr comment") : ;;
+  *) printf 'unexpected gh call: %s\n' "$*" >&2; exit 64 ;;
+esac"#
+    )
+}
+
+const CLEAN_REVIEW: &str =
+    r#"{"verdict":"approve","next_action":"hand_back","summary":"fine","findings":[]}"#;
+const ONE_BLOCKER_REVIEW: &str = r#"{"verdict":"changes_requested","next_action":"hand_back","summary":"one defect","findings":[{"severity":"blocking","title":"Retry loop never terminates","detail":"the guard compares against Some(0)","file":"src/net.rs:88","in_scope":true,"problem":null,"reproduction":null,"impact":null,"expected":null}]}"#;
+
+fn read_record(fx: &Fixture, number: i64) -> spar::model::ReviewRecord {
+    let path = fx
+        .work
+        .join(".spar")
+        .join("state")
+        .join(format!("review-{number}.json"));
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("no review record at {}: {e}", path.display()));
+    serde_json::from_str(&text).expect("a review record")
+}
+
+fn write_record(fx: &Fixture, number: i64, record: &serde_json::Value) {
+    let dir = fx.work.join(".spar").join("state");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("review-{number}.json")),
+        serde_json::to_string_pretty(record).unwrap(),
+    )
+    .unwrap();
+}
+
+/// `spar review --verdict` with the fake pair, from the work tree. Returns
+/// success, stdout, and the gh log.
+fn review_run(fx: &Fixture, args: &[&str], a: &str, b: &str, gh: &str) -> (bool, String, String) {
+    let (config, path) = brainstorm_commands(fx, a, b, gh);
+    let log = fx.dir.join("gh.log");
+    let mut argv = vec!["review"];
+    argv.extend_from_slice(args);
+    argv.extend_from_slice(&["--config", config.to_str().unwrap(), "--repo"]);
+    argv.push(fx.work.to_str().unwrap());
+    let (ok, stdout, stderr) = spar_with_env(
+        &argv,
+        &fx.dir,
+        &[
+            ("PATH", path.as_str()),
+            ("SPAR_FAKE_GH_LOG", log.to_str().unwrap()),
+        ],
+    );
+    let log = std::fs::read_to_string(&log).unwrap_or_default();
+    (ok, format!("{stdout}\n{stderr}"), log)
+}
+
+/// `spar review` used to leave nothing behind: not the commit it read, not the
+/// points it raised, and never a verdict GitHub would show. A second look needs
+/// all three.
+#[test]
+#[cfg(unix)]
+fn review_with_verdict_submits_a_formal_approval_and_leaves_a_record() {
+    let fx = repo("reviewverdict");
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/5/head"]);
+    let head = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let (ok, out, log) = review_run(
+        &fx,
+        &["5", "--verdict"],
+        CLEAN_REVIEW,
+        CLEAN_REVIEW,
+        &review_gh(5, &head, "someone-else"),
+    );
+
+    assert!(ok, "{out}");
+    assert!(
+        log.contains(
+            "pr review 5 --approve --body Two independent reviews, nothing blocking a merge."
+        ),
+        "{log}"
+    );
+    assert!(!log.contains("pr comment"), "{log}");
+    assert!(out.contains("#5     clean"), "{out}");
+    let record = read_record(&fx, 5);
+    assert_eq!(head, record.head);
+    assert!(record.posted);
+    assert_eq!(Some(spar::model::ReviewVerdict::Approve), record.verdict);
+    assert!(record.findings.is_empty());
+    assert_eq!(0, record.rechecks);
+    assert_eq!(20, record.reviewed_at.len(), "{}", record.reviewed_at);
+}
+
+#[test]
+#[cfg(unix)]
+fn review_with_verdict_requests_changes_on_a_blocking_finding_and_records_it() {
+    let fx = repo("reviewverdictblock");
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/5/head"]);
+    let head = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let (ok, out, log) = review_run(
+        &fx,
+        &["5", "--verdict"],
+        ONE_BLOCKER_REVIEW,
+        ONE_BLOCKER_REVIEW,
+        &review_gh(5, &head, "someone-else"),
+    );
+
+    assert!(ok, "{out}");
+    assert!(
+        log.contains("pr review 5 --request-changes --body Two independent reviews."),
+        "{log}"
+    );
+    assert!(
+        log.contains("- Retry loop never terminates (src/net.rs:88) [both]."),
+        "{log}"
+    );
+    assert!(out.contains("#5     reviewed"), "{out}");
+    let record = read_record(&fx, 5);
+    assert_eq!(
+        Some(spar::model::ReviewVerdict::RequestChanges),
+        record.verdict
+    );
+    assert_eq!(1, record.findings.len());
+    assert_eq!("Retry loop never terminates", record.findings[0].title);
+    assert_eq!(
+        spar::model::Standing::Corroborated,
+        record.findings[0].standing
+    );
+    assert!(record.findings[0].blocks());
+}
+
+/// GitHub refuses an approval from the account that opened the pull request,
+/// so the verdict travels as words in a review comment instead.
+#[test]
+#[cfg(unix)]
+fn review_with_verdict_on_your_own_pull_request_posts_a_comment() {
+    let fx = repo("reviewverdictown");
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/5/head"]);
+    let head = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let (ok, out, log) = review_run(
+        &fx,
+        &["5", "--verdict"],
+        CLEAN_REVIEW,
+        CLEAN_REVIEW,
+        &review_gh(5, &head, "viewer"),
+    );
+
+    assert!(ok, "{out}");
+    assert!(
+        log.contains("pr review 5 --comment --body Verdict: approve.\n\nTwo independent reviews"),
+        "{log}"
+    );
+    assert!(!log.contains("--approve"), "{log}");
+}
+
+/// Without --verdict nothing changes: a comment, as before, and now a record.
+#[test]
+#[cfg(unix)]
+fn a_plain_review_still_comments_and_now_leaves_a_record() {
+    let fx = repo("reviewplainrecord");
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/5/head"]);
+    let head = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let (ok, out, log) = review_run(
+        &fx,
+        &["5"],
+        CLEAN_REVIEW,
+        CLEAN_REVIEW,
+        &review_gh(5, &head, "someone-else"),
+    );
+
+    assert!(ok, "{out}");
+    assert!(
+        log.contains("pr comment 5 --body Two independent reviews"),
+        "{log}"
+    );
+    assert!(!log.contains("pr review"), "{log}");
+    let record = read_record(&fx, 5);
+    assert!(record.posted);
+    assert_eq!(None, record.verdict);
+}
+
+const RECHECK_FIXED: &str = r#"{"summary":"holds","rulings":[{"index":1,"outcome":"fixed","reasoning":"line 2 of file.txt now checks the bound"}],"findings":[]}"#;
+
+fn blocking_record(head: &str) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "head": head,
+        "reviewed_at": "2026-01-01T00:00:00Z",
+        "findings": [{
+            "title": "Retry loop never terminates",
+            "file": "src/net.rs:88",
+            "severity": "blocking",
+            "detail": "the guard compares against Some(0)",
+            "in_scope": true,
+            "raised_by": "a and b",
+            "standing": "corroborated"
+        }],
+        "rechecks": 0,
+        "verdict": "request_changes",
+        "posted": true
+    })
+}
+
+/// The whole point: a push after a review gets the earlier points ruled on
+/// against the new code, and an approval when both reviewers close them.
+#[test]
+#[cfg(unix)]
+fn a_recheck_rules_on_the_earlier_points_and_approves_when_both_say_fixed() {
+    let fx = repo("recheckfixed");
+    let before = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/9/head"]);
+    write_record(&fx, 9, &blocking_record(&before));
+    commit(&fx.work, "file.txt", "bounded\n", "check the bound");
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/9/head"]);
+    let after = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let (ok, out, log) = review_run(
+        &fx,
+        &["9", "--recheck"],
+        RECHECK_FIXED,
+        RECHECK_FIXED,
+        &review_gh(9, &after, "someone-else"),
+    );
+
+    assert!(ok, "{out}");
+    assert!(
+        log.contains("pr review 9 --approve --body Rechecked after 1 new commit ("),
+        "{log}"
+    );
+    assert!(log.contains("). Nothing blocking remains."), "{log}");
+    assert!(
+        log.contains("addressed\n- Retry loop never terminates (src/net.rs:88). Fixed: line 2 of file.txt now checks the bound"),
+        "{log}"
+    );
+    assert!(out.contains("#9     clean"), "{out}");
+    let record = read_record(&fx, 9);
+    assert_eq!(after, record.head);
+    assert_eq!(1, record.rechecks);
+    assert!(record.findings.is_empty());
+    assert_eq!(Some(spar::model::ReviewVerdict::Approve), record.verdict);
+    assert_ne!("2026-01-01T00:00:00Z", record.reviewed_at);
+}
+
+/// One reviewer still seeing the point keeps it open, and changes stay
+/// requested with the point named.
+#[test]
+#[cfg(unix)]
+fn a_recheck_keeps_a_point_open_when_one_reviewer_still_sees_it() {
+    let fx = repo("recheckopen");
+    let before = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/9/head"]);
+    write_record(&fx, 9, &blocking_record(&before));
+    commit(&fx.work, "file.txt", "half done\n", "try the bound");
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/9/head"]);
+    let after = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    let still_open = r#"{"summary":"no","rulings":[{"index":1,"outcome":"open","reasoning":"the guard still compares against Some(0)"}],"findings":[]}"#;
+
+    let (ok, out, log) = review_run(
+        &fx,
+        &["9", "--recheck"],
+        RECHECK_FIXED,
+        still_open,
+        &review_gh(9, &after, "someone-else"),
+    );
+
+    assert!(ok, "{out}");
+    assert!(
+        log.contains("pr review 9 --request-changes --body Rechecked after 1 new commit ("),
+        "{log}"
+    );
+    assert!(log.contains("One point still blocks a merge."), "{log}");
+    assert!(
+        log.contains("still open\n- Retry loop never terminates (src/net.rs:88) [both]. the guard compares against Some(0). B still sees it: the guard still compares against Some(0)"),
+        "{log}"
+    );
+    assert!(out.contains("#9     reviewed"), "{out}");
+    assert!(
+        out.contains("Retry loop never terminates is still open"),
+        "{out}"
+    );
+    let record = read_record(&fx, 9);
+    assert_eq!(1, record.rechecks);
+    assert_eq!(1, record.findings.len());
+    assert_eq!(
+        Some(spar::model::ReviewVerdict::RequestChanges),
+        record.verdict
+    );
+}
+
+/// Nothing moved and nobody spoke: no agent runs, nothing is posted, and the
+/// run says so.
+#[test]
+#[cfg(unix)]
+fn a_recheck_with_nothing_new_runs_no_agent_and_reports_clean() {
+    let fx = repo("recheckquiet");
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/9/head"]);
+    let head = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    let mut record = blocking_record(&head);
+    record["findings"] = serde_json::json!([]);
+    write_record(&fx, 9, &record);
+
+    let (ok, out, log) = review_run(
+        &fx,
+        &["9", "--recheck"],
+        "exit 1",
+        "exit 1",
+        &review_gh(9, &head, "someone-else"),
+    );
+
+    assert!(ok, "{out}");
+    assert!(out.contains("#9     clean"), "{out}");
+    assert!(out.contains("nothing changed since the review at"), "{out}");
+    assert!(!log.contains("pr review"), "{log}");
+    assert!(!log.contains("pr comment"), "{log}");
+    assert_eq!(0, read_record(&fx, 9).rechecks);
+}
+
+/// A record left by a dry run has findings nobody has read, so a second look
+/// at it would ask the author about points they were never told. A first look
+/// happens instead.
+#[test]
+#[cfg(unix)]
+fn a_recheck_without_a_posted_review_on_record_reviews_afresh() {
+    let fx = repo("recheckunposted");
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/9/head"]);
+    let head = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    let mut record = blocking_record(&head);
+    record["posted"] = serde_json::json!(false);
+    write_record(&fx, 9, &record);
+
+    let (ok, out, log) = review_run(
+        &fx,
+        &["9", "--recheck", "--verdict"],
+        CLEAN_REVIEW,
+        CLEAN_REVIEW,
+        &review_gh(9, &head, "someone-else"),
+    );
+
+    assert!(ok, "{out}");
+    assert!(out.contains("never posted"), "{out}");
+    assert!(
+        log.contains("pr review 9 --approve --body Two independent reviews"),
+        "{log}"
+    );
+    assert!(read_record(&fx, 9).posted);
+}
+
+// ---------------------------------------------------------------------------
+// Listening
+// ---------------------------------------------------------------------------
+
+/// A fake `gh` for `spar listen`. Notifications come from `$SPAR_FAKE_NOTIFY`
+/// when that file exists and are a 304 otherwise, the sweep reads
+/// `$SPAR_FAKE_PRS`, and pull request `number` is open at `head`, written by
+/// `author`, with nothing said on it.
+fn listen_gh(number: i64, head: &str, author: &str, state: &str) -> String {
+    format!(
+        r#"set -eu
+printf '%s\n' "$*" >> "$SPAR_FAKE_GH_LOG"
+case "$*" in
+  *notifications*)
+    if [ -f "${{SPAR_FAKE_NOTIFY:-/nonexistent}}" ]; then
+      printf 'HTTP/2.0 200 OK\r\nX-Poll-Interval: 60\r\nLast-Modified: Tue, 20 Oct 2026 10:00:00 GMT\r\nContent-Type: application/json\r\n\r\n'
+      cat "$SPAR_FAKE_NOTIFY"
+    elif [ "${{SPAR_FAKE_POLL_FAILS:-}}" = 1 ]; then
+      printf 'gh: API rate limit exceeded for viewer\n' >&2
+      exit 1
+    else
+      printf 'HTTP/2.0 304 Not Modified\r\nX-Poll-Interval: 60\r\n\r\n'
+      exit 1
+    fi ;;
+  "api user --jq .login") printf 'viewer\n' ;;
+  "repo view --json nameWithOwner --jq .nameWithOwner") printf 'example/project\n' ;;
+  "pr list --state open --limit 500 --json number,title,headRefOid,"*) cat "$SPAR_FAKE_PRS" ;;
+  "pr list "*) printf '[]\n' ;;
+  "pr view {number} --json number,title,headRefOid,"*) printf '%s\n' '{{"number":{number},"title":"PR {number}","headRefOid":"{head}","updatedAt":"2026-10-20T10:00:00Z","author":{{"login":"{author}"}},"isDraft":false,"isCrossRepository":false,"reviewRequests":[],"assignees":[],"state":"{state}"}}' ;;
+  "pr view {number} --json author") printf '%s\n' '{{"author":{{"login":"{author}"}}}}' ;;
+  "pr view {number} --json headRefOid") printf '%s\n' '{{"headRefOid":"{head}"}}' ;;
+  "pr view {number} "*) printf '%s\n' '{{"number":{number},"url":"https://github.com/example/project/pull/{number}","title":"PR {number}","body":"","headRefName":"feature-{number}","baseRefName":"main","state":"{state}","closingIssuesReferences":[],"isCrossRepository":false}}' ;;
+  "api repos/{{owner}}/{{repo}}/issues/{number} --jq"*) printf 'pr\n' ;;
+  "api repos/{{owner}}/{{repo}}/issues/42 --jq"*) printf 'issue\n' ;;
+  "issue view 42 "*) printf '%s\n' '{{"number":42,"title":"Retry smarter","body":"please","labels":[],"state":"OPEN","url":"https://github.com/example/project/issues/42","author":{{"login":"bob"}},"comments":[]}}' ;;
+  "api repos/{{owner}}/{{repo}}/compare/"*) printf '3\n' ;;
+  "api --paginate "*) printf '[]\n' ;;
+  "api graphql "*) printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[]}}}}}}}}}}' ;;
+  "pr review "*) : ;;
+  "pr comment "*) : ;;
+  *) printf 'unexpected gh call: %s\n' "$*" >&2; exit 64 ;;
+esac"#
+    )
+}
+
+/// An agent that notes it was called and refuses, so a listener that should
+/// have spent nothing fails loudly if it did.
+const REFUSING_AGENT: &str = "printf 'called\\n' >> \"$SPAR_FAKE_AGENT_LOG\"; exit 1";
+
+fn sweep_row(number: i64, head: &str, author: &str) -> String {
+    format!(
+        r#"{{"number":{number},"title":"PR {number}","headRefOid":"{head}","updatedAt":"2026-10-20T10:00:00Z","author":{{"login":"{author}"}},"isDraft":false,"isCrossRepository":false,"reviewRequests":[],"assignees":[],"state":"OPEN"}}"#
+    )
+}
+
+fn notification(id: &str, reason: &str, kind: &str, number: i64) -> String {
+    let path = if kind == "PullRequest" {
+        "pulls"
+    } else {
+        "issues"
+    };
+    format!(
+        r#"{{"id":"{id}","unread":true,"reason":"{reason}","updated_at":"2026-10-20T10:0{id}:00Z","subject":{{"title":"thing {number}","url":"https://api.github.com/repos/example/project/{path}/{number}","latest_comment_url":null,"type":"{kind}"}}}}"#
+    )
+}
+
+struct Listening {
+    fx: Fixture,
+    config: PathBuf,
+    path: String,
+    gh_log: PathBuf,
+    agent_log: PathBuf,
+    notify: PathBuf,
+    prs: PathBuf,
+}
+
+impl Listening {
+    /// A fixture with the fake pair, a fake gh, and no notifications yet.
+    fn new(tag: &str, a: &str, b: &str, gh: &str) -> Self {
+        let fx = repo(tag);
+        let a = format!("printf '%s\\n' >> \"$SPAR_FAKE_AGENT_LOG\" called; printf '%s\\n' '{a}'");
+        let b = format!("printf '%s\\n' >> \"$SPAR_FAKE_AGENT_LOG\" called; printf '%s\\n' '{b}'");
+        let (config, path) = brainstorm_commands(&fx, "", "", gh);
+        // The fixture's agents print a fixed answer; these also leave a mark
+        // per call, which is how a test proves nothing ran.
+        let bin = fx.dir.join("fake-bin");
+        executable(&bin.join("agent-a"), &format!("#!/bin/sh\n{a}\n"));
+        executable(&bin.join("agent-b"), &format!("#!/bin/sh\n{b}\n"));
+        let prs = fx.dir.join("prs.json");
+        std::fs::write(&prs, "[]\n").unwrap();
+        Self {
+            gh_log: fx.dir.join("gh.log"),
+            agent_log: fx.dir.join("agent.log"),
+            notify: fx.dir.join("notify.json"),
+            prs,
+            fx,
+            config,
+            path,
+        }
+    }
+
+    fn refusing(tag: &str, gh: &str) -> Self {
+        let this = Self::new(tag, "", "", gh);
+        let bin = this.fx.dir.join("fake-bin");
+        executable(
+            &bin.join("agent-a"),
+            &format!("#!/bin/sh\n{REFUSING_AGENT}\n"),
+        );
+        executable(
+            &bin.join("agent-b"),
+            &format!("#!/bin/sh\n{REFUSING_AGENT}\n"),
+        );
+        this
+    }
+
+    fn with_prs(&self, rows: &[String]) {
+        std::fs::write(&self.prs, format!("[{}]\n", rows.join(","))).unwrap();
+    }
+
+    fn with_notifications(&self, threads: &[String]) {
+        std::fs::write(&self.notify, format!("[{}]\n", threads.join(","))).unwrap();
+    }
+
+    fn env(&self) -> Vec<(String, String)> {
+        vec![
+            ("PATH".into(), self.path.clone()),
+            ("NO_COLOR".into(), "1".into()),
+            ("SPAR_FAKE_GH_LOG".into(), self.gh_log.display().to_string()),
+            (
+                "SPAR_FAKE_AGENT_LOG".into(),
+                self.agent_log.display().to_string(),
+            ),
+            ("SPAR_FAKE_NOTIFY".into(), self.notify.display().to_string()),
+            ("SPAR_FAKE_PRS".into(), self.prs.display().to_string()),
+        ]
+    }
+
+    /// `spar listen <args>`: success, stdout and stderr together, the gh log.
+    fn run(&self, args: &[&str]) -> (bool, String, String) {
+        let mut argv = vec!["listen"];
+        argv.extend_from_slice(args);
+        argv.extend_from_slice(&["--config", self.config.to_str().unwrap(), "--repo"]);
+        argv.push(self.fx.work.to_str().unwrap());
+        let env = self.env();
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let (ok, stdout, stderr) = spar_with_env(&argv, &self.fx.dir, &env);
+        let log = std::fs::read_to_string(&self.gh_log).unwrap_or_default();
+        (ok, format!("{stdout}\n{stderr}"), log)
+    }
+
+    fn agent_calls(&self) -> usize {
+        std::fs::read_to_string(&self.agent_log)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    fn state(&self) -> serde_json::Value {
+        let text = std::fs::read_to_string(self.fx.work.join(".spar/state/listen.json"))
+            .expect("listen.json");
+        serde_json::from_str(&text).expect("listen state")
+    }
+
+    fn lock_exists(&self) -> bool {
+        self.fx.work.join(".spar/state/listen.lock").exists()
+    }
+}
+
+/// The promise the command rests on: waiting spends nothing. A poll that finds
+/// nothing is a 304, which gh reports as a failure, and spar reads as quiet.
+#[test]
+#[cfg(unix)]
+fn listen_once_with_nothing_new_calls_no_agent_and_writes_nothing() {
+    let l = Listening::refusing("listenquiet", &listen_gh(7, "aaa", "alice", "OPEN"));
+
+    let (ok, out, log) = l.run(&["--once"]);
+
+    assert!(ok, "{out}");
+    assert!(out.contains("listening to example/project"), "{out}");
+    assert!(
+        out.contains("polling every 60s, sweeping open pull requests every 300s"),
+        "{out}"
+    );
+    assert_eq!(0, l.agent_calls(), "{out}");
+    assert!(!log.contains("pr review"), "{log}");
+    assert!(!log.contains("pr comment"), "{log}");
+    assert!(log.contains("api -i repos/{owner}/{repo}/notifications?participating=true&all=true&per_page=100&since="), "{log}");
+    let state = l.state();
+    assert_eq!(
+        20,
+        state["watermark"].as_str().unwrap_or("").len(),
+        "{state}"
+    );
+    assert!(!l.lock_exists());
+}
+
+/// Every event and what it would trigger, and nothing triggered: the way to
+/// see what listen would do before letting it.
+#[test]
+#[cfg(unix)]
+fn listen_once_dry_run_names_what_each_event_would_trigger_and_triggers_nothing() {
+    let l = Listening::refusing("listendry", &listen_gh(7, "aaa", "alice", "OPEN"));
+    l.with_prs(&[sweep_row(7, "aaa", "alice")]);
+    l.with_notifications(&[
+        notification("1", "review_requested", "PullRequest", 7),
+        notification("2", "mention", "Issue", 42),
+    ]);
+
+    let (ok, out, _) = l.run(&["--once", "--dry-run"]);
+
+    assert!(ok, "{out}");
+    assert!(out.contains("#7: your review was requested"), "{out}");
+    assert!(
+        out.contains("#7: would review it after a review request, dry run so nothing runs"),
+        "{out}"
+    );
+    assert!(out.contains("#42: mentioned"), "{out}");
+    assert!(
+        out.contains("#42: ignoring an issue with no reviewed pull request"),
+        "{out}"
+    );
+    assert_eq!(0, l.agent_calls(), "{out}");
+    let state = l.state();
+    assert_eq!(
+        2,
+        state["seen"].as_object().map(|s| s.len()).unwrap_or(0),
+        "{state}"
+    );
+    assert!(
+        state["pending"].as_object().is_some_and(|p| p.is_empty()),
+        "{state}"
+    );
+    // The threads are older than the start, so the watermark, which began at
+    // the start, stays where it was.
+    assert!(
+        state["watermark"].as_str().unwrap_or("") > "2026-10-20T10:02:00Z",
+        "{state}"
+    );
+}
+
+/// A push raises no notification for a reviewer, so the sweep is what notices
+/// a reviewed pull request moving. Seen once: the second run knows the head.
+#[test]
+#[cfg(unix)]
+fn listen_once_dry_run_notices_a_reviewed_pull_request_whose_head_moved() {
+    let l = Listening::refusing("listenmoved", &listen_gh(108, "bbb", "alice", "OPEN"));
+    write_record(&l.fx, 108, &blocking_record("aaa"));
+    l.with_prs(&[sweep_row(108, "bbb", "alice")]);
+
+    let (ok, out, _) = l.run(&["--once", "--dry-run"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("#108: head moved aaa to bbb, 3 new commits since the review"),
+        "{out}"
+    );
+    assert!(
+        out.contains("#108: would take a second look after a push"),
+        "{out}"
+    );
+
+    let (ok, out, _) = l.run(&["--once", "--dry-run"]);
+    assert!(ok, "{out}");
+    assert!(
+        !out.contains("head moved"),
+        "the same push was reported twice:\n{out}"
+    );
+    assert_eq!(0, l.agent_calls());
+}
+
+/// The first real dispatch: a review request becomes a review with a verdict.
+#[test]
+#[cfg(unix)]
+fn listen_once_with_a_review_request_reviews_the_pr_with_a_verdict() {
+    let l = Listening::new(
+        "listenreview",
+        ONE_BLOCKER_REVIEW,
+        ONE_BLOCKER_REVIEW,
+        &listen_gh(7, "aaa", "alice", "OPEN"),
+    );
+    git(
+        &l.fx.work,
+        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
+    );
+    l.with_prs(&[sweep_row(7, "aaa", "alice")]);
+    l.with_notifications(&[notification("1", "review_requested", "PullRequest", 7)]);
+
+    let (ok, out, log) = l.run(&["--once"]);
+
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("#7: about to review it after a review request"),
+        "{out}"
+    );
+    assert!(
+        log.contains("pr review 7 --request-changes --body Two independent reviews."),
+        "{log}"
+    );
+    assert_eq!(2, l.agent_calls(), "{out}");
+    assert!(out.contains("#7     reviewed"), "{out}");
+    assert!(out.contains("1 dispatch"), "{out}");
+    assert!(read_record(&l.fx, 7).posted);
+}
+
+/// The whole point, end to end: the author pushed after a review, the listener
+/// noticed, both reviewers closed the point, and the pull request is approved.
+#[test]
+#[cfg(unix)]
+fn listen_once_rechecks_a_reviewed_pull_request_that_moved_and_approves() {
+    let fx_head = |fx: &Fixture| git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    let l = {
+        // The gh script needs the final head, so the commits come first.
+        let fx = repo("listenrecheck");
+        let before = fx_head(&fx);
+        git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/7/head"]);
+        commit(&fx.work, "file.txt", "bounded\n", "check the bound");
+        git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/7/head"]);
+        let after = fx_head(&fx);
+        write_record(&fx, 7, &blocking_record(&before));
+        drop(fx);
+        let l = Listening::new(
+            "listenrecheck",
+            RECHECK_FIXED,
+            RECHECK_FIXED,
+            &listen_gh(7, &after, "alice", "OPEN"),
+        );
+        // A second fixture with the same tag is a different directory, so
+        // redo the history in it.
+        git(
+            &l.fx.work,
+            &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
+        );
+        let before = fx_head(&l.fx);
+        commit(&l.fx.work, "file.txt", "bounded\n", "check the bound");
+        git(
+            &l.fx.work,
+            &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
+        );
+        let after = fx_head(&l.fx);
+        write_record(&l.fx, 7, &blocking_record(&before));
+        let bin = l.fx.dir.join("fake-bin");
+        executable(
+            &bin.join("gh"),
+            &format!("#!/bin/sh\n{}\n", listen_gh(7, &after, "alice", "OPEN")),
+        );
+        l.with_prs(&[sweep_row(7, &after, "alice")]);
+        l
+    };
+
+    let (ok, out, log) = l.run(&["--once"]);
+
+    assert!(ok, "{out}");
+    assert!(out.contains("#7: head moved"), "{out}");
+    assert!(
+        out.contains("#7: about to take a second look after a push"),
+        "{out}"
+    );
+    assert!(
+        log.contains("pr review 7 --approve --body Rechecked after 1 new commit ("),
+        "{log}"
+    );
+    let record = read_record(&l.fx, 7);
+    assert_eq!(1, record.rechecks);
+    assert!(record.findings.is_empty());
+    assert_eq!(2, l.agent_calls(), "{out}");
+
+    // The commit spar just read is not news to the next sweep.
+    let (ok, out, _) = l.run(&["--once"]);
+    assert!(ok, "{out}");
+    assert!(!out.contains("head moved"), "{out}");
+    assert_eq!(2, l.agent_calls(), "{out}");
+}
+
+#[test]
+#[cfg(unix)]
+fn listen_refuses_a_second_listener_on_the_same_checkout() {
+    let l = Listening::refusing("listenlock", &listen_gh(7, "aaa", "alice", "OPEN"));
+    let dir = l.fx.work.join(".spar/state");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("listen.lock"),
+        format!(
+            r#"{{"pid":{},"started":"2026-10-20T10:00:00Z","touched":{}}}"#,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        ),
+    )
+    .unwrap();
+
+    let (ok, out, _) = l.run(&["--once"]);
+
+    assert!(!ok);
+    assert!(out.contains("already watching this checkout"), "{out}");
+    assert!(l.lock_exists(), "somebody else's lock was removed");
+}
+
+/// Named items end the listener when they are done, so `spar listen 7` is a
+/// command that finishes rather than a process to remember.
+#[test]
+#[cfg(unix)]
+fn listen_exits_when_every_named_item_is_closed() {
+    let l = Listening::refusing("listennamed", &listen_gh(7, "aaa", "alice", "MERGED"));
+
+    let (ok, out, _) = l.run(&["7"]);
+
+    assert!(ok, "{out}");
+    assert!(out.contains("listening to example/project for #7"), "{out}");
+    assert!(out.contains("#7: closed, no longer watched"), "{out}");
+    assert!(
+        out.contains("every named item is closed, nothing left to watch"),
+        "{out}"
+    );
+    assert_eq!(0, l.agent_calls());
+    assert!(!l.lock_exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn listen_once_fails_when_the_poll_fails() {
+    let l = Listening::refusing("listenpollfail", &listen_gh(7, "aaa", "alice", "OPEN"));
+    let mut env = l.env();
+    env.push(("SPAR_FAKE_POLL_FAILS".into(), "1".into()));
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    let (ok, _, err) = spar_with_env(
+        &[
+            "listen",
+            "--once",
+            "--config",
+            l.config.to_str().unwrap(),
+            "--repo",
+            l.fx.work.to_str().unwrap(),
+        ],
+        &l.fx.dir,
+        &env,
+    );
+
+    assert!(!ok, "{err}");
+    assert!(
+        err.contains("WARNING: could not read notifications"),
+        "{err}"
+    );
+    assert!(err.contains("rate limit exceeded"), "{err}");
+    assert_eq!(0, l.agent_calls());
+    assert!(!l.lock_exists());
+}
+
+/// Ctrl-C has to stop the agent call in flight, not leave it running in its
+/// own process group with nobody to read its answer, and the listener has to
+/// say what it was doing and exit 130.
+#[test]
+#[cfg(unix)]
+fn listen_stops_a_running_agent_on_ctrl_c_and_exits_130() {
+    use std::io::Read;
+
+    let l = Listening::refusing("listeninterrupt", &listen_gh(7, "aaa", "alice", "OPEN"));
+    git(
+        &l.fx.work,
+        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
+    );
+    let pid_file = l.fx.dir.join("agent.pid");
+    let sleeper = format!(
+        "#!/bin/sh\necho $$ > \"{}\"\nsleep 300\n",
+        pid_file.display()
+    );
+    let bin = l.fx.dir.join("fake-bin");
+    executable(&bin.join("agent-a"), &sleeper);
+    executable(&bin.join("agent-b"), &sleeper);
+    // Act at once rather than waiting for the item to settle.
+    let mut config = std::fs::read_to_string(&l.config).unwrap();
+    config.push_str("\n[listen]\nsettle = 0\n");
+    std::fs::write(&l.config, config).unwrap();
+    l.with_prs(&[sweep_row(7, "aaa", "alice")]);
+    l.with_notifications(&[notification("1", "review_requested", "PullRequest", 7)]);
+
+    let env = l.env();
+    let mut command = Command::new(SPAR_BIN);
+    command
+        .args([
+            "listen",
+            "--config",
+            l.config.to_str().unwrap(),
+            "--repo",
+            l.fx.work.to_str().unwrap(),
+        ])
+        .current_dir(&l.fx.dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in &env {
+        command.env(k, v);
+    }
+    let mut child = command.spawn().expect("spar listen starts");
+
+    let started = std::time::Instant::now();
+    while !pid_file.exists() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the agent never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let agent_pid: u32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let spar_pid = child.id();
+    assert!(Command::new("kill")
+        .args(["-INT", &spar_pid.to_string()])
+        .status()
+        .unwrap()
+        .success());
+
+    let mut stderr = child.stderr.take().unwrap();
+    let mut err = String::new();
+    let reader = std::thread::spawn(move || {
+        stderr.read_to_string(&mut err).unwrap();
+        err
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("spar listen did not stop within twenty seconds of Ctrl-C");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let err = reader.join().unwrap();
+
+    assert_eq!(Some(130), status.code(), "{err}");
+    assert!(err.contains("interrupted while working on #7"), "{err}");
+    let gone = !Command::new("kill")
+        .args(["-0", &agent_pid.to_string()])
+        .status()
+        .unwrap()
+        .success();
+    assert!(gone, "the agent (pid {agent_pid}) kept running:\n{err}");
+    assert!(!l.lock_exists(), "the lock was left behind:\n{err}");
 }

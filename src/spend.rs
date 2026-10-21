@@ -80,6 +80,16 @@ pub fn taken() -> Vec<Spent> {
         .clone()
 }
 
+/// Everything recorded so far, and forget it. For a process that reports
+/// more than once, so a dispatch's calls are written down exactly once.
+pub fn drain() -> Vec<Spent> {
+    std::mem::take(
+        &mut *SPENT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
 #[cfg(test)]
 pub fn forget() {
     SPENT

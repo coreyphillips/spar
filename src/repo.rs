@@ -18,7 +18,7 @@ use crate::config::{Config, Drafts, Followups, StateStore};
 use crate::error::Result;
 use crate::model::{
     Contested, ContestedItem, Followup, Issue, IssueRef, ItemKind, PersistedState, PrRef, PrRow,
-    PrView,
+    PrSweepRow, PrView, PR_SWEEP_FIELDS,
 };
 use crate::proc::{self, ExecOpts};
 use crate::style::{self, Style};
@@ -882,6 +882,91 @@ fn signed(body: &str) -> String {
 /// Whether a comment body is one spar composed rather than one a person wrote.
 pub fn is_spar_comment(body: &str) -> bool {
     body.contains(COMMENT_MARKER) || body.contains(STATE_MARKER)
+}
+
+/// What `gh api -i` printed, taken apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApiResponse {
+    pub status: u16,
+    /// Header names lowercased, values trimmed.
+    pub headers: BTreeMap<String, String>,
+    pub body: String,
+}
+
+/// Split `gh api -i` output into the status, the headers, and the body. None
+/// when it does not start with a status line, which is what a spawn that
+/// printed an error looks like.
+pub fn parse_api_response(stdout: &str) -> Option<ApiResponse> {
+    let mut lines = stdout.split_inclusive('\n');
+    let first = lines.next()?.trim_end_matches(['\r', '\n']);
+    if !first.starts_with("HTTP/") {
+        return None;
+    }
+    let status: u16 = first.split_whitespace().nth(1)?.parse().ok()?;
+    let mut headers = BTreeMap::new();
+    let mut body = String::new();
+    let mut in_body = false;
+    for line in lines {
+        if in_body {
+            body.push_str(line);
+            continue;
+        }
+        let bare = line.trim_end_matches(['\r', '\n']);
+        if bare.is_empty() {
+            in_body = true;
+            continue;
+        }
+        if let Some((name, value)) = bare.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+    Some(ApiResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+/// The pull request a per item state file is about: `pr-12.json`,
+/// `review-12.json`, `checkin-12.json`. None for anything else, so the shared
+/// files beside them, `spend.json` and the rest, are never touched.
+pub(crate) fn state_file_number(name: &str) -> Option<i64> {
+    let stem = name.strip_suffix(".json")?;
+    ["pr-", "review-", "checkin-"]
+        .iter()
+        .find_map(|prefix| stem.strip_prefix(prefix))
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|digits| digits.parse().ok())
+}
+
+/// Whether the viewer has already submitted a review with exactly this body.
+fn has_viewer_review(reviews: &[Value], viewer: &str, body: &str) -> bool {
+    reviews.iter().any(|review| {
+        review
+            .get("user")
+            .and_then(|u| u.get("login"))
+            .and_then(Value::as_str)
+            .is_some_and(|login| crate::comments::same_login(login, viewer))
+            && review.get("body").and_then(Value::as_str) == Some(body)
+    })
+}
+
+fn reconcile_review_post(
+    number: i64,
+    body: &str,
+    viewer: &str,
+    post_error: crate::error::SparError,
+    reviews: Result<Vec<Value>>,
+) -> Result<()> {
+    match reviews {
+        Ok(reviews) if has_viewer_review(&reviews, viewer, body) => Ok(()),
+        Ok(_) => Err(post_error),
+        Err(read_error) => Err(crate::error::SparError::uncertain_write(format!(
+            "could not submit a review on #{number}. {} The result could not be verified: {}",
+            post_error.last_line(),
+            read_error.last_line()
+        ))),
+    }
 }
 
 fn has_exact_comment(comments: &[Value], body: &str) -> bool {
@@ -3584,6 +3669,84 @@ impl Repo {
         .unwrap_or_default()
     }
 
+    /// `gh api -i`: the status line and headers with the body, and the exit
+    /// code ignored on purpose. A `304 Not Modified`, which is the answer a
+    /// conditional poll wants, makes gh exit 1 while printing exactly what is
+    /// needed. Only a spawn failure or a timeout is an error here.
+    pub fn gh_api_raw(&self, endpoint: &str, headers: &[(&str, &str)]) -> Result<ApiResponse> {
+        let mut argv = vec!["gh".to_string(), "api".to_string(), "-i".to_string()];
+        for (name, value) in headers {
+            argv.push("-H".to_string());
+            argv.push(format!("{name}: {value}"));
+        }
+        argv.push(endpoint.to_string());
+        let out = proc::exec(
+            &argv,
+            &ExecOpts::new()
+                .cwd(&self.root)
+                .check(false)
+                .timeout_secs(300),
+        )?;
+        parse_api_response(&out.stdout)
+            .ok_or_else(|| crate::error::SparError::call_failed(proc::failure_message(&argv, &out)))
+    }
+
+    /// Every open pull request, with what a sweep needs to know about each.
+    pub fn sweep_open_prs(&self) -> Result<Vec<PrSweepRow>> {
+        let text = self.gh(&[
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            "500",
+            "--json",
+            PR_SWEEP_FIELDS,
+        ])?;
+        serde_json::from_str(&text)
+            .map_err(|e| spar_err!("unexpected shape for the pull request list: {e}"))
+    }
+
+    /// One pull request, open or not, with what a sweep needs to know.
+    pub fn sweep_pr(&self, number: i64) -> Result<PrSweepRow> {
+        let text = self.gh(&["pr", "view", &number.to_string(), "--json", PR_SWEEP_FIELDS])?;
+        serde_json::from_str(&text).map_err(|e| spar_err!("unexpected shape for PR #{number}: {e}"))
+    }
+
+    /// How many commits lie between two SHAs, when GitHub will say.
+    pub fn commits_between(&self, from: &str, to: &str) -> Option<u64> {
+        if from.is_empty() || to.is_empty() {
+            return None;
+        }
+        let path = format!("repos/{{owner}}/{{repo}}/compare/{from}...{to}");
+        self.gh_try(&["api", &path, "--jq", ".total_commits"])
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// `owner/name`, for the line that says what is being watched.
+    pub fn repo_name(&self) -> Option<String> {
+        let name = self.gh_try(&[
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "--jq",
+            ".nameWithOwner",
+        ]);
+        let name = name.trim();
+        (!name.is_empty()).then(|| name.to_string())
+    }
+
+    pub fn listen_state_path(&self) -> PathBuf {
+        self.root.join(STATE_DIR).join("state").join("listen.json")
+    }
+
+    pub fn listen_lock_path(&self) -> PathBuf {
+        self.root.join(STATE_DIR).join("state").join("listen.lock")
+    }
+
     /// The login `gh` is authenticated as.
     ///
     /// A hard error, never a degradation. Everything spar wrote has to be
@@ -3951,6 +4114,64 @@ impl Repo {
             Err(post_error) => {
                 reconcile_comment_post(number, &body, post_error, self.try_issue_comments(number))
             }
+        };
+        self.record_write(result)
+    }
+
+    /// Whether the viewer wrote this pull request. GitHub refuses to let an
+    /// author approve or request changes on their own, so a verdict on one can
+    /// only ever be a comment.
+    fn pr_is_own(&self, number: i64) -> Result<bool> {
+        let text = self.gh(&["pr", "view", &number.to_string(), "--json", "author"])?;
+        let author = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v.get("author")?.get("login")?.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let viewer = self.viewer_login()?.to_string();
+        Ok(!author.is_empty() && crate::comments::same_login(&author, &viewer))
+    }
+
+    /// Submit a formal review, or a comment carrying the verdict's words when
+    /// GitHub will not take the verdict: the viewer's own pull request, or no
+    /// verdict at all.
+    ///
+    /// Mirrors `comment_pr` step for step: the style gate, the signature, a
+    /// duplicate check against the viewer's own reviews, the write, and a read
+    /// back on failure so an unverifiable write is reported as one.
+    pub fn submit_review(
+        &self,
+        number: i64,
+        verdict: Option<crate::model::ReviewVerdict>,
+        body: &str,
+    ) -> Result<()> {
+        let own = match verdict {
+            Some(_) => self.record_failed_write(self.pr_is_own(number))?,
+            None => false,
+        };
+        let text = match (verdict, own) {
+            (Some(v), true) => format!("Verdict: {}.\n\n{body}", v.words()),
+            _ => body.to_string(),
+        };
+        let body = signed(&self.record_failed_write(self.clean(&text))?);
+        let viewer = self.record_failed_write(self.viewer_login())?.to_string();
+        let reviews = self.record_failed_write(self.try_pr_reviews(number))?;
+        if has_viewer_review(&reviews, &viewer, &body) {
+            return Ok(());
+        }
+        let flag = match (verdict, own) {
+            (Some(v), false) => v.gh_flag(),
+            _ => "--comment",
+        };
+        let posted = self.gh(&["pr", "review", &number.to_string(), flag, "--body", &body]);
+        let result = match posted {
+            Ok(_) => Ok(()),
+            Err(post_error) => reconcile_review_post(
+                number,
+                &body,
+                &viewer,
+                post_error,
+                self.try_pr_reviews(number),
+            ),
         };
         self.record_write(result)
     }
@@ -4607,6 +4828,36 @@ impl Repo {
             .join(format!("checkin-{number}.json"))
     }
 
+    /// Where `spar review` records what it reviewed, and a second look reads it.
+    pub fn review_record_path(&self, number: i64) -> PathBuf {
+        self.root
+            .join(STATE_DIR)
+            .join("state")
+            .join(format!("review-{number}.json"))
+    }
+
+    /// None when there is no record, or when it cannot be read. A record spar
+    /// cannot read is one it reviews afresh over, and the log says so.
+    pub fn read_review_record(&self, number: i64) -> Option<crate::model::ReviewRecord> {
+        let path = self.review_record_path(number);
+        let text = std::fs::read_to_string(&path).ok()?;
+        match serde_json::from_str(&text) {
+            Ok(record) => Some(record),
+            Err(e) => {
+                logdim!("could not read {}: {e}", path.display());
+                None
+            }
+        }
+    }
+
+    pub fn write_review_record(
+        &self,
+        number: i64,
+        record: &crate::model::ReviewRecord,
+    ) -> Result<()> {
+        write_json_atomic(&self.review_record_path(number), record)
+    }
+
     /// Append a follow-up to a local note instead of the tracker.
     ///
     /// Deduplicated on the title, matching the issue path. The body arrives
@@ -4941,25 +5192,32 @@ impl Repo {
 
     // -- housekeeping -----------------------------------------------------
 
-    /// Remove state files whose PR is merged or closed.
+    /// Remove state files whose PR is merged or closed: the custody loop's
+    /// state, the review record, and the check-in watermark alike. Grouped by
+    /// number so each finished pull request costs one `gh` read however many
+    /// files it left.
     pub fn prune_state(&self) -> Vec<String> {
         let base = self.root.join(STATE_DIR).join("state");
         let Ok(entries) = std::fs::read_dir(&base) else {
             return Vec::new();
         };
-        let mut names: Vec<String> = entries
+        let mut by_number: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+        for name in entries
             .flatten()
             .filter_map(|e| e.file_name().to_str().map(str::to_string))
-            .filter(|n| n.starts_with("pr-") && n.ends_with(".json"))
-            .collect();
-        names.sort();
+        {
+            if let Some(number) = state_file_number(&name) {
+                by_number.entry(number).or_default().push(name);
+            }
+        }
 
         let mut removed = Vec::new();
-        for name in names {
-            let Ok(number) = name[3..name.len() - 5].parse::<i64>() else {
+        for (number, mut names) in by_number {
+            if !is_finished(&self.pr_state(number)) {
                 continue;
-            };
-            if is_finished(&self.pr_state(number)) {
+            }
+            names.sort();
+            for name in names {
                 let _ = std::fs::remove_file(base.join(&name));
                 removed.push(format!("state {name}"));
             }
@@ -7558,7 +7816,7 @@ pub fn find_linked_pr(json: &str, issue: i64) -> Option<PrRef> {
 /// document per page. A streaming parser reads either, and unlike splitting the
 /// text on a bracket pair it cannot be fooled by a comment body that happens to
 /// contain one, which would otherwise make a resume silently start over.
-fn try_parse_comment_pages(text: &str) -> Result<Vec<Value>> {
+pub(crate) fn try_parse_comment_pages(text: &str) -> Result<Vec<Value>> {
     if text.trim().is_empty() {
         return Err(spar_err!("GitHub returned no comment data"));
     }
@@ -9845,5 +10103,78 @@ mod min_number_tests {
     #[test]
     fn a_floor_above_everything_open_yields_nothing() {
         assert!(pick(&[1, 2, 3], 10, 9999).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod review_record_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn prune_state_knows_which_files_belong_to_a_pull_request() {
+        assert_eq!(Some(12), state_file_number("pr-12.json"));
+        assert_eq!(Some(12), state_file_number("review-12.json"));
+        assert_eq!(Some(12), state_file_number("checkin-12.json"));
+        for shared in [
+            "spend.json",
+            "implementors.json",
+            "contested.json",
+            "listen.json",
+            "pr-.json",
+            "pr-12.json.tmp",
+            "pr-x.json",
+        ] {
+            assert_eq!(None, state_file_number(shared), "{shared}");
+        }
+    }
+
+    #[test]
+    fn a_review_the_viewer_already_submitted_with_the_same_body_is_not_sent_again() {
+        let reviews = vec![
+            json!({"user": {"login": "Me"}, "body": "the body"}),
+            json!({"user": {"login": "alice"}, "body": "other"}),
+        ];
+        assert!(has_viewer_review(&reviews, "me", "the body"));
+        assert!(!has_viewer_review(&reviews, "me", "other"));
+        assert!(!has_viewer_review(&reviews, "alice", "the body"));
+    }
+
+    #[test]
+    fn a_response_splits_into_status_headers_and_body() {
+        let text = "HTTP/2.0 200 OK\r\nX-Poll-Interval: 60\r\nLast-Modified: Tue, 20 Oct 2026 10:00:00 GMT\r\nContent-Type: application/json\r\n\r\n[{\"id\": \"1\"}]\n";
+        let resp = parse_api_response(text).expect("a response");
+        assert_eq!(200, resp.status);
+        assert_eq!(Some(&"60".to_string()), resp.headers.get("x-poll-interval"));
+        assert_eq!(
+            Some(&"Tue, 20 Oct 2026 10:00:00 GMT".to_string()),
+            resp.headers.get("last-modified")
+        );
+        assert_eq!("[{\"id\": \"1\"}]\n", resp.body);
+
+        let not_modified =
+            parse_api_response("HTTP/2.0 304 Not Modified\nX-Poll-Interval: 60\n\n").unwrap();
+        assert_eq!(304, not_modified.status);
+        assert!(not_modified.body.is_empty());
+
+        assert_eq!(None, parse_api_response(""));
+        assert_eq!(None, parse_api_response("gh: command not found\n"));
+    }
+
+    #[test]
+    fn a_failed_review_submission_that_landed_is_reconciled_as_success() {
+        let landed = vec![json!({"user": {"login": "me"}, "body": "the body"})];
+        let error = crate::error::SparError::call_failed("gh: boom");
+        assert!(reconcile_review_post(5, "the body", "me", error.clone(), Ok(landed)).is_ok());
+
+        let missing = vec![json!({"user": {"login": "me"}, "body": "older"})];
+        let err =
+            reconcile_review_post(5, "the body", "me", error.clone(), Ok(missing)).unwrap_err();
+        assert_eq!(crate::error::ErrorKind::CallFailed, err.kind());
+
+        let unreadable = Err(crate::error::SparError::new("no network"));
+        let err = reconcile_review_post(5, "the body", "me", error, unreadable).unwrap_err();
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, err.kind());
+        assert!(err.to_string().contains("could not be verified"), "{err}");
     }
 }

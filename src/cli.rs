@@ -9,6 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::agent::{self, Agent};
 use crate::brainstorm;
 use crate::checkin;
+use crate::clock;
 use crate::config::{self, Config};
 use crate::error::Result;
 use crate::followups;
@@ -1760,10 +1761,10 @@ fn cmd_brainstorm(
         budget: cfg.loop_cfg.max_rounds,
         wanted: ideas,
     };
-    let now = brainstorm::now_secs();
+    let now = clock::now_secs();
     let outcome = brainstorm::run(&agents, &cfg, &repo, &session)?;
     let path = out.unwrap_or_else(|| brainstorm::default_path(&repo, &session, now));
-    let text = brainstorm::render_session(&outcome, &brainstorm::date_line(now), &repo.style);
+    let text = brainstorm::render_session(&outcome, &clock::date_line(now), &repo.style);
     crate::repo::write_text_atomic(&path, &text)?;
     brainstorm::print_summary(&outcome, &path);
     if file_issues {
@@ -1998,6 +1999,18 @@ const STYLE_OPTIONS: &[Setting] = &[
     (true, "max_issue_body_chars", "A filed issue's body. Far larger on purpose: an issue is picked up cold months later. Fenced code blocks are never truncated and never count against it."),
 ];
 
+const LISTEN_OPTIONS: &[Setting] = &[
+    (true, "interval", "Seconds between polls of GitHub's notifications for this repository. GitHub says how often it will answer and the larger of the two is used. A poll that finds nothing costs nothing against the rate limit, and waiting never costs an agent call."),
+    (true, "sweep", "Seconds between sweeps of the open pull requests. A push raises no notification for a reviewer, so the sweep is what notices a reviewed pull request moving."),
+    (true, "settle", "Seconds an item has to stay quiet before spar acts on it, so a push and three replies in the same minute cost one recheck rather than four."),
+    (true, "max_wait", "Most seconds an item may keep settling before it is acted on anyway."),
+    (true, "max_rechecks", "Rechecks one pull request gets from `spar listen` before a person has to run `spar review` on it again. A cap against two bots arguing, not a target. 0 turns automatic rechecks off."),
+    (true, "on_review_requested", "What a pull request somebody asked you to review gets: review or ignore."),
+    (true, "on_assigned", "What a pull request assigned to you gets: review or ignore."),
+    (false, "on_own_pr", "What activity on a pull request you authored gets, since the same account cannot approve it: checkin may push a change both agents agree on, reply answers in words only, ignore does nothing."),
+    (false, "verdicts", "Whether a review `spar listen` starts submits a formal verdict, approve or request changes, rather than a comment. A recheck always does."),
+];
+
 /// The `[loop]` and `[style]` blocks of a generated config.
 ///
 /// Safety valves, not editors: the length budgets here are sized so real
@@ -2034,11 +2047,14 @@ fn settings_block(first_implementor: &str) -> String {
         "# checkin     = \"high\"   # judging comments other people left\n",
         "# split       = \"high\"   # proposing and checking a split\n",
         "# brainstorm  = \"high\"   # every brainstorm round\n",
+        "# recheck     = \"low\"    # a second look after commits or replies\n",
         "# round_1     = \"high\"   # read by any call above with no key set\n",
         "# rest        = \"low\"    # the same, for later rounds and the close\n\n",
     ));
     out.push_str("[style]\n");
     out.push_str(&option_lines(STYLE_OPTIONS, &value));
+    out.push_str("\n[listen]\n");
+    out.push_str(&option_lines(LISTEN_OPTIONS, &value));
     out
 }
 
@@ -2145,6 +2161,7 @@ fn note_for(key: &str) -> &'static str {
     LOOP_OPTIONS
         .iter()
         .chain(STYLE_OPTIONS)
+        .chain(LISTEN_OPTIONS)
         .find(|(_, name, _)| *name == key)
         .map(|(_, _, note)| *note)
         .unwrap_or("")
@@ -3377,7 +3394,11 @@ mod settings_block_tests {
     /// A note reads as a sentence now that it leads rather than trails.
     #[test]
     fn every_note_starts_as_a_sentence() {
-        for (_, key, note) in LOOP_OPTIONS.iter().chain(STYLE_OPTIONS) {
+        for (_, key, note) in LOOP_OPTIONS
+            .iter()
+            .chain(STYLE_OPTIONS)
+            .chain(LISTEN_OPTIONS)
+        {
             let first = note.chars().next().expect("a note");
             assert!(
                 first.is_uppercase(),

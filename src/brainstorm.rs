@@ -24,6 +24,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::agent::Agent;
+use crate::clock::file_stamp;
 use crate::config::{Call, Config};
 use crate::error::{ErrorKind, Result};
 use crate::model::{ConvergeDoc, CrossDoc, CrossKind, Idea, IdeasDoc};
@@ -993,44 +994,6 @@ pub fn slug(text: &str) -> String {
     }
 }
 
-pub fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// `yyyymmdd-hhmmss` in UTC, for a file name that sorts by when it was made.
-pub fn file_stamp(secs: u64) -> String {
-    let (y, m, d, hh, mm, ss) = civil(secs);
-    format!("{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}")
-}
-
-/// `2026-09-12 14:03 UTC`, for the header a person reads.
-pub fn date_line(secs: u64) -> String {
-    let (y, m, d, hh, mm, _) = civil(secs);
-    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02} UTC")
-}
-
-/// Seconds since the epoch to a civil date and time, without a date crate.
-/// The days-to-civil arithmetic is Howard Hinnant's, valid for any date this
-/// will ever see.
-fn civil(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
-    let days = (secs / 86_400) as i64;
-    let rem = (secs % 86_400) as u32;
-    let z = days + 719_468;
-    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60)
-}
-
 fn plural(n: usize) -> &'static str {
     if n == 1 {
         ""
@@ -1417,17 +1380,6 @@ mod tests {
         assert!(long.len() <= 40, "{long}");
         assert!(!long.ends_with('-'));
         assert_eq!("one-two-three-four-five-six-seven-eight", long);
-    }
-
-    #[test]
-    fn the_stamp_is_a_utc_civil_date() {
-        // 2026-09-12 14:03:07 UTC.
-        let secs = 1_789_221_787;
-        assert_eq!("20260912-140307", file_stamp(secs));
-        assert_eq!("2026-09-12 14:03 UTC", date_line(secs));
-        assert_eq!("19700101-000000", file_stamp(0));
-        // The day after a leap day.
-        assert_eq!("20240301-000000", file_stamp(1_709_251_200));
     }
 
     /// The prompts and the schemas say the same things about the same fields.

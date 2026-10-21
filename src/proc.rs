@@ -121,7 +121,99 @@ pub fn exec(argv: &[String], opts: &ExecOpts) -> Result<Output> {
     exec_with_input(argv, opts, input)
 }
 
+/// Set once the process has been told to stop, by Ctrl-C or SIGTERM, when
+/// `stop_on_signal` has been installed. Every command that is running checks it
+/// and stops its child, and the idle sleep in `spar listen` checks it too.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the process has been told to stop.
+pub fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::SeqCst)
+}
+
+#[cfg(unix)]
+extern "C" fn note_signal(sig: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+    // Only calls that are safe inside a signal handler belong here. Restoring
+    // the default disposition means a second signal ends the process at once,
+    // for somebody who does not want to wait for the current call to stop.
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+    }
+}
+
+/// Turn SIGINT and SIGTERM into a flag that running commands and idle sleeps
+/// check, instead of the default action that ends the process where it stands.
+///
+/// Installed by `spar listen` alone. Every other command keeps the default, so
+/// nothing about them changes. The default would leave an agent CLI running:
+/// agent calls are started in their own process group, which is what keeps a
+/// terminal's Ctrl-C from reaching them.
+#[cfg(unix)]
+pub fn stop_on_signal() -> Result<()> {
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        // SAFETY: a zeroed sigaction is a valid starting point on every platform
+        // libc supports, and the handler does nothing a signal handler may not.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = note_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        // Reads on the output pipes restart rather than fail.
+        action.sa_flags = libc::SA_RESTART;
+        let failed = unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(sig, &action, std::ptr::null_mut()) != 0
+        };
+        if failed {
+            return Err(SparError::new(format!(
+                "could not watch for Ctrl-C: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn stop_on_signal() -> Result<()> {
+    Ok(())
+}
+
+/// Sleep for `total`, waking early if the process is told to stop. True when
+/// it woke early.
+pub fn sleep_unless_interrupted(total: Duration) -> bool {
+    sleep_until(total, &INTERRUPTED)
+}
+
+fn sleep_until(total: Duration, stop: &AtomicBool) -> bool {
+    let deadline = Instant::now() + total;
+    while !stop.load(Ordering::SeqCst) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(left.min(Duration::from_secs(1)));
+    }
+    true
+}
+
 fn exec_with_input(argv: &[String], opts: &ExecOpts, input: Option<&[u8]>) -> Result<Output> {
+    exec_until(argv, opts, input, &INTERRUPTED)
+}
+
+/// `exec_with_input`, stopping the child as soon as `stop` is set. The flag is
+/// a parameter so the kill path can be tested without touching the process
+/// wide one that every other test's commands check.
+fn exec_until(
+    argv: &[String],
+    opts: &ExecOpts,
+    input: Option<&[u8]>,
+    stop: &AtomicBool,
+) -> Result<Output> {
+    if stop.load(Ordering::SeqCst) {
+        return Err(SparError::interrupted(format!(
+            "interrupted before `{}` started",
+            abbreviate(argv)
+        )));
+    }
     let program = argv
         .first()
         .ok_or_else(|| SparError::new("cannot run an empty command"))?;
@@ -184,11 +276,19 @@ fn exec_with_input(argv: &[String], opts: &ExecOpts, input: Option<&[u8]>) -> Re
     let deadline = Instant::now() + opts.timeout;
     let mut poll = Duration::from_millis(5);
     let mut timed_out = false;
+    let mut stopped = false;
     let mut quiet_error = None;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
+                if stop.load(Ordering::SeqCst) {
+                    if let Err(error) = stop_and_reap(&mut child, opts.stop_descendants) {
+                        quiet_error = Some(error);
+                    }
+                    stopped = true;
+                    break None;
+                }
                 if Instant::now() >= deadline {
                     if let Err(error) = stop_and_reap(&mut child, opts.stop_descendants) {
                         quiet_error = Some(error);
@@ -226,6 +326,15 @@ fn exec_with_input(argv: &[String], opts: &ExecOpts, input: Option<&[u8]>) -> Re
     let stdout = out_reader.collect(DRAIN_GRACE);
     let stderr = err_reader.collect(DRAIN_GRACE);
 
+    if stopped {
+        let cleanup = quiet_error
+            .map(|error| format!(" Stopping it also failed: {error}."))
+            .unwrap_or_default();
+        return Err(SparError::interrupted(format!(
+            "interrupted: {}.{cleanup}",
+            abbreviate(argv)
+        )));
+    }
     if let Some(error) = quiet_error {
         return Err(quiet_point_failure(error, argv));
     }
@@ -355,6 +464,7 @@ impl Reader {
             let mut chunk = [0u8; 16 * 1024];
             loop {
                 match pipe.read(&mut chunk) {
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Ok(0) | Err(_) => break,
                     Ok(n) => buf_w
                         .lock()
@@ -822,6 +932,10 @@ mod timeout_kind_tests {
     use super::*;
     use crate::error::ErrorKind;
 
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
     /// A deadline is not a bad answer. Retrying one buys another wait of
     /// exactly the same length, which on a review at the highest effort
     /// setting turned a thirty minute failure into an hour of it.
@@ -836,6 +950,71 @@ mod timeout_kind_tests {
         assert_eq!(ErrorKind::TimedOut, err.kind());
         assert!(!err.worth_retrying());
         assert!(err.to_string().contains("Not retried"), "{err}");
+    }
+
+    /// `spar listen` runs for hours. Ctrl-C has to stop the agent call in
+    /// flight rather than leave it running in its own process group with
+    /// nobody to read its answer.
+    #[test]
+    fn a_cancelled_command_is_stopped_and_says_so() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let err = exec_until(
+            &argv(&["sh", "-c", "sleep 30"]),
+            &ExecOpts::new().timeout_secs(30).stop_descendants(true),
+            None,
+            &stop,
+        )
+        .unwrap_err();
+
+        assert_eq!(ErrorKind::Interrupted, err.kind());
+        assert!(
+            err.to_string().starts_with("interrupted: sh -c sleep 30"),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(!err.worth_retrying());
+    }
+
+    #[test]
+    fn a_command_asked_for_after_the_stop_is_refused_without_running() {
+        let stop = AtomicBool::new(true);
+        let err = exec_until(
+            &argv(&["sh", "-c", "exit 0"]),
+            &ExecOpts::new(),
+            None,
+            &stop,
+        )
+        .unwrap_err();
+        assert_eq!(ErrorKind::Interrupted, err.kind());
+        assert!(err.to_string().contains("before"), "{err}");
+    }
+
+    #[test]
+    fn a_sleep_ends_early_once_the_stop_is_set_and_on_time_otherwise() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        assert!(sleep_until(Duration::from_secs(30), &stop));
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let calm = AtomicBool::new(false);
+        let started = Instant::now();
+        assert!(!sleep_until(Duration::from_millis(50), &calm));
+        assert!(started.elapsed() >= Duration::from_millis(50));
     }
 
     /// A non-zero exit is the CLI reporting that it could not answer, which is

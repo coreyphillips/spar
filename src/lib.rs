@@ -9,6 +9,7 @@ pub mod agent;
 pub mod brainstorm;
 pub mod checkin;
 pub mod cli;
+pub mod clock;
 pub mod comments;
 pub mod config;
 pub mod error;

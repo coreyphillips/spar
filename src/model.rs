@@ -1625,6 +1625,9 @@ pub struct PrSweepRow {
 pub struct Login {
     #[serde(default)]
     pub login: String,
+    /// A team's `org/slug`, as gh gives it. Empty for a user.
+    #[serde(default)]
+    pub slug: String,
 }
 
 /// Issues and pull requests share one number sequence per repository, so a

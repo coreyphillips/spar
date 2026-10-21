@@ -1381,15 +1381,36 @@ fn open_count(record: &ReviewRecord) -> usize {
 }
 
 /// The mechanical note for a review request that found nothing to recheck.
+///
+/// Blocking points are told apart from the rest, so a note that follows an
+/// approval does not read as if the approval had been taken back.
 fn standing_note(record: &ReviewRecord) -> String {
     let lead = format!(
         "Nothing has changed since the review at {}: no new commits and no new replies.",
         record.short_head()
     );
-    match open_count(record) {
-        0 => format!("{lead} That review stands."),
-        1 => format!("{lead} The open point from that review stands."),
-        n => format!("{lead} The {n} open points from that review stand."),
+    let open = open_count(record);
+    let blocking = record
+        .open_points()
+        .filter(|f| f.blocks() && (f.standing.counts() || f.standing == Standing::Disputed))
+        .count();
+    let rest = open - blocking;
+    let stand = match blocking {
+        0 => "That review stands".to_string(),
+        1 => "The blocking point from that review stands".to_string(),
+        n => format!("The {n} blocking points from that review stand"),
+    };
+    match (blocking, rest) {
+        (_, 0) => format!("{lead} {stand}."),
+        (0, n) => format!(
+            "{lead} {stand}, with nothing blocking and {n} smaller point{} open.",
+            plural(n)
+        ),
+        (_, n) => format!(
+            "{lead} {stand}, with {n} smaller point{} open beside {}.",
+            plural(n),
+            if blocking == 1 { "it" } else { "them" }
+        ),
     }
 }
 
@@ -3195,9 +3216,9 @@ mod recheck_tests {
 
     #[test]
     fn standing_note_counts_the_open_points() {
-        assert!(standing_note(&record_with(vec![])).ends_with("That review stands."));
+        assert!(standing_note(&record_with(vec![])).ends_with(" That review stands."));
         assert!(standing_note(&record_with(one_blocker()))
-            .ends_with("The open point from that review stands."));
+            .ends_with(" The blocking point from that review stands."));
         let two = vec![
             one_blocker().remove(0),
             recorded(Severity::Nit, "Spacing", "", Standing::Disputed),
@@ -3205,11 +3226,60 @@ mod recheck_tests {
         ];
         let note = standing_note(&record_with(two));
         assert!(
-            note.ends_with("The 2 open points from that review stand."),
+            note.ends_with(
+                " The blocking point from that review stands, with 1 smaller point open beside it."
+            ),
             "{note}"
         );
         assert!(
             note.starts_with("Nothing has changed since the review at 0123abc:"),
+            "{note}"
+        );
+        let blockers = vec![
+            one_blocker().remove(0),
+            recorded(
+                Severity::Blocking,
+                "Unbounded cache",
+                "",
+                Standing::Confirmed,
+            ),
+        ];
+        assert!(standing_note(&record_with(blockers))
+            .ends_with(" The 2 blocking points from that review stand."));
+    }
+
+    #[test]
+    fn standing_note_after_an_approval_does_not_read_as_a_change_of_mind() {
+        // The record react-native-pubky#45 had when the note went out: an
+        // approval with two non-blocking points and a nit still open.
+        let mut record = record_with(vec![
+            recorded(
+                Severity::NonBlocking,
+                "Streams outlive teardown",
+                "",
+                Standing::Confirmed,
+            ),
+            recorded(
+                Severity::NonBlocking,
+                "Streams survive invalidation",
+                "",
+                Standing::Confirmed,
+            ),
+            recorded(
+                Severity::Nit,
+                "Lock handle dropped",
+                "",
+                Standing::Confirmed,
+            ),
+        ]);
+        record.verdict = Some(ReviewVerdict::Approve);
+        let note = standing_note(&record);
+        assert!(
+            note.ends_with(" That review stands, with nothing blocking and 3 smaller points open."),
+            "{note}"
+        );
+        assert!(
+            style::violations(&note, &Style::default()).is_empty(),
             "{note}"
         );
     }

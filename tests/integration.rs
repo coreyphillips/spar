@@ -6719,8 +6719,10 @@ fn a_recheck_without_a_posted_review_on_record_reviews_afresh() {
 /// is a second page of notifications, and `SPAR_FAKE_PAGE2_FAILS=1` makes it
 /// a 500; `SPAR_FAKE_REVIEW_FAILS=1` refuses a submitted review;
 /// `SPAR_FAKE_COMMENTS_FAIL=1` fails the read of the pull request's comments;
-/// `SPAR_FAKE_ISSUE_STATE` is issue 42's state; and `$SPAR_FAKE_LINKED` is the
-/// list a linked pull request is looked for in.
+/// `SPAR_FAKE_ISSUE_STATE` is issue 42's state; `$SPAR_FAKE_LINKED` is the
+/// list a linked pull request is looked for in; and `$SPAR_FAKE_REQUESTS` is
+/// who the pull request asks for a review, nobody when it is missing. The
+/// viewer is in team `ours` and in no other.
 fn listen_gh(number: i64, head: &str, author: &str, state: &str) -> String {
     format!(
         r#"set -eu
@@ -6749,12 +6751,20 @@ case "$*" in
       exit 1
     fi ;;
   "api user --jq .login") printf 'viewer\n' ;;
+  "api -i orgs/example/teams/ours/memberships/viewer")
+    printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n{{"state":"active","role":"member"}}\n' ;;
+  "api -i orgs/"*)
+    printf 'HTTP/2.0 404 Not Found\r\nContent-Type: application/json\r\n\r\n{{"message":"Not Found"}}\n'
+    exit 1 ;;
   "repo view --json nameWithOwner --jq .nameWithOwner") printf 'example/project\n' ;;
   "pr list --state open --limit 500 --json number,title,headRefOid,"*) cat "$SPAR_FAKE_PRS" ;;
   "pr list --state open --limit 500 --json number,url,title,baseRefName,closingIssuesReferences")
     if [ -f "${{SPAR_FAKE_LINKED:-/nonexistent}}" ]; then cat "$SPAR_FAKE_LINKED"; else printf '[]\n'; fi ;;
   "pr list "*) printf '[]\n' ;;
-  "pr view {number} --json number,title,headRefOid,"*) printf '%s\n' '{{"number":{number},"title":"PR {number}","headRefOid":"{head}","updatedAt":"2026-10-20T10:00:00Z","author":{{"login":"{author}"}},"isDraft":false,"isCrossRepository":false,"reviewRequests":[],"assignees":[],"state":"{state}"}}' ;;
+  "pr view {number} --json number,title,headRefOid,"*)
+    requests='[]'
+    if [ -f "${{SPAR_FAKE_REQUESTS:-/nonexistent}}" ]; then requests=$(cat "$SPAR_FAKE_REQUESTS"); fi
+    printf '{{"number":{number},"title":"PR {number}","headRefOid":"{head}","updatedAt":"2026-10-20T10:00:00Z","author":{{"login":"{author}"}},"isDraft":false,"isCrossRepository":false,"reviewRequests":%s,"assignees":[],"state":"{state}"}}\n' "$requests" ;;
   "pr view {number} --json author") printf '%s\n' '{{"author":{{"login":"{author}"}}}}' ;;
   "pr view {number} --json headRefOid") printf '%s\n' '{{"headRefOid":"{head}"}}' ;;
   "pr view {number} "*) printf '%s\n' '{{"number":{number},"url":"https://github.com/example/project/pull/{number}","title":"PR {number}","body":"","headRefName":"feature-{number}","baseRefName":"main","state":"{state}","closingIssuesReferences":[],"isCrossRepository":false}}' ;;
@@ -6804,6 +6814,7 @@ struct Listening {
     agent_log: PathBuf,
     notify: PathBuf,
     prs: PathBuf,
+    requests: PathBuf,
 }
 
 impl Listening {
@@ -6824,6 +6835,7 @@ impl Listening {
             gh_log: fx.dir.join("gh.log"),
             agent_log: fx.dir.join("agent.log"),
             notify: fx.dir.join("notify.json"),
+            requests: fx.dir.join("requests.json"),
             prs,
             fx,
             config,
@@ -6853,6 +6865,17 @@ impl Listening {
         std::fs::write(&self.notify, format!("[{}]\n", threads.join(","))).unwrap();
     }
 
+    /// Who the pull request asks for a review when it is read, as gh gives
+    /// `reviewRequests`.
+    fn with_review_requests(&self, requests: &str) {
+        std::fs::write(&self.requests, format!("{requests}\n")).unwrap();
+    }
+
+    /// The viewer, by name: what a review request just made looks like.
+    fn asking_the_viewer(&self) {
+        self.with_review_requests(r#"[{"__typename":"User","login":"viewer"}]"#);
+    }
+
     fn env(&self) -> Vec<(String, String)> {
         vec![
             ("PATH".into(), self.path.clone()),
@@ -6864,6 +6887,10 @@ impl Listening {
             ),
             ("SPAR_FAKE_NOTIFY".into(), self.notify.display().to_string()),
             ("SPAR_FAKE_PRS".into(), self.prs.display().to_string()),
+            (
+                "SPAR_FAKE_REQUESTS".into(),
+                self.requests.display().to_string(),
+            ),
         ]
     }
 
@@ -6967,11 +6994,15 @@ fn listen_once_dry_run_names_what_each_event_would_trigger_and_triggers_nothing(
         notification("1", "review_requested", "PullRequest", 7),
         notification("2", "mention", "Issue", 42),
     ]);
+    l.asking_the_viewer();
 
     let (ok, out, _) = l.run(&["--once", "--dry-run"]);
 
     assert!(ok, "{out}");
-    assert!(out.contains("#7: your review was requested"), "{out}");
+    assert!(
+        out.contains("#7: news on a thread that asked for your review"),
+        "{out}"
+    );
     assert!(
         out.contains("#7: would review it after a review request, dry run so nothing runs"),
         "{out}"
@@ -7038,6 +7069,7 @@ fn listen_once_with_a_review_request_reviews_the_pr_with_a_verdict() {
     let head = git(&l.fx.work, &["rev-parse", "HEAD"]).trim().to_string();
     l.with_prs(&[sweep_row(7, "aaa", "alice")]);
     l.with_notifications(&[notification("1", "review_requested", "PullRequest", 7)]);
+    l.asking_the_viewer();
 
     let (ok, out, log) = l.run(&["--once"]);
 
@@ -7057,6 +7089,99 @@ fn listen_once_with_a_review_request_reviews_the_pr_with_a_verdict() {
     assert!(out.contains("#7     reviewed"), "{out}");
     assert!(out.contains("1 dispatch"), "{out}");
     assert!(read_record(&l.fx, 7).posted);
+}
+
+/// react-native-pubky#45: spar had reviewed the pull request at its head, and
+/// its own review moved a thread that began as a review request. GitHub kept
+/// the old reason, the listener took it for a new request, and it posted a
+/// note nobody had asked for. What the pull request says now decides: a
+/// request still open, to the viewer or to a team the viewer is in, gets the
+/// note, and one already answered, or one to a team the viewer is not in, gets
+/// a quiet second look.
+#[test]
+#[cfg(unix)]
+fn a_review_request_gets_the_standing_note_only_while_it_is_open() {
+    let cases = [
+        (
+            "listenaskedname",
+            r#"[{"__typename":"User","login":"viewer"}]"#,
+            true,
+        ),
+        (
+            "listenaskedteam",
+            r#"[{"__typename":"Team","name":"Ours","slug":"example/ours"}]"#,
+            true,
+        ),
+        (
+            "listenotherteam",
+            r#"[{"__typename":"Team","name":"Theirs","slug":"example/theirs"}]"#,
+            false,
+        ),
+        ("listenanswered", "[]", false),
+    ];
+    for (tag, requests, open) in cases {
+        let l = Listening::refusing(tag, &listen_gh(7, "aaa", "alice", "OPEN"));
+        write_record(&l.fx, 7, &blocking_record("aaa"));
+        l.with_prs(&[sweep_row(7, "aaa", "alice")]);
+        l.with_notifications(&[notification("1", "review_requested", "PullRequest", 7)]);
+        l.with_review_requests(requests);
+
+        let (ok, out, log) = l.run(&["--once"]);
+
+        assert!(ok, "{tag}: {out}");
+        assert_eq!(0, l.agent_calls(), "{tag}: {out}");
+        assert!(!submitted_a_review(&log), "{tag}: {log}");
+        assert_eq!(
+            open,
+            log.contains("pr comment 7 --body Nothing has changed since the review at aaa"),
+            "{tag}: {log}"
+        );
+        if open {
+            assert!(
+                out.contains("#7: about to take a second look after a review request"),
+                "{tag}: {out}"
+            );
+        } else {
+            assert!(
+                out.contains("#7: no review is asked of you now, so that was only an update"),
+                "{tag}: {out}"
+            );
+            assert!(
+                out.contains("#7: about to take a second look after a reply"),
+                "{tag}: {out}"
+            );
+        }
+    }
+}
+
+/// A standing note is a comment, so the request it answered stays open. A
+/// sweep that had last seen the pull request with no request took the open
+/// one for the author asking again, and answered it a second time.
+#[test]
+#[cfg(unix)]
+fn a_request_answered_with_the_standing_note_is_not_raised_again_by_the_sweep() {
+    let l = Listening::refusing("listennoteonce", &listen_gh(7, "aaa", "alice", "OPEN"));
+    write_record(&l.fx, 7, &blocking_record("aaa"));
+    // The sweep reads the pull request as it was before the author asked.
+    l.with_prs(&[sweep_row(7, "aaa", "alice")]);
+    l.with_notifications(&[notification("1", "review_requested", "PullRequest", 7)]);
+    l.asking_the_viewer();
+    let (ok, out, log) = l.run(&["--once"]);
+    assert!(ok, "{out}");
+    assert_eq!(1, log.matches("pr comment 7 ").count(), "{log}");
+
+    // The next sweep finds the request still open, which is not news.
+    let asked = sweep_row(7, "aaa", "alice").replace(
+        r#""reviewRequests":[]"#,
+        r#""reviewRequests":[{"login":"viewer"}]"#,
+    );
+    l.with_prs(&[asked]);
+    std::fs::remove_file(&l.notify).unwrap();
+    let (ok, out, log) = l.run(&["--once"]);
+    assert!(ok, "{out}");
+    assert!(!out.contains("#7: your review was requested"), "{out}");
+    assert!(!out.contains("about to take a second look"), "{out}");
+    assert_eq!(1, log.matches("pr comment 7 ").count(), "{log}");
 }
 
 /// The whole point, end to end: the author pushed after a review, the listener
@@ -7176,6 +7301,7 @@ fn busy_listener(l: &Listening, listen: &str) -> (std::process::Child, u32) {
     l.configure(&format!("[listen]\nsettle = 0\n{listen}"));
     l.with_prs(&[sweep_row(7, "aaa", "alice")]);
     l.with_notifications(&[notification("1", "review_requested", "PullRequest", 7)]);
+    l.asking_the_viewer();
 
     let mut command = Command::new(SPAR_BIN);
     command
@@ -7304,6 +7430,7 @@ fn listen_keeps_a_review_it_could_not_post_for_another_try() {
     );
     l.with_prs(&[sweep_row(7, "aaa", "alice")]);
     l.with_notifications(&[notification("1", "review_requested", "PullRequest", 7)]);
+    l.asking_the_viewer();
 
     let (ok, out, _) = l.run_with(&["--once"], &[("SPAR_FAKE_REVIEW_FAILS", "1")]);
 
@@ -7607,6 +7734,7 @@ fn listen_stops_a_running_agent_on_ctrl_c_and_exits_130() {
     std::fs::write(&l.config, config).unwrap();
     l.with_prs(&[sweep_row(7, "aaa", "alice")]);
     l.with_notifications(&[notification("1", "review_requested", "PullRequest", 7)]);
+    l.asking_the_viewer();
 
     let env = l.env();
     let mut command = Command::new(SPAR_BIN);

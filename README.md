@@ -828,7 +828,10 @@ each head with the commit its review record holds. Your own actions raise no new
 notification, but they can still move a thread you are part of, and a thread
 keeps the reason it was first raised for. A thread that began as a review request
 is therefore called one again when spar's own review moves it, so spar checks the
-pull request: a review request counts only while it is still open.
+pull request: a review request counts only while it is still open, to you by name
+or to a team you are in. A team request asks GitHub whether you are in the team,
+which takes the `read:org` scope `gh auth login` asks for, and a team GitHub will
+not answer for counts as asking you.
 
 What an event leads to is a table, not a judgement:
 

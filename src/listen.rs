@@ -31,7 +31,7 @@ use crate::checkin;
 use crate::clock;
 use crate::config::{Config, ListenCfg, OwnPr, ReviewOrIgnore};
 use crate::error::Result;
-use crate::model::{IssueRun, ItemKind, PrSweepRow, Status};
+use crate::model::{IssueRun, ItemKind, Login, PrSweepRow, Status};
 use crate::proc;
 use crate::repo::{ApiResponse, Repo};
 use crate::review_only::{self, RecheckMode, ReviewOpts};
@@ -141,6 +141,10 @@ pub struct Event {
     pub head: Option<(String, String)>,
     /// New commits since the review, when cheap to know.
     pub commits: Option<u64>,
+    /// Raised by a notification thread, whose reason is the one the thread
+    /// began with: the trigger says how the thread started, not always what
+    /// just happened on it.
+    pub from_thread: bool,
 }
 
 /// What has happened to one item since spar last acted on it. Persisted, so a
@@ -404,6 +408,7 @@ pub fn events_from_threads(threads: &[Thread], state: &mut ListenState) -> Vec<E
             who: None,
             head: None,
             commits: None,
+            from_thread: true,
         });
     }
     out
@@ -448,6 +453,7 @@ pub fn events_from_sweep(
                 who: None,
                 head: None,
                 commits: None,
+                from_thread: false,
             });
             continue;
         }
@@ -464,6 +470,7 @@ pub fn events_from_sweep(
                     who: None,
                     head: Some((old, row.head_ref_oid.clone())),
                     commits: None,
+                    from_thread: false,
                 });
             }
         }
@@ -487,6 +494,7 @@ pub fn events_from_sweep(
                 who: None,
                 head: None,
                 commits: None,
+                from_thread: false,
             });
         }
         let assigned = row
@@ -502,6 +510,7 @@ pub fn events_from_sweep(
                 who: None,
                 head: None,
                 commits: None,
+                from_thread: false,
             });
         }
     }
@@ -522,6 +531,7 @@ pub fn events_from_sweep(
                 who: None,
                 head: None,
                 commits: None,
+                from_thread: false,
             });
         }
     }
@@ -664,20 +674,40 @@ pub struct Facts {
     pub below_floor: bool,
     /// For an issue: its open pull request, when spar reviewed that.
     pub linked_pr_with_record: Option<i64>,
-    /// The pull request asks the viewer for a review right now, or asks a
-    /// team the viewer may be in.
+    /// The pull request asks the viewer for a review right now, by name or
+    /// through a team the viewer is in.
     pub review_pending: bool,
+}
+
+/// Whether a pull request's `reviewRequests` ask the viewer now: by name, or
+/// through a team `in_team` says the viewer is in. A team nobody could check
+/// counts as asking, which is how every team request used to be read.
+pub fn review_pending(
+    requests: &[Login],
+    viewer: &str,
+    in_team: &dyn Fn(&str) -> Option<bool>,
+) -> bool {
+    requests
+        .iter()
+        .any(|r| crate::comments::same_login(&r.login, viewer))
+        || requests
+            .iter()
+            .filter(|r| r.login.is_empty())
+            .any(|team| in_team(&team.slug).unwrap_or(true))
 }
 
 /// A notification's reason is the one its thread was first raised for and it
 /// never changes, so a thread that began as a review request says so on every
 /// later update, spar's own review among them. What the pull request says now
 /// decides: when nobody is asking any more, the update is only something
-/// happening on a thread the viewer is part of.
-pub fn settle(p: &mut Pending, f: &Facts) {
-    if p.kind == ItemKind::Pr && !f.review_pending && p.triggers.remove(&Trigger::ReviewRequested) {
+/// happening on a thread the viewer is part of. True when it was.
+pub fn settle(p: &mut Pending, f: &Facts) -> bool {
+    let stale =
+        p.kind == ItemKind::Pr && !f.review_pending && p.triggers.remove(&Trigger::ReviewRequested);
+    if stale {
         p.triggers.insert(Trigger::Replied);
     }
+    stale
 }
 
 /// The dispatch table.
@@ -1104,12 +1134,9 @@ fn facts(repo: &Repo, cfg: &Config, number: i64, kind: ItemKind, named: bool) ->
                 has_custody_state: repo.state_path(number).exists(),
                 below_floor,
                 linked_pr_with_record: None,
-                // A team entry has no login, and whether the viewer is in the
-                // team is not something the row says.
-                review_pending: row
-                    .review_requests
-                    .iter()
-                    .any(|l| l.login.is_empty() || crate::comments::same_login(&l.login, &viewer)),
+                review_pending: review_pending(&row.review_requests, &viewer, &|team| {
+                    repo.team_has_member(team, &viewer)
+                }),
             })
         }
         ItemKind::Issue => {
@@ -1231,6 +1258,11 @@ fn describe(repo: &Repo, event: &Event) -> String {
             Some(who) => format!("#{n}: mentioned by {who}"),
             None => format!("#{n}: mentioned"),
         },
+        // The sweep read the request off the pull request. A thread says only
+        // that it began as one, which a later update on it says too.
+        Trigger::ReviewRequested if event.from_thread => {
+            format!("#{n}: news on a thread that asked for your review")
+        }
         Trigger::ReviewRequested => format!("#{n}: your review was requested"),
         Trigger::Assigned => format!("#{n}: assigned to you"),
         Trigger::Closed => format!("#{n}: closed, no longer watched"),
@@ -1390,6 +1422,7 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                         who: None,
                         head: None,
                         commits: None,
+                        from_thread: false,
                     }));
                     let record_head = |n: i64| {
                         repo.read_review_record(n)
@@ -1475,7 +1508,15 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                     continue;
                 }
             };
-            settle(&mut p, &f);
+            if settle(&mut p, &f) {
+                log!("#{number}: no review is asked of you now, so that was only an update");
+            }
+            if p.triggers.contains(&Trigger::ReviewRequested) {
+                // Answered now, whichever way it arrived. A standing note is a
+                // comment and leaves the request open, so the next sweep would
+                // otherwise take it for the author asking again.
+                state.watched(number, p.kind).requested_noticed = true;
+            }
             let action = plan(&p, &f, &cfg.listen);
             match &action {
                 Action::Ignore(why) => {
@@ -1669,10 +1710,24 @@ fn write_state(repo: &Repo, state: &ListenState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Author, Login};
+    use crate::model::Author;
 
     fn cfg() -> ListenCfg {
         ListenCfg::default()
+    }
+
+    fn user(login: &str) -> Login {
+        Login {
+            login: login.into(),
+            ..Login::default()
+        }
+    }
+
+    fn team(slug: &str) -> Login {
+        Login {
+            slug: slug.into(),
+            ..Login::default()
+        }
     }
 
     fn thread(id: &str, reason: &str, kind: &str, number: i64, at: &str) -> Thread {
@@ -1982,8 +2037,8 @@ mod tests {
     fn a_sweep_notices_a_review_request_once_not_every_five_minutes() {
         let mut state = ListenState::default();
         let mut asked = row(7, "aaa", "alice", "OPEN");
-        asked.review_requests = vec![Login { login: "ME".into() }];
-        asked.assignees = vec![Login { login: "me".into() }];
+        asked.review_requests = vec![user("ME")];
+        asked.assignees = vec![user("me")];
         let rows = [asked];
         let first = events_from_sweep(
             &rows,
@@ -2017,7 +2072,7 @@ mod tests {
     fn a_sweep_notices_a_review_requested_again_after_a_review() {
         let mut state = ListenState::default();
         let mut asked = row(7, "aaa", "alice", "OPEN");
-        asked.review_requests = vec![Login { login: "me".into() }];
+        asked.review_requests = vec![user("me")];
         let asked = [asked];
         let reviewed = [row(7, "aaa", "alice", "OPEN")];
         let mut sweep = |rows: &[PrSweepRow]| -> Vec<Trigger> {
@@ -2168,6 +2223,7 @@ mod tests {
             who: None,
             head: None,
             commits: None,
+            from_thread: false,
         };
         let asked = Event {
             trigger: Trigger::ReviewRequested,
@@ -2206,7 +2262,7 @@ mod tests {
             ..open_pr()
         };
         let mut p = waiting.remove(&7).expect("pending");
-        settle(&mut p, &reviewed);
+        assert!(settle(&mut p, &reviewed));
         assert_eq!(
             [Trigger::Replied].into_iter().collect::<BTreeSet<_>>(),
             p.triggers
@@ -2215,7 +2271,7 @@ mod tests {
 
         // On a pull request spar never reviewed it is not a reason to start.
         let mut p = pending(ItemKind::Pr, &[Trigger::ReviewRequested], 0);
-        settle(&mut p, &open_pr());
+        assert!(settle(&mut p, &open_pr()));
         assert!(matches!(plan(&p, &open_pr(), &cfg()), Action::Ignore(_)));
 
         // A request still standing is left as it is.
@@ -2224,9 +2280,44 @@ mod tests {
             ..open_pr()
         };
         let mut p = pending(ItemKind::Pr, &[Trigger::ReviewRequested], 0);
-        settle(&mut p, &asked);
+        assert!(!settle(&mut p, &asked));
         assert!(p.triggers.contains(&Trigger::ReviewRequested));
         assert_eq!(Action::Review, plan(&p, &asked, &cfg()));
+
+        // Nothing to settle without a request.
+        let mut p = pending(ItemKind::Pr, &[Trigger::Pushed], 0);
+        assert!(!settle(&mut p, &open_pr()));
+        assert_eq!(
+            [Trigger::Pushed].into_iter().collect::<BTreeSet<_>>(),
+            p.triggers
+        );
+    }
+
+    #[test]
+    fn a_review_request_counts_for_the_viewer_or_a_team_the_viewer_is_in() {
+        let teams = |team: &str| match team {
+            "example/ours" => Some(true),
+            "example/theirs" => Some(false),
+            _ => None,
+        };
+        let pending = |requests: &[Login]| review_pending(requests, "me", &teams);
+        assert!(!pending(&[]));
+        assert!(pending(&[user("ME")]));
+        assert!(!pending(&[user("alice")]));
+        assert!(pending(&[team("example/ours")]));
+        // Approving clears the viewer's own request and leaves a CODEOWNERS
+        // team the viewer is not in, which used to keep the request alive.
+        assert!(!pending(&[team("example/theirs"), user("alice")]));
+        assert!(pending(&[team("example/theirs"), team("example/ours")]));
+        // A team GitHub would not answer for keeps the request.
+        assert!(pending(&[team("example/unknown")]));
+        // Asked by name, no team is looked up.
+        let never = |_: &str| -> Option<bool> { panic!("looked a team up") };
+        assert!(review_pending(
+            &[team("example/ours"), user("me")],
+            "me",
+            &never
+        ));
     }
 
     #[test]
@@ -2557,6 +2648,7 @@ mod tests {
             who: None,
             head: Some(("aaa".into(), "bbb".into())),
             commits: None,
+            from_thread: false,
         };
         merge(&mut pending, &push, 1000);
         let reply = Event {

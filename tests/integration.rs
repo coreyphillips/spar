@@ -7365,6 +7365,104 @@ fn listen_once_waits_for_github_to_catch_up_with_a_push_before_a_second_look() {
     assert_eq!(0, l.state()["items"]["7"]["failures"], "{}", l.state());
 }
 
+/// A first review that GitHub's lag behind a push stopped until the listener
+/// gave up used to be lost: once GitHub caught up, the push was all that came
+/// back, and a push to a pull request spar has not reviewed is ignored. The
+/// request is held now, and the push brings it back.
+#[test]
+#[cfg(unix)]
+fn a_requested_review_given_up_on_while_github_lagged_runs_once_the_push_shows() {
+    let l = Listening::new(
+        "listenlaggaveup",
+        ONE_BLOCKER_REVIEW,
+        ONE_BLOCKER_REVIEW,
+        &listen_gh(7, "aaa", "alice", "OPEN"),
+    );
+    let asked = work_head(&l);
+    git(
+        &l.fx.work,
+        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
+    );
+    commit(&l.fx.work, "file.txt", "bounded\n", "check the bound");
+    git(
+        &l.fx.work,
+        &["push", "-q", "origin", "HEAD:refs/heads/feature-7"],
+    );
+    let pushed = work_head(&l);
+    l.with_gh(&listen_gh(7, &asked, "alice", "OPEN"));
+    l.with_prs(&[sweep_row(7, &asked, "alice")]);
+    l.with_notifications(&[notification("1", "review_requested", "PullRequest", 7)]);
+    l.asking_the_viewer();
+    let edit_state = |edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut state = l.state();
+        edit(&mut state);
+        std::fs::write(
+            l.fx.work.join(".spar/state/listen.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+    };
+
+    let (ok, out, _) = l.run(&["--once"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("#7: its head moved while spar read it, so it runs again on the new head"),
+        "{out}"
+    );
+
+    // GitHub stays behind for as many looks as the listener allows.
+    edit_state(&|state| {
+        state["items"]["7"]["failures"] = 4.into();
+        state["items"]["7"]["retry_after"] = 0.into();
+    });
+    let (ok, out, _) = l.run(&["--once"]);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("#7: giving up on it until it changes again"),
+        "{out}"
+    );
+    let state = l.state();
+    assert!(state["pending"].get("7").is_none(), "{state}");
+    assert_eq!(
+        serde_json::json!(["review_requested"]),
+        state["items"]["7"]["held"],
+        "{state}"
+    );
+
+    // GitHub catches up, which the sweep sees as a push.
+    git(
+        &l.fx.work,
+        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
+    );
+    l.with_gh(&listen_gh(7, &pushed, "alice", "OPEN"));
+    l.with_prs(&[sweep_row(7, &pushed, "alice")]);
+    l.with_notifications(&[]);
+    edit_state(&|state| state["items"]["7"]["retry_after"] = 0.into());
+
+    let (ok, out, log) = l.run(&["--once"]);
+
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("#7: about to review it after a push and a review request"),
+        "{out}"
+    );
+    assert!(
+        log.contains(&format!(
+            "{}Two independent reviews.",
+            review_post(7, &pushed, "REQUEST_CHANGES")
+        )),
+        "{log}"
+    );
+    assert_eq!(2, l.agent_calls(), "{out}");
+    let state = l.state();
+    assert_eq!(0, state["items"]["7"]["failures"], "{state}");
+    assert_eq!(
+        serde_json::json!([]),
+        state["items"]["7"]["held"],
+        "{state}"
+    );
+}
+
 /// A look takes minutes, and a push that lands while it runs used to leave its
 /// verdict on a commit the author had moved past. A look whose head moved by
 /// the time it is ready to post keeps it off the pull request, and the next

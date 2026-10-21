@@ -900,7 +900,10 @@ poll is all or nothing: one that cannot read every page of notifications moves
 past none of them. A review or second look that fails, or that GitHub would not
 take, is tried again after a quarter of an hour, doubling, and after five
 failures it is left until something new happens to it. One that ended `moved`
-is tried again once the push settles, under the same five.
+is tried again once the push settles, under the same five. Left is not
+forgotten: what the item was waiting on, a review request say, comes back with
+the next thing that happens to it, so a first review held up by GitHub lagging
+behind a push runs when the push shows.
 
 ## Splitting something too big to work in one piece
 

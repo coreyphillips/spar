@@ -280,6 +280,52 @@ pub fn adjudication() -> Value {
     })
 }
 
+/// Both agents, after a reviewed pull request moved: a ruling per earlier
+/// finding, matched back by the number the prompt gave it, and ordinary
+/// findings for anything new in the delta. The finding item is `review()`'s,
+/// so there is one definition of a finding.
+pub fn recheck() -> Value {
+    let mut findings = review()["properties"]["findings"].clone();
+    findings["description"] = json!(
+        "Only what is new since the last review. An earlier point belongs in its ruling, not here."
+    );
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "One sentence, at most 200 characters, on what changed since the last review and whether it holds up."
+            },
+            "rulings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "index": {
+                            "type": "integer",
+                            "description": "The number the earlier finding was given in the list. Copy it exactly, so the ruling can be matched back to the point it is about."
+                        },
+                        "outcome": {
+                            "type": "string",
+                            "enum": ["fixed", "rebutted", "open"],
+                            "description": "fixed: the code now answers the point. rebutted: the code did not change for it, and a quoted response shows the point was wrong or does not apply here. open: neither. Say open when you are unsure: an open point costs one more look, a wrongly closed one ships."
+                        },
+                        "reasoning": {
+                            "type": "string",
+                            "description": "One or two sentences. For fixed, the file and line that answers it and what you did to confirm that. For rebutted, which response and why it holds against the code. For open, what is still missing. This is posted for the author, so write it to them."
+                        }
+                    },
+                    "required": ["index", "outcome", "reasoning"]
+                }
+            },
+            "findings": findings
+        },
+        "required": ["summary", "rulings", "findings"]
+    })
+}
+
 /// One agent ruling on recorded follow-ups, before any becomes an issue.
 ///
 /// Deliberately not the triage schema. Triage asks whether an issue is worth a
@@ -774,6 +820,7 @@ pub fn all() -> Vec<(&'static str, Value)> {
         ("triage", triage()),
         ("implementation", implementation()),
         ("review", review()),
+        ("recheck", recheck()),
         ("response", response()),
         ("own_fix", own_fix()),
         ("screen", screen()),
@@ -884,6 +931,62 @@ mod tests {
                 asked.contains(field),
                 "a Finding holds `{field}` and the schema never asks for it, so the model will \
                  not fill it and the code reading it will always see nothing"
+            );
+        }
+    }
+
+    /// The same guard for the second look: its findings are `review()`'s
+    /// items, and its rulings have to ask for every field a ruling holds.
+    #[test]
+    fn the_recheck_schema_asks_for_every_field_a_finding_and_a_ruling_hold() {
+        use crate::model::{RecheckRuling, Ruling};
+
+        assert_eq!(
+            review()["properties"]["findings"]["items"],
+            recheck()["properties"]["findings"]["items"],
+            "a second look's findings are first look findings"
+        );
+
+        let asked: Vec<String> = recheck()["properties"]["rulings"]["items"]["properties"]
+            .as_object()
+            .expect("ruling properties")
+            .keys()
+            .cloned()
+            .collect();
+        let held: Vec<String> = serde_json::to_value(RecheckRuling {
+            index: 1,
+            outcome: Ruling::Open,
+            reasoning: "r".into(),
+        })
+        .expect("serialisable")
+        .as_object()
+        .expect("object")
+        .keys()
+        .cloned()
+        .collect();
+        for field in &held {
+            assert!(
+                asked.contains(field),
+                "a ruling holds `{field}`, unasked for"
+            );
+        }
+    }
+
+    /// Every outcome the schema offers is one the parser reads back.
+    #[test]
+    fn the_recheck_outcome_enum_matches_the_parser() {
+        use crate::model::Ruling;
+
+        let offered = recheck()["properties"]["rulings"]["items"]["properties"]["outcome"]["enum"]
+            .as_array()
+            .expect("an enum")
+            .clone();
+        assert_eq!(3, offered.len());
+        for value in offered {
+            let word = value.as_str().expect("a word");
+            assert!(
+                Ruling::parse_lenient(word).is_some(),
+                "{word} is offered and cannot be read back"
             );
         }
     }

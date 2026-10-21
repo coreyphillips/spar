@@ -334,6 +334,8 @@ pub enum Call {
     /// A brainstorm round: both agents diverge in round 1, cross in the
     /// middle rounds, and converge in the last.
     Brainstorm(u32),
+    /// A second look at a reviewed pull request after commits or replies.
+    Recheck,
 }
 
 impl Call {
@@ -350,6 +352,7 @@ impl Call {
             Call::Checkin(_) => "checkin",
             Call::Split(_) => "split",
             Call::Brainstorm(_) => "brainstorm",
+            Call::Recheck => "recheck",
         }
     }
 
@@ -360,17 +363,18 @@ impl Call {
             Call::Triage | Call::Implement | Call::Screen => 1,
             Call::Review(round) | Call::Respond(round) => round,
             Call::Checkin(round) | Call::Split(round) | Call::Brainstorm(round) => round,
-            Call::Close => 2,
+            Call::Close | Call::Recheck => 2,
         }
     }
 
     /// Every kind, for `doctor` to check a configuration against.
-    pub fn every() -> [Call; 10] {
+    pub fn every() -> [Call; 11] {
         [
             Call::Triage,
             Call::Implement,
             Call::Review(1),
             Call::Review(2),
+            Call::Recheck,
             Call::Respond(1),
             Call::Close,
             Call::Screen,
@@ -407,6 +411,15 @@ pub struct EffortSchedule {
     /// answer narrower questions, but they read the same key: a brainstorm is
     /// cheap next to a run, and one word for it is enough.
     pub brainstorm: Option<String>,
+    /// A second look at a reviewed pull request: a delta and a list of claims
+    /// to check, so it sits with the later review rounds and reads
+    /// `review_rest` when it has no word of its own.
+    pub recheck: Option<String>,
+}
+
+/// A schedule entry that was actually written, blank meaning unset.
+fn set(value: &Option<String>) -> Option<String> {
+    value.clone().filter(|s| !s.trim().is_empty())
 }
 
 impl EffortSchedule {
@@ -422,9 +435,12 @@ impl EffortSchedule {
             "screen" => &self.screen,
             "checkin" => &self.checkin,
             "brainstorm" => &self.brainstorm,
+            "recheck" => {
+                return set(&self.recheck).or_else(|| set(&self.review_rest));
+            }
             _ => &self.split,
         };
-        value.clone().filter(|s| !s.trim().is_empty())
+        set(value)
     }
 
     /// What the old two key schedule would have said.
@@ -714,6 +730,100 @@ impl StyleCfg {
 }
 
 // ---------------------------------------------------------------------------
+// Listening
+// ---------------------------------------------------------------------------
+
+/// What `spar listen` does with a pull request somebody put in front of you.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewOrIgnore {
+    /// Review it, with a verdict when `verdicts` is on.
+    Review,
+    /// Say so in the log and do nothing.
+    Ignore,
+}
+
+impl std::fmt::Display for ReviewOrIgnore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ReviewOrIgnore::Review => "review",
+            ReviewOrIgnore::Ignore => "ignore",
+        })
+    }
+}
+
+/// What `spar listen` does when somebody speaks on a pull request you wrote.
+/// GitHub will not let the same account approve it, so the choice is between
+/// `spar checkin` with and without the power to push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OwnPr {
+    /// `spar checkin`: a change both agents agree on is pushed, behind
+    /// `checkin_trust`.
+    Checkin,
+    /// `spar checkin --reply-only`: answered in words, nothing pushed.
+    Reply,
+    /// Say so in the log and do nothing.
+    Ignore,
+}
+
+impl std::fmt::Display for OwnPr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            OwnPr::Checkin => "checkin",
+            OwnPr::Reply => "reply",
+            OwnPr::Ignore => "ignore",
+        })
+    }
+}
+
+/// What `spar listen` watches for and what it does about it. As with `LoopCfg`,
+/// every field takes its value from `ListenCfg::default()` when a config does
+/// not mention it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ListenCfg {
+    /// Seconds between polls of GitHub's notifications for the repository.
+    /// GitHub says how often it will answer, and the larger of the two is used.
+    pub interval: u64,
+    /// Seconds between sweeps of the open pull requests. A push raises no
+    /// notification for a reviewer, so the sweep is what notices a reviewed
+    /// pull request moving.
+    pub sweep: u64,
+    /// Seconds an item has to stay quiet before spar acts on it, so a push and
+    /// three replies in the same minute cost one recheck rather than four.
+    pub settle: u64,
+    /// Most seconds an item may keep settling before it is acted on anyway.
+    pub max_wait: u64,
+    /// Rechecks one pull request gets before a person has to run `spar review`
+    /// on it again. A cap against two bots arguing, not a target. 0 turns
+    /// automatic rechecks off.
+    pub max_rechecks: u32,
+    pub on_review_requested: ReviewOrIgnore,
+    pub on_assigned: ReviewOrIgnore,
+    pub on_own_pr: OwnPr,
+    /// Whether a review `spar listen` starts submits a formal verdict, approve
+    /// or request changes, rather than a comment. A recheck always does.
+    pub verdicts: bool,
+}
+
+impl Default for ListenCfg {
+    fn default() -> Self {
+        Self {
+            interval: 60,
+            sweep: 300,
+            settle: 120,
+            max_wait: 900,
+            max_rechecks: 5,
+            on_review_requested: ReviewOrIgnore::Review,
+            on_assigned: ReviewOrIgnore::Review,
+            on_own_pr: OwnPr::Checkin,
+            verdicts: true,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The whole config
 // ---------------------------------------------------------------------------
 
@@ -723,6 +833,7 @@ pub struct Config {
     pub agents: Vec<AgentSpec>,
     pub loop_cfg: LoopCfg,
     pub style: Style,
+    pub listen: ListenCfg,
     /// Resolved: never empty, always one of the configured agents. Under the
     /// alternating policy this is who goes first on the first issue.
     pub first_implementor: String,
@@ -817,6 +928,8 @@ struct RawConfig {
     loop_cfg: Option<LoopCfg>,
     #[serde(default)]
     style: Option<StyleCfg>,
+    #[serde(default)]
+    listen: Option<ListenCfg>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1025,8 +1138,10 @@ pub fn known_options() -> Vec<OptionInfo> {
             checkin: Some("high".into()),
             split: Some("high".into()),
             brainstorm: Some("high".into()),
+            recheck: Some("low".into()),
         },
     ));
+    out.extend(lines("listen", &ListenCfg::default()));
     out
 }
 
@@ -1103,9 +1218,24 @@ pub fn parse(text: &str) -> Result<Config> {
 
     let loop_cfg = raw.loop_cfg.unwrap_or_default();
     let style = raw.style.unwrap_or_default().to_style();
+    let listen = raw.listen.unwrap_or_default();
 
     if loop_cfg.max_rounds == 0 {
         bail!("max_rounds must be at least 1");
+    }
+    if listen.settle > listen.max_wait {
+        bail!(
+            "[listen] settle ({}) cannot be longer than max_wait ({}): an item that kept \
+             changing would never be acted on. Raise max_wait or lower settle.",
+            listen.settle,
+            listen.max_wait
+        );
+    }
+    if listen.interval == 0 || listen.sweep == 0 {
+        bail!(
+            "[listen] interval and sweep are seconds between polls and must be at least 1. \
+             Polling never goes below 15 seconds whatever they say."
+        );
     }
     // A draft cannot be merged, so merging one means promoting it first, which
     // is the one thing `always` asks spar not to do. Refusing is better than
@@ -1148,6 +1278,7 @@ pub fn parse(text: &str) -> Result<Config> {
         agents,
         loop_cfg,
         style,
+        listen,
         first_implementor: first,
         alternate_first: alternate,
         source: None,
@@ -1387,6 +1518,110 @@ model = "gpt-5.6-sol"
         let text = format!("{TWO_AGENTS}\n[loop]\nmax_round = 4\n");
         let err = parse(&text).unwrap_err().to_string();
         assert!(err.contains("max_round"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_listen_option_is_named() {
+        let text = format!("{TWO_AGENTS}\n[listen]\ninterval_secs = 30\n");
+        let err = parse(&text).unwrap_err().to_string();
+        assert!(err.contains("interval_secs"), "{err}");
+    }
+
+    #[test]
+    fn a_listen_block_keeps_the_defaults_it_did_not_name() {
+        let text = format!("{TWO_AGENTS}\n[listen]\nsweep = 30\n");
+        let cfg = parse(&text).expect("parses");
+        assert_eq!(30, cfg.listen.sweep);
+        assert_eq!(ListenCfg::default().interval, cfg.listen.interval);
+        assert_eq!(ListenCfg::default().settle, cfg.listen.settle);
+        assert_eq!(OwnPr::Checkin, cfg.listen.on_own_pr);
+        assert!(cfg.listen.verdicts);
+
+        let bare = parse(TWO_AGENTS).unwrap();
+        assert_eq!(60, bare.listen.interval);
+        assert_eq!(300, bare.listen.sweep);
+        assert_eq!(120, bare.listen.settle);
+        assert_eq!(900, bare.listen.max_wait);
+        assert_eq!(5, bare.listen.max_rechecks);
+        assert_eq!(ReviewOrIgnore::Review, bare.listen.on_review_requested);
+        assert_eq!(ReviewOrIgnore::Review, bare.listen.on_assigned);
+    }
+
+    #[test]
+    fn settle_longer_than_max_wait_is_refused_with_a_reason() {
+        let text = format!("{TWO_AGENTS}\n[listen]\nsettle = 1000\nmax_wait = 900\n");
+        let err = parse(&text).unwrap_err().to_string();
+        assert!(err.contains("settle"), "{err}");
+        assert!(err.contains("Raise max_wait"), "{err}");
+
+        let text = format!("{TWO_AGENTS}\n[listen]\ninterval = 0\n");
+        let err = parse(&text).unwrap_err().to_string();
+        assert!(err.contains("at least 1"), "{err}");
+    }
+
+    #[test]
+    fn each_listen_action_word_parses() {
+        for (text, want) in [
+            ("review", ReviewOrIgnore::Review),
+            ("ignore", ReviewOrIgnore::Ignore),
+        ] {
+            let cfg = parse(&format!(
+                "{TWO_AGENTS}\n[listen]\non_review_requested = \"{text}\"\non_assigned = \"{text}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(want, cfg.listen.on_review_requested);
+            assert_eq!(want, cfg.listen.on_assigned);
+            assert_eq!(text, want.to_string());
+        }
+        for (text, want) in [
+            ("checkin", OwnPr::Checkin),
+            ("reply", OwnPr::Reply),
+            ("ignore", OwnPr::Ignore),
+        ] {
+            let cfg = parse(&format!("{TWO_AGENTS}\n[listen]\non_own_pr = \"{text}\"\n")).unwrap();
+            assert_eq!(want, cfg.listen.on_own_pr);
+            assert_eq!(text, want.to_string());
+        }
+        let err = parse(&format!("{TWO_AGENTS}\n[listen]\non_own_pr = \"push\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("on_own_pr") || err.contains("push"), "{err}");
+    }
+
+    #[test]
+    fn a_recheck_reads_its_own_key_before_review_rest_and_falls_back_to_it() {
+        let text = format!(
+            "{TWO_AGENTS}\n[loop.effort_schedule]\nreview_rest = \"low\"\nrecheck = \"high\"\n"
+        );
+        let cfg = parse(&text).unwrap();
+        let spec = cfg.spec("claude").unwrap();
+        assert_eq!(
+            Some("high".to_string()),
+            cfg.effort_for(spec, Call::Recheck)
+        );
+
+        let text = format!("{TWO_AGENTS}\n[loop.effort_schedule]\nreview_rest = \"low\"\n");
+        let cfg = parse(&text).unwrap();
+        let spec = cfg.spec("claude").unwrap();
+        assert_eq!(Some("low".to_string()), cfg.effort_for(spec, Call::Recheck));
+
+        let text = format!(
+            "{TWO_AGENTS}\n[loop.effort_schedule]\nround_1 = \"ultra\"\nrest = \"medium\"\n"
+        );
+        let cfg = parse(&text).unwrap();
+        let spec = cfg.spec("claude").unwrap();
+        assert_eq!(
+            Some("medium".to_string()),
+            cfg.effort_for(spec, Call::Recheck)
+        );
+    }
+
+    #[test]
+    fn every_call_kind_is_in_every() {
+        let every = Call::every();
+        assert_eq!(11, every.len());
+        assert!(every.contains(&Call::Recheck));
+        assert_eq!("recheck", Call::Recheck.key());
     }
 
     #[test]

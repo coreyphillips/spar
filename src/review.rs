@@ -965,7 +965,13 @@ pub fn resume_pr(
     // that rather than refusing.
     if pr.is_cross_repository {
         log!("PR #{pr_number} comes from a fork, reviewing it without changing it");
-        return crate::review_only::review_pr(agents, cfg, repo, pr_number, false);
+        return crate::review_only::review_pr(
+            agents,
+            cfg,
+            repo,
+            pr_number,
+            crate::review_only::ReviewOpts::default(),
+        );
     }
 
     match resume_inner(agents, cfg, repo, pr, holder_override) {

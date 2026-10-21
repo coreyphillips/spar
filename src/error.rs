@@ -22,6 +22,10 @@ pub enum ErrorKind {
     /// A write failed locally, but the destination could not be reread to tell
     /// whether it landed. Repeating it blindly could duplicate the write.
     UncertainWrite,
+    /// The process was told to stop while the call ran, and the call was
+    /// killed. Nothing about the call went wrong, so nothing is retried or
+    /// handed to a fallback: the next thing to do is stop.
+    Interrupted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +64,14 @@ impl SparError {
         }
     }
 
+    /// The process was told to stop while this ran.
+    pub fn interrupted(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: ErrorKind::Interrupted,
+        }
+    }
+
     /// Replace the explanation without changing how callers classify the
     /// failure. Recovery checks use this after safely observing changed work:
     /// the call must not be retried, but its original failure kind still tells
@@ -77,7 +89,10 @@ impl SparError {
 
     /// Whether asking the same thing again could plausibly go better.
     pub fn worth_retrying(&self) -> bool {
-        !matches!(self.kind, ErrorKind::TimedOut | ErrorKind::UncertainWrite)
+        !matches!(
+            self.kind,
+            ErrorKind::TimedOut | ErrorKind::UncertainWrite | ErrorKind::Interrupted
+        )
     }
 
     pub fn message(&self) -> &str {

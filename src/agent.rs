@@ -577,6 +577,11 @@ impl Agent {
     /// configuration for this same call, so a schedule reaches a stand in
     /// rather than being dropped at the handover.
     fn hand_over<T>(&self, primary: SparError, run: impl FnOnce(&Agent) -> Result<T>) -> Result<T> {
+        // A stop is not a failure to hand on: the stand in would be killed
+        // before it had said anything.
+        if primary.kind() == ErrorKind::Interrupted {
+            return Err(primary);
+        }
         let Some(backup) = self.fallback() else {
             return Err(primary);
         };
@@ -752,6 +757,7 @@ impl Agent {
         match e.kind() {
             ErrorKind::TimedOut => false,
             ErrorKind::UncertainWrite => false,
+            ErrorKind::Interrupted => false,
             ErrorKind::CallFailed => self.fallback().is_none(),
             ErrorKind::Other => true,
         }

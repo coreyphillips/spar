@@ -119,6 +119,36 @@ string_enum! {
 }
 
 string_enum! {
+    /// What a formal pull request review says. `Verdict` is what a model
+    /// answers; this is what spar submits, and spar never asks a model for it.
+    /// It is derived from the findings: approve when nothing blocks, request
+    /// changes when something both reviewers count does.
+    pub enum ReviewVerdict {
+        Approve = "approve" | "approved",
+        RequestChanges = "request_changes" | "changes_requested" | "request-changes",
+    }
+}
+
+impl ReviewVerdict {
+    /// The `event` the reviews API submits it as.
+    pub fn api_event(self) -> &'static str {
+        match self {
+            ReviewVerdict::Approve => "APPROVE",
+            ReviewVerdict::RequestChanges => "REQUEST_CHANGES",
+        }
+    }
+
+    /// The words that stand in for the badge when GitHub will not take the
+    /// verdict itself, on the viewer's own pull request.
+    pub fn words(self) -> &'static str {
+        match self {
+            ReviewVerdict::Approve => "approve",
+            ReviewVerdict::RequestChanges => "changes requested",
+        }
+    }
+}
+
+string_enum! {
     pub enum NextAction {
         Merge = "merge" | "approve" | "ship",
         FixMyself = "fix_myself" | "fix-myself" | "fix" | "self_fix",
@@ -762,6 +792,45 @@ pub struct AdjudicationDoc {
     pub verdicts: Vec<Adjudication>,
 }
 
+string_enum! {
+    /// What a second look found about one earlier finding.
+    pub enum Ruling {
+        /// The code now answers the point.
+        Fixed = "fixed" | "resolved" | "addressed" | "done",
+        /// The code did not change for it, and a response showed the point
+        /// was wrong or does not apply.
+        Rebutted = "rebutted" | "refuted" | "answered" | "withdrawn" | "not_a_bug",
+        /// Neither. The point stands, or the change made for it does not
+        /// settle it.
+        Open = "open" | "still_open" | "unresolved" | "stands" | "unfixed",
+    }
+}
+
+/// One reviewer's ruling on one earlier finding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecheckRuling {
+    /// The 1-based number the prompt gave the earlier finding. A number rather
+    /// than a title, for the reason the follow-up screen uses one: a model
+    /// rewrites titles, and a number it copies.
+    #[serde(deserialize_with = "de_i64")]
+    pub index: i64,
+    pub outcome: Ruling,
+    #[serde(default, deserialize_with = "de_string")]
+    pub reasoning: String,
+}
+
+/// What one reviewer answers on a second look: a ruling per earlier finding,
+/// and ordinary findings for anything new.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RecheckDoc {
+    #[serde(default, deserialize_with = "de_string")]
+    pub summary: String,
+    #[serde(default)]
+    pub rulings: Vec<RecheckRuling>,
+    #[serde(default)]
+    pub findings: Vec<Finding>,
+}
+
 // ---------------------------------------------------------------------------
 // Brainstorming
 // ---------------------------------------------------------------------------
@@ -871,19 +940,22 @@ pub struct Judged {
     pub defence: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Standing {
-    /// Both reviewers raised it independently. The strongest signal there is.
-    Corroborated,
-    /// One raised it, the other read the code and agreed.
-    Confirmed,
-    /// One raised it, the other read the code and rejected it, and it survived
-    /// a rebuttal. A person decides.
-    Disputed,
-    /// Raised, rejected, and withdrawn by the reviewer who raised it.
-    Withdrawn,
-    /// Raised with nobody left to check it, because the round budget ran out.
-    Unverified,
+string_enum! {
+    /// How a finding stands after both reviewers have had their say. A word
+    /// rather than a bare enum because the review record keeps it on disk.
+    pub enum Standing {
+        /// Both reviewers raised it independently. The strongest signal there is.
+        Corroborated = "corroborated" | "both",
+        /// One raised it, the other read the code and agreed.
+        Confirmed = "confirmed",
+        /// One raised it, the other read the code and rejected it, and it survived
+        /// a rebuttal. A person decides.
+        Disputed = "disputed",
+        /// Raised, rejected, and withdrawn by the reviewer who raised it.
+        Withdrawn = "withdrawn",
+        /// Raised with nobody left to check it, because the round budget ran out.
+        Unverified = "unverified" | "one_reviewer",
+    }
 }
 
 /// What the implementor did, and what the pull request body is built from.
@@ -1186,6 +1258,125 @@ pub struct PersistedState {
 
 pub const STATE_VERSION: u32 = 2;
 
+/// One finding as the review record keeps it: enough to list it again, rule on
+/// it, and post it, and nothing a model is not asked for. The parts of a bug
+/// report a `Finding` may carry are for an issue filed from it, which a record
+/// never does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedFinding {
+    pub title: String,
+    #[serde(default)]
+    pub file: String,
+    pub severity: Severity,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default = "yes")]
+    pub in_scope: bool,
+    #[serde(default)]
+    pub raised_by: String,
+    pub standing: Standing,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counterpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defence: Option<String>,
+}
+
+impl RecordedFinding {
+    pub fn blocks(&self) -> bool {
+        self.severity == Severity::Blocking && self.in_scope
+    }
+
+    pub fn where_at(&self) -> &str {
+        if self.file.trim().is_empty() {
+            "general"
+        } else {
+            self.file.trim()
+        }
+    }
+
+    /// Back to the in-memory shape, for the renderer and the record that
+    /// follows a second look.
+    pub fn to_judged(&self) -> Judged {
+        Judged {
+            finding: Finding {
+                severity: self.severity,
+                title: self.title.clone(),
+                detail: self.detail.clone(),
+                file: self.file.clone(),
+                in_scope: self.in_scope,
+                ..Finding::default()
+            },
+            raised_by: self.raised_by.clone(),
+            standing: self.standing,
+            counterpoint: self.counterpoint.clone(),
+            defence: self.defence.clone(),
+        }
+    }
+}
+
+impl From<&Judged> for RecordedFinding {
+    fn from(j: &Judged) -> Self {
+        Self {
+            title: j.finding.title.clone(),
+            file: j.finding.file.clone(),
+            severity: j.finding.severity,
+            detail: j.finding.detail.clone(),
+            in_scope: j.finding.in_scope,
+            raised_by: j.raised_by.clone(),
+            standing: j.standing,
+            counterpoint: j.counterpoint.clone(),
+            defence: j.defence.clone(),
+        }
+    }
+}
+
+/// What `spar review` leaves behind, and what a second look reads and rewrites.
+///
+/// `spar review` used to leave nothing machine readable: not the commit it
+/// read, not the points it raised. There was therefore nothing to check a later
+/// push against, and the only second look possible was a first look again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRecord {
+    pub version: u32,
+    /// The commit the review worktree had checked out when the reviewers read
+    /// it. From `git rev-parse HEAD` there, never from a second `gh` call.
+    pub head: String,
+    /// When the review began, in the one shape GitHub returns,
+    /// `2026-10-20T18:04:05Z`, so it compares with a comment's `created_at`
+    /// as a string. The start rather than the end, so a reply made while a
+    /// long review ran still counts as new on the next look.
+    pub reviewed_at: String,
+    #[serde(default)]
+    pub findings: Vec<RecordedFinding>,
+    /// Second looks taken so far, which `[listen] max_rechecks` caps.
+    #[serde(default)]
+    pub rechecks: u32,
+    /// The formal verdict posted, when one was. None for a plain comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<ReviewVerdict>,
+    /// Whether the review reached the pull request. A dry run's record is kept
+    /// so `spar post` can complete it, but nobody has seen its findings, so it
+    /// does not count as a review to take a second look after.
+    #[serde(default)]
+    pub posted: bool,
+}
+
+pub const REVIEW_RECORD_VERSION: u32 = 1;
+
+impl ReviewRecord {
+    pub fn short_head(&self) -> &str {
+        let end = self.head.len().min(7);
+        &self.head[..end]
+    }
+
+    /// The points a second look rules on: everything but what was withdrawn.
+    pub fn open_points(&self) -> impl Iterator<Item = &RecordedFinding> {
+        self.findings
+            .iter()
+            .filter(|f| f.standing != Standing::Withdrawn)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // What gh returns
 // ---------------------------------------------------------------------------
@@ -1391,9 +1582,51 @@ pub struct PrView {
     pub is_cross_repository: bool,
 }
 
+/// The fields a sweep reads from `gh pr list` and `gh pr view`: enough to
+/// notice a head that moved, a review request, an assignment, and a close.
+pub const PR_SWEEP_FIELDS: &str =
+    "number,title,headRefOid,updatedAt,author,isDraft,isCrossRepository,reviewRequests,assignees,state";
+
+/// One row of `gh pr list --json PR_SWEEP_FIELDS`, or of `gh pr view` with
+/// the same fields.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrSweepRow {
+    pub number: i64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub head_ref_oid: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub author: Option<Author>,
+    #[serde(default)]
+    pub is_draft: bool,
+    #[serde(default)]
+    pub is_cross_repository: bool,
+    #[serde(default)]
+    pub review_requests: Vec<Login>,
+    #[serde(default)]
+    pub assignees: Vec<Login>,
+    /// OPEN, CLOSED, or MERGED.
+    #[serde(default)]
+    pub state: String,
+}
+
+/// A user in a `reviewRequests` or `assignees` array. A team entry has `name`
+/// and `slug` instead, which reads as an empty login and never matches the
+/// viewer.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Login {
+    #[serde(default)]
+    pub login: String,
+}
+
 /// Issues and pull requests share one number sequence per repository, so a
 /// number names exactly one of them and spar can work out which.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ItemKind {
     Issue,
     Pr,
@@ -1590,5 +1823,91 @@ mod body_for_prompt_tests {
         let (out, _) = issue(&body).body_for_prompt(100);
         let kept = out.split("\n\n[Shortened").next().expect("the kept part");
         assert!(kept.ends_with("cccc"), "{kept:?}");
+    }
+}
+
+#[cfg(test)]
+mod review_record_tests {
+    use super::*;
+
+    fn judged() -> Judged {
+        Judged {
+            finding: Finding {
+                severity: Severity::Blocking,
+                title: "Retry loop never terminates".into(),
+                detail: "the guard compares against Some(0)".into(),
+                file: "src/net.rs:88".into(),
+                in_scope: true,
+                problem: Some("dropped on the way to the record".into()),
+                ..Finding::default()
+            },
+            raised_by: "claude and codex".into(),
+            standing: Standing::Corroborated,
+            counterpoint: None,
+            defence: Some("stands".into()),
+        }
+    }
+
+    #[test]
+    fn a_review_record_round_trips_through_json_and_keeps_its_standing_as_a_word() {
+        let record = ReviewRecord {
+            version: REVIEW_RECORD_VERSION,
+            head: "0123abcdef".into(),
+            reviewed_at: "2026-10-20T18:04:05Z".into(),
+            findings: vec![RecordedFinding::from(&judged())],
+            rechecks: 2,
+            verdict: Some(ReviewVerdict::RequestChanges),
+            posted: true,
+        };
+        let text = serde_json::to_string_pretty(&record).unwrap();
+        assert!(text.contains("\"standing\": \"corroborated\""), "{text}");
+        assert!(text.contains("\"verdict\": \"request_changes\""), "{text}");
+        assert!(text.contains("\"severity\": \"blocking\""), "{text}");
+        assert!(!text.contains("problem"), "{text}");
+        let back: ReviewRecord = serde_json::from_str(&text).unwrap();
+        assert_eq!(record, back);
+        assert_eq!("0123abc", back.short_head());
+    }
+
+    #[test]
+    fn a_record_missing_the_newer_fields_still_reads() {
+        let text = r#"{"version":1,"head":"abc","reviewed_at":"2026-10-20T18:04:05Z",
+            "findings":[{"title":"T","severity":"nit","standing":"one_reviewer"}]}"#;
+        let back: ReviewRecord = serde_json::from_str(text).unwrap();
+        assert_eq!(0, back.rechecks);
+        assert!(!back.posted);
+        assert_eq!(None, back.verdict);
+        assert!(back.findings[0].in_scope);
+        assert_eq!(Standing::Unverified, back.findings[0].standing);
+        assert_eq!("general", back.findings[0].where_at());
+    }
+
+    #[test]
+    fn a_recorded_finding_turns_back_into_a_judged_finding() {
+        let original = judged();
+        let back = RecordedFinding::from(&original).to_judged();
+        assert_eq!(original.finding.title, back.finding.title);
+        assert_eq!(original.finding.file, back.finding.file);
+        assert_eq!(original.finding.severity, back.finding.severity);
+        assert_eq!(original.raised_by, back.raised_by);
+        assert_eq!(original.standing, back.standing);
+        assert_eq!(original.defence, back.defence);
+        assert_eq!(None, back.finding.problem);
+        assert!(back.finding.blocks());
+    }
+
+    #[test]
+    fn a_ruling_tolerates_a_quoted_index_and_a_synonym_outcome() {
+        let doc: RecheckDoc = serde_json::from_str(
+            r#"{"summary":"holds","rulings":[{"index":"2","outcome":"Resolved","reasoning":"line 4"}],"findings":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(2, doc.rulings[0].index);
+        assert_eq!(Ruling::Fixed, doc.rulings[0].outcome);
+        let doc: RecheckDoc =
+            serde_json::from_str(r#"{"summary":"","rulings":[],"findings":[]}"#).unwrap();
+        assert!(doc.rulings.is_empty());
+        assert_eq!("APPROVE", ReviewVerdict::Approve.api_event());
+        assert_eq!("changes requested", ReviewVerdict::RequestChanges.words());
     }
 }

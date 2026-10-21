@@ -9,9 +9,11 @@ use clap::{Args, Parser, Subcommand};
 use crate::agent::{self, Agent};
 use crate::brainstorm;
 use crate::checkin;
+use crate::clock;
 use crate::config::{self, Config};
 use crate::error::Result;
 use crate::followups;
+use crate::listen;
 use crate::model::{Issue, IssueRun, ItemKind, Plan, PlanItem, Status};
 use crate::proc::{self, ExecOpts};
 use crate::progress::Progress;
@@ -42,7 +44,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
                   issues and once to pull requests. `followup` takes none: it works the queue in \
                   .spar/followups.md, and an entry there has no number to name. `brainstorm` \
                   takes words rather than numbers: the subject to brainstorm, or nothing to \
-                  brainstorm the repository itself.",
+                  brainstorm the repository itself. `listen` takes issue or pull request \
+                  numbers to watch, or nothing to watch the whole repository.",
     max_term_width = 96
 )]
 pub struct Cli {
@@ -180,6 +183,17 @@ pub enum Command {
         /// cross-checking, 2 adds it, 3 adds a rebuttal on what they dispute.
         #[arg(long)]
         max_rounds: Option<u32>,
+        /// Submit a formal review instead of a comment: approve when nothing
+        /// blocks, request changes when a blocking finding stands. The verdict
+        /// is derived from the findings, never asked of a model.
+        #[arg(long)]
+        verdict: bool,
+        /// Take a second look instead of a first: rule on the findings the
+        /// last review recorded, review only what landed since, and submit a
+        /// verdict. A pull request with no posted review on record gets a
+        /// first look.
+        #[arg(long)]
+        recheck: bool,
     },
 
     /// Brainstorm novel ways to reach a goal, by pairing pieces that exist.
@@ -253,6 +267,38 @@ pub enum Command {
         /// not resume retained branches.
         #[arg(long)]
         again: bool,
+    },
+
+    /// Watch the repository and act on what happens, spending nothing while
+    /// it waits.
+    ///
+    /// Polls GitHub through gh for activity on pull requests spar has
+    /// reviewed, for pull requests assigned to you or awaiting your review,
+    /// and for mentions of you. A reviewed pull request that moves or gets a
+    /// reply gets a second look and a verdict; a new one gets a review; a
+    /// comment on a pull request you wrote gets `spar checkin`. Waiting costs
+    /// no agent calls: only a review, a second look, or a check-in does.
+    ///
+    /// With numbers, watches only those issues and pull requests and exits
+    /// once every one is closed. Ctrl-C stops it after the call in flight is
+    /// stopped; a second Ctrl-C stops it at once.
+    Listen {
+        /// Issue or pull request numbers to watch. Omit to watch the whole
+        /// repository.
+        items: Vec<i64>,
+        #[command(flatten)]
+        common: Common,
+        /// Poll once, act on what is due, and exit. For cron.
+        #[arg(long)]
+        once: bool,
+        /// Log every event and the action it would trigger, and trigger
+        /// nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// How far back to look on the first run: 30m, 2h, 1d. Later runs
+        /// resume where they stopped.
+        #[arg(long, value_name = "DURATION")]
+        since: Option<String>,
     },
 
     /// Post a review a dry run produced, without running the agents again.
@@ -411,6 +457,8 @@ fn dispatch(cli: Cli) -> Result<i32> {
             common,
             dry_run,
             max_rounds,
+            verdict,
+            recheck,
         } => {
             let overrides = Overrides {
                 max_rounds,
@@ -444,14 +492,46 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
             let mut results = Vec::new();
             for number in targets {
-                results.push(review_only::review_pr(
-                    &agents, &cfg, &repo, number, dry_run,
-                ));
+                results.push(if recheck {
+                    let mode = review_only::RecheckMode {
+                        dry_run,
+                        requested: false,
+                        verdict_on_fallback: verdict,
+                    };
+                    review_only::recheck_pr(&agents, &cfg, &repo, number, mode)
+                } else {
+                    let opts = review_only::ReviewOpts { dry_run, verdict };
+                    review_only::review_pr(&agents, &cfg, &repo, number, opts)
+                });
             }
             if results.is_empty() {
                 return Ok(0);
             }
             Ok(report(&results, &cfg, &repo))
+        }
+
+        Command::Listen {
+            items,
+            common,
+            once,
+            dry_run,
+            since,
+        } => {
+            // A bad duration fails before a config is read or a repo opened.
+            let since = since.as_deref().map(listen::parse_duration).transpose()?;
+            let (cfg, repo, agents) = prepare(&common, None)?;
+            listen::run(
+                &agents,
+                &cfg,
+                &repo,
+                listen::Opts {
+                    items,
+                    once,
+                    dry_run,
+                    since,
+                    limit: common.limit,
+                },
+            )
         }
 
         Command::Brainstorm {
@@ -1699,7 +1779,19 @@ fn cmd_post(
         // Through the style gate like anything else spar sends, so an edit that
         // reintroduces a banned dash is caught rather than published.
         match repo.comment_pr(*number, &text) {
-            Ok(()) => log!("posted to PR #{number}"),
+            Ok(()) => {
+                log!("posted to PR #{number}");
+                // The review the dry run recorded has now been seen, so a
+                // later push or reply gets a second look rather than a first.
+                if let Some(mut record) = repo.read_review_record(*number) {
+                    if !record.posted {
+                        record.posted = true;
+                        if let Err(e) = repo.write_review_record(*number, &record) {
+                            logdim!("could not mark the review record posted: {e}");
+                        }
+                    }
+                }
+            }
             Err(e) => {
                 logging::error(format!("could not post to PR #{number}: {e}"));
                 failed = true;
@@ -1760,10 +1852,10 @@ fn cmd_brainstorm(
         budget: cfg.loop_cfg.max_rounds,
         wanted: ideas,
     };
-    let now = brainstorm::now_secs();
+    let now = clock::now_secs();
     let outcome = brainstorm::run(&agents, &cfg, &repo, &session)?;
     let path = out.unwrap_or_else(|| brainstorm::default_path(&repo, &session, now));
-    let text = brainstorm::render_session(&outcome, &brainstorm::date_line(now), &repo.style);
+    let text = brainstorm::render_session(&outcome, &clock::date_line(now), &repo.style);
     crate::repo::write_text_atomic(&path, &text)?;
     brainstorm::print_summary(&outcome, &path);
     if file_issues {
@@ -1998,6 +2090,18 @@ const STYLE_OPTIONS: &[Setting] = &[
     (true, "max_issue_body_chars", "A filed issue's body. Far larger on purpose: an issue is picked up cold months later. Fenced code blocks are never truncated and never count against it."),
 ];
 
+const LISTEN_OPTIONS: &[Setting] = &[
+    (true, "interval", "Seconds between polls of GitHub's notifications for this repository. GitHub says how often it will answer and the larger of the two is used. A poll that finds nothing costs nothing against the rate limit, and waiting never costs an agent call."),
+    (true, "sweep", "Seconds between sweeps of the open pull requests. A push raises no notification for a reviewer, so the sweep is what notices a reviewed pull request moving."),
+    (true, "settle", "Seconds an item has to stay quiet before spar acts on it, so a push and three replies in the same minute cost one recheck rather than four."),
+    (true, "max_wait", "Most seconds an item may keep settling before it is acted on anyway."),
+    (true, "max_rechecks", "Rechecks one pull request gets from `spar listen` before a person has to run `spar review` on it again. A cap against two bots arguing, not a target. 0 turns automatic rechecks off."),
+    (true, "on_review_requested", "What a pull request somebody asked you to review gets: review or ignore."),
+    (true, "on_assigned", "What a pull request assigned to you gets: review or ignore."),
+    (false, "on_own_pr", "What activity on a pull request you authored gets, since the same account cannot approve it: checkin may push a change both agents agree on, reply answers in words only, ignore does nothing."),
+    (false, "verdicts", "Whether a review `spar listen` starts submits a formal verdict, approve or request changes, rather than a comment. A recheck always does."),
+];
+
 /// The `[loop]` and `[style]` blocks of a generated config.
 ///
 /// Safety valves, not editors: the length budgets here are sized so real
@@ -2034,11 +2138,14 @@ fn settings_block(first_implementor: &str) -> String {
         "# checkin     = \"high\"   # judging comments other people left\n",
         "# split       = \"high\"   # proposing and checking a split\n",
         "# brainstorm  = \"high\"   # every brainstorm round\n",
+        "# recheck     = \"low\"    # a second look after commits or replies\n",
         "# round_1     = \"high\"   # read by any call above with no key set\n",
         "# rest        = \"low\"    # the same, for later rounds and the close\n\n",
     ));
     out.push_str("[style]\n");
     out.push_str(&option_lines(STYLE_OPTIONS, &value));
+    out.push_str("\n[listen]\n");
+    out.push_str(&option_lines(LISTEN_OPTIONS, &value));
     out
 }
 
@@ -2145,6 +2252,7 @@ fn note_for(key: &str) -> &'static str {
     LOOP_OPTIONS
         .iter()
         .chain(STYLE_OPTIONS)
+        .chain(LISTEN_OPTIONS)
         .find(|(_, name, _)| *name == key)
         .map(|(_, _, note)| *note)
         .unwrap_or("")
@@ -2385,34 +2493,7 @@ fn report_with(
     }
     println!("\n{}", "=".repeat(60));
     for r in results {
-        println!(
-            "#{:<5} {:<10} rounds={} {}",
-            r.issue,
-            r.status.to_string(),
-            r.rounds,
-            r.pr.as_deref().unwrap_or("")
-        );
-        for note in &r.notes {
-            println!("       {}", first_line(note));
-        }
-        for url in &r.filed {
-            println!("       filed {url}");
-        }
-        for dispute in &r.disputes {
-            println!(
-                "       disputed: {}",
-                report_item(&dispute.title, &dispute.file)
-            );
-        }
-        for finding in &r.noted {
-            println!(
-                "       noted, not blocking: {}",
-                report_item(&finding.title, &finding.file)
-            );
-        }
-        if let Some(cost) = spend::for_subject(&spent, r.issue) {
-            println!("       {cost}");
-        }
+        print_outcome(r, &spent);
     }
     println!("{}", "=".repeat(60));
 
@@ -2449,11 +2530,43 @@ fn report_with(
     issue_exit.max(report_writes(repo))
 }
 
+/// One item's outcome, as the report prints it.
+pub(crate) fn print_outcome(r: &IssueRun, spent: &[spend::Spent]) {
+    println!(
+        "#{:<5} {:<10} rounds={} {}",
+        r.issue,
+        r.status.to_string(),
+        r.rounds,
+        r.pr.as_deref().unwrap_or("")
+    );
+    for note in &r.notes {
+        println!("       {}", first_line(note));
+    }
+    for url in &r.filed {
+        println!("       filed {url}");
+    }
+    for dispute in &r.disputes {
+        println!(
+            "       disputed: {}",
+            report_item(&dispute.title, &dispute.file)
+        );
+    }
+    for finding in &r.noted {
+        println!(
+            "       noted, not blocking: {}",
+            report_item(&finding.title, &finding.file)
+        );
+    }
+    if let Some(cost) = spend::for_subject(spent, r.issue) {
+        println!("       {cost}");
+    }
+}
+
 /// A failed write makes the final status non-zero, including a partial failure.
 /// Independent writes still finish first, so one failure does not discard work
 /// that another item can land. The non-zero status lets automation retry what
 /// was missed.
-fn report_writes(repo: &Repo) -> i32 {
+pub(crate) fn report_writes(repo: &Repo) -> i32 {
     let writes = repo.write_summary();
     if let Some(line) = write_summary_line(writes) {
         println!("\n{line}");
@@ -2718,6 +2831,7 @@ review_1 = \"ultra\"
             vec!["spar", "checkin"],
             vec!["spar", "split"],
             vec!["spar", "brainstorm"],
+            vec!["spar", "listen"],
             vec!["spar", "clean"],
             vec!["spar", "doctor"],
         ] {
@@ -2731,6 +2845,7 @@ review_1 = \"ultra\"
                 | Command::Followup { common, .. }
                 | Command::Split { common, .. }
                 | Command::Brainstorm { common, .. }
+                | Command::Listen { common, .. }
                 | Command::Checkin { common, .. } => common.config,
                 Command::Clean { config, .. } | Command::Doctor { config } => config,
                 other => panic!("{other:?}"),
@@ -2800,6 +2915,13 @@ review_1 = \"ultra\"
                 "--instructions",
                 "Do not wait for CI.",
             ],
+            vec![
+                "spar",
+                "listen",
+                "7",
+                "--instructions",
+                "Do not wait for CI.",
+            ],
         ] {
             let parsed = Cli::parse_from(&argv);
             let common = match parsed.command {
@@ -2810,6 +2932,7 @@ review_1 = \"ultra\"
                 | Command::Followup { common, .. }
                 | Command::Split { common, .. }
                 | Command::Brainstorm { common, .. }
+                | Command::Listen { common, .. }
                 | Command::Checkin { common, .. } => common,
                 other => panic!("{other:?}"),
             };
@@ -3021,6 +3144,79 @@ review_1 = \"ultra\"
     }
 
     #[test]
+    fn review_takes_verdict_and_recheck_flags_and_neither_by_default() {
+        match Cli::parse_from(["spar", "review", "108", "--verdict", "--recheck"]).command {
+            Command::Review {
+                items,
+                verdict,
+                recheck,
+                ..
+            } => {
+                assert_eq!(vec![108], items);
+                assert!(verdict);
+                assert!(recheck);
+            }
+            other => panic!("{other:?}"),
+        }
+        match Cli::parse_from(["spar", "review", "108"]).command {
+            Command::Review {
+                verdict, recheck, ..
+            } => {
+                assert!(!verdict);
+                assert!(!recheck);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(Cli::try_parse_from(["spar", "checkin", "108", "--verdict"]).is_err());
+    }
+
+    #[test]
+    fn listen_takes_numbers_once_dry_run_and_since() {
+        match Cli::parse_from([
+            "spar",
+            "listen",
+            "108",
+            "42",
+            "--once",
+            "--dry-run",
+            "--since",
+            "2h",
+        ])
+        .command
+        {
+            Command::Listen {
+                items,
+                once,
+                dry_run,
+                since,
+                ..
+            } => {
+                assert_eq!(vec![108, 42], items);
+                assert!(once);
+                assert!(dry_run);
+                assert_eq!(Some("2h".to_string()), since);
+            }
+            other => panic!("{other:?}"),
+        }
+        match Cli::parse_from(["spar", "listen"]).command {
+            Command::Listen {
+                items,
+                once,
+                dry_run,
+                since,
+                common,
+            } => {
+                assert!(items.is_empty());
+                assert!(!once);
+                assert!(!dry_run);
+                assert_eq!(None, since);
+                assert_eq!(20, common.limit);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn resume_takes_a_next_override() {
         let cli = Cli::parse_from(["spar", "resume", "108", "--next", "codex"]);
         match cli.command {
@@ -3173,6 +3369,7 @@ mod min_number_tests {
             | Command::Review { common, .. }
             | Command::Followup { common, .. }
             | Command::Split { common, .. }
+            | Command::Listen { common, .. }
             | Command::Checkin { common, .. } => common.min_number,
             other => panic!("{other:?}"),
         }
@@ -3185,7 +3382,9 @@ mod min_number_tests {
 
     #[test]
     fn every_command_that_picks_for_itself_accepts_a_floor() {
-        for cmd in ["run", "triage", "resume", "review", "checkin", "split"] {
+        for cmd in [
+            "run", "triage", "resume", "review", "checkin", "split", "listen",
+        ] {
             assert_eq!(
                 Some(480),
                 read(&["spar", cmd, "--min-number", "480"]),
@@ -3377,7 +3576,11 @@ mod settings_block_tests {
     /// A note reads as a sentence now that it leads rather than trails.
     #[test]
     fn every_note_starts_as_a_sentence() {
-        for (_, key, note) in LOOP_OPTIONS.iter().chain(STYLE_OPTIONS) {
+        for (_, key, note) in LOOP_OPTIONS
+            .iter()
+            .chain(STYLE_OPTIONS)
+            .chain(LISTEN_OPTIONS)
+        {
             let first = note.chars().next().expect("a note");
             assert!(
                 first.is_uppercase(),

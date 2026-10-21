@@ -85,13 +85,16 @@ spar checkin 108 --dry-run  # every reply and every change, posted nowhere
 spar followup --screen-only # judges the queue, writes nothing, files nothing
 spar split 10 --dry-run     # the parts it would make, filed and branched nowhere
 spar run 42 --no-close-skipped   # will not close an issue it declines
+spar listen --dry-run       # every event and what it would trigger, nothing triggered
 ```
 
-`--dry-run` is on `review`, `checkin` and `split`. The first two are the commands
-whose whole output is a comment; `split` writes more kinds of thing than any
-other command, which is why its read-only half exists. There is no `--dry-run` on
-`run`, since `run` writes code: `triage` is its read-only half, and
-`followup --screen-only` is `followup`'s.
+`--dry-run` is on `review`, `checkin`, `split` and `listen`. The first two are the
+commands whose whole output is a comment; `split` writes more kinds of thing than
+any other command, which is why its read-only half exists. `listen --dry-run` is
+different in kind: it calls no agent at all, since what it would have run is the
+thing being previewed, and `spar review N --dry-run` is how to see a review's text.
+There is no `--dry-run` on `run`, since `run` writes code: `triage` is its
+read-only half, and `followup --screen-only` is `followup`'s.
 
 ### Write outcomes
 
@@ -189,6 +192,15 @@ spar split 42 --dry-run     # print the proposal, write nothing
 spar review 108             # review a PR without touching it, fork or not
 spar review 108 --dry-run   # print the review instead of posting it
 spar review                 # review every open PR
+spar review 108 --verdict   # approve or request changes instead of commenting
+spar review 108 --recheck   # rule on the last review's points, review what landed since
+
+spar listen                 # watch the repo: second looks at reviewed PRs that move,
+                            # reviews of what is assigned to you or awaiting your review
+spar listen 108 42          # watch only these, and stop once they are closed
+spar listen --once          # one poll, act on what is due, exit; for cron
+spar listen --dry-run       # say what each event would trigger, trigger nothing
+spar listen --since 2h      # on the first run, catch up on the last two hours
 
 spar brainstorm novel uses of Bitcoin Script for shared custody
                             # both agents propose, build on and challenge each
@@ -458,6 +470,45 @@ the reviewers disagree, your call
 Nothing is committed, pushed, merged, or closed. `--max-rounds` picks how far it
 goes: 1 is two independent reviews with no cross-checking, 2 adds it, 3 adds the
 rebuttal.
+
+What goes up is a comment, unless you ask for a verdict:
+
+```bash
+spar review 108 --verdict   # approve, or request changes, as GitHub shows them
+```
+
+The verdict is derived from the findings and never asked of a model: approve
+when nothing blocks, request changes when a blocking finding both reviewers count
+stands, and a plain review comment with no verdict when the only thing short of
+approval is a blocking finding the two dispute, which is yours to settle. The
+review names the commit the reviewers read, so a push that lands while it runs
+gets no approval nobody gave it. GitHub refuses an approval from the account
+that opened the pull request, so on your own the verdict travels as words in a
+comment.
+
+Every review now leaves a record under `.spar/state/review-N.json`: the commit it
+read, when it began, and the points it raised with how well each was attested.
+That is what makes a second look possible:
+
+```bash
+spar review 108 --recheck   # after the author pushed or replied
+```
+
+A second look reads the record, and before any agent runs it checks with `gh`
+alone whether anything changed: a new head, or something somebody other than you
+said since. Nothing new means nothing spent. Otherwise both agents, independently,
+rule on every earlier point by number with the code in front of them, fixed,
+rebutted by a quoted reply, or open, and review only the commits that landed
+since for anything new. A point is closed only when both close it; one reviewer
+still seeing it keeps it open and says so; a reviewer that did not answer closes
+nothing. New findings go through the same cross-check as a first review. The
+verdict follows the same rule as `--verdict`, earlier points included: a blocker
+the first look left disputed is still yours to settle, not a change request,
+for as long as it stays open. The comment leads with the
+commits it read, then what was addressed, what is still open, what is new, and
+what the two disagree about. A branch rewritten since the review is said as
+such, and every earlier point is verified from scratch. The record is rewritten
+afterwards, so the next look starts from this one.
 
 This is also the cheapest way to adopt spar. No agent writes a feature from
 scratch; it only reviews what already exists.
@@ -751,6 +802,91 @@ own resolved flag, and what spar answered is recorded in `.spar/state`, which is
 what makes leaving a disputed thread open terminate rather than re-arguing it
 once a run forever. A fresh clone has no record, so it will answer a previously
 declined point once more.
+
+## Listening for what happens next
+
+Every command above does one pass and exits, so a reply to a review spar posted,
+or a push that answered it, waited for you to notice and run spar again. `spar
+listen` waits instead, and it waits for free: nothing calls an agent until GitHub
+says something happened.
+
+```bash
+spar listen                 # watch the repository
+spar listen 108 42          # watch only these, and exit once every one is closed
+spar listen --once          # one poll and one sweep, act on what is due, exit
+spar listen --dry-run       # every event and what it would trigger, nothing triggered
+spar listen --since 2h      # on the first run, catch up on the last two hours
+```
+
+Two sources feed it, because neither is enough alone. GitHub's notifications for
+the repository say why a thread moved, a review request, a mention, a comment,
+and spar polls them with a conditional request: when nothing changed GitHub
+answers `304 Not Modified`, which costs nothing against the rate limit, and spar
+obeys the interval GitHub asks for. But a push raises no notification for a
+reviewer, so every `sweep` seconds spar lists the open pull requests and compares
+each head with the commit its review record holds. Notifications are never
+raised for your own actions, which is also why spar's own comments never wake it.
+
+What an event leads to is a table, not a judgement:
+
+- A pull request spar has reviewed, written by somebody else, that moved or got a
+  reply gets a **second look**: the earlier points ruled on, what landed since
+  reviewed, and a verdict. A review request on it that arrives with nothing new
+  gets a mechanical comment saying so, and no agent call.
+- A pull request spar has not reviewed, written by somebody else, where your
+  review was requested or that was assigned to you gets a review with a verdict,
+  under `on_review_requested` and `on_assigned`. A mention on it gets a review
+  whatever those say. A push or a comment on one gets nothing, unless you named
+  it, in which case the first thing that happens to it starts the first review.
+- A pull request you wrote, which the same account cannot approve, follows
+  `on_own_pr`: `checkin` runs `spar checkin`, which may push a change both agents
+  agree on behind `checkin_trust`; `reply` answers in words only; `ignore` does
+  nothing. A push to your own branch is never news.
+- A pull request in the custody loop's hands, with `.spar/state/pr-N.json` and
+  no review record, is left to `spar resume`, and the log says so once.
+- A mention on an issue is logged and left alone, unless the issue has an open
+  pull request spar reviewed, in which case that pull request gets a second look
+  on the same terms as its own: none once it has had `max_rechecks`, and none
+  when it is yours.
+- Anything closed or merged is dropped. Anything below `min_number` is ignored
+  unless you named it.
+
+Events settle before anything runs. An item is acted on once it has been quiet
+for `settle` seconds, or after `max_wait` seconds however noisy, so a push
+followed by three replies in the same minute is one second look rather than four.
+Dispatches run one at a time; what arrives during one is read on the next tick,
+and nothing is lost, because the notifications stay on GitHub's side until spar
+reads past them. Each pull request gets `max_rechecks` second looks before spar
+leaves it to a person, which is what keeps two bots from arguing forever; `spar
+review N` resets that.
+
+With numbers, `spar listen 108 42` watches only those: a named pull request is
+rechecked when it moves or is replied to, reviewed on the first thing that
+happens to it if spar never reviewed it, and the command exits once every named
+item is closed. A named issue is watched through its open pull request, when spar
+has reviewed one. Nothing else is acted on, including work a listener over the
+whole repository left pending, which stays for the next one.
+
+`--once` does one poll and one sweep, acts on whatever is due without waiting
+for it to settle, and exits non-zero if a poll or a sweep failed, so cron can run
+it instead of a resident process. Only one listener may watch a checkout at a
+time; a second refuses, naming the first's pid, for as long as the first is
+running, however long one review takes. A lock left by a process that is gone
+holds nothing. Between runs the listener keeps where it got to in
+`.spar/state/listen.json`, so stopping and starting it loses no event. A dry run
+writes none of it, so the run after one acts on everything it showed.
+
+Ctrl-C stops it. An agent call in flight is stopped rather than left running,
+the item is reported as interrupted with its worktree kept, and spar exits 130. A
+second Ctrl-C ends it at once.
+
+A `gh` failure, a network drop or a rate limit does not end the listener: it
+backs off, a minute doubling to fifteen for an ordinary failure and until the
+limit resets for a rate limit, says so once, and says when `gh` answers again. A
+poll is all or nothing: one that cannot read every page of notifications moves
+past none of them. A review or second look that fails, or that GitHub would not
+take, is tried again after a quarter of an hour, doubling, and after five
+failures it is left until something new happens to it.
 
 ## Splitting something too big to work in one piece
 
@@ -1170,6 +1306,7 @@ worktrees         = true
 triage      = "low"         # both agents, over the whole queue
 review_1    = "high"        # the deep pass
 review_rest = "high"        # later rounds and the closing pass
+recheck     = "high"        # the second look after commits or replies
 
 [style]
 ban_em_dash        = true
@@ -1366,6 +1503,7 @@ spar checkin        # answer the comments nobody replied to
 spar clean          # drop local worktrees, branches, and state for finished PRs
 spar clean --all    # drop every local worktree and branch spar recorded
 spar clean --pr-state   # also delete state comments left on finished PRs
+spar listen         # wait for pushes, replies, review requests and mentions, and act
 spar doctor         # check prerequisites and resolve each configured agent
 spar doctor --config other.toml   # check a config before adopting it
 
@@ -1436,9 +1574,10 @@ Every review round is a repo-aware pass at the configured effort. A full ultra
 review of a three-line round-3 delta is money on fire, which is what
 `effort_schedule` exists to prevent. It has one key per kind of call, so a value
 means what its name says: `triage`, `implement`, `review_1`, `review_rest`,
-`respond`, `close`, `screen`, `checkin`, `split`, `brainstorm`. A call with no key set falls
-back to `round_1` or `rest`, which is what the schedule used to be, and then to
-the agent's own `effort`.
+`respond`, `close`, `screen`, `checkin`, `split`, `brainstorm`, `recheck`. A call with no key
+set falls back to `round_1` or `rest`, which is what the schedule used to be, and
+then to the agent's own `effort`. `recheck` reads `review_rest` first, since a
+second look is a delta and a list of claims rather than a first reading.
 
 Effort words are each CLI's own vocabulary, so a schedule that has to say
 different things to the two agents goes under `[agents.NAME.effort_schedule]`
@@ -1468,6 +1607,13 @@ there is something to implement.
 
 `spar brainstorm` is two calls per round, so six at the default of three rounds
 and two with `--max-rounds 1`. Filing from a saved session costs nothing.
+
+`spar listen` costs nothing while it waits: polling is `gh` alone, and a poll
+that finds nothing does not even count against GitHub's rate limit. What an
+event costs is what the command it dispatches costs: a review's four to six
+calls, a check-in's two or three, and a second look's two calls plus the
+cross-check when something new turned up, which reads the `recheck` effort key.
+`settle` is what keeps a burst of pushes and replies to one of them.
 
 ## Caveats
 

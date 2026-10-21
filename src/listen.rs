@@ -757,6 +757,17 @@ pub fn dispatch_backoff_secs(failures: u32) -> u64 {
     (900u64 << failures.saturating_sub(1).min(10)).min(6 * 3600)
 }
 
+/// How long an item whose dispatch did not finish waits to run again. A head
+/// that moved under it is GitHub or the author rather than a failure, so the
+/// next look starts once the push settles. Anything else backs off.
+pub fn retry_wait(moved: bool, failures: u32, cfg: &ListenCfg) -> u64 {
+    if moved {
+        cfg.settle.max(FLOOR_SECS)
+    } else {
+        dispatch_backoff_secs(failures)
+    }
+}
+
 /// What a `gh` failure is retried after, said loudly once and quietly after.
 #[derive(Debug, Default)]
 struct Backoff {
@@ -1535,17 +1546,28 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                         // would lose it for good.
                         let unposted = repo.write_summary().failed > failed_before;
                         let w = state.watched(number, p.kind);
-                        if run.status == Status::Error || unposted {
+                        // Nothing posted because the head moved under it: the
+                        // pending item stays, and the next look reads the new
+                        // head.
+                        let moved = run.status == Status::Moved && !unposted;
+                        if run.status == Status::Error || moved || unposted {
                             w.failures += 1;
-                            let wait = dispatch_backoff_secs(w.failures);
+                            let wait = retry_wait(moved, w.failures, &cfg.listen);
                             // From now rather than the start of the tick, which
                             // a long review leaves far behind.
                             w.retry_after = clock::now_secs() + wait;
-                            if w.failures >= MAX_FAILURES {
+                            let gave_up = w.failures >= MAX_FAILURES;
+                            if gave_up {
                                 logwarn!("#{number}: giving up on it until it changes again");
                                 state.pending.remove(&number);
                             } else {
-                                if unposted {
+                                if moved {
+                                    log!(
+                                        "#{number}: its head moved while spar read it, so it runs \
+                                         again on the new head in {}",
+                                        spend::clock(Duration::from_secs(wait))
+                                    );
+                                } else if unposted {
                                     logwarn!(
                                         "#{number}: not everything it wrote reached GitHub, so it \
                                          runs again in {}",
@@ -1556,7 +1578,11 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                                     p.first_seen = now;
                                 }
                             }
-                            tick_failed = true;
+                            // A moved head failed nothing: it is still pending,
+                            // and the next `--once` reads the new head.
+                            if !moved || gave_up {
+                                tick_failed = true;
+                            }
                         } else {
                             w.failures = 0;
                             w.retry_after = 0;
@@ -2560,6 +2586,23 @@ mod tests {
         assert_eq!(900, dispatch_backoff_secs(1));
         assert_eq!(3600, dispatch_backoff_secs(3));
         assert_eq!(6 * 3600, dispatch_backoff_secs(9));
+    }
+
+    /// A pull request can sit minutes behind its branch. A look that stops
+    /// for that, or for a push while it ran, goes again once the push settles,
+    /// not a quarter of an hour later and doubling.
+    #[test]
+    fn a_head_that_moved_runs_again_once_it_settles_and_a_failure_backs_off() {
+        let c = cfg();
+        for failures in [1, 2, 4] {
+            assert_eq!(c.settle, retry_wait(true, failures, &c));
+            assert_eq!(
+                dispatch_backoff_secs(failures),
+                retry_wait(false, failures, &c)
+            );
+        }
+        let quick = ListenCfg { settle: 1, ..cfg() };
+        assert_eq!(FLOOR_SECS, retry_wait(true, 1, &quick));
     }
 
     #[test]

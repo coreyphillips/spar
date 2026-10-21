@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 use crate::config::{Config, Drafts, Followups, StateStore};
 use crate::error::Result;
 use crate::model::{
-    Contested, ContestedItem, Followup, Issue, IssueRef, ItemKind, PersistedState, PrRef, PrRow,
-    PrSweepRow, PrView, PR_SWEEP_FIELDS,
+    Contested, ContestedItem, Followup, Issue, IssueRef, ItemKind, LiveHead, PersistedState, PrRef,
+    PrRow, PrSweepRow, PrView, PR_SWEEP_FIELDS,
 };
 use crate::proc::{self, ExecOpts};
 use crate::style::{self, Style};
@@ -4090,6 +4090,29 @@ impl Repo {
             })
             .ok_or_else(|| spar_err!("could not read the head commit for PR #{number}"))?;
         Ok(oid)
+    }
+
+    /// Where a pull request's head stands now: what GitHub's pull request
+    /// names, and, for a branch in this repository, where `origin` has the
+    /// branch. The two differ until GitHub catches up with a push.
+    pub fn live_head(&self, pr: &PrView) -> Result<LiveHead> {
+        let pull = self.pr_head_oid(pr.number)?;
+        let branch = if pr.is_cross_repository || pr.head_ref_name.trim().is_empty() {
+            None
+        } else {
+            let remote_ref = format!("refs/heads/{}", pr.head_ref_name.trim());
+            let listed = self
+                .git(&["ls-remote", "--heads", "origin", &remote_ref])
+                .map_err(|e| {
+                    spar_err!(
+                        "could not read where {} is on origin: {}",
+                        pr.head_ref_name.trim(),
+                        e.last_line()
+                    )
+                })?;
+            remote_head_oid(&listed, &remote_ref)?
+        };
+        Ok(LiveHead { pull, branch })
     }
 
     pub fn create_pr(

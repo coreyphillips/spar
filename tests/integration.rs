@@ -6853,6 +6853,33 @@ impl Listening {
         std::fs::write(&self.notify, format!("[{}]\n", threads.join(","))).unwrap();
     }
 
+    fn with_gh(&self, gh: &str) {
+        executable(
+            &self.fx.dir.join("fake-bin").join("gh"),
+            &format!("#!/bin/sh\n{gh}\n"),
+        );
+    }
+
+    /// Publish the work tree's HEAD as the head of pull request `number` the
+    /// way GitHub has it once it has caught up with a push: `refs/pull/N/head`,
+    /// the fake gh's `headRefOid` and the sweep all name the same commit. A
+    /// review reads a head only when they agree.
+    fn publish_head(&self, number: i64, author: &str) -> String {
+        git(
+            &self.fx.work,
+            &[
+                "push",
+                "-q",
+                "origin",
+                &format!("HEAD:refs/pull/{number}/head"),
+            ],
+        );
+        let head = work_head(self);
+        self.with_gh(&listen_gh(number, &head, author, "OPEN"));
+        self.with_prs(&[sweep_row(number, &head, author)]);
+        head
+    }
+
     fn env(&self) -> Vec<(String, String)> {
         vec![
             ("PATH".into(), self.path.clone()),
@@ -6958,11 +6985,7 @@ fn listen_once_dry_run_names_what_each_event_would_trigger_and_triggers_nothing(
         ONE_BLOCKER_REVIEW,
         &listen_gh(7, "aaa", "alice", "OPEN"),
     );
-    git(
-        &l.fx.work,
-        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
-    );
-    l.with_prs(&[sweep_row(7, "aaa", "alice")]);
+    l.publish_head(7, "alice");
     l.with_notifications(&[
         notification("1", "review_requested", "PullRequest", 7),
         notification("2", "mention", "Issue", 42),
@@ -7031,12 +7054,7 @@ fn listen_once_with_a_review_request_reviews_the_pr_with_a_verdict() {
         ONE_BLOCKER_REVIEW,
         &listen_gh(7, "aaa", "alice", "OPEN"),
     );
-    git(
-        &l.fx.work,
-        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
-    );
-    let head = git(&l.fx.work, &["rev-parse", "HEAD"]).trim().to_string();
-    l.with_prs(&[sweep_row(7, "aaa", "alice")]);
+    let head = l.publish_head(7, "alice");
     l.with_notifications(&[notification("1", "review_requested", "PullRequest", 7)]);
 
     let (ok, out, log) = l.run(&["--once"]);
@@ -7132,6 +7150,160 @@ fn listen_once_rechecks_a_reviewed_pull_request_that_moved_and_approves() {
     assert_eq!(2, l.agent_calls(), "{out}");
 }
 
+fn work_head(l: &Listening) -> String {
+    git(&l.fx.work, &["rev-parse", "HEAD"]).trim().to_string()
+}
+
+/// A reply woke the listener while GitHub still named the commit before a
+/// push, so the second look read that commit, called it no new commit, and
+/// asked for changes the branch already had. It now waits for the pull request
+/// to catch up with its branch, then reads the push.
+#[test]
+#[cfg(unix)]
+fn listen_once_waits_for_github_to_catch_up_with_a_push_before_a_second_look() {
+    let l = Listening::new(
+        "listenlag",
+        RECHECK_FIXED,
+        RECHECK_FIXED,
+        &listen_gh(7, "aaa", "alice", "OPEN"),
+    );
+    let reviewed = work_head(&l);
+    git(
+        &l.fx.work,
+        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
+    );
+    write_record(&l.fx, 7, &blocking_record(&reviewed));
+    // The branch moved, and the pull request has not caught up with it.
+    commit(&l.fx.work, "file.txt", "bounded\n", "check the bound");
+    git(
+        &l.fx.work,
+        &["push", "-q", "origin", "HEAD:refs/heads/feature-7"],
+    );
+    let pushed = work_head(&l);
+    l.with_gh(&listen_gh(7, &reviewed, "alice", "OPEN"));
+    l.with_prs(&[sweep_row(7, &reviewed, "alice")]);
+    l.with_notifications(&[notification("1", "comment", "PullRequest", 7)]);
+
+    let (ok, out, log) = l.run(&["--once"]);
+
+    assert!(ok, "{out}");
+    assert!(
+        out.contains(&format!(
+            "GitHub has not caught up with the push to feature-7 yet: the pull request says {}, \
+             the branch is at {}",
+            &reviewed[..7],
+            &pushed[..7]
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains("#7: its head moved while spar read it, so it runs again on the new head"),
+        "{out}"
+    );
+    assert_eq!(0, l.agent_calls(), "{out}");
+    assert!(!submitted_a_review(&log), "{log}");
+    assert!(!log.contains("pr comment"), "{log}");
+    let record = read_record(&l.fx, 7);
+    assert_eq!(reviewed, record.head);
+    assert_eq!(0, record.rechecks);
+    assert!(l.state()["pending"].get("7").is_some(), "{}", l.state());
+
+    // GitHub catches up, and the wait the listener set has passed.
+    git(
+        &l.fx.work,
+        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
+    );
+    l.with_gh(&listen_gh(7, &pushed, "alice", "OPEN"));
+    l.with_prs(&[sweep_row(7, &pushed, "alice")]);
+    l.with_notifications(&[]);
+    let mut state = l.state();
+    state["items"]["7"]["retry_after"] = 0.into();
+    std::fs::write(
+        l.fx.work.join(".spar/state/listen.json"),
+        serde_json::to_string(&state).unwrap(),
+    )
+    .unwrap();
+
+    let (ok, out, log) = l.run(&["--once"]);
+
+    assert!(ok, "{out}");
+    assert!(
+        log.contains(&format!(
+            "{}Rechecked after 1 new commit (",
+            review_post(7, &pushed, "APPROVE")
+        )),
+        "{log}"
+    );
+    let record = read_record(&l.fx, 7);
+    assert_eq!(pushed, record.head);
+    assert_eq!(1, record.rechecks);
+    assert_eq!(0, l.state()["items"]["7"]["failures"], "{}", l.state());
+}
+
+/// A look takes minutes, and a push that lands while it runs used to leave its
+/// verdict on a commit the author had moved past. A look whose head moved by
+/// the time it is ready to post keeps it off the pull request, and the next
+/// look reads the new head.
+#[test]
+#[cfg(unix)]
+fn listen_once_does_not_post_a_second_look_whose_head_moved_while_it_ran() {
+    let l = Listening::new(
+        "listenmovedunder",
+        RECHECK_FIXED,
+        RECHECK_FIXED,
+        &listen_gh(7, "aaa", "alice", "OPEN"),
+    );
+    let reviewed = work_head(&l);
+    git(
+        &l.fx.work,
+        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
+    );
+    write_record(&l.fx, 7, &blocking_record(&reviewed));
+    commit(&l.fx.work, "file.txt", "bounded\n", "check the bound");
+    git(
+        &l.fx.work,
+        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
+    );
+    let read = work_head(&l);
+    // The first read of the head is the one the look reads. Every read after
+    // it finds a push that landed while the agents ran.
+    let later = "c49363528b6fc025465828bc7115ba3a4541a7b6";
+    let calls = l.fx.dir.join("head-calls");
+    l.with_gh(&format!(
+        "if [ \"$*\" = \"pr view 7 --json headRefOid\" ]; then\n  n=$(cat '{calls}' 2>/dev/null \
+         || printf 0)\n  n=$((n + 1))\n  printf '%s' \"$n\" > '{calls}'\n  if [ \"$n\" -gt 1 ]; \
+         then printf '%s\\n' '{{\"headRefOid\":\"{later}\"}}'; exit 0; fi\nfi\n{}",
+        listen_gh(7, &read, "alice", "OPEN"),
+        calls = calls.display(),
+    ));
+    l.with_prs(&[sweep_row(7, &read, "alice")]);
+
+    let (ok, out, log) = l.run(&["--once"]);
+
+    assert!(ok, "{out}");
+    assert_eq!(2, l.agent_calls(), "{out}");
+    assert!(
+        out.contains(&format!(
+            "the head moved from {} to c493635 while it was being read, so the review of {} was \
+             not posted",
+            &read[..7],
+            &read[..7]
+        )),
+        "{out}"
+    );
+    assert!(out.contains("spar post 7"), "{out}");
+    assert!(
+        out.contains("#7: its head moved while spar read it, so it runs again on the new head"),
+        "{out}"
+    );
+    assert!(!submitted_a_review(&log), "{log}");
+    let record = read_record(&l.fx, 7);
+    assert_eq!(reviewed, record.head);
+    assert_eq!(0, record.rechecks);
+    assert!(l.fx.work.join(".spar/reviews/pr-7.md").exists());
+    assert!(l.state()["pending"].get("7").is_some(), "{}", l.state());
+}
+
 /// A lock file is not a lock: one left behind by a listener that died, even
 /// naming a pid that is alive now, as a reboot can arrange, holds nothing.
 #[test]
@@ -7161,10 +7333,7 @@ fn listen_takes_over_a_lock_file_nobody_holds() {
 /// the child and the agent's pid.
 #[cfg(unix)]
 fn busy_listener(l: &Listening, listen: &str) -> (std::process::Child, u32) {
-    git(
-        &l.fx.work,
-        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
-    );
+    l.publish_head(7, "alice");
     let pid_file = l.fx.dir.join("agent.pid");
     let sleeper = format!(
         "#!/bin/sh\necho $$ > \"{}\"\nsleep 300\n",
@@ -7174,7 +7343,6 @@ fn busy_listener(l: &Listening, listen: &str) -> (std::process::Child, u32) {
     executable(&bin.join("agent-a"), &sleeper);
     executable(&bin.join("agent-b"), &sleeper);
     l.configure(&format!("[listen]\nsettle = 0\n{listen}"));
-    l.with_prs(&[sweep_row(7, "aaa", "alice")]);
     l.with_notifications(&[notification("1", "review_requested", "PullRequest", 7)]);
 
     let mut command = Command::new(SPAR_BIN);
@@ -7298,11 +7466,7 @@ fn listen_keeps_a_review_it_could_not_post_for_another_try() {
         ONE_BLOCKER_REVIEW,
         &listen_gh(7, "aaa", "alice", "OPEN"),
     );
-    git(
-        &l.fx.work,
-        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
-    );
-    l.with_prs(&[sweep_row(7, "aaa", "alice")]);
+    l.publish_head(7, "alice");
     l.with_notifications(&[notification("1", "review_requested", "PullRequest", 7)]);
 
     let (ok, out, _) = l.run_with(&["--once"], &[("SPAR_FAKE_REVIEW_FAILS", "1")]);
@@ -7589,10 +7753,7 @@ fn listen_stops_a_running_agent_on_ctrl_c_and_exits_130() {
     use std::io::Read;
 
     let l = Listening::refusing("listeninterrupt", &listen_gh(7, "aaa", "alice", "OPEN"));
-    git(
-        &l.fx.work,
-        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
-    );
+    l.publish_head(7, "alice");
     let pid_file = l.fx.dir.join("agent.pid");
     let sleeper = format!(
         "#!/bin/sh\necho $$ > \"{}\"\nsleep 300\n",
@@ -7605,7 +7766,6 @@ fn listen_stops_a_running_agent_on_ctrl_c_and_exits_130() {
     let mut config = std::fs::read_to_string(&l.config).unwrap();
     config.push_str("\n[listen]\nsettle = 0\n");
     std::fs::write(&l.config, config).unwrap();
-    l.with_prs(&[sweep_row(7, "aaa", "alice")]);
     l.with_notifications(&[notification("1", "review_requested", "PullRequest", 7)]);
 
     let env = l.env();

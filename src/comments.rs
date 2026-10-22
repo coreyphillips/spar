@@ -330,7 +330,9 @@ impl Repo {
     /// on either path. So replying keeps working on a host where reading the
     /// threads did not.
     pub fn reply_in_thread(&self, pr: i64, root: i64, body: &str) -> Result<()> {
-        let body = self.record_failed_write(self.clean(body))?;
+        // Signed like every other comment spar posts. `--include-own` reads the
+        // viewer's own messages in a thread, and an unsigned reply would be one.
+        let body = crate::repo::signed(&self.record_failed_write(self.clean(body))?);
         let path = format!("repos/{{owner}}/{{repo}}/pulls/{pr}/comments");
         let replied = self
             .gh(&[
@@ -503,11 +505,16 @@ pub fn same_login(a: &str, b: &str) -> bool {
 ///   thread it disagreed with open, for the person who raised it. Unresolved
 ///   alone would therefore make spar re-argue every point it lost, once per
 ///   run, forever.
-pub fn thread_wants_an_answer(thread: &RawThread, viewer: &str, seen: &Answered) -> bool {
+pub fn thread_wants_an_answer(
+    thread: &RawThread,
+    viewer: &str,
+    include_own: bool,
+    seen: &Answered,
+) -> bool {
     if thread.is_resolved {
         return false;
     }
-    let Some(newest) = newest_from_others(thread, viewer) else {
+    let Some(newest) = newest_input(thread, viewer, include_own) else {
         return false;
     };
     seen.seen.get(&thread_key(thread)) != Some(&newest.id)
@@ -531,11 +538,43 @@ fn thread_key(thread: &RawThread) -> String {
 
 /// The newest message in a thread that neither the viewer nor spar wrote.
 fn newest_from_others<'a>(thread: &'a RawThread, viewer: &str) -> Option<&'a RawComment> {
+    newest_input(thread, viewer, false)
+}
+
+/// The newest message in a thread that `checkin` should read. See `is_input`.
+fn newest_input<'a>(
+    thread: &'a RawThread,
+    viewer: &str,
+    include_own: bool,
+) -> Option<&'a RawComment> {
     thread
         .comments
         .nodes
         .iter()
-        .rfind(|c| c.is_live() && !same_login(c.login(), viewer))
+        .rfind(|c| c.is_live() && is_input(c.login(), &c.body, viewer, include_own))
+}
+
+/// Whether a comment is something for `checkin` to answer.
+///
+/// Anybody else's always is. The viewer's own is only with `include_own`, and
+/// even then never one spar composed, because spar posts as the viewer and its
+/// replies and bookkeeping read back as requests do not terminate. The one
+/// signed comment let through is a `spar review`: findings for a person to act
+/// on, which is exactly what the flag is for.
+pub fn is_input(login: &str, body: &str, viewer: &str, include_own: bool) -> bool {
+    if !same_login(login, viewer) {
+        return true;
+    }
+    include_own && (!crate::repo::is_spar_comment(body) || crate::repo::is_spar_review(body))
+}
+
+/// A comment of the viewer's own that `--include-own` would have read, so an
+/// empty run can say why rather than look like there was nothing.
+fn passed_over_as_own(login: &str, body: &str, viewer: &str, include_own: bool) -> bool {
+    !include_own
+        && !body.trim().is_empty()
+        && same_login(login, viewer)
+        && is_input(login, body, viewer, true)
 }
 
 /// Whether anything the viewer wrote lands after `at`.
@@ -564,7 +603,16 @@ pub fn answered_after(viewer_times: &[String], at: &str) -> bool {
 ///
 /// `pr` is false for an issue with no pull request, where there are no review
 /// threads and no reviews to read.
-pub fn gather(repo: &Repo, number: i64, pr: bool, seen: &Answered) -> Result<Gathered> {
+///
+/// `include_own` reads the viewer's own comments too, and the reviews `spar
+/// review` posted under their name. See `is_input`.
+pub fn gather(
+    repo: &Repo,
+    number: i64,
+    pr: bool,
+    include_own: bool,
+    seen: &Answered,
+) -> Result<Gathered> {
     let viewer = repo.viewer_login()?.to_string();
     let mut out = Gathered::default();
     let mut n = 0usize;
@@ -594,11 +642,18 @@ pub fn gather(repo: &Repo, number: i64, pr: bool, seen: &Answered) -> Result<Gat
             out.skipped.push("a resolved thread".into());
             continue;
         }
-        if !thread_wants_an_answer(thread, &viewer, seen) {
-            out.skipped.push("a thread already answered".into());
+        if !thread_wants_an_answer(thread, &viewer, include_own, seen) {
+            let own = thread.comments.nodes.iter().any(|c| {
+                c.is_live() && passed_over_as_own(c.login(), &c.body, &viewer, include_own)
+            });
+            if own && newest_from_others(thread, &viewer).is_none() {
+                out.skipped.push(OWN_SKIPPED.into());
+            } else {
+                out.skipped.push("a thread already answered".into());
+            }
             continue;
         }
-        let Some(newest) = newest_from_others(thread, &viewer) else {
+        let Some(newest) = newest_input(thread, &viewer, include_own) else {
             continue;
         };
         let live: Vec<&RawComment> = thread
@@ -608,7 +663,7 @@ pub fn gather(repo: &Repo, number: i64, pr: bool, seen: &Answered) -> Result<Gat
             .filter(|c| c.is_live())
             .collect();
         let root = live.first().and_then(|c| c.database_id).unwrap_or_default();
-        let gate = least_privileged(&live, &viewer)
+        let gate = least_privileged(&live, &viewer, include_own)
             .unwrap_or((newest.login(), newest.author_association.as_str()));
         out.pending.push(Pending {
             ref_id: next_ref(),
@@ -643,16 +698,23 @@ pub fn gather(repo: &Repo, number: i64, pr: bool, seen: &Answered) -> Result<Gat
     let top = repo.issue_comments(number);
     let viewer_times = viewer_answer_times(&top, &viewer);
 
+    let reviews = if pr {
+        repo.pr_reviews(number)
+    } else {
+        Vec::new()
+    };
+    let rows = reviews
+        .iter()
+        .map(|r| (r, "review", CommentKind::ReviewSummary))
+        .chain(top.iter().map(|c| (c, "comment", CommentKind::TopLevel)));
     let mut loose: Vec<(String, Pending)> = Vec::new();
-    if pr {
-        for review in repo.pr_reviews(number) {
-            if let Some(p) = loose_comment(&review, "review", CommentKind::ReviewSummary, &viewer) {
-                loose.push(p);
-            }
+    for (row, prefix, kind) in rows {
+        let (login, body) = row_author_and_body(row);
+        if passed_over_as_own(login, body, &viewer, include_own) {
+            out.skipped.push(OWN_SKIPPED.into());
+            continue;
         }
-    }
-    for comment in &top {
-        if let Some(p) = loose_comment(comment, "comment", CommentKind::TopLevel, &viewer) {
+        if let Some(p) = loose_comment(row, prefix, kind, &viewer, include_own) {
             loose.push(p);
         }
     }
@@ -662,7 +724,11 @@ pub fn gather(repo: &Repo, number: i64, pr: bool, seen: &Answered) -> Result<Gat
             out.skipped.push("a comment already answered".into());
             continue;
         }
-        if answered_after(&viewer_times, &p.at) {
+        // A later comment of the viewer's answers somebody else's, but not one
+        // of the viewer's own: a note added after a review is more to do, not a
+        // reply to it. What spar recorded is what ends those.
+        let own = same_login(&p.author, &viewer);
+        if !own && answered_after(&viewer_times, &p.at) {
             out.skipped.push("a comment replied to since".into());
             continue;
         }
@@ -671,6 +737,20 @@ pub fn gather(repo: &Repo, number: i64, pr: bool, seen: &Answered) -> Result<Gat
     }
 
     Ok(out)
+}
+
+/// How a comment of the viewer's own is named when it was passed over.
+const OWN_SKIPPED: &str = "a comment of your own (--include-own reads them)";
+
+/// Who wrote a review body or top level comment, and what it says.
+fn row_author_and_body(row: &Value) -> (&str, &str) {
+    let login = row
+        .get("user")
+        .and_then(|u| u.get("login"))
+        .and_then(Value::as_str)
+        .unwrap_or("ghost");
+    let body = row.get("body").and_then(Value::as_str).unwrap_or("");
+    (login, body)
 }
 
 /// The review threads, or the inline comments rebuilt into threads when the
@@ -800,8 +880,13 @@ pub fn said_since(repo: &Repo, number: i64, since: &str) -> Result<Vec<Said>> {
     };
     let mut out = said_in_threads(&threads, &viewer, since);
     for review in submitted_with_a_body(repo.try_pr_reviews(number)?) {
-        if let Some((_, p)) = loose_comment(&review, "review", CommentKind::ReviewSummary, &viewer)
-        {
+        if let Some((_, p)) = loose_comment(
+            &review,
+            "review",
+            CommentKind::ReviewSummary,
+            &viewer,
+            false,
+        ) {
             if later_than(&p.at, since) {
                 out.push(Said::from_pending("review", p));
             }
@@ -813,7 +898,9 @@ pub fn said_since(repo: &Repo, number: i64, since: &str) -> Result<Vec<Said>> {
         if crate::repo::is_spar_comment(body) {
             continue;
         }
-        if let Some((_, p)) = loose_comment(&comment, "comment", CommentKind::TopLevel, &viewer) {
+        if let Some((_, p)) =
+            loose_comment(&comment, "comment", CommentKind::TopLevel, &viewer, false)
+        {
             if later_than(&p.at, since) {
                 out.push(Said::from_pending("comment", p));
             }
@@ -871,31 +958,31 @@ fn privilege(association: &str) -> u8 {
 /// request being judged can be anybody's. Gating on the newest commenter meant
 /// a stranger could pass the gate by waiting for somebody with write access to
 /// reply.
-fn least_privileged<'a>(live: &[&'a RawComment], viewer: &str) -> Option<(&'a str, &'a str)> {
+fn least_privileged<'a>(
+    live: &[&'a RawComment],
+    viewer: &str,
+    include_own: bool,
+) -> Option<(&'a str, &'a str)> {
     live.iter()
-        .filter(|c| !same_login(c.login(), viewer))
+        .filter(|c| is_input(c.login(), &c.body, viewer, include_own))
         .map(|c| (c.login(), c.author_association.as_str()))
         .min_by_key(|(_, association)| privilege(association))
 }
 
-/// One review body or top level comment, when it is somebody else's and says
-/// something.
+/// One review body or top level comment, when it says something and is
+/// somebody else's, or the viewer's own with `include_own`. See `is_input`.
 fn loose_comment(
     row: &Value,
     prefix: &str,
     kind: CommentKind,
     viewer: &str,
+    include_own: bool,
 ) -> Option<(String, Pending)> {
-    let body = row.get("body").and_then(Value::as_str).unwrap_or("");
+    let (login, body) = row_author_and_body(row);
     if body.trim().is_empty() || body.contains(STATE_MARKER) {
         return None;
     }
-    let login = row
-        .get("user")
-        .and_then(|u| u.get("login"))
-        .and_then(Value::as_str)
-        .unwrap_or("ghost");
-    if same_login(login, viewer) {
+    if !is_input(login, body, viewer, include_own) {
         return None;
     }
     let id = row.get("id").and_then(Value::as_i64).unwrap_or_default();
@@ -1125,7 +1212,11 @@ fn said_on_issue(comment: &IssueComment, filed_it: bool) -> String {
         .unwrap_or_default();
     format!(
         "----- comment from {who}{when} -----\n{}",
-        comment.body.replace(COMMENT_MARKER, "").trim()
+        comment
+            .body
+            .replace(COMMENT_MARKER, "")
+            .replace(crate::repo::REVIEW_MARKER, "")
+            .trim()
     )
 }
 
@@ -1174,14 +1265,24 @@ mod tests {
     fn a_thread_github_calls_resolved_is_never_read_again() {
         let mut t = thread("T1", vec![comment("c1", "alice", "please fix this")]);
         t.is_resolved = true;
-        assert!(!thread_wants_an_answer(&t, "me", &Answered::default()));
+        assert!(!thread_wants_an_answer(
+            &t,
+            "me",
+            false,
+            &Answered::default()
+        ));
     }
 
     /// Answering yourself does not terminate.
     #[test]
     fn a_thread_only_the_viewer_wrote_in_is_not_something_to_answer() {
         let t = thread("T1", vec![comment("c1", "me", "a note to myself")]);
-        assert!(!thread_wants_an_answer(&t, "me", &Answered::default()));
+        assert!(!thread_wants_an_answer(
+            &t,
+            "me",
+            false,
+            &Answered::default()
+        ));
     }
 
     /// `gh api user` and the GraphQL `author.login` have not always agreed on
@@ -1196,6 +1297,7 @@ mod tests {
         assert!(!thread_wants_an_answer(
             &t,
             "coreyphillips",
+            false,
             &Answered::default()
         ));
     }
@@ -1206,7 +1308,12 @@ mod tests {
     fn spars_own_state_comment_is_never_treated_as_a_comment() {
         let body = format!("{STATE_MARKER}\n{{\"round\":2}}\n-->");
         let t = thread("T1", vec![comment("c1", "alice", &body)]);
-        assert!(!thread_wants_an_answer(&t, "me", &Answered::default()));
+        assert!(!thread_wants_an_answer(
+            &t,
+            "me",
+            false,
+            &Answered::default()
+        ));
     }
 
     /// A minimised comment has been hidden by somebody, which is as clear a
@@ -1218,6 +1325,7 @@ mod tests {
         assert!(!thread_wants_an_answer(
             &thread("T1", vec![c]),
             "me",
+            false,
             &Answered::default()
         ));
     }
@@ -1238,6 +1346,7 @@ mod tests {
         assert!(!thread_wants_an_answer(
             &t,
             "me",
+            false,
             &seen(&[("thread:T1", "c1")])
         ));
     }
@@ -1257,8 +1366,85 @@ mod tests {
         assert!(thread_wants_an_answer(
             &t,
             "me",
+            false,
             &seen(&[("thread:T1", "c1")])
         ));
+    }
+
+    /// `--include-own` reads the viewer's own words and the reviews spar posted
+    /// for them, and nothing else spar posted as them. Reading a reply or a
+    /// round comment back as a request is spar arguing with itself.
+    #[test]
+    fn include_own_reads_your_words_and_spars_reviews_and_nothing_else_of_spars() {
+        let note = "rename this before merging";
+        let review = format!(
+            "Two independent reviews.\n\n{COMMENT_MARKER}\n{}",
+            crate::repo::REVIEW_MARKER
+        );
+        let reply = format!("Fixed in abc1234.\n\n{COMMENT_MARKER}");
+        let state = format!("{STATE_MARKER}\n{{}}\n-->");
+
+        assert!(is_input("alice", note, "me", false));
+        assert!(is_input("alice", &reply, "me", false));
+        for body in [note, review.as_str(), reply.as_str()] {
+            assert!(!is_input("me", body, "me", false));
+        }
+        assert!(is_input("Me", note, "me", true));
+        assert!(is_input("me", &review, "me", true));
+        assert!(!is_input("me", &reply, "me", true));
+        assert!(!is_input("me", &state, "me", true));
+    }
+
+    /// A thread only the viewer wrote in is read with the flag. Once spar has
+    /// answered it, its signed reply is not the next thing to answer, so the
+    /// thread ends there rather than once a run forever.
+    #[test]
+    fn a_thread_of_your_own_is_answered_once_with_include_own() {
+        let mine = thread("T1", vec![comment("c1", "me", "this should be a const")]);
+        assert!(!thread_wants_an_answer(
+            &mine,
+            "me",
+            false,
+            &Answered::default()
+        ));
+        assert!(thread_wants_an_answer(
+            &mine,
+            "me",
+            true,
+            &Answered::default()
+        ));
+
+        let reply = format!("Made it a const.\n\n{COMMENT_MARKER}");
+        let answered = thread(
+            "T1",
+            vec![
+                comment("c1", "me", "this should be a const"),
+                comment("c2", "me", &reply),
+            ],
+        );
+        assert!(!thread_wants_an_answer(
+            &answered,
+            "me",
+            true,
+            &seen(&[("thread:T1", "c1")])
+        ));
+    }
+
+    /// Without the flag, an empty run on a pull request you only commented on
+    /// yourself says so rather than looking like there was nothing there.
+    #[test]
+    fn your_own_comment_is_named_when_it_is_passed_over() {
+        let review = format!(
+            "Two independent reviews.\n\n{COMMENT_MARKER}\n{}",
+            crate::repo::REVIEW_MARKER
+        );
+        let reply = format!("Fixed in abc1234.\n\n{COMMENT_MARKER}");
+        assert!(passed_over_as_own("me", "a note", "me", false));
+        assert!(passed_over_as_own("me", &review, "me", false));
+        assert!(!passed_over_as_own("me", "a note", "me", true));
+        assert!(!passed_over_as_own("me", &reply, "me", false));
+        assert!(!passed_over_as_own("me", "  ", "me", false));
+        assert!(!passed_over_as_own("alice", "a note", "me", false));
     }
 
     /// A request refined three replies down is not the opening sentence, and
@@ -1379,14 +1565,14 @@ mod tests {
         maintainer.author_association = "OWNER".into();
 
         let live = vec![&stranger, &maintainer];
-        let (login, association) = least_privileged(&live, "me").expect("somebody wrote it");
+        let (login, association) = least_privileged(&live, "me", false).expect("somebody wrote it");
         assert_eq!("mallory", login);
         assert_eq!("NONE", association);
         assert!(!crate::config::Trust::Write.may_act_on(association));
 
         // A thread only maintainers wrote in is still a maintainer's thread.
         let live = vec![&maintainer];
-        let (login, association) = least_privileged(&live, "me").unwrap();
+        let (login, association) = least_privileged(&live, "me", false).unwrap();
         assert_eq!("alice", login);
         assert!(crate::config::Trust::Write.may_act_on(association));
 
@@ -1394,7 +1580,7 @@ mod tests {
         let mut mine = comment("c3", "me", "done");
         mine.author_association = "OWNER".into();
         let live = vec![&stranger, &mine];
-        assert_eq!("mallory", least_privileged(&live, "me").unwrap().0);
+        assert_eq!("mallory", least_privileged(&live, "me", false).unwrap().0);
     }
 
     /// spar's own bookkeeping is not an answer to anybody.

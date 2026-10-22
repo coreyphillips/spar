@@ -52,6 +52,16 @@ pub const STATE_MARKER: &str = "<!-- spar:state";
 /// newer than it.
 pub const COMMENT_MARKER: &str = "<!-- spar:comment -->";
 
+/// A second signature, on a comment that is a `spar review` and nothing else.
+///
+/// Every comment spar posts is signed, and `checkin` never reads a signed one
+/// from the viewer: those are its own replies and bookkeeping, and reading them
+/// back does not terminate. A review is the exception somebody can ask for with
+/// `--include-own`. It is findings for a person to act on, which is what
+/// `checkin` acts on, and running `spar review` on your own pull request and
+/// then `spar checkin` on it is a flow that otherwise reads nothing at all.
+pub const REVIEW_MARKER: &str = "<!-- spar:review -->";
+
 /// An entry boundary in the local follow-up note, on the same principle as
 /// `STATE_MARKER` and rendered as nothing for the same reason.
 ///
@@ -872,16 +882,31 @@ fn pr_for_base(text: &str, branch: &str, base: &str) -> Result<Option<PrRef>> {
 
 /// Sign a comment spar composed, so it can be told from one the same account
 /// wrote by hand. Idempotent: a body already signed is returned as it is.
-fn signed(body: &str) -> String {
+pub(crate) fn signed(body: &str) -> String {
     if body.contains(COMMENT_MARKER) {
         return body.to_string();
     }
     format!("{body}\n\n{COMMENT_MARKER}")
 }
 
+/// Sign a review, so `checkin --include-own` can tell it from every other
+/// comment spar posts. Idempotent, like `signed`.
+fn signed_review(body: &str) -> String {
+    let body = signed(body);
+    if body.contains(REVIEW_MARKER) {
+        return body;
+    }
+    format!("{body}\n{REVIEW_MARKER}")
+}
+
 /// Whether a comment body is one spar composed rather than one a person wrote.
 pub fn is_spar_comment(body: &str) -> bool {
     body.contains(COMMENT_MARKER) || body.contains(STATE_MARKER)
+}
+
+/// Whether a comment body is a review `spar review` posted.
+pub fn is_spar_review(body: &str) -> bool {
+    body.contains(REVIEW_MARKER)
 }
 
 /// What `gh api -i` printed, taken apart.
@@ -4165,6 +4190,16 @@ impl Repo {
 
     pub fn comment_pr(&self, number: i64, body: &str) -> Result<()> {
         let body = signed(&self.record_failed_write(self.clean(body))?);
+        self.post_pr_comment(number, body)
+    }
+
+    /// Post a review as a comment, signed as one. See `REVIEW_MARKER`.
+    pub fn comment_pr_review(&self, number: i64, body: &str) -> Result<()> {
+        let body = signed_review(&self.record_failed_write(self.clean(body))?);
+        self.post_pr_comment(number, body)
+    }
+
+    fn post_pr_comment(&self, number: i64, body: String) -> Result<()> {
         let comments = self.record_failed_write(self.try_issue_comments(number))?;
         if has_exact_comment(&comments, &body) {
             return Ok(());
@@ -4219,7 +4254,7 @@ impl Repo {
             (Some(v), true) => format!("Verdict: {}.\n\n{body}", v.words()),
             _ => body.to_string(),
         };
-        let body = signed(&self.record_failed_write(self.clean(&text))?);
+        let body = signed_review(&self.record_failed_write(self.clean(&text))?);
         let viewer = self.record_failed_write(self.viewer_login())?.to_string();
         let reviews = self.record_failed_write(self.try_pr_reviews(number))?;
         if has_viewer_review(&reviews, &viewer, &body, commit) {
@@ -8035,6 +8070,19 @@ mod tests {
     use crate::config::StateStore;
     use crate::model::{Dispute, Finding, Ledger, PersistedState, Severity, Status};
     use std::process::Command;
+
+    /// A review carries both signatures, so everything that skips spar's own
+    /// comments still skips it, and `checkin --include-own` can still find it.
+    /// Signing twice changes nothing, since a duplicate check compares bodies.
+    #[test]
+    fn a_review_is_signed_as_spars_and_as_a_review() {
+        let once = signed_review("Two independent reviews.");
+        assert!(is_spar_comment(&once));
+        assert!(is_spar_review(&once));
+        assert_eq!(once, signed_review(&once));
+        assert_eq!(once, signed_review(&signed("Two independent reviews.")));
+        assert!(!is_spar_review(&signed("Fixed in abc1234.")));
+    }
 
     fn repo_for_titles() -> Repo {
         Repo {

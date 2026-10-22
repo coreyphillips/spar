@@ -6090,7 +6090,7 @@ fn post_counts_a_reported_failure_as_success_when_read_back_finds_it() {
 case "$1 $2" in
   "api --paginate")
     if [ -f "$SPAR_FAKE_COMMENT_LANDED" ]; then
-      printf '%s\n' '[{"body":"review landed\n\n<!-- spar:comment -->"}]'
+      printf '%s\n' '[{"body":"review landed\n\n<!-- spar:comment -->\n<!-- spar:review -->"}]'
     else
       printf '%s\n' '[]'
     fi

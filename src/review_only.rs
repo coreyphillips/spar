@@ -790,7 +790,7 @@ fn finish(
         Ok(None) if reviewed.opts.verdict => {
             repo.submit_review(pr.number, verdict, &comment, reviewed.head)
         }
-        Ok(None) => repo.comment_pr(pr.number, &comment),
+        Ok(None) => repo.comment_pr_review(pr.number, &comment),
         Err(e) => Err(e),
     };
     match posted {

@@ -183,6 +183,7 @@ spar checkin 108            # answer the unanswered comments on a PR
 spar checkin                # every open PR
 spar checkin 108 --dry-run  # every reply and every change, posted nowhere
 spar checkin 108 --reply-only    # answer in words, never touch the code
+spar checkin 108 --include-own   # read your own comments and spar reviews too
 
 spar split 42               # break an issue into smaller issues, and stop
 spar split 108              # break a PR into smaller PRs, leaving it untouched
@@ -730,6 +731,7 @@ spar checkin 108 --dry-run  # every reply and every change, posted nowhere
 spar checkin 108 --reply-only    # answer in words, never touch the code
 spar checkin 108 --any-author    # act on a comment from outside the repo too
 spar checkin 108 --again         # re-read what spar already answered
+spar checkin 108 --include-own   # read your own comments and spar reviews too
 ```
 
 Unanswered means three things: an inline review thread GitHub has not marked
@@ -809,6 +811,39 @@ own resolved flag, and what spar answered is recorded in `.spar/state`, which is
 what makes leaving a disputed thread open terminate rather than re-arguing it
 once a run forever. A fresh clone has no record, so it will answer a previously
 declined point once more.
+
+### Acting on your own review
+
+Everything above skips what you wrote, which is right when the comments come
+from other people and wrong when they come from you: run `spar review 108` on
+your own pull request and `spar checkin 108` finds nothing, because the review
+went up under your name. `--include-own` reads your comments too, so this works:
+
+```bash
+spar review 108                  # two agents review your PR and post the findings
+spar checkin 108 --include-own   # both judge each finding, and fix what they agree on
+```
+
+It reads what you typed by hand, inline or not, and the reviews `spar review`
+posted, which carry a signature of their own for the purpose. It never reads
+anything else spar posted as you: its replies, its round and outcome comments,
+and its state block are still skipped, because reading those back as requests
+does not terminate. A note you add after a review does not count as having
+answered it, since it is more to do rather than a reply. What spar recorded
+answering ends each one, as it does for anybody else's.
+
+Without the flag, a run that only found comments of yours says so, rather than
+looking as if there was nothing there. `checkin_include_own = true` in `[loop]`
+turns it on for every run, including one `spar listen` starts. `listen` is never
+woken by your own comments, though: GitHub raises no notification for them, so
+the flow above is one you run by hand.
+
+Two things to know. Your own comments still go through `checkin_trust` like
+anybody's, so on a repository you do not own, where you are a `CONTRIBUTOR`,
+they are answered in words only unless you pass `--any-author`. And replies spar
+posted into a review thread before this release were not signed, so on an older
+pull request with a thread spar argued in and left open, the flag reads that old
+reply as yours and answers it once.
 
 ## Listening for what happens next
 

@@ -1256,6 +1256,7 @@ fn dispatch(
                 reply_only: *reply_only,
                 trust: cfg.loop_cfg.checkin_trust,
                 again: false,
+                include_own: cfg.loop_cfg.checkin_include_own,
                 resolve: cfg.loop_cfg.checkin_resolve,
                 posts: checkin::posts(cfg),
             },

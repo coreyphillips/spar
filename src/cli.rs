@@ -161,6 +161,11 @@ pub enum Command {
         /// Answer comments spar already answered, ignoring what it recorded.
         #[arg(long)]
         again: bool,
+        /// Read your own comments too, and the reviews `spar review` posted
+        /// under your name, so you can review your own pull request and then
+        /// act on what it found. spar's replies and bookkeeping are never read.
+        #[arg(long)]
+        include_own: bool,
         /// Leave worktrees in place afterwards, for inspection.
         #[arg(long)]
         keep_worktrees: bool,
@@ -559,6 +564,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             reply_only,
             any_author,
             again,
+            include_own,
             keep_worktrees,
         } => {
             let overrides = Overrides {
@@ -575,6 +581,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                     cfg.loop_cfg.checkin_trust
                 },
                 again,
+                include_own: include_own || cfg.loop_cfg.checkin_include_own,
                 resolve: cfg.loop_cfg.checkin_resolve,
                 posts: checkin::posts(&cfg),
             };
@@ -1778,7 +1785,7 @@ fn cmd_post(
         }
         // Through the style gate like anything else spar sends, so an edit that
         // reintroduces a banned dash is caught rather than published.
-        match repo.comment_pr(*number, &text) {
+        match repo.comment_pr_review(*number, &text) {
             Ok(()) => {
                 log!("posted to PR #{number}");
                 // The review the dry run recorded has now been seen, so a
@@ -2075,6 +2082,7 @@ const LOOP_OPTIONS: &[Setting] = &[
     (true, "max_triage_chars", "Most every issue together, bodies and comments, may add to one triage prompt, or every recorded follow-up in one screening prompt. Past it, whole items wait for the next run rather than all of them losing their tails."),
     (true, "checkin_trust", "Whose comments `spar checkin` will act on, and whose comments under an issue reach the prompts that implement, triage, and review it. write is anybody GitHub says can write to this repository, which is the default because acting on a comment means pushing a commit to somebody's branch. The person who filed an issue is always read under it. anyone answers everyone, and still only changes code when both agents agree."),
     (true, "checkin_resolve", "Mark a review thread resolved when spar made the change it asked for. A thread spar disagreed with is left open whatever this says."),
+    (true, "checkin_include_own", "Have `spar checkin` read your own comments too, and the reviews `spar review` posted under your name, as --include-own does for one run. Off, because spar posts as you, and most of what you wrote on a pull request is answers rather than requests. spar's own replies and bookkeeping are never read either way."),
     (true, "max_checkin_comments", "Most unanswered comments spar will answer on one pull request in a run. A backstop against a long argument being read back to somebody, not a target."),
 ];
 

@@ -2159,6 +2159,21 @@ impl Repo {
 
         self.refuse_review_worktree_changes(number)?;
 
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| spar_err!("could not create {}: {e}", parent.display()))?;
+        }
+        // Removed before the fetch, while `local_ref` still holds the head
+        // this checkout is at. A force push moves the ref off that commit,
+        // and the checkout's reflog would then name a commit no ref holds,
+        // which the removal check rightly keeps as local work.
+        if !self.remove_review_worktree_at(&path)? {
+            bail!(
+                "the existing review worktree for PR #{number} could not be removed safely. Its \
+                 reference was kept."
+            );
+        }
+
         self.git(&["fetch", "origin", &refspec]).map_err(|e| {
             spar_err!(
                 "could not fetch the head of PR #{number}. {}\nGitHub serves refs/pull/N/head for \
@@ -2168,16 +2183,6 @@ impl Repo {
             )
         })?;
 
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| spar_err!("could not create {}: {e}", parent.display()))?;
-        }
-        if !self.remove_review_worktree_at(&path)? {
-            bail!(
-                "the existing review worktree for PR #{number} could not be removed safely. Its \
-                 reference was kept."
-            );
-        }
         let path_str = path.display().to_string();
         self.git(&["worktree", "add", "--detach", &path_str, &local_ref])?;
         Ok(path)
@@ -8250,6 +8255,41 @@ mod tests {
             .unwrap();
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_force_pushed_pull_request_rebuilds_its_review_worktree() {
+        let (fixture, repo, path, _checkpoint) = review_fixture("force-push", 923);
+        let work = fixture.root.join("work");
+        let seed = test_git(&work, &["rev-parse", "HEAD"]);
+        let tree = test_git(&work, &["rev-parse", "HEAD^{tree}"]);
+        // Heads only the pull request holds, the second rewritten rather than
+        // built on the first, as a rebase and force push leave them.
+        let publish = |message: &str| {
+            let oid = test_git(
+                &work,
+                &["commit-tree", tree.trim(), "-p", seed.trim(), "-m", message],
+            );
+            let oid = oid.trim().to_string();
+            test_git(
+                &work,
+                &[
+                    "push",
+                    "--force",
+                    "origin",
+                    &format!("{oid}:refs/pull/923/head"),
+                ],
+            );
+            oid
+        };
+        let reviewed = publish("reviewed head");
+        repo.worktree_for_pr_head(923).unwrap();
+        assert_eq!(test_git(&path, &["rev-parse", "HEAD"]).trim(), reviewed);
+
+        let rewritten = publish("rewritten head");
+        repo.worktree_for_pr_head(923).unwrap();
+
+        assert_eq!(test_git(&path, &["rev-parse", "HEAD"]).trim(), rewritten);
     }
 
     #[test]

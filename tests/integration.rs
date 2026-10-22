@@ -6719,6 +6719,8 @@ fn a_recheck_without_a_posted_review_on_record_reviews_afresh() {
 /// is a second page of notifications, and `SPAR_FAKE_PAGE2_FAILS=1` makes it
 /// a 500; `SPAR_FAKE_REVIEW_FAILS=1` refuses a submitted review;
 /// `SPAR_FAKE_COMMENTS_FAIL=1` fails the read of the pull request's comments;
+/// `$SPAR_FAKE_COMMENTS` is the comments on the pull request and on issue 42,
+/// none when it is missing;
 /// `SPAR_FAKE_ISSUE_STATE` is issue 42's state; `$SPAR_FAKE_LINKED` is the
 /// list a linked pull request is looked for in; `$SPAR_FAKE_REQUESTS` is
 /// who the pull request asks for a review, nobody when it is missing; and
@@ -6773,9 +6775,9 @@ case "$*" in
   "api repos/{{owner}}/{{repo}}/issues/42 --jq"*) printf 'issue\n' ;;
   "issue view 42 "*) printf '{{"number":42,"title":"Retry smarter","body":"please","labels":[],"state":"%s","url":"https://github.com/example/project/issues/42","author":{{"login":"bob"}},"comments":[]}}\n' "${{SPAR_FAKE_ISSUE_STATE:-OPEN}}" ;;
   "api repos/{{owner}}/{{repo}}/compare/"*) printf '3\n' ;;
-  "api --paginate repos/{{owner}}/{{repo}}/issues/{number}/comments")
+  "api --paginate repos/{{owner}}/{{repo}}/issues/{number}/comments"|"api --paginate repos/{{owner}}/{{repo}}/issues/42/comments")
     if [ "${{SPAR_FAKE_COMMENTS_FAIL:-}}" = 1 ]; then printf 'gh: HTTP 502: Bad Gateway\n' >&2; exit 1; fi
-    printf '[]\n' ;;
+    if [ -f "${{SPAR_FAKE_COMMENTS:-/nonexistent}}" ]; then cat "$SPAR_FAKE_COMMENTS"; else printf '[]\n'; fi ;;
   "api --paginate "*) printf '[]\n' ;;
   "api graphql "*REVIEW_REQUESTED_EVENT*)
     if [ -f "${{SPAR_FAKE_REQUESTED:-/nonexistent}}" ]; then cat "$SPAR_FAKE_REQUESTED"
@@ -6905,6 +6907,20 @@ impl Listening {
     /// The viewer, by name: what a review request just made looks like.
     fn asking_the_viewer(&self) {
         self.with_review_requests(r#"[{"__typename":"User","login":"viewer"}]"#);
+    }
+
+    /// The author asks the viewer for another review of pull request 7: the
+    /// notification and the request it is about.
+    fn asked_again(&self) {
+        self.with_notifications(&[notification("1", "review_requested", "PullRequest", 7)]);
+        self.asking_the_viewer();
+    }
+
+    /// The comments on the pull request and on issue 42, as REST gives them.
+    fn with_comments(&self, comments: serde_json::Value) -> PathBuf {
+        let path = self.fx.dir.join("comments.json");
+        std::fs::write(&path, comments.to_string()).unwrap();
+        path
     }
 
     fn env(&self) -> Vec<(String, String)> {
@@ -7054,11 +7070,12 @@ fn listen_once_dry_run_names_what_each_event_would_trigger_and_triggers_nothing(
 }
 
 /// A push raises no notification for a reviewer, so the sweep is what notices
-/// a reviewed pull request moving. A dry run keeps nothing, so a second one
-/// sees the same push; a real run is what moves past it.
+/// a reviewed pull request moving, and a push alone asks for no second look:
+/// the author may still be working. A dry run keeps nothing, so a second one
+/// sees the same push.
 #[test]
 #[cfg(unix)]
-fn listen_once_dry_run_notices_a_reviewed_pull_request_whose_head_moved() {
+fn listen_once_dry_run_notices_a_reviewed_pull_request_whose_head_moved_and_leaves_it() {
     let l = Listening::refusing("listenmoved", &listen_gh(108, "bbb", "alice", "OPEN"));
     write_record(&l.fx, 108, &blocking_record("aaa"));
     l.with_prs(&[sweep_row(108, "bbb", "alice")]);
@@ -7071,7 +7088,10 @@ fn listen_once_dry_run_notices_a_reviewed_pull_request_whose_head_moved() {
             "{out}"
         );
         assert!(
-            out.contains("#108: would take a second look after a push"),
+            out.contains(
+                "#108: ignoring what is neither a review request nor a mention, the only things \
+                 that ask for a second look"
+            ),
             "{out}"
         );
     }
@@ -7118,8 +7138,8 @@ fn listen_once_with_a_review_request_reviews_the_pr_with_a_verdict() {
 /// the old reason, the listener took it for a new request, and it posted a
 /// note nobody had asked for. What the pull request says now decides: a
 /// request still open, to the viewer or to a team the viewer is in, gets the
-/// note, and one already answered, or one to a team the viewer is not in, gets
-/// a quiet second look.
+/// note, and one already answered, or one to a team the viewer is not in, is
+/// only an update, which asks for nothing.
 #[test]
 #[cfg(unix)]
 fn a_review_request_gets_the_standing_note_only_while_it_is_open() {
@@ -7169,7 +7189,7 @@ fn a_review_request_gets_the_standing_note_only_while_it_is_open() {
                 "{tag}: {out}"
             );
             assert!(
-                out.contains("#7: about to take a second look after a reply"),
+                out.contains("#7: ignoring what is neither a review request nor a mention"),
                 "{tag}: {out}"
             );
         }
@@ -7275,8 +7295,9 @@ fn the_first_sweep_posts_no_note_for_a_request_the_review_on_record_answered() {
     }
 }
 
-/// The whole point, end to end: the author pushed after a review, the listener
-/// noticed, both reviewers closed the point, and the pull request is approved.
+/// The whole point, end to end: the author pushed after a review and asked for
+/// another, the listener noticed, both reviewers closed the point, and the pull
+/// request is approved.
 #[test]
 #[cfg(unix)]
 fn listen_once_rechecks_a_reviewed_pull_request_that_moved_and_approves() {
@@ -7319,13 +7340,14 @@ fn listen_once_rechecks_a_reviewed_pull_request_that_moved_and_approves() {
         l.with_prs(&[sweep_row(7, &after, "alice")]);
         l
     };
+    l.asked_again();
 
     let (ok, out, log) = l.run(&["--once"]);
 
     assert!(ok, "{out}");
     assert!(out.contains("#7: head moved"), "{out}");
     assert!(
-        out.contains("#7: about to take a second look after a push"),
+        out.contains("#7: about to take a second look after a push and a review request"),
         "{out}"
     );
     let head = git(&l.fx.work, &["rev-parse", "HEAD"]).trim().to_string();
@@ -7352,9 +7374,9 @@ fn work_head(l: &Listening) -> String {
     git(&l.fx.work, &["rev-parse", "HEAD"]).trim().to_string()
 }
 
-/// A reply woke the listener while GitHub still named the commit before a
-/// push, so the second look read that commit, called it no new commit, and
-/// asked for changes the branch already had. It now waits for the pull request
+/// A review request woke the listener while GitHub still named the commit
+/// before a push, so the second look read that commit, called it no new commit,
+/// and asked for changes the branch already had. It now waits for the pull request
 /// to catch up with its branch, then reads the push.
 #[test]
 #[cfg(unix)]
@@ -7380,7 +7402,7 @@ fn listen_once_waits_for_github_to_catch_up_with_a_push_before_a_second_look() {
     let pushed = work_head(&l);
     l.with_gh(&listen_gh(7, &reviewed, "alice", "OPEN"));
     l.with_prs(&[sweep_row(7, &reviewed, "alice")]);
-    l.with_notifications(&[notification("1", "comment", "PullRequest", 7)]);
+    l.asked_again();
 
     let (ok, out, log) = l.run(&["--once"]);
 
@@ -7573,6 +7595,7 @@ fn listen_once_does_not_post_a_second_look_whose_head_moved_while_it_ran() {
         calls = calls.display(),
     ));
     l.with_prs(&[sweep_row(7, &read, "alice")]);
+    l.asked_again();
 
     let (ok, out, log) = l.run(&["--once"]);
 
@@ -7787,11 +7810,12 @@ fn listen_keeps_a_review_it_could_not_post_for_another_try() {
 #[cfg(unix)]
 fn a_second_look_that_could_not_post_waits_to_try_again_rather_than_every_sweep() {
     let (l, after) = moved_since_its_review("listenrecheckfail", RECHECK_FIXED, RECHECK_FIXED);
+    l.asked_again();
 
     let (ok, out, _) = l.run_with(&["--once"], &[("SPAR_FAKE_REVIEW_FAILS", "1")]);
     assert!(!ok, "{out}");
     assert!(
-        out.contains("#7: about to take a second look after a push"),
+        out.contains("#7: about to take a second look after a push and a review request"),
         "{out}"
     );
     assert_eq!(2, l.agent_calls(), "{out}");
@@ -7815,6 +7839,7 @@ fn a_second_look_that_could_not_post_waits_to_try_again_rather_than_every_sweep(
 fn a_second_look_that_posts_nothing_by_design_is_not_raised_again() {
     let (l, _) = moved_since_its_review("listenrechecksilent", RECHECK_FIXED, RECHECK_FIXED);
     l.configure("[style]\npr_comments = \"none\"\n");
+    l.asked_again();
 
     let (ok, out, log) = l.run(&["--once"]);
     assert!(ok, "{out}");
@@ -7825,6 +7850,61 @@ fn a_second_look_that_posts_nothing_by_design_is_not_raised_again() {
     let (ok, out, _) = l.run(&["--once"]);
     assert!(ok, "{out}");
     assert!(!out.contains("head moved"), "{out}");
+    assert_eq!(2, l.agent_calls(), "{out}");
+}
+
+/// reardencode/rbitcoin#1137: another bot's review on a pull request spar had
+/// approved got a long second look nobody asked for. A push and a comment,
+/// even one on a thread that began with a mention, or a bot naming the viewer,
+/// ask for nothing. A person mentioning the viewer since the review does.
+#[test]
+#[cfg(unix)]
+fn only_a_request_or_a_new_mention_asks_for_a_second_look() {
+    let (l, _) = moved_since_its_review("listenunasked", RECHECK_FIXED, RECHECK_FIXED);
+    l.with_notifications(&[notification("1", "mention", "PullRequest", 7)]);
+    let bot = serde_json::json!({
+        "user": {"login": "grok[bot]", "type": "Bot"},
+        "body": "Agreeing with @viewer, one suggestion.",
+        "created_at": "2026-10-20T10:00:00Z"
+    });
+    let comments = l.with_comments(serde_json::json!([bot]));
+    let env = [("SPAR_FAKE_COMMENTS", comments.to_str().unwrap())];
+
+    let (ok, out, log) = l.run_with(&["--once"], &env);
+
+    assert!(ok, "{out}");
+    assert!(out.contains("#7: head moved"), "{out}");
+    assert!(
+        out.contains(
+            "#7: nobody mentioned you since the review on record, so that was only an update"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("#7: ignoring what is neither a review request nor a mention"),
+        "{out}"
+    );
+    assert_eq!(0, l.agent_calls(), "{out}");
+    assert!(!submitted_a_review(&log), "{log}");
+    assert!(!log.contains("pr comment"), "{log}");
+
+    // The author mentions the viewer.
+    let person = serde_json::json!({
+        "user": {"login": "alice", "type": "User"},
+        "body": "@viewer pushed a fix, can you look again?",
+        "created_at": "2026-10-20T11:00:00Z"
+    });
+    l.with_comments(serde_json::json!([bot, person]));
+    l.with_notifications(&[notification("2", "mention", "PullRequest", 7)]);
+
+    let (ok, out, log) = l.run_with(&["--once"], &env);
+
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("#7: about to take a second look after a mention"),
+        "{out}"
+    );
+    assert!(log.contains("Rechecked after 1 new commit ("), "{log}");
     assert_eq!(2, l.agent_calls(), "{out}");
 }
 
@@ -7901,10 +7981,18 @@ fn an_issue_mention_does_not_recheck_a_pull_request_past_its_cap() {
     )
     .unwrap();
     l.with_notifications(&[notification("1", "mention", "Issue", 42)]);
+    let comments = l.with_comments(serde_json::json!([{
+        "user": {"login": "bob", "type": "User"},
+        "body": "@viewer can you look again?",
+        "created_at": "2026-10-20T10:00:00Z"
+    }]));
 
     let (ok, out, _) = l.run_with(
         &["--once"],
-        &[("SPAR_FAKE_LINKED", linked.to_str().unwrap())],
+        &[
+            ("SPAR_FAKE_LINKED", linked.to_str().unwrap()),
+            ("SPAR_FAKE_COMMENTS", comments.to_str().unwrap()),
+        ],
     );
 
     assert!(ok, "{out}");
@@ -7966,22 +8054,22 @@ fn a_poll_whose_second_page_fails_reads_nothing_and_the_next_poll_reads_both() {
     );
 }
 
-/// After a reply, a comments read that failed was taken for nobody having
-/// said anything, so the second look reported nothing changed, and the reply,
-/// already read past, was never looked at again.
+/// A comments read that failed was taken for nobody having said anything, so
+/// the second look reported nothing changed, and what was said, already read
+/// past, was never looked at again.
 #[test]
 #[cfg(unix)]
-fn a_reply_whose_comments_cannot_be_read_is_kept_for_another_try() {
+fn a_second_look_whose_comments_cannot_be_read_is_kept_for_another_try() {
     let l = Listening::refusing("listenreplyfail", &listen_gh(7, "aaa", "alice", "OPEN"));
     write_record(&l.fx, 7, &blocking_record("aaa"));
     l.with_prs(&[sweep_row(7, "aaa", "alice")]);
-    l.with_notifications(&[notification("1", "comment", "PullRequest", 7)]);
+    l.asked_again();
 
     let (ok, out, _) = l.run_with(&["--once"], &[("SPAR_FAKE_COMMENTS_FAIL", "1")]);
 
     assert!(!ok, "{out}");
     assert!(
-        out.contains("#7: about to take a second look after a reply"),
+        out.contains("#7: about to take a second look after a review request"),
         "{out}"
     );
     assert!(!out.contains("nothing changed since the review"), "{out}");

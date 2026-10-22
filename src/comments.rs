@@ -823,6 +823,80 @@ pub fn said_since(repo: &Repo, number: i64, since: &str) -> Result<Vec<Said>> {
     Ok(out)
 }
 
+/// Whether `text` asks for the viewer by name: `@viewer`, or `@org/team` for a
+/// team `in_team` says the viewer is in. A team nobody could check counts, as
+/// it does for a review request. An `@` inside a word is an email address or
+/// code, and a login that runs on past the viewer's is somebody else's.
+pub fn mentions(text: &str, viewer: &str, in_team: &dyn Fn(&str) -> Option<bool>) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let name_char = |c: char| c.is_ascii_alphanumeric() || c == '-';
+    for (i, c) in chars.iter().enumerate() {
+        if *c != '@' {
+            continue;
+        }
+        if i > 0 && (chars[i - 1].is_alphanumeric() || "_.-/@`".contains(chars[i - 1])) {
+            continue;
+        }
+        let login: String = chars[i + 1..]
+            .iter()
+            .take_while(|c| name_char(**c))
+            .collect();
+        if login.is_empty() {
+            continue;
+        }
+        let after = i + 1 + login.chars().count();
+        if chars.get(after) == Some(&'/') {
+            let team: String = chars[after + 1..]
+                .iter()
+                .take_while(|c| name_char(**c) || **c == '_')
+                .collect();
+            if !team.is_empty() && in_team(&format!("{login}/{team}")).unwrap_or(true) {
+                return true;
+            }
+            continue;
+        }
+        if same_login(&login, viewer) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a person asked for the viewer by name after `since`, in any of
+/// `rows`: review comments, reviews, or comments as the REST API returns them.
+/// The viewer's own words do not count, nor a bot's, nor a spar review: none
+/// of them is somebody asking.
+pub fn mentioned_in(
+    rows: &[Value],
+    viewer: &str,
+    since: &str,
+    in_team: &dyn Fn(&str) -> Option<bool>,
+) -> bool {
+    rows.iter().any(|row| {
+        let user = row.get("user");
+        let login = user
+            .and_then(|u| u.get("login"))
+            .and_then(Value::as_str)
+            .unwrap_or("ghost");
+        let bot = login.ends_with("[bot]")
+            || user
+                .and_then(|u| u.get("type"))
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.eq_ignore_ascii_case("bot"));
+        let body = row.get("body").and_then(Value::as_str).unwrap_or("");
+        let at = row
+            .get("created_at")
+            .or_else(|| row.get("submitted_at"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        !same_login(login, viewer)
+            && !bot
+            && !crate::repo::is_spar_comment(body)
+            && later_than(at, since)
+            && mentions(body, viewer, in_team)
+    })
+}
+
 /// When the viewer answered on this pull request, in their own words.
 ///
 /// spar posts as whoever ran it, so "the viewer commented after this" is not
@@ -1848,5 +1922,79 @@ mod said_since_tests {
         );
         assert_eq!("review thread", out[1].what);
         assert_eq!("2026-10-20T11:30:00Z", out[1].at);
+    }
+
+    fn ours(team: &str) -> Option<bool> {
+        match team {
+            "example/ours" => Some(true),
+            "example/unknown" => None,
+            _ => Some(false),
+        }
+    }
+
+    #[test]
+    fn a_mention_is_the_viewer_by_name_or_a_team_the_viewer_is_in() {
+        for text in [
+            "@viewer can you look again?",
+            "thanks @Viewer, fixed",
+            "(@viewer)",
+            "over to @example/ours",
+            "over to @example/unknown",
+        ] {
+            assert!(mentions(text, "viewer", &ours), "{text}");
+        }
+        for text in [
+            "@viewerish can you look?",
+            "mail me at a@viewer.com",
+            "`@viewer` is the login",
+            "over to @example/theirs",
+            "a bare @ sign",
+            "nobody at all",
+        ] {
+            assert!(!mentions(text, "viewer", &ours), "{text}");
+        }
+    }
+
+    fn row(login: &str, kind: &str, body: &str, key: &str, at: &str) -> Value {
+        serde_json::json!({
+            "user": {"login": login, "type": kind},
+            "body": body,
+            key: at,
+        })
+    }
+
+    #[test]
+    fn only_a_person_mentioning_the_viewer_after_the_time_counts() {
+        let since = "2026-10-20T10:00:00Z";
+        let later = "2026-10-20T11:00:00Z";
+        let quiet = [
+            row(
+                "viewer",
+                "User",
+                "@viewer note to self",
+                "created_at",
+                later,
+            ),
+            row("grok[bot]", "Bot", "as @viewer said", "created_at", later),
+            row("grok", "Bot", "as @viewer said", "submitted_at", later),
+            row(
+                "alice",
+                "User",
+                "@viewer\n\n<!-- spar:comment -->",
+                "created_at",
+                later,
+            ),
+            row("alice", "User", "@viewer look", "created_at", since),
+            row("alice", "User", "looks fine to me", "created_at", later),
+        ];
+        assert!(!mentioned_in(&quiet, "viewer", since, &ours));
+        let asked = [row(
+            "alice",
+            "User",
+            "@viewer look again",
+            "submitted_at",
+            later,
+        )];
+        assert!(mentioned_in(&asked, "viewer", since, &ours));
     }
 }

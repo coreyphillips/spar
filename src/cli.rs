@@ -274,8 +274,9 @@ pub enum Command {
     ///
     /// Polls GitHub through gh for activity on pull requests spar has
     /// reviewed, for pull requests assigned to you or awaiting your review,
-    /// and for mentions of you. A reviewed pull request that moves or gets a
-    /// reply gets a second look and a verdict; a new one gets a review; a
+    /// and for mentions of you. A reviewed pull request gets a second look
+    /// and a verdict when your review is requested again or you are mentioned
+    /// on it, never for a push or a comment alone; a new one gets a review; a
     /// comment on a pull request you wrote gets `spar checkin`. Waiting costs
     /// no agent calls: only a review, a second look, or a check-in does.
     ///
@@ -529,7 +530,6 @@ fn dispatch(cli: Cli) -> Result<i32> {
                     once,
                     dry_run,
                     since,
-                    limit: common.limit,
                 },
             )
         }
@@ -2092,8 +2092,8 @@ const STYLE_OPTIONS: &[Setting] = &[
 
 const LISTEN_OPTIONS: &[Setting] = &[
     (true, "interval", "Seconds between polls of GitHub's notifications for this repository. GitHub says how often it will answer and the larger of the two is used. A poll that finds nothing costs nothing against the rate limit, and waiting never costs an agent call."),
-    (true, "sweep", "Seconds between sweeps of the open pull requests. A push raises no notification for a reviewer, so the sweep is what notices a reviewed pull request moving."),
-    (true, "settle", "Seconds an item has to stay quiet before spar acts on it, so a push and three replies in the same minute cost one recheck rather than four."),
+    (true, "sweep", "Seconds between sweeps of the open pull requests. The sweep sees what a notification can miss: a review asked for again, an assignment, a close, or a push, which raises no notification for a reviewer."),
+    (true, "settle", "Seconds an item has to stay quiet before spar acts on it, so a review request and three comments in the same minute cost one recheck rather than four."),
     (true, "max_wait", "Most seconds an item may keep settling before it is acted on anyway."),
     (true, "max_rechecks", "Rechecks one pull request gets from `spar listen` before a person has to run `spar review` on it again. A cap against two bots arguing, not a target. 0 turns automatic rechecks off."),
     (true, "on_review_requested", "What a pull request somebody asked you to review gets: review or ignore."),

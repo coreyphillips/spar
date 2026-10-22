@@ -1372,11 +1372,12 @@ fn nothing_new(
 }
 
 /// The earlier points a person still has to weigh: counted ones and disputed
-/// ones.
+/// ones, in scope, since a point that predates the pull request was never
+/// shown.
 fn open_count(record: &ReviewRecord) -> usize {
     record
         .open_points()
-        .filter(|f| f.standing.counts() || f.standing == Standing::Disputed)
+        .filter(|f| f.in_scope && (f.standing.counts() || f.standing == Standing::Disputed))
         .count()
 }
 
@@ -1952,8 +1953,11 @@ pub fn recheck_comment(
         "general" => String::new(),
         file => format!(" ({file})"),
     };
-    let addressed: Vec<String> = earlier
-        .iter()
+    // A point that predates the pull request was never shown, so it is not
+    // shown as addressed or still open either. It stays on record, so it is not
+    // raised again as new.
+    let shown = || earlier.iter().filter(|e| e.recorded.in_scope);
+    let addressed: Vec<String> = shown()
         .filter_map(|e| {
             let (how, why) = match &e.resolution {
                 Resolution::Fixed(why) => ("Fixed", why),
@@ -1982,8 +1986,7 @@ pub fn recheck_comment(
         out.push(format!("addressed\n{}", addressed.join("\n")));
     }
 
-    let still_open: Vec<String> = earlier
-        .iter()
+    let still_open: Vec<String> = shown()
         .filter_map(|e| {
             let Resolution::Open(why) = &e.resolution else {
                 return None;
@@ -2951,6 +2954,33 @@ mod recheck_tests {
         );
     }
 
+    fn predating(title: &str) -> RecordedFinding {
+        RecordedFinding {
+            in_scope: false,
+            ..recorded(
+                Severity::NonBlocking,
+                title,
+                "src/chain.rs:2736",
+                Standing::Unverified,
+            )
+        }
+    }
+
+    #[test]
+    fn a_point_that_predates_the_pull_request_is_never_listed() {
+        // reardencode/rbitcoin#1137: two points the reviews had kept out as
+        // predating the branch came back in full under "still open".
+        let earlier = vec![
+            open(predating("Side branch ignores mock time")),
+            closed(predating("Side branch replies raw")),
+        ];
+        let text = recheck_comment(&delta(&["abc1234 x"]), &earlier, &[], &Style::default(), 2);
+        assert_eq!(
+            "Rechecked after 1 new commit (abc1234). Nothing blocking remains.",
+            text
+        );
+    }
+
     #[test]
     fn replies_without_commits_and_a_rewritten_branch_are_said_in_the_first_line() {
         let text = recheck_comment(&delta(&[]), &[], &[], &Style::default(), 2);
@@ -3246,6 +3276,9 @@ mod recheck_tests {
         ];
         assert!(standing_note(&record_with(blockers))
             .ends_with(" The 2 blocking points from that review stand."));
+        let unseen = vec![one_blocker().remove(0), predating("Side branch clock")];
+        assert!(standing_note(&record_with(unseen))
+            .ends_with(" The blocking point from that review stands."));
     }
 
     #[test]

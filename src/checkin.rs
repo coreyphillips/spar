@@ -72,6 +72,12 @@ the thread, so it is the reason and not an apology, and it is written for them.
 A comment you cannot confirm, about code that already does the right thing, is
 one to decline with the line that shows it.
 
+A comment that asks for nothing is ask=nothing: praise, an approval, a review
+that found nothing to change, a summary of the pull request, a bot reporting a
+build or a check, or a thread somebody settled themselves. spar says nothing in
+reply to it, so do not use answer to acknowledge one. Answer is for a question
+somebody asked.
+
 Set unambiguous=false whenever the comment could be read more than one way. spar
 will answer in words rather than guess. That is cheap; a commit somebody did not
 ask for is not.
@@ -233,7 +239,9 @@ pub fn settle(judge: &CommentVerdict, check: Option<&CommentCheck>) -> Ask {
         // One agent saying "do not change this" is enough to not change it.
         (Ask::Decline, _) => Ask::Decline,
         (Ask::Answer, _) => Ask::Answer,
-        (Ask::Nothing, Some(c)) if !c.agrees => Ask::Answer,
+        // A checker that objects and also says nothing is asked has not
+        // objected to the silence.
+        (Ask::Nothing, Some(c)) if !c.agrees && c.ask != Ask::Nothing => Ask::Answer,
         (Ask::Nothing, _) => Ask::Nothing,
     }
 }
@@ -449,7 +457,8 @@ fn listed(fence: &Fence, items: &[&Pending]) -> String {
 /// Composed from fields rather than forwarding model prose, like everything
 /// else spar posts. A decline is the argument and nothing before it: no "I
 /// disagree because", because the reasoning is the reply, and the last line is
-/// the one that says whose move it is.
+/// the one that says whose move it is. A comment that asked for nothing gets
+/// nothing: a reply saying there is nothing to act on is only noise.
 pub fn thread_reply(item: &Settled, style: &Style) -> String {
     let reasoning = style::sentence(&item.reasoning, style);
     match item.ask {
@@ -487,7 +496,7 @@ pub fn thread_reply(item: &Settled, style: &Style) -> String {
             Some(why) => format!("{reasoning} Not changed here: {why}."),
             None => reasoning,
         },
-        Ask::Nothing => reasoning,
+        Ask::Nothing => String::new(),
     }
 }
 
@@ -511,8 +520,9 @@ fn bullets(lines: &[String]) -> String {
 ///
 /// One comment and not one per point: there is nowhere to thread these, so five
 /// replies to five comments is spar talking to itself down the page, while one
-/// comment naming each of them is the thing somebody reads. Returns None when
-/// there is nothing to say, on the same principle as `outcome_comment`.
+/// comment naming each of them is the thing somebody reads. A comment that
+/// asked for nothing is not named. Returns None when there is nothing to say,
+/// on the same principle as `outcome_comment`.
 pub fn checkin_comment(items: &[Settled], style: &Style) -> Option<String> {
     let mut out: Vec<String> = Vec::new();
     let say = |item: &Settled, what: &str| match (&item.pending.file, item.pending.line) {
@@ -530,7 +540,7 @@ pub fn checkin_comment(items: &[Settled], style: &Style) -> Option<String> {
         .map(|i| say(i, &style::sentence(&i.summary, style)))
         .collect();
     let answered: Vec<String> = settled_ones()
-        .filter(|i| matches!(i.ask, Ask::Answer | Ask::Nothing))
+        .filter(|i| i.ask == Ask::Answer)
         .map(|i| say(i, &style::sentence(&i.reasoning, style)))
         .collect();
     let refused: Vec<String> = settled_ones()
@@ -1249,12 +1259,19 @@ fn post(
 
     if !mode.posts || mode.dry_run {
         for item in items {
+            let reply = match item.ask {
+                Ask::Nothing => format!(
+                    "nothing posted: {}",
+                    style::sentence(&item.reasoning, &repo.style)
+                ),
+                _ => thread_reply(item, &repo.style),
+            };
             println!(
                 "\n[{}] @{} on {}\n  {}",
                 item.ask,
                 item.pending.author,
                 item.pending.located(),
-                thread_reply(item, &repo.style)
+                reply
             );
         }
         if let Some(text) = &summary {
@@ -1278,6 +1295,14 @@ fn post(
             Err(e) => logdim!("{why}, nothing posted, and could not save it: {e}"),
         }
         return;
+    }
+
+    let quiet = said_nothing(items, seen);
+    if quiet > 0 {
+        logdim!(
+            "#{number}: {quiet} comment{} asked for nothing, so nothing was said",
+            if quiet == 1 { "" } else { "s" }
+        );
     }
 
     for item in items {
@@ -1333,6 +1358,18 @@ fn post(
             }
         }
     }
+}
+
+/// Record every comment that asked for nothing as answered, since saying
+/// nothing is its answer, so it is not judged again until somebody adds to it.
+/// How many there were.
+fn said_nothing(items: &[Settled], seen: &mut Answered) -> usize {
+    let quiet: Vec<&Settled> = items.iter().filter(|i| i.ask == Ask::Nothing).collect();
+    for item in &quiet {
+        seen.seen
+            .insert(item.pending.key.clone(), item.pending.newest.clone());
+    }
+    quiet.len()
 }
 
 fn write_answered(repo: &Repo, number: i64, seen: &Answered) {
@@ -1465,6 +1502,37 @@ mod tests {
                 Some(&check(false, Ask::Decline, true))
             )
         );
+    }
+
+    /// Silence takes both. A checker that sees something asked turns it into an
+    /// answer, and one that disagrees while saying nothing is asked either has
+    /// not objected to the silence.
+    #[test]
+    fn nothing_is_said_only_when_neither_agent_sees_anything_asked() {
+        assert_eq!(
+            Ask::Nothing,
+            settle(
+                &judge(Ask::Nothing, true),
+                Some(&check(true, Ask::Nothing, true))
+            )
+        );
+        assert_eq!(
+            Ask::Nothing,
+            settle(
+                &judge(Ask::Nothing, true),
+                Some(&check(false, Ask::Nothing, true))
+            )
+        );
+        for objection in [Ask::Answer, Ask::Decline, Ask::Implement] {
+            assert_eq!(
+                Ask::Answer,
+                settle(
+                    &judge(Ask::Nothing, true),
+                    Some(&check(false, objection, true))
+                ),
+                "{objection}"
+            );
+        }
     }
 
     /// Either agent unsure of what was meant is enough to stop guessing. A
@@ -1768,7 +1836,32 @@ mod tests {
     #[test]
     fn the_summary_comment_is_nothing_when_there_is_nothing_to_say() {
         assert!(checkin_comment(&[], &Style::default()).is_none());
-        assert!(checkin_comment(&[settled(Ask::Nothing)], &Style::default()).is_some());
+        assert!(checkin_comment(&[settled(Ask::Answer)], &Style::default()).is_some());
+    }
+
+    /// synonymdev/bitkit-android#1665: a review that found nothing and a CI
+    /// bot's build comment each got "nothing to act on" under "Answered". A
+    /// comment that asked for nothing gets no reply and no line, and is still
+    /// recorded, so it is not judged again until somebody adds to it.
+    #[test]
+    fn a_comment_that_asked_for_nothing_gets_nothing_said() {
+        let quiet = settled(Ask::Nothing);
+        assert_eq!("", thread_reply(&quiet, &Style::default()));
+        assert!(checkin_comment(std::slice::from_ref(&quiet), &Style::default()).is_none());
+        let out = checkin_comment(&[quiet.clone(), settled(Ask::Answer)], &Style::default())
+            .expect("the answer");
+        assert_eq!(1, out.matches("@alice").count(), "{out}");
+
+        let mut seen = Answered::default();
+        assert_eq!(
+            1,
+            said_nothing(&[quiet.clone(), settled(Ask::Answer)], &mut seen)
+        );
+        assert_eq!(
+            Some(&quiet.pending.newest),
+            seen.seen.get(&quiet.pending.key)
+        );
+        assert_eq!(1, seen.seen.len());
     }
 
     /// Each block is omitted when empty, so a check-in that only answered

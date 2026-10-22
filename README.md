@@ -741,7 +741,7 @@ an outcome or round comment counts as you having answered anybody.
 
 Both agents then judge each one. The first rules on it with the code checked
 out; the second reads the same comments and those rulings, goes to the code, and
-agrees or does not. Four outcomes:
+agrees or does not. Five outcomes:
 
 - **A change they both agree is right and belongs here** is made, committed,
   pushed to the pull request branch, answered in that comment's own thread, and
@@ -755,6 +755,11 @@ agrees or does not. Four outcomes:
   summary.
 - **The two disagree** and nothing is changed. It is answered, left open, and
   handed to you.
+- **Nothing asked**, such as praise, an approval, a review that found nothing to
+  change, or a bot reporting a build, gets no reply and no line in the summary
+  comment. It still counts as answered, so it is not judged again until
+  somebody adds to it. It takes both agents: one that sees something asked
+  turns it into an answer.
 
 Replies to inline threads go into those threads. A review summary and a top
 level comment have no thread to reply into, so they are answered together in one

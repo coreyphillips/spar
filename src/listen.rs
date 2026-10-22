@@ -31,7 +31,7 @@ use crate::checkin;
 use crate::clock;
 use crate::config::{Config, ListenCfg, OwnPr, ReviewOrIgnore};
 use crate::error::Result;
-use crate::model::{IssueRun, ItemKind, Login, PrSweepRow, Status};
+use crate::model::{IssueRun, ItemKind, Login, PrSweepRow, ReviewRequested, Status};
 use crate::proc;
 use crate::repo::{ApiResponse, Repo};
 use crate::review_only::{self, RecheckMode, ReviewOpts};
@@ -507,8 +507,10 @@ pub fn events_from_sweep(
             .review_requests
             .iter()
             .any(|l| crate::comments::same_login(&l.login, viewer));
-        // Reviewing clears a request, so a request seen again later is the
-        // author asking again and is news.
+        // A formal review clears a request, so a request seen again later is
+        // the author asking again and is news. A review posted as a comment
+        // leaves it open, and the dispatch tells that one apart by when it was
+        // made.
         if !asked {
             watched.requested_noticed = false;
         } else if !watched.requested_noticed {
@@ -703,6 +705,9 @@ pub struct Facts {
     /// The pull request asks the viewer for a review right now, by name or
     /// through a team the viewer is in.
     pub review_pending: bool,
+    /// That request was made before the posted review began, so the review
+    /// answered it.
+    pub request_answered: bool,
 }
 
 /// Whether a pull request's `reviewRequests` ask the viewer now: by name, or
@@ -722,14 +727,40 @@ pub fn review_pending(
             .any(|team| in_team(&team.slug).unwrap_or(true))
 }
 
+/// Whether the review the viewer is asked for is already on record: the newest
+/// request that counts for the viewer, as `review_pending` counts one, was made
+/// no later than the posted review began at `reviewed_at`.
+///
+/// A review posted as a comment leaves its request open, and a first sweep has
+/// never seen the request before, so without this a request the review already
+/// answered reads as the author asking again. False when no request counts or
+/// a time cannot be read: answered takes the timeline saying so.
+pub fn request_answered(
+    made: &[ReviewRequested],
+    viewer: &str,
+    in_team: &dyn Fn(&str) -> Option<bool>,
+    reviewed_at: &str,
+) -> bool {
+    let Some(reviewed) = clock::parse_rfc3339(reviewed_at) else {
+        return false;
+    };
+    made.iter()
+        .filter(|r| review_pending(std::slice::from_ref(&r.who), viewer, in_team))
+        .filter_map(|r| clock::parse_rfc3339(&r.at))
+        .max()
+        .is_some_and(|newest| newest <= reviewed)
+}
+
 /// A notification's reason is the one its thread was first raised for and it
 /// never changes, so a thread that began as a review request says so on every
 /// later update, spar's own review among them. What the pull request says now
-/// decides: when nobody is asking any more, the update is only something
+/// decides: when nobody is asking any more, or the request is older than the
+/// review on record and so was answered by it, the update is only something
 /// happening on a thread the viewer is part of. True when it was.
 pub fn settle(p: &mut Pending, f: &Facts) -> bool {
-    let stale =
-        p.kind == ItemKind::Pr && !f.review_pending && p.triggers.remove(&Trigger::ReviewRequested);
+    let stale = p.kind == ItemKind::Pr
+        && (!f.review_pending || f.request_answered)
+        && p.triggers.remove(&Trigger::ReviewRequested);
     if stale {
         p.triggers.insert(Trigger::Replied);
     }
@@ -1155,6 +1186,16 @@ fn facts(repo: &Repo, cfg: &Config, number: i64, kind: ItemKind, named: bool) ->
             let row = repo.sweep_pr(number)?;
             let record = repo.read_review_record(number);
             let posted = record.as_ref().is_some_and(|r| r.posted);
+            let in_team = |team: &str| repo.team_has_member(team, &viewer);
+            let pending = review_pending(&row.review_requests, &viewer, &in_team);
+            // Only an open request can have been answered, and only by a
+            // review somebody saw, so the timeline is read for nothing else.
+            let answered = pending
+                && record.as_ref().filter(|r| r.posted).is_some_and(|r| {
+                    repo.review_requests_made(number).is_some_and(|made| {
+                        request_answered(&made, &viewer, &in_team, &r.reviewed_at)
+                    })
+                });
             Ok(Facts {
                 number,
                 named,
@@ -1171,9 +1212,8 @@ fn facts(repo: &Repo, cfg: &Config, number: i64, kind: ItemKind, named: bool) ->
                 has_custody_state: repo.state_path(number).exists(),
                 below_floor,
                 linked_pr_with_record: None,
-                review_pending: review_pending(&row.review_requests, &viewer, &|team| {
-                    repo.team_has_member(team, &viewer)
-                }),
+                review_pending: pending,
+                request_answered: answered,
             })
         }
         ItemKind::Issue => {
@@ -1211,6 +1251,7 @@ fn facts(repo: &Repo, cfg: &Config, number: i64, kind: ItemKind, named: bool) ->
                 below_floor,
                 linked_pr_with_record: linked.map(|(pr, _)| pr),
                 review_pending: false,
+                request_answered: false,
             })
         }
     }
@@ -1545,12 +1586,20 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                 }
             };
             if settle(&mut p, &f) {
-                log!("#{number}: no review is asked of you now, so that was only an update");
+                if f.request_answered {
+                    log!(
+                        "#{number}: the review asked of you is the one on record, so that was \
+                         only an update"
+                    );
+                } else {
+                    log!("#{number}: no review is asked of you now, so that was only an update");
+                }
             }
-            if p.triggers.contains(&Trigger::ReviewRequested) {
-                // Answered now, whichever way it arrived. A standing note is a
-                // comment and leaves the request open, so the next sweep would
-                // otherwise take it for the author asking again.
+            if p.triggers.contains(&Trigger::ReviewRequested) || f.request_answered {
+                // Answered now, or by the review on record, whichever way it
+                // arrived. A standing note or a review posted as a comment
+                // leaves the request open, so the next sweep would otherwise
+                // take it for the author asking again.
                 state.watched(number, p.kind).requested_noticed = true;
             }
             let action = plan(&p, &f, &cfg.listen);
@@ -2335,6 +2384,23 @@ mod tests {
         assert!(p.triggers.contains(&Trigger::ReviewRequested));
         assert_eq!(Action::Review, plan(&p, &asked, &cfg()));
 
+        // A request still standing that the review on record answered is
+        // only an update too: a quiet second look, which posts nothing when
+        // nothing is new.
+        let answered = Facts {
+            has_posted_record: true,
+            review_pending: true,
+            request_answered: true,
+            ..open_pr()
+        };
+        let mut p = pending(ItemKind::Pr, &[Trigger::ReviewRequested], 0);
+        assert!(settle(&mut p, &answered));
+        assert_eq!(
+            [Trigger::Replied].into_iter().collect::<BTreeSet<_>>(),
+            p.triggers
+        );
+        assert_eq!(Action::Recheck(7), plan(&p, &answered, &cfg()));
+
         // Nothing to settle without a request.
         let mut p = pending(ItemKind::Pr, &[Trigger::Pushed], 0);
         assert!(!settle(&mut p, &open_pr()));
@@ -2368,6 +2434,52 @@ mod tests {
             &[team("example/ours"), user("me")],
             "me",
             &never
+        ));
+    }
+
+    /// A review posted as a comment leaves its request open, and a first sweep
+    /// has never seen that request, so it read as the author asking again and
+    /// got a "nothing has changed" note on every pull request reviewed that way.
+    #[test]
+    fn a_request_made_before_the_review_on_record_was_answered_by_it() {
+        let teams = |team: &str| match team {
+            "example/ours" => Some(true),
+            _ => Some(false),
+        };
+        let made = |at: &str, who: Login| ReviewRequested { at: at.into(), who };
+        let answered = |requests: &[ReviewRequested]| {
+            request_answered(requests, "me", &teams, "2026-10-20T12:00:00Z")
+        };
+        assert!(answered(&[made("2026-10-20T11:00:00Z", user("me"))]));
+        assert!(answered(&[made("2026-10-20T12:00:00Z", user("ME"))]));
+        assert!(answered(&[made(
+            "2026-10-20T11:00:00Z",
+            team("example/ours")
+        )]));
+        // Asked again after the review: the newest request decides.
+        assert!(!answered(&[
+            made("2026-10-20T11:00:00Z", user("me")),
+            made("2026-10-20T13:00:00Z", user("me")),
+        ]));
+        assert!(!answered(&[
+            made("2026-10-20T11:00:00Z", user("me")),
+            made("2026-10-20T13:00:00Z", team("example/ours")),
+        ]));
+        // Somebody else asked later, which asks nothing of the viewer.
+        assert!(answered(&[
+            made("2026-10-20T11:00:00Z", user("me")),
+            made("2026-10-20T13:00:00Z", user("alice")),
+            made("2026-10-20T13:00:00Z", team("example/theirs")),
+        ]));
+        // Nothing on the timeline to go by, or no time to compare with.
+        assert!(!answered(&[]));
+        assert!(!answered(&[made("2026-10-20T11:00:00Z", user("alice"))]));
+        assert!(!answered(&[made("", user("me"))]));
+        assert!(!request_answered(
+            &[made("2026-10-20T11:00:00Z", user("me"))],
+            "me",
+            &teams,
+            ""
         ));
     }
 

@@ -521,7 +521,7 @@ pub fn checkin() -> Value {
                         "ask": {
                             "type": "string",
                             "enum": ["implement", "defer", "decline", "answer", "nothing"],
-                            "description": "implement: the change is right and belongs on this branch. defer: the change is right and is really its own piece of work, so supply new_issue_title and new_issue_body. decline: the change should not be made. answer: a question rather than a request. nothing: nothing is being asked for."
+                            "description": "implement: the change is right and belongs on this branch. defer: the change is right and is really its own piece of work, so supply new_issue_title and new_issue_body. decline: the change should not be made. answer: a question somebody asked, which gets a reply. nothing: nothing is being asked for, such as praise, an approval, a review that found nothing to change, or a bot reporting a build; nothing is said in reply."
                         },
                         "request": {
                             "type": "string",

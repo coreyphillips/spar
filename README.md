@@ -838,14 +838,19 @@ is therefore called one again when spar's own review moves it, so spar checks th
 pull request: a review request counts only while it is still open, to you by name
 or to a team you are in. A team request asks GitHub whether you are in the team,
 which takes the `read:org` scope `gh auth login` asks for, and a team GitHub will
-not answer for counts as asking you.
+not answer for counts as asking you. A review spar posted as a comment, which is
+what `spar review` does without `--verdict`, leaves the request open, so on a
+pull request spar reviewed it also checks when the request was made: one made
+before that review began was answered by it, and counts as an update.
 
 What an event leads to is a table, not a judgement:
 
 - A pull request spar has reviewed, written by somebody else, that moved or got a
   reply gets a **second look**: the earlier points ruled on, what landed since
-  reviewed, and a verdict. A review request still open on it that arrives with
-  nothing new gets a mechanical comment saying so, and no agent call.
+  reviewed, and a verdict. A review request made since that review, still open,
+  that arrives with nothing new gets a mechanical comment saying so, and no
+  agent call. One the review already answered gets a second look that posts
+  nothing when nothing is new.
 - A pull request spar has not reviewed, written by somebody else, where your
   review was requested or that was assigned to you gets a review with a verdict,
   under `on_review_requested` and `on_assigned`. A mention on it gets a review

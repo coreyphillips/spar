@@ -927,6 +927,56 @@ pub fn parse_api_response(stdout: &str) -> Option<ApiResponse> {
     })
 }
 
+/// The review requests on a pull request's timeline. The last hundred are
+/// plenty: only the newest one that asks the viewer matters.
+const REQUESTS_QUERY: &str = "\
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      timelineItems(itemTypes: [REVIEW_REQUESTED_EVENT], last: 100) {
+        nodes {
+          ... on ReviewRequestedEvent {
+            createdAt
+            requestedReviewer {
+              ... on User { login }
+              ... on Team { combinedSlug }
+            }
+          }
+        }
+      }
+    }
+  }
+}";
+
+/// The requests `REQUESTS_QUERY` returned, oldest first. None when the answer
+/// is not that shape. A request for somebody GitHub no longer knows names
+/// nobody and is left out, or it would read as a team nobody could check.
+pub fn parse_review_requests(text: &str) -> Option<Vec<crate::model::ReviewRequested>> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    let nodes = v
+        .pointer("/data/repository/pullRequest/timelineItems/nodes")?
+        .as_array()?;
+    let text_at = |node: &Value, path: &str| {
+        node.pointer(path)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    Some(
+        nodes
+            .iter()
+            .map(|node| crate::model::ReviewRequested {
+                at: text_at(node, "/createdAt"),
+                who: crate::model::Login {
+                    login: text_at(node, "/requestedReviewer/login"),
+                    slug: text_at(node, "/requestedReviewer/combinedSlug"),
+                },
+            })
+            .filter(|r| !r.at.is_empty() && !(r.who.login.is_empty() && r.who.slug.is_empty()))
+            .collect(),
+    )
+}
+
 /// The pull request a per item state file is about: `pr-12.json`,
 /// `review-12.json`, `checkin-12.json`. None for anything else, so the shared
 /// files beside them, `spend.json` and the rest, are never touched.
@@ -3749,6 +3799,30 @@ impl Repo {
             404 => Some(false),
             _ => None,
         }
+    }
+
+    /// Every review request made on a pull request, oldest first. None when
+    /// GitHub did not answer.
+    ///
+    /// A review spar posts as a comment leaves the request it answered open,
+    /// so `reviewRequests` alone cannot tell that request from one made after
+    /// the review. When it was made can.
+    pub fn review_requests_made(&self, number: i64) -> Option<Vec<crate::model::ReviewRequested>> {
+        let text = self
+            .gh(&[
+                "api",
+                "graphql",
+                "-F",
+                "owner={owner}",
+                "-F",
+                "repo={repo}",
+                "-F",
+                &format!("number={number}"),
+                "-f",
+                &format!("query={REQUESTS_QUERY}"),
+            ])
+            .ok()?;
+        parse_review_requests(&text)
     }
 
     /// How many commits lie between two SHAs, when GitHub will say.
@@ -10290,6 +10364,34 @@ mod review_record_tests {
 
         assert_eq!(None, parse_api_response(""));
         assert_eq!(None, parse_api_response("gh: command not found\n"));
+    }
+
+    #[test]
+    fn review_requests_are_read_off_the_timeline_with_who_and_when() {
+        let text = json!({"data": {"repository": {"pullRequest": {"timelineItems": {"nodes": [
+            {"createdAt": "2026-10-20T10:00:00Z", "requestedReviewer": {"login": "viewer"}},
+            {"createdAt": "2026-10-20T11:00:00Z", "requestedReviewer": {"combinedSlug": "example/ours"}},
+            {"createdAt": "2026-10-20T12:00:00Z", "requestedReviewer": null},
+            {}
+        ]}}}}})
+        .to_string();
+        let made = parse_review_requests(&text).expect("requests");
+        assert_eq!(2, made.len());
+        assert_eq!("2026-10-20T10:00:00Z", made[0].at);
+        assert_eq!("viewer", made[0].who.login);
+        assert!(made[0].who.slug.is_empty());
+        assert_eq!("2026-10-20T11:00:00Z", made[1].at);
+        assert!(made[1].who.login.is_empty());
+        assert_eq!("example/ours", made[1].who.slug);
+
+        let none =
+            json!({"data": {"repository": {"pullRequest": {"timelineItems": {"nodes": []}}}}});
+        assert_eq!(
+            Some(0),
+            parse_review_requests(&none.to_string()).map(|m| m.len())
+        );
+        assert!(parse_review_requests(r#"{"errors": [{"message": "no"}]}"#).is_none());
+        assert!(parse_review_requests("gh: not json").is_none());
     }
 
     #[test]

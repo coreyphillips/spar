@@ -6720,9 +6720,10 @@ fn a_recheck_without_a_posted_review_on_record_reviews_afresh() {
 /// a 500; `SPAR_FAKE_REVIEW_FAILS=1` refuses a submitted review;
 /// `SPAR_FAKE_COMMENTS_FAIL=1` fails the read of the pull request's comments;
 /// `SPAR_FAKE_ISSUE_STATE` is issue 42's state; `$SPAR_FAKE_LINKED` is the
-/// list a linked pull request is looked for in; and `$SPAR_FAKE_REQUESTS` is
-/// who the pull request asks for a review, nobody when it is missing. The
-/// viewer is in team `ours` and in no other.
+/// list a linked pull request is looked for in; `$SPAR_FAKE_REQUESTS` is
+/// who the pull request asks for a review, nobody when it is missing; and
+/// `$SPAR_FAKE_REQUESTED` is its timeline of review requests, empty when it is
+/// missing. The viewer is in team `ours` and in no other.
 fn listen_gh(number: i64, head: &str, author: &str, state: &str) -> String {
     format!(
         r#"set -eu
@@ -6776,6 +6777,9 @@ case "$*" in
     if [ "${{SPAR_FAKE_COMMENTS_FAIL:-}}" = 1 ]; then printf 'gh: HTTP 502: Bad Gateway\n' >&2; exit 1; fi
     printf '[]\n' ;;
   "api --paginate "*) printf '[]\n' ;;
+  "api graphql "*REVIEW_REQUESTED_EVENT*)
+    if [ -f "${{SPAR_FAKE_REQUESTED:-/nonexistent}}" ]; then cat "$SPAR_FAKE_REQUESTED"
+    else printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"timelineItems":{{"nodes":[]}}}}}}}}}}'; fi ;;
   "api graphql "*) printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[]}}}}}}}}}}' ;;
   "api -X POST repos/{{owner}}/{{repo}}/pulls/{number}/reviews "*)
     if [ "${{SPAR_FAKE_REVIEW_FAILS:-}}" = 1 ]; then printf 'gh: Unprocessable Entity (HTTP 422)\n' >&2; exit 1; fi ;;
@@ -7200,6 +7204,75 @@ fn a_request_answered_with_the_standing_note_is_not_raised_again_by_the_sweep() 
     assert!(!out.contains("#7: your review was requested"), "{out}");
     assert!(!out.contains("about to take a second look"), "{out}");
     assert_eq!(1, log.matches("pr comment 7 ").count(), "{log}");
+}
+
+/// `spar review` without `--verdict` posts its review as a comment, which
+/// leaves the review request open. The first sweep of a new listener had never
+/// seen that request, took it for the author asking again, and posted "Nothing
+/// has changed" on every open pull request reviewed that way. When the request
+/// was made decides: one older than the review was answered by it, and one
+/// made after it still gets the note.
+#[test]
+#[cfg(unix)]
+fn the_first_sweep_posts_no_note_for_a_request_the_review_on_record_answered() {
+    // The review on record began at 2026-01-01T00:00:00Z.
+    let cases = [
+        ("listenreqbefore", "2025-12-31T09:00:00Z", false),
+        ("listenreqafter", "2026-01-02T09:00:00Z", true),
+    ];
+    for (tag, asked_at, note) in cases {
+        let l = Listening::refusing(tag, &listen_gh(7, "aaa", "alice", "OPEN"));
+        write_record(&l.fx, 7, &blocking_record("aaa"));
+        let asked = sweep_row(7, "aaa", "alice").replace(
+            r#""reviewRequests":[]"#,
+            r#""reviewRequests":[{"login":"viewer"}]"#,
+        );
+        l.with_prs(&[asked]);
+        l.asking_the_viewer();
+        let timeline = l.fx.dir.join("requested.json");
+        std::fs::write(
+            &timeline,
+            serde_json::json!({"data": {"repository": {"pullRequest": {"timelineItems": {"nodes": [
+                {"createdAt": asked_at, "requestedReviewer": {"login": "viewer"}}
+            ]}}}}})
+            .to_string(),
+        )
+        .unwrap();
+
+        let (ok, out, log) = l.run_with(
+            &["--once"],
+            &[("SPAR_FAKE_REQUESTED", timeline.to_str().unwrap())],
+        );
+
+        assert!(ok, "{tag}: {out}");
+        assert_eq!(0, l.agent_calls(), "{tag}: {out}");
+        assert!(!submitted_a_review(&log), "{tag}: {log}");
+        assert_eq!(
+            note,
+            log.contains("pr comment 7 --body Nothing has changed since the review at aaa"),
+            "{tag}: {log}"
+        );
+        assert_eq!(
+            !note,
+            out.contains(
+                "#7: the review asked of you is the one on record, so that was only an update"
+            ),
+            "{tag}: {out}"
+        );
+
+        // Restarting the listener does not raise the open request again.
+        let (ok, out, log) = l.run_with(
+            &["--once"],
+            &[("SPAR_FAKE_REQUESTED", timeline.to_str().unwrap())],
+        );
+        assert!(ok, "{tag}: {out}");
+        assert!(!out.contains("about to take a second look"), "{tag}: {out}");
+        assert_eq!(
+            usize::from(note),
+            log.matches("pr comment 7 ").count(),
+            "{tag}: {log}"
+        );
+    }
 }
 
 /// The whole point, end to end: the author pushed after a review, the listener

@@ -1630,6 +1630,14 @@ pub struct Login {
     pub slug: String,
 }
 
+/// One review request from a pull request's timeline: when it was made, and
+/// who it asked, a user by `login` or a team by `slug` as in `Login`.
+#[derive(Debug, Clone, Default)]
+pub struct ReviewRequested {
+    pub at: String,
+    pub who: Login,
+}
+
 /// Issues and pull requests share one number sequence per repository, so a
 /// number names exactly one of them and spar can work out which.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

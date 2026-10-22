@@ -617,6 +617,14 @@ pub struct LoopCfg {
     /// A thread spar disagreed with is left open whatever this says: the person
     /// who raised it has not had their say yet, and it is their thread.
     pub checkin_resolve: bool,
+    /// Have `spar checkin` read the viewer's own comments too, and the reviews
+    /// `spar review` posted under their name.
+    ///
+    /// Off, because spar posts as whoever runs it and most of what that account
+    /// wrote on a pull request is answers, not requests. spar's own replies and
+    /// bookkeeping are never read either way: reading them back does not
+    /// terminate.
+    pub checkin_include_own: bool,
     /// Most unanswered comments spar answers on one pull request in a run.
     ///
     /// A backstop against a long argument being read back to somebody, not a
@@ -663,6 +671,7 @@ impl Default for LoopCfg {
             max_triage_chars: 200_000,
             checkin_trust: Trust::Write,
             checkin_resolve: true,
+            checkin_include_own: false,
             max_checkin_comments: 20,
             check: CheckCommand::default(),
             effort_schedule: EffortSchedule::default(),

@@ -139,6 +139,9 @@ pub struct Mode {
     pub trust: Trust,
     /// Read every comment again, ignoring what spar recorded answering.
     pub again: bool,
+    /// Read the viewer's own comments too, and the reviews `spar review`
+    /// posted under their name.
+    pub include_own: bool,
     pub resolve: bool,
     /// Whether `[style] pr_comments` allows spar to say anything at all here.
     pub posts: bool,
@@ -635,7 +638,7 @@ fn inner_pr(
     state.pr = Some(pr.url.clone());
 
     let seen = read_answered(repo, number, mode);
-    let found = comments::gather(repo, number, true, &seen)?;
+    let found = comments::gather(repo, number, true, mode.include_own, &seen)?;
     if found.pending.is_empty() {
         report_empty(number, &found);
         state.status = Status::Clean;
@@ -758,7 +761,7 @@ fn inner_issue(
     let mut state = IssueRun::new(number, issue.title.clone());
 
     let seen = read_answered(repo, number, mode);
-    let found = comments::gather(repo, number, false, &seen)?;
+    let found = comments::gather(repo, number, false, mode.include_own, &seen)?;
     if found.pending.is_empty() {
         report_empty(number, &found);
         state.status = Status::Clean;
@@ -1408,6 +1411,7 @@ mod tests {
             reply_only: false,
             trust: Trust::Write,
             again: false,
+            include_own: false,
             resolve: true,
             posts: true,
         }

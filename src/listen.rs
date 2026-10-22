@@ -1,10 +1,16 @@
 //! Listening for what happens after a review.
 //!
-//! Every other command does one pass and exits, so a reply to a review spar
-//! posted, or a push that answered it, waited for a person to notice and run
-//! spar again. `spar listen` waits instead, and it waits for free: the only
-//! thing that calls an agent is a review, a second look, or a check-in, and
-//! none of those starts until GitHub says something happened.
+//! Every other command does one pass and exits, so a review asked for again
+//! after spar posted one waited for a person to notice and run spar again.
+//! `spar listen` waits instead, and it waits for free: the only thing that
+//! calls an agent is a review, a second look, or a check-in, and none of those
+//! starts until GitHub says something happened.
+//!
+//! A second look is asked for, never assumed: a review requested again or a
+//! mention starts one, and a push or a comment alone does not. The author may
+//! still be working, and a comment may be another reviewer's review rather than
+//! an answer to this one. The look that runs reads every commit and reply since
+//! the review on record.
 //!
 //! Two sources feed it, because neither is enough alone. GitHub's notifications
 //! say why a thread moved, a review request, a mention, a comment, and they are
@@ -14,10 +20,11 @@
 //! spar last read. Notifications are never raised for the viewer's own actions,
 //! which is also why spar's own comments never wake it.
 //!
-//! Events settle before anything runs: a push followed by three replies in the
-//! same minute is one second look, not four. What runs is decided by a table
-//! that is a pure function of the event, a few facts about the item, and the
-//! `[listen]` settings, so it can be read and tested on its own.
+//! Events settle before anything runs: a review request followed by three
+//! comments in the same minute is one second look, not four. What runs is
+//! decided by a table that is a pure function of the event, a few facts about
+//! the item, and the `[listen]` settings, so it can be read and tested on its
+//! own.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -61,8 +68,6 @@ pub struct Opts {
     pub dry_run: bool,
     /// How far back the first run looks.
     pub since: Option<Duration>,
-    /// Most pending second looks the first sweep may queue.
-    pub limit: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -255,8 +260,6 @@ pub struct ListenState {
     pub items: BTreeMap<i64, Watched>,
     #[serde(default)]
     pub pending: BTreeMap<i64, Pending>,
-    #[serde(default)]
-    pub swept_once: bool,
 }
 
 impl ListenState {
@@ -566,26 +569,6 @@ pub fn events_from_sweep(
     out
 }
 
-/// On the first sweep ever, keep only the `limit` lowest numbered pushes and
-/// say how many were held back. Later sweeps see one push at a time.
-pub fn cap_first_sweep(events: Vec<Event>, limit: usize, first: bool) -> (Vec<Event>, usize) {
-    if !first {
-        return (events, 0);
-    }
-    let mut pushes: Vec<&Event> = events
-        .iter()
-        .filter(|e| e.trigger == Trigger::Pushed)
-        .collect();
-    pushes.sort_by_key(|e| e.number);
-    let allowed: BTreeSet<i64> = pushes.iter().take(limit).map(|e| e.number).collect();
-    let held = pushes.len().saturating_sub(allowed.len());
-    let kept = events
-        .into_iter()
-        .filter(|e| e.trigger != Trigger::Pushed || allowed.contains(&e.number))
-        .collect();
-    (kept, held)
-}
-
 /// Fold one event into what is pending for its item.
 pub fn merge(pending: &mut BTreeMap<i64, Pending>, event: &Event, now: u64) {
     let p = pending.entry(event.number).or_insert_with(|| Pending {
@@ -708,6 +691,10 @@ pub struct Facts {
     /// That request was made before the posted review began, so the review
     /// answered it.
     pub request_answered: bool,
+    /// Somebody, not a bot, @mentioned the viewer since the review on record,
+    /// or for an issue since its pull request's. Read only when a mention is
+    /// pending.
+    pub mentioned: bool,
 }
 
 /// Whether a pull request's `reviewRequests` ask the viewer now: by name, or
@@ -767,6 +754,23 @@ pub fn settle(p: &mut Pending, f: &Facts) -> bool {
     stale
 }
 
+/// A mention is a reason a thread keeps too, so a thread that began with one
+/// says so on every later update. On a pull request spar reviewed, or an issue
+/// whose pull request it reviewed, only a mention made since that review asks
+/// for a second look; any other is only something happening on a thread the
+/// viewer is part of. True when it was.
+pub fn settle_mention(p: &mut Pending, f: &Facts) -> bool {
+    let reviewed = match p.kind {
+        ItemKind::Pr => f.has_posted_record,
+        ItemKind::Issue => f.linked_pr_with_record.is_some(),
+    };
+    let stale = reviewed && !f.mentioned && p.triggers.remove(&Trigger::Mentioned);
+    if stale {
+        p.triggers.insert(Trigger::Replied);
+    }
+    stale
+}
+
 /// The dispatch table.
 pub fn plan(p: &Pending, f: &Facts, cfg: &ListenCfg) -> Action {
     use Trigger::*;
@@ -778,10 +782,10 @@ pub fn plan(p: &Pending, f: &Facts, cfg: &ListenCfg) -> Action {
     }
     match p.kind {
         ItemKind::Issue => {
-            let asked = p.triggers.contains(&Mentioned)
-                || p.triggers.contains(&Assigned)
-                || (f.named && p.triggers.contains(&Replied));
-            if !asked {
+            // Only a mention asks. A reply is not a request, and an issue
+            // thread that began with an assignment says so on every later
+            // comment.
+            if !p.triggers.contains(&Mentioned) {
                 return Action::Ignore("nothing on the issue asked for spar");
             }
             // The pull request's own guards hold whichever way its second look
@@ -813,6 +817,17 @@ pub fn plan(p: &Pending, f: &Facts, cfg: &ListenCfg) -> Action {
                 };
             }
             if f.has_posted_record {
+                // A second look is asked for, never assumed. A push may be
+                // work in progress, and a comment may be another reviewer's
+                // review rather than an answer to this one.
+                let asked =
+                    p.triggers.contains(&ReviewRequested) || p.triggers.contains(&Mentioned);
+                if !asked {
+                    return Action::Ignore(
+                        "what is neither a review request nor a mention, the only things that \
+                         ask for a second look",
+                    );
+                }
                 return if f.recheck_capped {
                     Action::Capped(f.number)
                 } else {
@@ -1168,7 +1183,7 @@ fn sweep_rows(
             continue;
         }
         // A named issue's open pull request joins the watch once spar has
-        // reviewed it, so a push there is a second look.
+        // reviewed it, so a review requested again there is a second look.
         if let Ok(Some(pr)) = repo.try_open_pr_for_issue(*issue, cfg.base_branch()) {
             if repo.read_review_record(pr.number).is_some_and(|r| r.posted) {
                 swept.rows.push(repo.sweep_pr(pr.number)?);
@@ -1178,15 +1193,24 @@ fn sweep_rows(
     Ok(swept)
 }
 
-fn facts(repo: &Repo, cfg: &Config, number: i64, kind: ItemKind, named: bool) -> Result<Facts> {
+/// `mention` says a mention is pending, which is the only time the comments are
+/// read for one.
+fn facts(
+    repo: &Repo,
+    cfg: &Config,
+    number: i64,
+    kind: ItemKind,
+    named: bool,
+    mention: bool,
+) -> Result<Facts> {
     let viewer = repo.viewer_login()?.to_string();
     let below_floor = number < cfg.loop_cfg.min_number;
+    let in_team = |team: &str| repo.team_has_member(team, &viewer);
     match kind {
         ItemKind::Pr => {
             let row = repo.sweep_pr(number)?;
             let record = repo.read_review_record(number);
             let posted = record.as_ref().is_some_and(|r| r.posted);
-            let in_team = |team: &str| repo.team_has_member(team, &viewer);
             let pending = review_pending(&row.review_requests, &viewer, &in_team);
             // Only an open request can have been answered, and only by a
             // review somebody saw, so the timeline is read for nothing else.
@@ -1196,6 +1220,17 @@ fn facts(repo: &Repo, cfg: &Config, number: i64, kind: ItemKind, named: bool) ->
                         request_answered(&made, &viewer, &in_team, &r.reviewed_at)
                     })
                 });
+            // Read, not believed: the thread may have begun with a mention
+            // long before the review on record.
+            let mentioned = match record.as_ref().filter(|r| r.posted) {
+                Some(r) if mention => {
+                    let mut rows = repo.try_pr_review_comments(number)?;
+                    rows.extend(repo.try_pr_reviews(number)?);
+                    rows.extend(repo.try_issue_comments(number)?);
+                    crate::comments::mentioned_in(&rows, &viewer, &r.reviewed_at, &in_team)
+                }
+                _ => false,
+            };
             Ok(Facts {
                 number,
                 named,
@@ -1214,6 +1249,7 @@ fn facts(repo: &Repo, cfg: &Config, number: i64, kind: ItemKind, named: bool) ->
                 linked_pr_with_record: None,
                 review_pending: pending,
                 request_answered: answered,
+                mentioned,
             })
         }
         ItemKind::Issue => {
@@ -1240,6 +1276,15 @@ fn facts(repo: &Repo, cfg: &Config, number: i64, kind: ItemKind, named: bool) ->
                 }
                 None => (false, false),
             };
+            let mentioned = match &linked {
+                Some((_, record)) if mention => crate::comments::mentioned_in(
+                    &repo.try_issue_comments(number)?,
+                    &viewer,
+                    &record.reviewed_at,
+                    &in_team,
+                ),
+                _ => false,
+            };
             Ok(Facts {
                 number,
                 named,
@@ -1252,6 +1297,7 @@ fn facts(repo: &Repo, cfg: &Config, number: i64, kind: ItemKind, named: bool) ->
                 linked_pr_with_record: linked.map(|(pr, _)| pr),
                 review_pending: false,
                 request_answered: false,
+                mentioned,
             })
         }
     }
@@ -1516,16 +1562,7 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                         &record_head,
                         repo_mode,
                     );
-                    let (kept, held) = cap_first_sweep(swept, opts.limit, !state.swept_once);
-                    if held > 0 {
-                        log!(
-                            "{held} more reviewed pull request{} moved since their review; raise \
-                             --limit or run `spar review` on them",
-                            plural(held)
-                        );
-                    }
-                    events.extend(kept);
-                    state.swept_once = true;
+                    events.extend(swept);
                     next_sweep = now + cfg.listen.sweep;
                 }
                 Err(e) => {
@@ -1573,7 +1610,8 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                 continue;
             };
             let named_item = named.contains(&number);
-            let f = match facts(repo, cfg, number, p.kind, named_item) {
+            let mention = p.triggers.contains(&Trigger::Mentioned);
+            let f = match facts(repo, cfg, number, p.kind, named_item, mention) {
                 Ok(f) => f,
                 Err(e) => {
                     let w = state.watched(number, p.kind);
@@ -1594,6 +1632,12 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                 } else {
                     log!("#{number}: no review is asked of you now, so that was only an update");
                 }
+            }
+            if settle_mention(&mut p, &f) {
+                log!(
+                    "#{number}: nobody mentioned you since the review on record, so that was only \
+                     an update"
+                );
             }
             if p.triggers.contains(&Trigger::ReviewRequested) || f.request_answered {
                 // Answered now, or by the review on record, whichever way it
@@ -2314,31 +2358,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_first_sweep_caps_pending_rechecks_at_the_limit_and_counts_the_rest() {
-        let push = |n: i64| Event {
-            number: n,
-            kind: ItemKind::Pr,
-            trigger: Trigger::Pushed,
-            who: None,
-            head: None,
-            commits: None,
-            from_thread: false,
-        };
-        let asked = Event {
-            trigger: Trigger::ReviewRequested,
-            ..push(50)
-        };
-        let events = vec![push(9), push(3), push(7), asked.clone()];
-        let (kept, held) = cap_first_sweep(events.clone(), 2, true);
-        let numbers: Vec<i64> = kept.iter().map(|e| e.number).collect();
-        assert_eq!(vec![3, 7, 50], numbers, "{kept:?}");
-        assert_eq!(1, held);
-        let (kept, held) = cap_first_sweep(events, 2, false);
-        assert_eq!(4, kept.len());
-        assert_eq!(0, held);
-    }
-
     // -- the table -------------------------------------------------------------------
 
     #[test]
@@ -2367,7 +2386,7 @@ mod tests {
             [Trigger::Replied].into_iter().collect::<BTreeSet<_>>(),
             p.triggers
         );
-        assert_eq!(Action::Recheck(7), plan(&p, &reviewed, &cfg()));
+        assert!(matches!(plan(&p, &reviewed, &cfg()), Action::Ignore(_)));
 
         // On a pull request spar never reviewed it is not a reason to start.
         let mut p = pending(ItemKind::Pr, &[Trigger::ReviewRequested], 0);
@@ -2385,8 +2404,7 @@ mod tests {
         assert_eq!(Action::Review, plan(&p, &asked, &cfg()));
 
         // A request still standing that the review on record answered is
-        // only an update too: a quiet second look, which posts nothing when
-        // nothing is new.
+        // only an update too, and an update asks for no second look.
         let answered = Facts {
             has_posted_record: true,
             review_pending: true,
@@ -2399,7 +2417,7 @@ mod tests {
             [Trigger::Replied].into_iter().collect::<BTreeSet<_>>(),
             p.triggers
         );
-        assert_eq!(Action::Recheck(7), plan(&p, &answered, &cfg()));
+        assert!(matches!(plan(&p, &answered, &cfg()), Action::Ignore(_)));
 
         // Nothing to settle without a request.
         let mut p = pending(ItemKind::Pr, &[Trigger::Pushed], 0);
@@ -2484,23 +2502,95 @@ mod tests {
     }
 
     #[test]
-    fn a_push_or_a_reply_on_a_reviewed_pull_request_is_a_recheck() {
+    fn a_review_request_or_a_mention_on_a_reviewed_pull_request_is_a_recheck() {
         let f = Facts {
             has_posted_record: true,
             ..open_pr()
         };
-        for t in [
-            Trigger::Pushed,
-            Trigger::Replied,
-            Trigger::Mentioned,
-            Trigger::ReviewRequested,
+        for triggers in [
+            &[Trigger::ReviewRequested][..],
+            &[Trigger::Mentioned],
+            &[Trigger::Pushed, Trigger::Replied, Trigger::ReviewRequested],
         ] {
             assert_eq!(
                 Action::Recheck(7),
-                plan(&pending(ItemKind::Pr, &[t], 0), &f, &cfg()),
-                "{t:?}"
+                plan(&pending(ItemKind::Pr, triggers, 0), &f, &cfg()),
+                "{triggers:?}"
             );
         }
+    }
+
+    /// reardencode/rbitcoin#1137: another bot's review on a pull request spar
+    /// had approved, with no new commit and nobody asking, got a second look
+    /// that said nothing new at length.
+    #[test]
+    fn a_push_a_reply_or_an_assignment_on_a_reviewed_pull_request_asks_for_nothing() {
+        let f = Facts {
+            has_posted_record: true,
+            ..open_pr()
+        };
+        for triggers in [
+            &[Trigger::Pushed][..],
+            &[Trigger::Replied],
+            &[Trigger::Assigned],
+            &[Trigger::Pushed, Trigger::Replied],
+        ] {
+            assert!(
+                matches!(
+                    plan(&pending(ItemKind::Pr, triggers, 0), &f, &cfg()),
+                    Action::Ignore(_)
+                ),
+                "{triggers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mention_from_before_the_review_on_record_is_only_an_update() {
+        let reviewed = Facts {
+            has_posted_record: true,
+            ..open_pr()
+        };
+        let mut p = pending(ItemKind::Pr, &[Trigger::Mentioned], 0);
+        assert!(settle_mention(&mut p, &reviewed));
+        assert_eq!(
+            [Trigger::Replied].into_iter().collect::<BTreeSet<_>>(),
+            p.triggers
+        );
+        assert!(matches!(plan(&p, &reviewed, &cfg()), Action::Ignore(_)));
+
+        // Made since the review, it asks.
+        let asked = Facts {
+            mentioned: true,
+            ..reviewed.clone()
+        };
+        let mut p = pending(ItemKind::Pr, &[Trigger::Mentioned], 0);
+        assert!(!settle_mention(&mut p, &asked));
+        assert_eq!(Action::Recheck(7), plan(&p, &asked, &cfg()));
+
+        // On a pull request spar never reviewed there is no review to be
+        // older than, and a mention starts the first one.
+        let mut p = pending(ItemKind::Pr, &[Trigger::Mentioned], 0);
+        assert!(!settle_mention(&mut p, &open_pr()));
+        assert_eq!(Action::Review, plan(&p, &open_pr(), &cfg()));
+
+        // An issue is held to its reviewed pull request's review.
+        let linked = Facts {
+            number: 42,
+            open: true,
+            linked_pr_with_record: Some(108),
+            ..Default::default()
+        };
+        let mut p = pending(ItemKind::Issue, &[Trigger::Mentioned], 0);
+        assert!(settle_mention(&mut p, &linked));
+        assert!(matches!(plan(&p, &linked, &cfg()), Action::Ignore(_)));
+        let asked = Facts {
+            mentioned: true,
+            ..linked
+        };
+        let mut p = pending(ItemKind::Issue, &[Trigger::Mentioned], 0);
+        assert!(!settle_mention(&mut p, &asked));
+        assert_eq!(Action::Recheck(108), plan(&p, &asked, &cfg()));
     }
 
     #[test]
@@ -2635,11 +2725,19 @@ mod tests {
         assert_eq!(
             Action::Capped(7),
             plan(
-                &pending(ItemKind::Pr, &[Trigger::Pushed], 0),
+                &pending(ItemKind::Pr, &[Trigger::ReviewRequested], 0),
                 &capped,
                 &cfg()
             )
         );
+        assert!(matches!(
+            plan(
+                &pending(ItemKind::Pr, &[Trigger::Pushed], 0),
+                &capped,
+                &cfg()
+            ),
+            Action::Ignore(_)
+        ));
     }
 
     /// The issue route used to recheck its pull request unconditionally, so a
@@ -2714,27 +2812,29 @@ mod tests {
                 &cfg()
             )
         );
-        assert_eq!(
-            Action::Recheck(108),
+        // Only a mention asks. An issue thread that began with an assignment
+        // says so on every later comment, and a comment asks for nothing, on a
+        // named issue too.
+        assert!(matches!(
             plan(
                 &pending(ItemKind::Issue, &[Trigger::Assigned], 0),
                 &linked,
                 &cfg()
-            )
-        );
-        // A plain comment on a named issue counts as asking.
+            ),
+            Action::Ignore(_)
+        ));
         let named = Facts {
             named: true,
             ..linked
         };
-        assert_eq!(
-            Action::Recheck(108),
+        assert!(matches!(
             plan(
                 &pending(ItemKind::Issue, &[Trigger::Replied], 0),
                 &named,
                 &cfg()
-            )
-        );
+            ),
+            Action::Ignore(_)
+        ));
     }
 
     #[test]
@@ -2777,7 +2877,7 @@ mod tests {
         assert_eq!(
             Action::Recheck(7),
             plan(
-                &pending(ItemKind::Pr, &[Trigger::Pushed], 0),
+                &pending(ItemKind::Pr, &[Trigger::ReviewRequested], 0),
                 &named_low,
                 &cfg()
             )

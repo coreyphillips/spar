@@ -786,12 +786,13 @@ pub struct ListenCfg {
     /// Seconds between polls of GitHub's notifications for the repository.
     /// GitHub says how often it will answer, and the larger of the two is used.
     pub interval: u64,
-    /// Seconds between sweeps of the open pull requests. A push raises no
-    /// notification for a reviewer, so the sweep is what notices a reviewed
-    /// pull request moving.
+    /// Seconds between sweeps of the open pull requests. The sweep sees what a
+    /// notification can miss: a review asked for again, an assignment, a
+    /// close, or a push, which raises no notification for a reviewer.
     pub sweep: u64,
-    /// Seconds an item has to stay quiet before spar acts on it, so a push and
-    /// three replies in the same minute cost one recheck rather than four.
+    /// Seconds an item has to stay quiet before spar acts on it, so a review
+    /// request and three comments in the same minute cost one recheck rather
+    /// than four.
     pub settle: u64,
     /// Most seconds an item may keep settling before it is acted on anyway.
     pub max_wait: u64,

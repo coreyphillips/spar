@@ -297,11 +297,12 @@ interval            = 60       # seconds between polls of GitHub's notifications
                                # A poll that finds nothing costs nothing against
                                # the rate limit.
 sweep               = 300      # seconds between sweeps of the open pull
-                               # requests. A push raises no notification for a
-                               # reviewer, so the sweep is what notices a
-                               # reviewed pull request moving.
+                               # requests. The sweep sees what a notification
+                               # can miss: a review asked for again, an
+                               # assignment, a close, or a push.
 settle              = 120      # quiet seconds before an item is acted on, so a
-                               # push and three replies cost one recheck
+                               # review request and three comments cost one
+                               # recheck
 max_wait            = 900      # act anyway after this long, even if the
                                # activity continues
 max_rechecks        = 5        # second looks one pull request gets before a

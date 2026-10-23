@@ -1592,6 +1592,20 @@ pub struct PrView {
     /// repository.
     #[serde(default)]
     pub is_cross_repository: bool,
+    /// Who owns the repository the head branch is in: for a pull request
+    /// from a fork, the fork's owner. That is what tells the authenticated
+    /// user's own fork, which spar can push to, from anybody else's.
+    #[serde(default)]
+    pub head_repository_owner: Option<Author>,
+    /// The repository the head branch is in.
+    #[serde(default)]
+    pub head_repository: Option<HeadRepository>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HeadRepository {
+    #[serde(default)]
+    pub name: String,
 }
 
 /// The fields a sweep reads from `gh pr list` and `gh pr view`: enough to

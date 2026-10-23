@@ -890,52 +890,168 @@ fn push_denial(message: &str) -> Option<&str> {
         .find(|line| line.starts_with("Permission to ") && line.contains(" denied to "))
 }
 
+/// The line of a failed push that names the ref the remote turned down and
+/// why, such as `[rejected] HEAD -> issue-7 (stale info)`.
+fn push_rejection(message: &str) -> Option<&str> {
+    message
+        .lines()
+        .map(|line| line.trim().trim_start_matches('!').trim())
+        .find(|line| line.starts_with("[rejected]") || line.starts_with("[remote rejected]"))
+}
+
 fn push_error(
     target: &PushTarget,
     branch: &str,
     e: &crate::error::SparError,
 ) -> crate::error::SparError {
     let message = e.to_string();
-    match push_denial(&message) {
-        Some(denied) => spar_err!("could not push to {}. {denied}", target.describe(branch)),
-        None => spar_err!(
-            "could not push to {}. {}\nCheck push access and whether the branch moved under you.",
-            target.describe(branch),
-            e.last_line()
-        ),
+    if let Some(denied) = push_denial(&message) {
+        return spar_err!("could not push to {}. {denied}", target.describe(branch));
+    }
+    spar_err!(
+        "could not push to {}. {}\nCheck push access and whether the branch moved under you.",
+        target.describe(branch),
+        push_rejection(&message).unwrap_or(e.last_line())
+    )
+}
+
+/// The fork's URL, reached the way origin is: origin's push URL with only its
+/// `owner/repo` path replaced.
+///
+/// Keeping everything but the path is what keeps an SSH host alias, which is
+/// how one machine pushes as two GitHub accounts, a port, such as SSH over
+/// 443 where 22 is blocked, and an scp-style address with no user in it.
+/// GitHub's own URLs for the fork would drop all three. None for anything
+/// that is not a URL or an scp-style address with an `owner/repo` path.
+fn fork_url(origin_url: &str, full_name: &str) -> Option<String> {
+    let origin = origin_url.trim();
+    let path_start = match origin.find("://") {
+        Some(scheme) => {
+            let host = scheme + 3;
+            host + origin[host..].find('/')? + 1
+        }
+        None => {
+            // scp-style is `[user@]host:path`, and git reads a colon after a
+            // slash as part of a local path instead.
+            let colon = origin.find(':')?;
+            if origin[..colon].contains('/') {
+                return None;
+            }
+            colon + 1
+        }
+    };
+    let path = origin[path_start..].trim_end_matches('/');
+    let (path, suffix) = match path.strip_suffix(".git") {
+        Some(bare) => (bare, ".git"),
+        None => (path, ""),
+    };
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments.len() < 2 || segments[segments.len() - 2..].iter().any(|s| s.is_empty()) {
+        return None;
+    }
+    let prefix = &segments[..segments.len() - 2];
+    let prefix = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", prefix.join("/"))
+    };
+    Some(format!(
+        "{}{prefix}{full_name}{suffix}",
+        &origin[..path_start]
+    ))
+}
+
+/// A fork from what GitHub said about it, reached the way origin is.
+///
+/// GitHub's own URL is the fallback for an origin `fork_url` cannot read, the
+/// SSH one when origin looks like SSH.
+fn fork_reached_like_origin(
+    owner: String,
+    full_name: String,
+    origin_url: &str,
+    ssh_url: String,
+    https_url: String,
+) -> Fork {
+    let origin = origin_url.trim();
+    let url = fork_url(origin, &full_name).unwrap_or_else(|| {
+        if origin.starts_with("git@") || origin.starts_with("ssh://") {
+            ssh_url
+        } else {
+            https_url
+        }
+    });
+    Fork {
+        owner,
+        full_name,
+        url,
     }
 }
 
-/// The fork GitHub described, with the URL that matches how origin is reached.
-///
-/// An SSH origin gets the SSH URL and anything else the HTTPS one, so the push
-/// authenticates the way every other push from this checkout does.
+#[derive(Deserialize)]
+struct ForkOwner {
+    login: String,
+}
+
+/// The fork GitHub made, or already had, in answer to a request to fork.
 fn fork_from_api(answer: &str, origin_url: &str) -> Result<Fork> {
-    #[derive(Deserialize)]
-    struct Owner {
-        login: String,
-    }
     #[derive(Deserialize)]
     struct Answer {
         full_name: String,
-        owner: Owner,
+        owner: ForkOwner,
         ssh_url: String,
         clone_url: String,
     }
 
     let answer: Answer = serde_json::from_str(answer.trim())
         .map_err(|e| spar_err!("unexpected answer from GitHub when forking: {e}"))?;
-    let origin = origin_url.trim();
-    let ssh = origin.starts_with("git@") || origin.starts_with("ssh://");
-    Ok(Fork {
-        owner: answer.owner.login,
-        full_name: answer.full_name,
-        url: if ssh {
-            answer.ssh_url
-        } else {
-            answer.clone_url
-        },
-    })
+    Ok(fork_reached_like_origin(
+        answer.owner.login,
+        answer.full_name,
+        origin_url,
+        answer.ssh_url,
+        answer.clone_url,
+    ))
+}
+
+/// The authenticated user's fork from a listing of this repository's forks
+/// that only the user owns, or None when there is no such fork.
+fn fork_from_listing(answer: &str, origin_url: &str) -> Result<Option<Fork>> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Node {
+        name_with_owner: String,
+        owner: ForkOwner,
+        ssh_url: String,
+        url: String,
+    }
+
+    let nodes: Vec<Node> = serde_json::from_str(answer.trim())
+        .map_err(|e| spar_err!("unexpected answer from GitHub listing forks: {e}"))?;
+    Ok(nodes.into_iter().next().map(|node| {
+        fork_reached_like_origin(
+            node.owner.login,
+            node.name_with_owner,
+            origin_url,
+            node.ssh_url,
+            node.url,
+        )
+    }))
+}
+
+/// Where spar can push a pull request from a fork: the fork, when it is the
+/// authenticated user's own, and nowhere when it is anybody else's.
+fn own_fork_target(pr: &PrView, viewer: &str, origin_url: &str) -> Option<PushTarget> {
+    let owner = pr.head_repository_owner.as_ref()?.login.trim();
+    let name = pr.head_repository.as_ref()?.name.trim();
+    if owner.is_empty() || name.is_empty() || !owner.eq_ignore_ascii_case(viewer.trim()) {
+        return None;
+    }
+    let full_name = format!("{owner}/{name}");
+    Some(PushTarget::Fork(Fork {
+        owner: owner.to_string(),
+        url: fork_url(origin_url, &full_name)?,
+        full_name,
+    }))
 }
 
 fn reconcile_pr_creation(
@@ -1696,6 +1812,18 @@ impl Repo {
             }
         }
 
+        // The same question of the fork a refused push would go to, asked here
+        // rather than after an agent has spent its call implementing.
+        if self.fork_when_denied && self.origin_refuses_push() {
+            match self.existing_fork() {
+                Ok(Some(fork)) => {
+                    self.fork_branch_lease(&fork, &branch, base)?;
+                }
+                Ok(None) => {}
+                Err(e) => logdim!("{e} It is checked again before anything is pushed to it."),
+            }
+        }
+
         let local_ref = format!("refs/heads/{branch}");
         if self.exact_ref_exists_checked(&self.root, &local_ref)? {
             let ahead = self.commit_count_checked(&self.root, &local_ref, base)?;
@@ -2190,8 +2318,9 @@ impl Repo {
         Ok(())
     }
 
-    /// Check an existing PR branch out into an isolated worktree.
-    pub fn worktree_for_pr(&self, pr: &PrView) -> Result<(PathBuf, String)> {
+    /// Check an existing PR branch out into an isolated worktree, from
+    /// wherever `target` says the branch is published.
+    pub fn worktree_for_pr(&self, pr: &PrView, target: &PushTarget) -> Result<(PathBuf, String)> {
         let head = pr.head_ref_name.clone();
         if head.trim().is_empty() {
             bail!("PR #{} has no head branch to check out", pr.number);
@@ -2199,22 +2328,38 @@ impl Repo {
         let path = self.worktree_path(&format!("pr-{}", pr.number));
         let local = self.branch_for_pr(pr.number);
 
-        self.git(&["fetch", "origin", &head]).map_err(|e| {
+        let unfetched = |e: crate::error::SparError| {
             spar_err!(
                 "could not fetch the branch behind PR #{}: {}",
                 pr.number,
                 e.last_line()
             )
-        })?;
-        let start = format!("origin/{head}");
-        let start_ref = format!("refs/remotes/origin/{head}");
+        };
+        // What the worktree starts from, the ref behind it, and what to call
+        // it when saying so.
+        let (start, start_ref, shown) = match target {
+            PushTarget::Origin => {
+                self.git(&["fetch", "origin", &head]).map_err(unfetched)?;
+                let start = format!("origin/{head}");
+                (start.clone(), format!("refs/remotes/origin/{head}"), start)
+            }
+            // A fork has no remote here to track it, so its branch is
+            // fetched into a ref of spar's own.
+            PushTarget::Fork(fork) => {
+                let start_ref = format!("refs/spar/fork/{head}");
+                let refspec = format!("+refs/heads/{head}:{start_ref}");
+                self.git(&["fetch", "--no-tags", &fork.url, &refspec])
+                    .map_err(unfetched)?;
+                (start_ref.clone(), start_ref, target.describe(&head))
+            }
+        };
         let local_ref = format!("refs/heads/{local}");
         if self.exact_ref_exists_checked(&self.root, &local_ref)? {
             let unpushed = self.commits_not_in_checked(&self.root, &local_ref, &start_ref)?;
             if unpushed > 0 {
                 bail!(
                     "the existing worktree for PR #{} has {unpushed} local commit(s) that are not \
-                     on {start}. Rebuilding it would delete their branch.\nInspect the worktree at \
+                     on {shown}. Rebuilding it would delete their branch.\nInspect the worktree at \
                      {} and push or recover those commits before running this command again.",
                     pr.number,
                     path.display()
@@ -3765,14 +3910,14 @@ impl Repo {
     /// refuses it.
     ///
     /// Only a new branch can move. A pull request that already exists has its
-    /// branch on origin, and pushing it anywhere else would not update it. A
+    /// branch where it is, and pushing it anywhere else would not update it. A
     /// new one has no pull request yet, so a fork is just where it is opened
     /// from, which is how anybody without write access contributes.
     ///
-    /// The refusal is not counted as a failed write when the fork takes the
-    /// branch: the run did what it set out to, and a failed write makes the
-    /// exit status say otherwise.
-    pub fn publish_new_branch(&self, cwd: &Path, branch: &str) -> Result<PushTarget> {
+    /// One write whichever way it goes. The refusal is not counted as a
+    /// failure when the fork takes the branch: the run did what it set out to,
+    /// and a failed write makes the exit status say otherwise.
+    pub fn publish_new_branch(&self, cwd: &Path, branch: &str, base: &str) -> Result<PushTarget> {
         let origin = PushTarget::Origin;
         let refused = match self.git_push(cwd, &origin, branch, None) {
             Ok(()) => return self.record_write(Ok(origin)),
@@ -3790,21 +3935,83 @@ impl Repo {
                 return self.record_write(Err(err));
             }
         };
+        self.record_write(self.publish_on_fork(cwd, branch, base, &refused))
+    }
+
+    fn publish_on_fork(
+        &self,
+        cwd: &Path,
+        branch: &str,
+        base: &str,
+        refused: &crate::error::SparError,
+    ) -> Result<PushTarget> {
         let fork = self.fork().map_err(|e| {
             spar_err!(
                 "{} spar could not publish it from a fork instead: {}",
-                push_error(&origin, branch, &refused),
+                push_error(&PushTarget::Origin, branch, refused),
                 e.last_line()
             )
         })?;
+        let lease = self.fork_branch_lease(&fork, branch, base)?;
+        let refused = refused.to_string();
         log!(
             "{} Publishing {branch} from the fork {} instead.",
-            push_denial(&refused.to_string()).unwrap_or("origin refused the push."),
+            push_denial(&refused).unwrap_or("origin refused the push."),
             fork.full_name
         );
         let target = PushTarget::Fork(fork);
-        self.push_to(cwd, &target, branch, None)?;
+        // Not `push_to`: a lease on a branch a closed pull request left behind
+        // replaces it, and that branch was never this HEAD's to contain.
+        self.git_push(cwd, &target, branch, lease.as_deref())
+            .map_err(|e| push_error(&target, branch, &e))?;
         Ok(target)
+    }
+
+    /// What the first push of `branch` to the fork leases against.
+    ///
+    /// Nothing when the fork has no such branch. Its tip when a pull request
+    /// already holds every commit on it beyond `base`, which is what a closed
+    /// pull request leaves, since GitHub keeps the branch on the fork. Anything
+    /// else is work only that branch has, and is refused the way an issue
+    /// branch on origin is.
+    fn fork_branch_lease(&self, fork: &Fork, branch: &str, base: &str) -> Result<Option<String>> {
+        let live_ref = format!("refs/heads/{branch}");
+        let unreadable = |e: crate::error::SparError| {
+            spar_err!(
+                "could not check whether the fork {} already has {branch}. {}",
+                fork.full_name,
+                e.last_line()
+            )
+        };
+        let listed = self
+            .git(&["ls-remote", "--heads", &fork.url, &live_ref])
+            .map_err(unreadable)?;
+        let Some(tip) = remote_head_oid(&listed, &live_ref)? else {
+            return Ok(None);
+        };
+        let local = format!("refs/spar/fork/{branch}");
+        self.git(&[
+            "fetch",
+            "--no-tags",
+            &fork.url,
+            &format!("+{live_ref}:{local}"),
+        ])
+        .map_err(unreadable)?;
+        let ahead = self.commit_count_checked(&self.root, &local, base);
+        let held = matches!(ahead, Ok(0)) || self.pull_request_holds(branch, &local, base);
+        self.git_try(&["update-ref", "-d", &local]);
+        let ahead = ahead?;
+        if !held {
+            bail!(
+                "the fork {} already has {branch} with {ahead} commit(s) that are not on {base}, \
+                 and no pull request accounts for them. Publishing over it would lose that work.\n\
+                 Delete it with `git push {} --delete {branch}` if it is no longer needed, then \
+                 run spar again.",
+                fork.full_name,
+                fork.url
+            );
+        }
+        Ok(Some(tip))
     }
 
     fn git_push(
@@ -3830,20 +4037,77 @@ impl Repo {
     /// The authenticated user's fork of this repository, made if there is none.
     ///
     /// GitHub answers a request to fork with the fork that already exists, so
-    /// this is the same call whether or not one was made before. A new fork is
-    /// copied in the background, so it is waited for before anything is
-    /// pushed to it.
+    /// asking is safe either way, but it is a write and it is only made when
+    /// looking found nothing. A new fork is copied in the background, so it is
+    /// waited for before anything is pushed to it.
     fn fork(&self) -> Result<Fork> {
-        if let Some(fork) = self.fork.get() {
-            return Ok(fork.clone());
+        match self.existing_fork() {
+            Ok(Some(fork)) => return Ok(fork),
+            Ok(None) => {}
+            Err(e) => logdim!("{e} Asking GitHub to fork it, which returns any fork there is."),
         }
         let answer = self
-            .record_write(self.gh(&["api", "-X", "POST", "repos/{owner}/{repo}/forks"]))
+            .gh(&["api", "-X", "POST", "repos/{owner}/{repo}/forks"])
             .map_err(|e| spar_err!("could not fork this repository. {}", e.last_line()))?;
-        let origin_url = self.git_try(&["remote", "get-url", "--push", "origin"]);
-        let fork = fork_from_api(&answer, &origin_url)?;
+        let fork = fork_from_api(&answer, &self.origin_push_url())?;
         self.wait_for_fork(&fork)?;
         Ok(self.fork.get_or_init(|| fork).clone())
+    }
+
+    /// The authenticated user's fork of this repository, if there is one,
+    /// found without making one.
+    fn existing_fork(&self) -> Result<Option<Fork>> {
+        if let Some(fork) = self.fork.get() {
+            return Ok(Some(fork.clone()));
+        }
+        let answer = self
+            .gh(&[
+                "api",
+                "graphql",
+                "-F",
+                "owner={owner}",
+                "-F",
+                "name={repo}",
+                "-f",
+                "query=query($owner: String!, $name: String!) { repository(owner: $owner, name: \
+                 $name) { forks(first: 1, affiliations: [OWNER]) { nodes { nameWithOwner owner { \
+                 login } sshUrl url } } } }",
+                "--jq",
+                ".data.repository.forks.nodes",
+            ])
+            .map_err(|e| {
+                spar_err!(
+                    "could not look for a fork of this repository. {}",
+                    e.last_line()
+                )
+            })?;
+        let found = fork_from_listing(&answer, &self.origin_push_url())?;
+        Ok(found.map(|fork| self.fork.get_or_init(|| fork).clone()))
+    }
+
+    /// Whether GitHub says the authenticated user cannot push here. False
+    /// when it cannot say, so an unanswered question skips the early check
+    /// rather than guessing.
+    fn origin_refuses_push(&self) -> bool {
+        self.gh_try(&["api", "repos/{owner}/{repo}", "--jq", ".permissions.push"])
+            .trim()
+            == "false"
+    }
+
+    fn origin_push_url(&self) -> String {
+        self.git_try(&["remote", "get-url", "--push", "origin"])
+    }
+
+    /// Where spar can push a pull request's branch: origin for a branch in
+    /// this repository, the fork for one on the authenticated user's own fork,
+    /// such as one spar opened after origin refused it, and nowhere for
+    /// anybody else's.
+    pub fn pr_push_target(&self, pr: &PrView) -> Option<PushTarget> {
+        if !pr.is_cross_repository {
+            return Some(PushTarget::Origin);
+        }
+        let viewer = self.viewer_login().ok()?;
+        own_fork_target(pr, viewer, &self.origin_push_url())
     }
 
     fn wait_for_fork(&self, fork: &Fork) -> Result<()> {
@@ -4382,7 +4646,8 @@ impl Repo {
             "view",
             &number.to_string(),
             "--json",
-            "number,url,title,body,headRefName,baseRefName,state,closingIssuesReferences,isCrossRepository",
+            "number,url,title,body,headRefName,baseRefName,state,closingIssuesReferences,\
+             isCrossRepository,headRepositoryOwner,headRepository",
         ])?;
         serde_json::from_str(&text).map_err(|e| spar_err!("unexpected shape for PR #{number}: {e}"))
     }
@@ -10343,24 +10608,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_fork_is_pushed_to_the_way_origin_is_reached() {
-        let answer = r#"{"full_name":"someone/project","owner":{"login":"someone"},
-            "ssh_url":"git@github.com:someone/project.git",
-            "clone_url":"https://github.com/someone/project.git","fork":true}"#;
-
-        let ssh = fork_from_api(answer, "git@github.com:example/project.git\n").unwrap();
-        assert_eq!("git@github.com:someone/project.git", ssh.url);
-        assert_eq!("someone", ssh.owner);
-        assert_eq!("someone/project", ssh.full_name);
-
-        let https = fork_from_api(answer, "https://github.com/example/project.git").unwrap();
-        assert_eq!("https://github.com/someone/project.git", https.url);
-
-        assert_eq!("someone:issue-7", PushTarget::Fork(ssh).head("issue-7"));
-        assert_eq!("issue-7", PushTarget::Origin.head("issue-7"));
-    }
-
     /// An origin whose hook refuses every push with GitHub's wording, a bare
     /// repository standing in for the fork, and a checkout on a new branch
     /// with one commit to publish.
@@ -10432,7 +10679,7 @@ mod tests {
         let (_fixture, repo, work, origin, fork) = denied_fixture("publish", true);
         let first = test_git(&work, &["rev-parse", "HEAD"]);
 
-        let target = repo.publish_new_branch(&work, "issue-7").unwrap();
+        let target = repo.publish_new_branch(&work, "issue-7", "main").unwrap();
 
         assert_eq!("someone:issue-7", target.head("issue-7"));
         assert_eq!(
@@ -10464,10 +10711,13 @@ mod tests {
         );
     }
 
+    /// What a closed pull request leaves on the fork: a branch with nothing
+    /// a pull request does not hold. Origin's issue branches are rebuilt over
+    /// in the same case.
     #[cfg(unix)]
     #[test]
-    fn a_branch_already_on_the_fork_is_not_moved_by_a_new_publish() {
-        let (_fixture, repo, work, _origin, fork) = denied_fixture("fork-taken", true);
+    fn a_branch_on_the_fork_with_nothing_of_its_own_is_replaced() {
+        let (_fixture, repo, work, _origin, fork) = denied_fixture("fork-stale", true);
         test_git(
             &work,
             &[
@@ -10477,20 +10727,255 @@ mod tests {
                 "main:refs/heads/issue-7",
             ],
         );
-        let seed = test_git(&work, &["rev-parse", "main"]);
+        let head = test_git(&work, &["rev-parse", "HEAD"]);
 
-        let err = repo.publish_new_branch(&work, "issue-7").unwrap_err();
+        repo.publish_new_branch(&work, "issue-7", "main").unwrap();
 
-        assert!(
-            err.to_string()
-                .contains("could not push to issue-7 on the fork someone/project"),
-            "{err}"
-        );
         assert_eq!(
-            seed.trim(),
+            head.trim(),
             test_git(&fork, &["rev-parse", "issue-7"]).trim()
         );
-        assert_eq!(1, repo.write_summary().failed);
+        assert_eq!(0, repo.write_summary().failed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn work_only_the_fork_has_is_not_published_over() {
+        let (_fixture, repo, work, _origin, fork) = denied_fixture("fork-taken", true);
+        test_git(&work, &["checkout", "-q", "-b", "elsewhere", "main"]);
+        std::fs::write(work.join("other.txt"), "somebody's work\n").unwrap();
+        test_git(&work, &["add", "."]);
+        test_git(&work, &["commit", "-qm", "Somebody's work"]);
+        test_git(
+            &work,
+            &[
+                "push",
+                "-q",
+                fork.to_str().unwrap(),
+                "elsewhere:refs/heads/issue-7",
+            ],
+        );
+        let theirs = test_git(&work, &["rev-parse", "elsewhere"]);
+        test_git(&work, &["checkout", "-q", "issue-7"]);
+
+        let err = repo
+            .publish_new_branch(&work, "issue-7", "main")
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains(
+                "the fork someone/project already has issue-7 with 1 commit(s) that are not on main"
+            ),
+            "{err}"
+        );
+        assert!(err.contains("--delete issue-7"), "{err}");
+        assert_eq!(
+            theirs.trim(),
+            test_git(&fork, &["rev-parse", "issue-7"]).trim()
+        );
+        assert_eq!(
+            WriteSummary {
+                attempted: 1,
+                failed: 1
+            },
+            repo.write_summary()
+        );
+    }
+
+    /// A lease that loses says which ref and why, not git's closing line.
+    #[test]
+    fn a_rejected_push_names_the_ref_it_rejected() {
+        let stale = "To github.com:example/project.git\n \
+                     ! [rejected]        HEAD -> issue-7 (stale info)\n\
+                     error: failed to push some refs to 'github.com:example/project.git'";
+
+        let err = push_error(
+            &PushTarget::Origin,
+            "issue-7",
+            &crate::error::SparError::new(stale),
+        )
+        .to_string();
+
+        assert!(
+            err.starts_with(
+                "could not push to origin/issue-7. [rejected]        HEAD -> issue-7 (stale info)"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_fork_is_reached_by_whatever_reaches_origin() {
+        let cases = [
+            (
+                "git@github.com:example/project.git",
+                Some("git@github.com:someone/project.git"),
+            ),
+            // No user: ~/.ssh/config supplies it.
+            (
+                "github.com:example/project.git",
+                Some("github.com:someone/project.git"),
+            ),
+            // A host alias, how one machine pushes as two accounts.
+            (
+                "git@github-work:example/project.git",
+                Some("git@github-work:someone/project.git"),
+            ),
+            // SSH over 443, where 22 is blocked.
+            (
+                "ssh://git@ssh.github.com:443/example/project.git",
+                Some("ssh://git@ssh.github.com:443/someone/project.git"),
+            ),
+            (
+                "https://github.com/example/project",
+                Some("https://github.com/someone/project"),
+            ),
+            (
+                "https://ghe.example.com/scm/example/project.git/",
+                Some("https://ghe.example.com/scm/someone/project.git"),
+            ),
+            (
+                "git@host:/srv/example/project.git",
+                Some("git@host:/srv/someone/project.git"),
+            ),
+            ("/srv/git/project.git", None),
+            ("https://github.com/project", None),
+            ("", None),
+        ];
+        for (origin, want) in cases {
+            assert_eq!(
+                want.map(str::to_string),
+                fork_url(origin, "someone/project"),
+                "{origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fork_found_or_made_is_reached_the_way_origin_is() {
+        let made = r#"{"full_name":"someone/project","owner":{"login":"someone"},
+            "ssh_url":"git@github.com:someone/project.git",
+            "clone_url":"https://github.com/someone/project.git","fork":true}"#;
+        let listed = r#"[{"nameWithOwner":"someone/project","owner":{"login":"someone"},
+            "sshUrl":"git@github.com:someone/project.git",
+            "url":"https://github.com/someone/project"}]"#;
+
+        let fork = fork_from_api(made, "git@github-work:example/project.git\n").unwrap();
+        assert_eq!("git@github-work:someone/project.git", fork.url);
+        assert_eq!("someone", fork.owner);
+        assert_eq!("someone/project", fork.full_name);
+        let fork = fork_from_listing(listed, "ssh://git@ssh.github.com:443/example/project.git")
+            .unwrap()
+            .unwrap();
+        assert_eq!("ssh://git@ssh.github.com:443/someone/project.git", fork.url);
+        assert_eq!(
+            None,
+            fork_from_listing("[]", "git@github.com:a/b.git").unwrap()
+        );
+
+        // An origin with no owner/repo path falls back to GitHub's URL, the
+        // SSH one when origin looks like SSH.
+        let fork = fork_from_api(made, "https://github.com/project").unwrap();
+        assert_eq!("https://github.com/someone/project.git", fork.url);
+        let fork = fork_from_api(made, "ssh://git@github.com/project").unwrap();
+        assert_eq!("git@github.com:someone/project.git", fork.url);
+
+        assert_eq!("someone:issue-7", PushTarget::Fork(fork).head("issue-7"));
+        assert_eq!("issue-7", PushTarget::Origin.head("issue-7"));
+    }
+
+    #[test]
+    fn only_the_viewers_own_fork_can_be_pushed_to() {
+        let pr = |owner: &str, name: &str| PrView {
+            number: 9,
+            url: String::new(),
+            title: String::new(),
+            body: String::new(),
+            head_ref_name: "issue-7".into(),
+            base_ref_name: "main".into(),
+            state: "OPEN".into(),
+            closing_issues_references: Vec::new(),
+            is_cross_repository: true,
+            head_repository_owner: Some(crate::model::Author {
+                login: owner.into(),
+            }),
+            head_repository: Some(crate::model::HeadRepository { name: name.into() }),
+        };
+        let origin = "git@github.com:example/project.git";
+
+        assert_eq!(
+            Some(PushTarget::Fork(Fork {
+                owner: "Someone".into(),
+                full_name: "Someone/project".into(),
+                url: "git@github.com:Someone/project.git".into(),
+            })),
+            own_fork_target(&pr("Someone", "project"), "someone", origin)
+        );
+        assert_eq!(
+            None,
+            own_fork_target(&pr("other", "project"), "someone", origin)
+        );
+        assert_eq!(None, own_fork_target(&pr("someone", ""), "someone", origin));
+        assert_eq!(
+            None,
+            own_fork_target(&pr("someone", "project"), "someone", "/srv/x")
+        );
+        let mut unnamed = pr("someone", "project");
+        unnamed.head_repository_owner = None;
+        assert_eq!(None, own_fork_target(&unnamed, "someone", origin));
+    }
+
+    /// `spar resume` and `spar checkin` on a pull request from the user's own
+    /// fork check its branch out from the fork and push back there.
+    #[cfg(unix)]
+    #[test]
+    fn a_pull_request_on_the_viewers_fork_is_checked_out_and_pushed_there() {
+        let (_fixture, repo, work, origin, fork) = denied_fixture("fork-resume", true);
+        test_git(
+            &work,
+            &[
+                "push",
+                "-q",
+                fork.to_str().unwrap(),
+                "issue-7:refs/heads/issue-7",
+            ],
+        );
+        let published = test_git(&work, &["rev-parse", "issue-7"]);
+        test_git(&work, &["checkout", "-q", "main"]);
+        let target = PushTarget::Fork(repo.fork.get().unwrap().clone());
+        let pr = PrView {
+            number: 31,
+            url: String::new(),
+            title: String::new(),
+            body: String::new(),
+            head_ref_name: "issue-7".into(),
+            base_ref_name: "main".into(),
+            state: "OPEN".into(),
+            closing_issues_references: Vec::new(),
+            is_cross_repository: true,
+            head_repository_owner: None,
+            head_repository: None,
+        };
+
+        let (path, branch) = repo.worktree_for_pr(&pr, &target).unwrap();
+
+        assert_eq!("issue-7", branch);
+        assert_eq!(
+            published.trim(),
+            test_git(&path, &["rev-parse", "HEAD"]).trim()
+        );
+        std::fs::write(path.join("fix.txt"), "answered a comment\n").unwrap();
+        test_git(&path, &["commit", "-qam", "Answer a comment"]);
+        repo.push_to(&path, &target, &branch, Some(published.trim()))
+            .unwrap();
+        assert_eq!(
+            test_git(&path, &["rev-parse", "HEAD"]).trim(),
+            test_git(&fork, &["rev-parse", "issue-7"]).trim()
+        );
+        assert!(test_git(&origin, &["branch", "--list", "issue-7"])
+            .trim()
+            .is_empty());
     }
 
     #[cfg(unix)]
@@ -10499,7 +10984,7 @@ mod tests {
         let (_fixture, repo, work, _origin, fork) = denied_fixture("fork-off", false);
 
         let err = repo
-            .publish_new_branch(&work, "issue-7")
+            .publish_new_branch(&work, "issue-7", "main")
             .unwrap_err()
             .to_string();
 

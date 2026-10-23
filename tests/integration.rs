@@ -12,7 +12,7 @@ use spar::agent::Agent;
 use spar::config::CommandPart;
 use spar::config::{self, Config, Followups};
 use spar::model::{Complexity, Followup, Issue, IssueRun, PlanItem, PrView, Risk, Status};
-use spar::repo::Repo;
+use spar::repo::{PushTarget, Repo};
 use spar::review::{drop_uncommitted, file_followup, park, run_issue, snapshot, undo_edits};
 
 const SPAR_BIN: &str = env!("CARGO_BIN_EXE_spar");
@@ -135,6 +135,8 @@ fn pr(number: i64, head: &str) -> PrView {
         state: "OPEN".into(),
         closing_issues_references: Vec::new(),
         is_cross_repository: false,
+        head_repository_owner: None,
+        head_repository: None,
     }
 }
 
@@ -2043,7 +2045,9 @@ exec REAL_GIT "$@"
     // A later invocation must not fail because cleanup cannot delete the
     // custom output it deliberately accepted in the preceding invocation.
     let repo = Repo::open(&fx.work, &cfg()).unwrap();
-    let (resumed, _) = repo.worktree_for_pr(&pr(42, "feature")).unwrap();
+    let (resumed, _) = repo
+        .worktree_for_pr(&pr(42, "feature"), &PushTarget::Origin)
+        .unwrap();
     assert_eq!(
         resumed.canonicalize().unwrap(),
         worktree.canonicalize().unwrap()
@@ -4496,10 +4500,13 @@ fn a_dirty_pr_worktree_is_not_rebuilt() {
     git(&fx.work, &["checkout", "-q", "main"]);
     let repo = Repo::open(&fx.work, &cfg()).unwrap();
     let view = pr(60, "feature-60");
-    let (path, _) = repo.worktree_for_pr(&view).unwrap();
+    let (path, _) = repo.worktree_for_pr(&view, &PushTarget::Origin).unwrap();
     std::fs::write(path.join("README.md"), "recover me\n").unwrap();
 
-    let err = repo.worktree_for_pr(&view).unwrap_err().to_string();
+    let err = repo
+        .worktree_for_pr(&view, &PushTarget::Origin)
+        .unwrap_err()
+        .to_string();
 
     assert!(err.contains("uncommitted changes"), "{err}");
     assert_eq!(
@@ -4518,12 +4525,15 @@ fn ignored_output_does_not_hide_ordinary_untracked_pr_work() {
     git(&fx.work, &["checkout", "-q", "main"]);
     let repo = Repo::open(&fx.work, &cfg()).unwrap();
     let view = pr(63, "feature-63");
-    let (path, _) = repo.worktree_for_pr(&view).unwrap();
+    let (path, _) = repo.worktree_for_pr(&view, &PushTarget::Origin).unwrap();
     std::fs::create_dir_all(path.join("local-output")).unwrap();
     std::fs::write(path.join("local-output/cache"), "cache\n").unwrap();
     std::fs::write(path.join("new-source.txt"), "recover me\n").unwrap();
 
-    let error = repo.worktree_for_pr(&view).unwrap_err().to_string();
+    let error = repo
+        .worktree_for_pr(&view, &PushTarget::Origin)
+        .unwrap_err()
+        .to_string();
 
     assert!(error.contains("uncommitted changes"), "{error}");
     assert_eq!("pr-63\n", git(&path, &["branch", "--show-current"]));
@@ -4542,12 +4552,15 @@ fn a_failed_pr_worktree_move_preserves_the_original_branch_name() {
     git(&fx.work, &["checkout", "-q", "main"]);
     let repo = Repo::open(&fx.work, &cfg()).unwrap();
     let view = pr(64, "feature-64");
-    let (path, _) = repo.worktree_for_pr(&view).unwrap();
+    let (path, _) = repo.worktree_for_pr(&view, &PushTarget::Origin).unwrap();
     std::fs::create_dir_all(path.join("local-output")).unwrap();
     std::fs::write(path.join("local-output/cache"), "keep me\n").unwrap();
     git(&fx.work, &["worktree", "lock", path.to_str().unwrap()]);
 
-    let error = repo.worktree_for_pr(&view).unwrap_err().to_string();
+    let error = repo
+        .worktree_for_pr(&view, &PushTarget::Origin)
+        .unwrap_err()
+        .to_string();
 
     assert!(error.contains("could not retain"), "{error}");
     assert_eq!("pr-64\n", git(&path, &["branch", "--show-current"]));
@@ -4556,7 +4569,7 @@ fn a_failed_pr_worktree_move_preserves_the_original_branch_name() {
         std::fs::read_to_string(path.join("local-output/cache")).unwrap()
     );
     git(&fx.work, &["worktree", "unlock", path.to_str().unwrap()]);
-    repo.worktree_for_pr(&view).unwrap();
+    repo.worktree_for_pr(&view, &PushTarget::Origin).unwrap();
 }
 
 #[test]
@@ -4568,11 +4581,14 @@ fn an_unpushed_pr_worktree_commit_is_not_rebuilt() {
     git(&fx.work, &["checkout", "-q", "main"]);
     let repo = Repo::open(&fx.work, &cfg()).unwrap();
     let view = pr(61, "feature-61");
-    let (path, _) = repo.worktree_for_pr(&view).unwrap();
+    let (path, _) = repo.worktree_for_pr(&view, &PushTarget::Origin).unwrap();
     commit(&path, "feature.txt", "local\n", "local repair");
     let before = git(&path, &["rev-parse", "HEAD"]);
 
-    let err = repo.worktree_for_pr(&view).unwrap_err().to_string();
+    let err = repo
+        .worktree_for_pr(&view, &PushTarget::Origin)
+        .unwrap_err()
+        .to_string();
 
     assert!(err.contains("local commit"), "{err}");
     assert!(err.contains(&path.display().to_string()), "{err}");
@@ -4590,7 +4606,7 @@ fn a_same_named_tag_cannot_hide_an_unpushed_pr_commit() {
     git(&fx.work, &["checkout", "-q", "main"]);
     let repo = Repo::open(&fx.work, &cfg()).unwrap();
     let view = pr(62, "feature-62");
-    let (path, _) = repo.worktree_for_pr(&view).unwrap();
+    let (path, _) = repo.worktree_for_pr(&view, &PushTarget::Origin).unwrap();
     commit(&path, "feature.txt", "local\n", "local repair");
     let before = git(&path, &["rev-parse", "HEAD"]);
     git(
@@ -4598,7 +4614,10 @@ fn a_same_named_tag_cannot_hide_an_unpushed_pr_commit() {
         &["tag", "pr-62", "refs/remotes/origin/feature-62"],
     );
 
-    let err = repo.worktree_for_pr(&view).unwrap_err().to_string();
+    let err = repo
+        .worktree_for_pr(&view, &PushTarget::Origin)
+        .unwrap_err()
+        .to_string();
 
     assert!(err.contains("local commit"), "{err}");
     assert_eq!(before, git(&path, &["rev-parse", "HEAD"]));

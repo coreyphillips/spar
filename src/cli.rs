@@ -2009,7 +2009,7 @@ fn cmd_init(out: &Path, force: bool) -> Result<i32> {
 
     std::fs::write(out, text).map_err(|e| spar_err!("could not write {}: {e}", out.display()))?;
     println!("\nwrote {}", out.display());
-    println!("Next: `spar doctor` to check it, then `spar run` in a repo you have push access to.");
+    println!("Next: `spar doctor` to check it, then `spar run` in a GitHub checkout.");
     Ok(0)
 }
 

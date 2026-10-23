@@ -3832,33 +3832,35 @@ impl Repo {
     ///
     /// Every flag that shapes the hunks is spelled out as git's own default,
     /// which is what GitHub shows, so a user's `diff.noprefix`, `diff.context`,
-    /// `diff.interHunkContext` or `diff.algorithm` cannot move a line comment
-    /// onto a line GitHub does not show. `--no-ext-diff` and `--no-textconv`
-    /// also matter for more than the shape: the branch being reviewed is
-    /// somebody else's, and a diff driver or text converter would run a script
-    /// it changed. A failure is no hunks, which only means every finding stays
-    /// in the summary.
+    /// `diff.interHunkContext`, `diff.algorithm` or `diff.submodule` cannot
+    /// move a line comment onto a line GitHub does not show. `GIT_DIFF_OPTS`
+    /// is emptied for the same reason: git reads it after the command line,
+    /// so it would widen every hunk past `--unified=3`. `--no-ext-diff` and
+    /// `--no-textconv` also matter for more than the shape: the branch being
+    /// reviewed is somebody else's, and a diff driver or text converter would
+    /// run a script it changed. A failure is no hunks, which only means every
+    /// finding stays in the summary.
     pub fn diff_hunks(&self, cwd: &Path, base: &str) -> Hunks {
         let range = format!("{}...HEAD", self.base_ref(cwd, base));
-        new_side_hunks(&self.git_try_at(
-            Some(cwd),
-            &[
-                "-c",
-                "core.quotePath=false",
-                "diff",
-                "--no-color",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--unified=3",
-                "--inter-hunk-context=0",
-                "--diff-algorithm=myers",
-                "--indent-heuristic",
-                "--find-renames",
-                "--src-prefix=a/",
-                "--dst-prefix=b/",
-                &range,
-            ],
-        ))
+        let argv = git_without_maintenance_argv(&[
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--unified=3",
+            "--inter-hunk-context=0",
+            "--diff-algorithm=myers",
+            "--indent-heuristic",
+            "--submodule=short",
+            "--find-renames",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            &range,
+        ]);
+        let opts = self.git_opts(Some(cwd), false).env("GIT_DIFF_OPTS", "");
+        new_side_hunks(&proc::run(&argv, &opts).unwrap_or_default())
     }
 
     /// The files one commit range touched, for checking a claim against the

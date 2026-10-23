@@ -6805,6 +6805,38 @@ fn a_review_with_line_comments_lost_to_a_gateway_error_is_not_sent_again() {
     assert!(!read_record(&fx, 5).posted);
 }
 
+/// `GIT_DIFF_OPTS` widens every hunk git prints past `--unified=3`, which would
+/// make a line GitHub does not show look like one a comment can go on, and
+/// cost the review every line comment it has when GitHub refuses it.
+#[test]
+#[cfg(unix)]
+fn git_diff_opts_does_not_widen_the_lines_a_finding_can_go_on() {
+    // Line 5 changed, so GitHub's diff shows lines 2 to 8, and line 12 only
+    // with ten lines of context.
+    let (fx, head) = inline_fixture("reviewinlinediffopts", Some(5));
+    let review = ONE_BLOCKER_REVIEW.replace("src/net.rs:88", "src/net.rs:12");
+
+    let (ok, out, log) = review_run_with(
+        &fx,
+        &["5", "--verdict"],
+        &review,
+        &review,
+        &review_gh(5, &head, "someone-else"),
+        &[("GIT_DIFF_OPTS", "-u10")],
+        "",
+    );
+
+    assert!(ok, "{out}");
+    assert!(!log.contains("--input"), "{log}");
+    assert!(
+        log.contains(&format!(
+            "{}Two independent reviews.",
+            review_post(5, &head, "REQUEST_CHANGES")
+        )),
+        "{log}"
+    );
+}
+
 /// `inline_comments = false` keeps every finding in the summary alone.
 #[test]
 #[cfg(unix)]

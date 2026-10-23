@@ -446,7 +446,10 @@ markdown, so editing it before posting is the expected thing rather than a
 trick: strike the finding you disagree with, then post. Anything you post still
 goes through the style gate, so an edit that reintroduces an em dash is caught
 rather than published. `spar post 108 --file notes.md` posts something else
-entirely.
+entirely. What `spar post` puts up is the comment alone: findings go on their
+lines only in a review that posts itself, since the saved file is yours to edit
+and a line comment rebuilt from the record could bring back a finding you
+struck.
 
 The same saving happens when `pr_comments = "none"` suppresses a comment, so
 nothing spar spent money producing is thrown away.
@@ -497,6 +500,20 @@ review names the commit the reviewers read, so a push that lands while it runs
 gets no approval nobody gave it. GitHub refuses an approval from the account
 that opened the pull request, so on your own the verdict travels as words in a
 comment.
+
+Each finding the comment lists also goes on the line it is about, when the pull
+request's diff shows that line, so it can be answered and resolved where it is.
+The comment itself is unchanged and still lists every finding: the line
+comments repeat it rather than replace it. A finding with no line, or a line
+the diff does not show, is in the comment alone, since GitHub refuses a whole
+review over one line comment it cannot place. If GitHub refuses one anyway, the
+review goes up again without them and spar says so. A line comment can only
+travel on a review, so without `--verdict` a review that has one goes up as a
+plain review comment, which approves nothing and asks for nothing. A reply in
+one of those threads is something said since, so a second look reads it, and
+the new points a second look raises go on their lines the same way.
+`inline_comments = false` under `[style]` keeps every finding in the comment
+alone.
 
 Every review now leaves a record under `.spar/state/review-N.json`: the commit it
 read, when it began, and the points it raised with how well each was attested.

@@ -286,7 +286,32 @@ fn short_hash(basis: &str) -> String {
 /// Review locations move as fixes land. The path identifies the point across
 /// rounds, while the full location is still kept on the finding for display.
 pub(crate) fn finding_file(file: &str) -> String {
+    split_location(file).0.to_string()
+}
+
+/// A finding's path and the lines it names, first and last, from `path:N`,
+/// `path:N-M` or `path:N:C`, whose column is ignored. None when it names no
+/// line, or a line no file has.
+///
+/// What puts a finding on its line in the pull request rather than only in
+/// the summary, so a location it cannot read is no location at all.
+pub(crate) fn finding_location(file: &str) -> Option<(String, u32, u32)> {
+    let (path, lines) = split_location(file);
+    let lines = lines?;
+    let (start, end) = match lines.split_once('-') {
+        Some((start, end)) => (start.parse::<u32>().ok()?, end.parse::<u32>().ok()?),
+        None => {
+            let line = lines.parse::<u32>().ok()?;
+            (line, line)
+        }
+    };
+    (!path.is_empty() && start > 0 && start <= end).then(|| (path.to_string(), start, end))
+}
+
+/// The path, and the first `:N` or `:N-M` after it when there is one.
+fn split_location(file: &str) -> (&str, Option<&str>) {
     let mut path = file.trim();
+    let mut lines = None;
     while let Some((head, suffix)) = path.rsplit_once(':') {
         let is_number = !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
         let is_range = suffix.split_once('-').is_some_and(|(start, end)| {
@@ -298,9 +323,10 @@ pub(crate) fn finding_file(file: &str) -> String {
         if !is_number && !is_range {
             break;
         }
+        lines = Some(suffix);
         path = head.trim_end();
     }
-    path.to_string()
+    (path, lines)
 }
 
 #[cfg(test)]
@@ -450,6 +476,31 @@ mod tests {
     #[test]
     fn a_numeric_filename_is_not_treated_as_a_line_number() {
         assert_eq!("fixtures/2024", finding_file("fixtures/2024"));
+    }
+
+    #[test]
+    fn a_location_names_its_path_and_lines() {
+        let at = |path: &str, start, end| Some((path.to_string(), start, end));
+        assert_eq!(at("src/net.rs", 88, 88), finding_location("src/net.rs:88"));
+        assert_eq!(
+            at("src/net.rs", 88, 94),
+            finding_location(" src/net.rs:88-94 ")
+        );
+        assert_eq!(
+            at("src/net.rs", 88, 88),
+            finding_location("src/net.rs:88:12")
+        );
+    }
+
+    #[test]
+    fn a_location_without_a_usable_line_is_none() {
+        assert_eq!(None, finding_location("src/net.rs"));
+        assert_eq!(None, finding_location(""));
+        assert_eq!(None, finding_location("fixtures/2024"));
+        assert_eq!(None, finding_location("src/net.rs:0"));
+        assert_eq!(None, finding_location("src/net.rs:94-88"));
+        assert_eq!(None, finding_location(":88"));
+        assert_eq!(None, finding_location("src/net.rs:99999999999"));
     }
 
     #[test]

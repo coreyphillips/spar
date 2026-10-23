@@ -1386,6 +1386,19 @@ impl ReviewRecord {
     }
 }
 
+/// A finding placed on the line it is about, to travel with a review.
+///
+/// `line` is on the new side of the diff, and `start_line`, when there is one,
+/// makes it a range ending there. Both are lines GitHub will accept: it refuses
+/// the whole review if any comment names a line the diff does not show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineComment {
+    pub path: String,
+    pub line: u32,
+    pub start_line: Option<u32>,
+    pub body: String,
+}
+
 // ---------------------------------------------------------------------------
 // What gh returns
 // ---------------------------------------------------------------------------

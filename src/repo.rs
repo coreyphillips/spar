@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 use crate::config::{Config, Drafts, Followups, StateStore};
 use crate::error::Result;
 use crate::model::{
-    Contested, ContestedItem, Followup, Issue, IssueRef, ItemKind, LiveHead, PersistedState, PrRef,
-    PrRow, PrSweepRow, PrView, PR_SWEEP_FIELDS,
+    Contested, ContestedItem, Followup, InlineComment, Issue, IssueRef, ItemKind, LiveHead,
+    PersistedState, PrRef, PrRow, PrSweepRow, PrView, PR_SWEEP_FIELDS,
 };
 use crate::proc::{self, ExecOpts};
 use crate::style::{self, Style};
@@ -1263,6 +1263,110 @@ fn reconcile_review_post(
             read_error.last_line()
         ))),
     }
+}
+
+/// The body of a review that carries line comments, for `gh api --input -`.
+///
+/// Every comment is on the new side of the diff, which is the only side a
+/// finding about the branch is ever about.
+fn review_payload(commit: &str, event: &str, body: &str, comments: &[InlineComment]) -> Value {
+    let comments: Vec<Value> = comments
+        .iter()
+        .map(|c| {
+            let mut row = serde_json::json!({
+                "path": c.path,
+                "line": c.line,
+                "side": "RIGHT",
+                "body": c.body,
+            });
+            if let Some(start) = c.start_line {
+                row["start_line"] = serde_json::json!(start);
+                row["start_side"] = serde_json::json!("RIGHT");
+            }
+            row
+        })
+        .collect();
+    serde_json::json!({
+        "commit_id": commit,
+        "event": event,
+        "body": body,
+        "comments": comments,
+    })
+}
+
+/// Whether GitHub looked at a write and refused it, rather than failing to
+/// answer. A refusal is final, so the same write changed is safe to send; a
+/// timeout or a gateway error says nothing about whether the first one landed.
+fn refused(e: &crate::error::SparError) -> bool {
+    e.to_string().contains("(HTTP 422)")
+}
+
+/// The lines of each file a pull request's diff shows on its new side, as
+/// first and last line of each hunk. GitHub takes a line comment only on one
+/// of these, and refuses the whole review over one that is not.
+pub type Hunks = BTreeMap<String, Vec<(u32, u32)>>;
+
+/// Read the hunks out of a unified diff.
+///
+/// A hunk's lines are counted off against its header rather than recognised by
+/// their first character, so an added line that itself begins `+++ ` or `@@ `
+/// is content and not the start of something. A path git had to quote is left
+/// out: what is between the quotes is escaped, not a path GitHub would match.
+fn new_side_hunks(diff: &str) -> Hunks {
+    let mut out = Hunks::new();
+    let mut path: Option<String> = None;
+    let (mut old_left, mut new_left) = (0u32, 0u32);
+    for line in diff.lines() {
+        if old_left > 0 || new_left > 0 {
+            match line.as_bytes().first() {
+                Some(b'+') => new_left = new_left.saturating_sub(1),
+                Some(b'-') => old_left = old_left.saturating_sub(1),
+                Some(b'\\') => {}
+                _ => {
+                    old_left = old_left.saturating_sub(1);
+                    new_left = new_left.saturating_sub(1);
+                }
+            }
+            continue;
+        }
+        if line.starts_with("diff --git ") {
+            path = None;
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            // git ends the line with a tab when the path has a space in it,
+            // so that a patch tool can tell where the name stops.
+            let rest = if rest.contains(' ') {
+                rest.strip_suffix('\t').unwrap_or(rest)
+            } else {
+                rest
+            };
+            path = rest
+                .strip_prefix("b/")
+                .filter(|p| !p.is_empty())
+                .map(str::to_string);
+        } else if let Some(((_, old_len), (start, len))) = hunk_header(line) {
+            old_left = old_len;
+            new_left = len;
+            if let (Some(path), true) = (&path, len > 0 && start > 0) {
+                out.entry(path.clone())
+                    .or_default()
+                    .push((start, start + len - 1));
+            }
+        }
+    }
+    out
+}
+
+/// `@@ -a,b +c,d @@`, as `((a, b), (c, d))`. A count left out is one.
+fn hunk_header(line: &str) -> Option<((u32, u32), (u32, u32))> {
+    let ranges = line.strip_prefix("@@ -")?.split_once(" @@")?.0;
+    let (old, new) = ranges.split_once(" +")?;
+    let range = |s: &str| -> Option<(u32, u32)> {
+        match s.split_once(',') {
+            Some((start, len)) => Some((start.parse().ok()?, len.parse().ok()?)),
+            None => Some((s.parse().ok()?, 1)),
+        }
+    };
+    Some((range(old)?, range(new)?))
 }
 
 fn has_exact_comment(comments: &[Value], body: &str) -> bool {
@@ -3722,6 +3826,43 @@ impl Repo {
         .collect()
     }
 
+    /// The lines a line comment can go on: the new side of each hunk of the
+    /// branch's three dot diff, which is the diff GitHub shows for a pull
+    /// request.
+    ///
+    /// Every flag that shapes the hunks is spelled out as git's own default,
+    /// which is what GitHub shows, so a user's `diff.noprefix`, `diff.context`,
+    /// `diff.interHunkContext`, `diff.algorithm` or `diff.submodule` cannot
+    /// move a line comment onto a line GitHub does not show. `GIT_DIFF_OPTS`
+    /// is emptied for the same reason: git reads it after the command line,
+    /// so it would widen every hunk past `--unified=3`. `--no-ext-diff` and
+    /// `--no-textconv` also matter for more than the shape: the branch being
+    /// reviewed is somebody else's, and a diff driver or text converter would
+    /// run a script it changed. A failure is no hunks, which only means every
+    /// finding stays in the summary.
+    pub fn diff_hunks(&self, cwd: &Path, base: &str) -> Hunks {
+        let range = format!("{}...HEAD", self.base_ref(cwd, base));
+        let argv = git_without_maintenance_argv(&[
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--unified=3",
+            "--inter-hunk-context=0",
+            "--diff-algorithm=myers",
+            "--indent-heuristic",
+            "--submodule=short",
+            "--find-renames",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            &range,
+        ]);
+        let opts = self.git_opts(Some(cwd), false).env("GIT_DIFF_OPTS", "");
+        new_side_hunks(&proc::run(&argv, &opts).unwrap_or_default())
+    }
+
     /// The files one commit range touched, for checking a claim against the
     /// diff rather than against the report that made it.
     pub fn files_changed_between(&self, cwd: &Path, from: &str, to: &str) -> Vec<String> {
@@ -4774,12 +4915,21 @@ impl Repo {
     /// that names no commit to whatever the head is when it arrives, so a push
     /// made while a review ran would otherwise receive an approval nobody
     /// gave it. `gh pr review` cannot name one, hence the REST call.
+    ///
+    /// `comments` go on their lines in the same review, so they arrive with
+    /// it or not at all. GitHub refuses the whole review over one line its diff
+    /// does not show, so when it refused this one and the read back finds
+    /// nothing landed, the review goes up again without them: the body already
+    /// says everything they do. Any other failure is reconciled as a review
+    /// without them would be, never retried: a gateway error can arrive while
+    /// GitHub is still saving a review that will land.
     pub fn submit_review(
         &self,
         number: i64,
         verdict: Option<crate::model::ReviewVerdict>,
         body: &str,
         commit: &str,
+        comments: &[InlineComment],
     ) -> Result<()> {
         let own = match verdict {
             Some(_) => self.record_failed_write(self.pr_is_own(number))?,
@@ -4790,6 +4940,13 @@ impl Repo {
             _ => body.to_string(),
         };
         let body = signed(&self.record_failed_write(self.clean(&text))?);
+        let mut inline = Vec::with_capacity(comments.len());
+        for c in comments {
+            inline.push(InlineComment {
+                body: signed(&self.record_failed_write(self.clean(&c.body))?),
+                ..c.clone()
+            });
+        }
         let viewer = self.record_failed_write(self.viewer_login())?.to_string();
         let reviews = self.record_failed_write(self.try_pr_reviews(number))?;
         if has_viewer_review(&reviews, &viewer, &body, commit) {
@@ -4799,6 +4956,51 @@ impl Repo {
             (Some(v), false) => v.api_event(),
             _ => "COMMENT",
         };
+        let result = if inline.is_empty() {
+            self.post_review(number, &body, &viewer, commit, event)
+        } else {
+            let path = format!("repos/{{owner}}/{{repo}}/pulls/{number}/reviews");
+            let payload = review_payload(commit, event, &body, &inline).to_string();
+            match self.gh_stdin(
+                &["api", "-X", "POST", &path, "--input", "-", "--silent"],
+                &payload,
+            ) {
+                Ok(_) => Ok(()),
+                Err(post_error) if !refused(&post_error) => reconcile_review_post(
+                    number,
+                    &body,
+                    &viewer,
+                    commit,
+                    post_error,
+                    self.try_pr_reviews(number),
+                ),
+                Err(post_error) => match self.try_pr_reviews(number) {
+                    Ok(reviews) if !has_viewer_review(&reviews, &viewer, &body, commit) => {
+                        logwarn!(
+                            "the review of #{number} with its line comments did not go up ({}), \
+                             so it is going up with every finding in its body only",
+                            post_error.last_line()
+                        );
+                        self.post_review(number, &body, &viewer, commit, event)
+                    }
+                    reviews => {
+                        reconcile_review_post(number, &body, &viewer, commit, post_error, reviews)
+                    }
+                },
+            }
+        };
+        self.record_write(result)
+    }
+
+    /// A review with its body alone, read back if the post reports a failure.
+    fn post_review(
+        &self,
+        number: i64,
+        body: &str,
+        viewer: &str,
+        commit: &str,
+        event: &str,
+    ) -> Result<()> {
         let path = format!("repos/{{owner}}/{{repo}}/pulls/{number}/reviews");
         let posted = self.gh(&[
             "api",
@@ -4813,18 +5015,17 @@ impl Repo {
             &format!("body={body}"),
             "--silent",
         ]);
-        let result = match posted {
+        match posted {
             Ok(_) => Ok(()),
             Err(post_error) => reconcile_review_post(
                 number,
-                &body,
-                &viewer,
+                body,
+                viewer,
                 commit,
                 post_error,
                 self.try_pr_reviews(number),
             ),
-        };
-        self.record_write(result)
+        }
     }
 
     pub fn comment_issue(&self, number: i64, body: &str) -> Result<()> {
@@ -8774,6 +8975,78 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
+    /// The diff a line comment is checked against is parsed from git's output,
+    /// so a user setting that changes that output must not change the answer,
+    /// and a text converter the branch could have changed must never run.
+    #[test]
+    fn the_lines_a_comment_can_go_on_ignore_how_the_user_has_git_print_a_diff() {
+        let root =
+            std::env::temp_dir().join(format!("spar-repo-test-hunks-{}", std::process::id()));
+        let _cleanup = ReviewFixture { root: root.clone() };
+        let origin = root.join("origin.git");
+        let work = root.join("work");
+        let marker = root.join("textconv-ran");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        test_git(&origin, &["init", "--bare", "-b", "main"]);
+        test_git(&work, &["init", "-b", "main"]);
+        test_git(&work, &["config", "user.email", "spar@example.invalid"]);
+        test_git(&work, &["config", "user.name", "spar test"]);
+        test_git(&work, &["config", "commit.gpgsign", "false"]);
+        test_git(&work, &["config", "diff.noprefix", "true"]);
+        test_git(&work, &["config", "diff.context", "0"]);
+        test_git(&work, &["config", "diff.interHunkContext", "10"]);
+        test_git(&work, &["config", "diff.algorithm", "patience"]);
+        test_git(&work, &["config", "color.diff", "always"]);
+        test_git(
+            &work,
+            &[
+                "config",
+                "diff.conv.textconv",
+                &format!("touch {}; cat", marker.display()),
+            ],
+        );
+        std::fs::write(work.join(".git/info/attributes"), "*.txt diff=conv\n").unwrap();
+        let lines: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(work.join("src.txt"), &lines).unwrap();
+        test_git(&work, &["add", "."]);
+        test_git(&work, &["commit", "-m", "seed"]);
+        test_git(
+            &work,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        test_git(&work, &["push", "-u", "origin", "main"]);
+        test_git(&work, &["checkout", "-b", "feature"]);
+        std::fs::write(
+            work.join("src.txt"),
+            lines
+                .replace("line 5\n", "changed 5\n")
+                .replace("line 15\n", "changed 15\n"),
+        )
+        .unwrap();
+        std::fs::write(work.join("new.txt"), "a\nb\n").unwrap();
+        std::fs::write(work.join("with space.txt"), "a\n").unwrap();
+        test_git(&work, &["add", "."]);
+        test_git(&work, &["commit", "-m", "change"]);
+        let cfg = crate::config::parse(
+            "[agents.a]\ncommand = [\"true\"]\n[agents.b]\ncommand = [\"true\"]\n",
+        )
+        .unwrap();
+        let repo = Repo::open(&work, &cfg).unwrap();
+        assert_eq!(
+            Hunks::from([
+                ("new.txt".to_string(), vec![(1, 2)]),
+                ("src.txt".to_string(), vec![(2, 8), (12, 18)]),
+                ("with space.txt".to_string(), vec![(1, 1)]),
+            ]),
+            repo.diff_hunks(&work, "main")
+        );
+        assert!(!marker.exists(), "the text converter ran");
+        // The converter is real: a plain diff with the same settings runs it.
+        test_git(&work, &["diff", "origin/main...HEAD"]);
+        assert!(marker.exists(), "the fixture's converter never runs at all");
+    }
+
     fn review_fixture(
         tag: &str,
         number: i64,
@@ -11340,5 +11613,110 @@ mod review_record_tests {
         let err = reconcile_review_post(5, "the body", "me", "aaa", error, unreadable).unwrap_err();
         assert_eq!(crate::error::ErrorKind::UncertainWrite, err.kind());
         assert!(err.to_string().contains("could not be verified"), "{err}");
+    }
+    #[test]
+    fn a_review_with_line_comments_names_the_new_side_and_a_range_only_when_it_has_one() {
+        let comments = vec![
+            InlineComment {
+                path: "src/a.rs".into(),
+                line: 12,
+                start_line: None,
+                body: "one".into(),
+            },
+            InlineComment {
+                path: "src/b.rs".into(),
+                line: 9,
+                start_line: Some(4),
+                body: "two".into(),
+            },
+        ];
+        assert_eq!(
+            json!({
+                "commit_id": "abc",
+                "event": "COMMENT",
+                "body": "the body",
+                "comments": [
+                    {"path": "src/a.rs", "line": 12, "side": "RIGHT", "body": "one"},
+                    {"path": "src/b.rs", "line": 9, "side": "RIGHT", "start_line": 4,
+                     "start_side": "RIGHT", "body": "two"},
+                ],
+            }),
+            review_payload("abc", "COMMENT", "the body", &comments)
+        );
+    }
+
+    #[test]
+    fn the_new_side_of_each_hunk_is_read_and_its_lines_are_never_taken_for_headers() {
+        let diff = r#"diff --git a/src/a.rs b/src/a.rs
+index 1111111..2222222 100644
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1,3 +1,4 @@ fn x
+ one
++++ an added line that looks like a header
+ two
+ three
+@@ -20 +21,2 @@
+-old
++new
++more
+@@ -30,1 +32,0 @@
+-gone
+diff --git a/gone.rs b/gone.rs
+deleted file mode 100644
+--- a/gone.rs
++++ /dev/null
+@@ -1,2 +0,0 @@
+-a
+-b
+diff --git a/old.rs b/renamed.rs
+similarity index 90%
+rename from old.rs
+rename to renamed.rs
+--- a/old.rs
++++ b/renamed.rs
+@@ -5,0 +6,1 @@
++inserted
+diff --git a/with space.rs b/with space.rs
+--- a/with space.rs	
++++ b/with space.rs	
+@@ -2 +2 @@
+-x
++y
+diff --git "a/sp\tace.rs" "b/sp\tace.rs"
+--- "a/sp\tace.rs"
++++ "b/sp\tace.rs"
+@@ -1 +1 @@
+-x
++y
+"#;
+        let hunks = new_side_hunks(diff);
+        assert_eq!(
+            Hunks::from([
+                ("renamed.rs".to_string(), vec![(6, 6)]),
+                ("src/a.rs".to_string(), vec![(1, 4), (21, 22)]),
+                ("with space.rs".to_string(), vec![(2, 2)]),
+            ]),
+            hunks
+        );
+    }
+
+    #[test]
+    fn only_a_refusal_is_final_enough_to_send_a_review_again() {
+        let error = |text: &str| crate::error::SparError::new(text);
+        assert!(refused(&error(
+            "command failed (1): gh api\ngh: Validation Failed (HTTP 422)"
+        )));
+        assert!(!refused(&error("gh: Bad Gateway (HTTP 502)")));
+        assert!(!refused(&error("gh: HTTP 504: Gateway Timeout")));
+        assert!(!refused(&error("command timed out after 300s")));
+    }
+
+    #[test]
+    fn a_hunk_header_with_its_counts_left_out_counts_one() {
+        assert_eq!(Some(((20, 1), (21, 2))), hunk_header("@@ -20 +21,2 @@"));
+        assert_eq!(Some(((1, 3), (1, 1))), hunk_header("@@ -1,3 +1 @@ fn x"));
+        assert_eq!(None, hunk_header("@@@ -1,3 -1,3 +1,4 @@@"));
+        assert_eq!(None, hunk_header(" @@ -1 +1 @@"));
     }
 }

@@ -350,6 +350,11 @@ pr_comments        = "outcome"
                              # Set this to "none" and spar never comments on a
                              # pull request in any mode, which is the standing
                              # equivalent of `spar review --dry-run`.
+inline_comments    = true    # put each finding of `spar review` on the line it
+                             # is about as well, when the pull request's diff
+                             # shows that line. The summary still lists every
+                             # finding. A line GitHub refuses sends the review
+                             # up again with its summary alone.
 max_title_chars    = 140     # a finding, issue, or PR title. Never ellipsised:
                              # a title ending in "..." reads as broken.
 max_summary_chars  = 2000    # a verdict or a refutation's argument

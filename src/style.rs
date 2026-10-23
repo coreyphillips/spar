@@ -138,6 +138,9 @@ pub struct Style {
     pub max_title_chars: usize,
     /// How much of its own working spar narrates into a pull request thread.
     pub pr_comments: crate::config::PrComments,
+    /// Put each finding of `spar review` on the line it is about, as well as
+    /// in the summary, when the diff shows that line.
+    pub inline_comments: bool,
 }
 
 impl Default for Style {
@@ -152,6 +155,7 @@ impl Default for Style {
             max_issue_body_chars: 20000,
             max_title_chars: 140,
             pr_comments: crate::config::PrComments::Outcome,
+            inline_comments: true,
         }
     }
 }

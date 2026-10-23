@@ -23,7 +23,7 @@ use crate::model::{
 use crate::proc::{self, ExecOpts};
 use crate::style::{self, Style};
 use crate::textsim;
-use crate::{bail, logdim, logwarn, spar_err};
+use crate::{bail, log, logdim, logwarn, spar_err};
 
 /// What is read of one issue that is about to reach a prompt.
 ///
@@ -171,6 +171,52 @@ fn split_slot(parent: i64, index: usize, attempt: u32) -> String {
     }
 }
 
+/// Where a branch spar opened a pull request from is published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushTarget {
+    Origin,
+    /// The authenticated user's fork, for a repository origin would not let
+    /// them push to.
+    Fork(Fork),
+}
+
+/// A fork of this repository that spar publishes branches to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fork {
+    /// The account that owns it, which `gh pr create --head` needs in front of
+    /// the branch name.
+    pub owner: String,
+    /// `owner/name`, for saying where a branch went.
+    pub full_name: String,
+    /// The SSH or HTTPS URL, whichever origin uses, pushed to directly so the
+    /// checkout's remotes are left as they were.
+    pub url: String,
+}
+
+impl PushTarget {
+    /// What `gh pr create --head` takes for a branch published here.
+    pub fn head(&self, branch: &str) -> String {
+        match self {
+            PushTarget::Origin => branch.to_string(),
+            PushTarget::Fork(fork) => format!("{}:{branch}", fork.owner),
+        }
+    }
+
+    fn remote(&self) -> &str {
+        match self {
+            PushTarget::Origin => "origin",
+            PushTarget::Fork(fork) => &fork.url,
+        }
+    }
+
+    fn describe(&self, branch: &str) -> String {
+        match self {
+            PushTarget::Origin => format!("origin/{branch}"),
+            PushTarget::Fork(fork) => format!("{branch} on the fork {}", fork.full_name),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Repo {
     root: PathBuf,
@@ -179,6 +225,11 @@ pub struct Repo {
     pub state_store: StateStore,
     pub followups: Followups,
     pub drafts: Drafts,
+    /// Publish a new branch from a fork when origin refuses the push.
+    pub fork_when_denied: bool,
+    /// The fork new branches go to once origin has refused one, found at most
+    /// once.
+    fork: OnceLock<Fork>,
     /// The login `gh` is authenticated as, asked at most once.
     ///
     /// `OnceLock` rather than `OnceCell` because `&Repo` crosses a
@@ -819,6 +870,74 @@ fn merge_pr_args<'a>(
     args
 }
 
+/// The line of a failed push where the host says this account may not write
+/// to the repository, as opposed to the branch having moved or the network
+/// failing.
+///
+/// GitHub words it the same over SSH (`ERROR: Permission to o/r.git denied to
+/// u.`) and HTTPS (`remote: Permission to ...`), and in both it comes before
+/// several lines of generic advice, so the last line is the least useful one:
+/// it used to be all spar said, and all it said was "and the repository
+/// exists."
+fn push_denial(message: &str) -> Option<&str> {
+    message
+        .lines()
+        .map(|line| {
+            let line = line.trim();
+            let line = line.strip_prefix("ERROR:").unwrap_or(line);
+            line.strip_prefix("remote:").unwrap_or(line).trim()
+        })
+        .find(|line| line.starts_with("Permission to ") && line.contains(" denied to "))
+}
+
+fn push_error(
+    target: &PushTarget,
+    branch: &str,
+    e: &crate::error::SparError,
+) -> crate::error::SparError {
+    let message = e.to_string();
+    match push_denial(&message) {
+        Some(denied) => spar_err!("could not push to {}. {denied}", target.describe(branch)),
+        None => spar_err!(
+            "could not push to {}. {}\nCheck push access and whether the branch moved under you.",
+            target.describe(branch),
+            e.last_line()
+        ),
+    }
+}
+
+/// The fork GitHub described, with the URL that matches how origin is reached.
+///
+/// An SSH origin gets the SSH URL and anything else the HTTPS one, so the push
+/// authenticates the way every other push from this checkout does.
+fn fork_from_api(answer: &str, origin_url: &str) -> Result<Fork> {
+    #[derive(Deserialize)]
+    struct Owner {
+        login: String,
+    }
+    #[derive(Deserialize)]
+    struct Answer {
+        full_name: String,
+        owner: Owner,
+        ssh_url: String,
+        clone_url: String,
+    }
+
+    let answer: Answer = serde_json::from_str(answer.trim())
+        .map_err(|e| spar_err!("unexpected answer from GitHub when forking: {e}"))?;
+    let origin = origin_url.trim();
+    let ssh = origin.starts_with("git@") || origin.starts_with("ssh://");
+    Ok(Fork {
+        owner: answer.owner.login,
+        full_name: answer.full_name,
+        url: if ssh {
+            answer.ssh_url
+        } else {
+            answer.clone_url
+        },
+    })
+}
+
 fn reconcile_pr_creation(
     branch: &str,
     created: Result<String>,
@@ -1202,6 +1321,8 @@ impl Repo {
             state_store: cfg.loop_cfg.state_store,
             followups: cfg.loop_cfg.followups,
             drafts: cfg.loop_cfg.drafts,
+            fork_when_denied: cfg.loop_cfg.fork_when_denied,
+            fork: OnceLock::new(),
             viewer: OnceLock::new(),
             checkpoints: Mutex::new(BTreeMap::new()),
             writes: WriteStats::default(),
@@ -3619,26 +3740,130 @@ impl Repo {
     /// silently drops somebody's commit. Naming the head makes the push refuse
     /// exactly that case.
     pub fn push(&self, cwd: &Path, branch: &str, expected: Option<&str>) -> Result<()> {
+        self.push_to(cwd, &PushTarget::Origin, branch, expected)
+    }
+
+    /// `push`, to wherever the branch was first published.
+    pub fn push_to(
+        &self,
+        cwd: &Path,
+        target: &PushTarget,
+        branch: &str,
+        expected: Option<&str>,
+    ) -> Result<()> {
         let expected = expected.map(str::trim).filter(|head| !head.is_empty());
         if let Some(head) = expected {
             self.refuse_push_that_drops(cwd, head)?;
         }
-        let refspec = format!("HEAD:{branch}");
-        let lease = match expected {
-            Some(head) => format!("--force-with-lease=refs/heads/{branch}:{head}"),
-            None => "--force-with-lease".to_string(),
-        };
         let pushed = self
-            .git_at(Some(cwd), &["push", &lease, "origin", &refspec])
-            .map(|_| ())
-            .map_err(|e| {
-                spar_err!(
-                    "could not push to origin/{branch}. {}\nCheck push access and whether the \
-                     branch moved under you.",
-                    e.last_line()
-                )
-            });
+            .git_push(cwd, target, branch, expected)
+            .map_err(|e| push_error(target, branch, &e));
         self.record_write(pushed)
+    }
+
+    /// Publish a branch created in this invocation, from a fork if origin
+    /// refuses it.
+    ///
+    /// Only a new branch can move. A pull request that already exists has its
+    /// branch on origin, and pushing it anywhere else would not update it. A
+    /// new one has no pull request yet, so a fork is just where it is opened
+    /// from, which is how anybody without write access contributes.
+    ///
+    /// The refusal is not counted as a failed write when the fork takes the
+    /// branch: the run did what it set out to, and a failed write makes the
+    /// exit status say otherwise.
+    pub fn publish_new_branch(&self, cwd: &Path, branch: &str) -> Result<PushTarget> {
+        let origin = PushTarget::Origin;
+        let refused = match self.git_push(cwd, &origin, branch, None) {
+            Ok(()) => return self.record_write(Ok(origin)),
+            Err(e) if self.fork_when_denied && push_denial(&e.to_string()).is_some() => e,
+            Err(e) => {
+                let err = push_error(&origin, branch, &e);
+                let err = if push_denial(&e.to_string()).is_some() {
+                    spar_err!(
+                        "{err} Set fork_when_denied = true under [loop] to publish it from a fork \
+                         instead."
+                    )
+                } else {
+                    err
+                };
+                return self.record_write(Err(err));
+            }
+        };
+        let fork = self.fork().map_err(|e| {
+            spar_err!(
+                "{} spar could not publish it from a fork instead: {}",
+                push_error(&origin, branch, &refused),
+                e.last_line()
+            )
+        })?;
+        log!(
+            "{} Publishing {branch} from the fork {} instead.",
+            push_denial(&refused.to_string()).unwrap_or("origin refused the push."),
+            fork.full_name
+        );
+        let target = PushTarget::Fork(fork);
+        self.push_to(cwd, &target, branch, None)?;
+        Ok(target)
+    }
+
+    fn git_push(
+        &self,
+        cwd: &Path,
+        target: &PushTarget,
+        branch: &str,
+        expected: Option<&str>,
+    ) -> Result<()> {
+        let refspec = format!("HEAD:refs/heads/{branch}");
+        let lease = match (expected, target) {
+            (Some(head), _) => format!("--force-with-lease=refs/heads/{branch}:{head}"),
+            // A fork is pushed to by URL, so there is no tracking ref for a
+            // bare lease to read. Leasing against nothing makes the first push
+            // a create that never moves a branch already there.
+            (None, PushTarget::Fork(_)) => format!("--force-with-lease=refs/heads/{branch}:"),
+            (None, PushTarget::Origin) => "--force-with-lease".to_string(),
+        };
+        self.git_at(Some(cwd), &["push", &lease, target.remote(), &refspec])
+            .map(|_| ())
+    }
+
+    /// The authenticated user's fork of this repository, made if there is none.
+    ///
+    /// GitHub answers a request to fork with the fork that already exists, so
+    /// this is the same call whether or not one was made before. A new fork is
+    /// copied in the background, so it is waited for before anything is
+    /// pushed to it.
+    fn fork(&self) -> Result<Fork> {
+        if let Some(fork) = self.fork.get() {
+            return Ok(fork.clone());
+        }
+        let answer = self
+            .record_write(self.gh(&["api", "-X", "POST", "repos/{owner}/{repo}/forks"]))
+            .map_err(|e| spar_err!("could not fork this repository. {}", e.last_line()))?;
+        let origin_url = self.git_try(&["remote", "get-url", "--push", "origin"]);
+        let fork = fork_from_api(&answer, &origin_url)?;
+        self.wait_for_fork(&fork)?;
+        Ok(self.fork.get_or_init(|| fork).clone())
+    }
+
+    fn wait_for_fork(&self, fork: &Fork) -> Result<()> {
+        const TRIES: u32 = 30;
+        let mut tries = 1;
+        loop {
+            match self.git(&["ls-remote", &fork.url, "HEAD"]) {
+                Ok(_) => return Ok(()),
+                Err(e) if tries >= TRIES => bail!(
+                    "the fork {} could not be reached after {} seconds. {}",
+                    fork.full_name,
+                    TRIES * 2,
+                    e.last_line()
+                ),
+                Err(_) => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            }
+        }
     }
 
     /// Refuse a push whose HEAD does not contain the head spar reviewed.
@@ -4216,18 +4441,24 @@ impl Repo {
         Ok(LiveHead { pull, branch })
     }
 
+    /// Open a pull request from `branch`, published at `target`.
+    ///
+    /// The lookup that confirms it landed goes by branch name alone, which
+    /// `gh pr list --head` matches on a fork's pull request too.
     pub fn create_pr(
         &self,
         cwd: &Path,
         branch: &str,
+        target: &PushTarget,
         base: &str,
         title: &str,
         body: &str,
     ) -> Result<PrRef> {
         let title = self.record_failed_write(self.clean_title(title))?;
         let body = self.record_failed_write(self.clean(body))?;
+        let head = target.head(branch);
         let mut argv = vec![
-            "pr", "create", "--base", base, "--head", branch, "--title", &title, "--body", &body,
+            "pr", "create", "--base", base, "--head", &head, "--title", &title, "--body", &body,
         ];
         if self.drafts != Drafts::Never {
             argv.push("--draft");
@@ -8118,6 +8349,8 @@ mod tests {
             state_store: StateStore::Local,
             followups: crate::config::Followups::Issues,
             drafts: Drafts::Never,
+            fork_when_denied: true,
+            fork: OnceLock::new(),
             viewer: OnceLock::new(),
             checkpoints: Mutex::new(BTreeMap::new()),
             writes: WriteStats::default(),
@@ -10073,6 +10306,217 @@ mod tests {
         assert!(
             !style.terse,
             "the commit filter must not truncate a commit message"
+        );
+    }
+
+    // -- publishing from a fork --------------------------------------------
+
+    /// GitHub's refusal is several lines of advice after the one that says
+    /// what happened, and spar used to report only the last of them.
+    #[test]
+    fn a_push_denial_is_read_from_either_transport() {
+        let ssh = "ERROR: Permission to example/project.git denied to someone.\n\
+                   fatal: Could not read from remote repository.\n\n\
+                   Please make sure you have the correct access rights\n\
+                   and the repository exists.";
+        let https = "remote: Permission to example/project.git denied to someone.\n\
+                     fatal: unable to access 'https://github.com/example/project.git/': The \
+                     requested URL returned error: 403";
+        let denied = Some("Permission to example/project.git denied to someone.");
+        assert_eq!(denied, push_denial(ssh));
+        assert_eq!(denied, push_denial(https));
+
+        let stale = "To github.com:example/project.git\n \
+                     ! [rejected]        HEAD -> issue-7 (stale info)\n\
+                     error: failed to push some refs to 'github.com:example/project.git'";
+        assert_eq!(None, push_denial(stale));
+
+        let err = push_error(
+            &PushTarget::Origin,
+            "issue-7",
+            &crate::error::SparError::new(ssh),
+        );
+        assert_eq!(
+            "could not push to origin/issue-7. Permission to example/project.git denied to \
+             someone.",
+            err.to_string()
+        );
+    }
+
+    #[test]
+    fn a_fork_is_pushed_to_the_way_origin_is_reached() {
+        let answer = r#"{"full_name":"someone/project","owner":{"login":"someone"},
+            "ssh_url":"git@github.com:someone/project.git",
+            "clone_url":"https://github.com/someone/project.git","fork":true}"#;
+
+        let ssh = fork_from_api(answer, "git@github.com:example/project.git\n").unwrap();
+        assert_eq!("git@github.com:someone/project.git", ssh.url);
+        assert_eq!("someone", ssh.owner);
+        assert_eq!("someone/project", ssh.full_name);
+
+        let https = fork_from_api(answer, "https://github.com/example/project.git").unwrap();
+        assert_eq!("https://github.com/someone/project.git", https.url);
+
+        assert_eq!("someone:issue-7", PushTarget::Fork(ssh).head("issue-7"));
+        assert_eq!("issue-7", PushTarget::Origin.head("issue-7"));
+    }
+
+    /// An origin whose hook refuses every push with GitHub's wording, a bare
+    /// repository standing in for the fork, and a checkout on a new branch
+    /// with one commit to publish.
+    #[cfg(unix)]
+    fn denied_fixture(
+        tag: &str,
+        fork_when_denied: bool,
+    ) -> (ReviewFixture, Repo, PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("spar-fork-test-{tag}-{}-{id}", std::process::id()));
+        let origin = root.join("origin.git");
+        let fork = root.join("fork.git");
+        let work = root.join("work");
+        for dir in [&origin, &fork, &work] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        test_git(&origin, &["init", "--bare", "-b", "main"]);
+        test_git(&fork, &["init", "--bare", "-b", "main"]);
+        test_git(&work, &["init", "-b", "main"]);
+        test_git(&work, &["config", "user.email", "spar@example.invalid"]);
+        test_git(&work, &["config", "user.name", "spar test"]);
+        test_git(&work, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(work.join("README.md"), "seed\n").unwrap();
+        test_git(&work, &["add", "."]);
+        test_git(&work, &["commit", "-m", "seed"]);
+        test_git(
+            &work,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        test_git(&work, &["push", "-q", "origin", "main"]);
+        // Installed after the seed, so it is only spar's pushes it refuses.
+        let hook = origin.join("hooks").join("pre-receive");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\necho 'Permission to example/project.git denied to someone.' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        test_git(&work, &["checkout", "-q", "-b", "issue-7"]);
+        std::fs::write(work.join("fix.txt"), "fixed\n").unwrap();
+        test_git(&work, &["add", "."]);
+        test_git(&work, &["commit", "-m", "Fix it"]);
+
+        let mut text =
+            String::from("[agents.a]\ncommand = [\"true\"]\n[agents.b]\ncommand = [\"true\"]\n");
+        if !fork_when_denied {
+            text.push_str("[loop]\nfork_when_denied = false\n");
+        }
+        let cfg = crate::config::parse(&text).unwrap();
+        let repo = Repo::open(&work, &cfg).unwrap();
+        // What `fork` would have asked GitHub for, so no test reaches it.
+        repo.fork
+            .set(Fork {
+                owner: "someone".into(),
+                full_name: "someone/project".into(),
+                url: fork.to_str().unwrap().into(),
+            })
+            .unwrap();
+        (ReviewFixture { root }, repo, work, origin, fork)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_branch_origin_refuses_is_published_from_the_fork() {
+        let (_fixture, repo, work, origin, fork) = denied_fixture("publish", true);
+        let first = test_git(&work, &["rev-parse", "HEAD"]);
+
+        let target = repo.publish_new_branch(&work, "issue-7").unwrap();
+
+        assert_eq!("someone:issue-7", target.head("issue-7"));
+        assert_eq!(
+            first.trim(),
+            test_git(&fork, &["rev-parse", "issue-7"]).trim()
+        );
+        assert!(test_git(&origin, &["branch", "--list", "issue-7"])
+            .trim()
+            .is_empty());
+        assert_eq!(
+            WriteSummary {
+                attempted: 1,
+                failed: 0
+            },
+            repo.write_summary(),
+            "a refusal the fork answered is not a failed write"
+        );
+
+        // A later round follows the branch to the fork, leasing what it
+        // published there.
+        std::fs::write(work.join("fix.txt"), "fixed again\n").unwrap();
+        test_git(&work, &["commit", "-qam", "Fix it again"]);
+        repo.push_to(&work, &target, "issue-7", Some(first.trim()))
+            .unwrap();
+        let second = test_git(&work, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            second.trim(),
+            test_git(&fork, &["rev-parse", "issue-7"]).trim()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_branch_already_on_the_fork_is_not_moved_by_a_new_publish() {
+        let (_fixture, repo, work, _origin, fork) = denied_fixture("fork-taken", true);
+        test_git(
+            &work,
+            &[
+                "push",
+                "-q",
+                fork.to_str().unwrap(),
+                "main:refs/heads/issue-7",
+            ],
+        );
+        let seed = test_git(&work, &["rev-parse", "main"]);
+
+        let err = repo.publish_new_branch(&work, "issue-7").unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("could not push to issue-7 on the fork someone/project"),
+            "{err}"
+        );
+        assert_eq!(
+            seed.trim(),
+            test_git(&fork, &["rev-parse", "issue-7"]).trim()
+        );
+        assert_eq!(1, repo.write_summary().failed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn with_forking_off_a_refused_push_says_why_and_how() {
+        let (_fixture, repo, work, _origin, fork) = denied_fixture("fork-off", false);
+
+        let err = repo
+            .publish_new_branch(&work, "issue-7")
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("Permission to example/project.git denied to someone."),
+            "{err}"
+        );
+        assert!(err.contains("fork_when_denied = true"), "{err}");
+        assert!(test_git(&fork, &["branch", "--list", "issue-7"])
+            .trim()
+            .is_empty());
+        assert_eq!(
+            WriteSummary {
+                attempted: 1,
+                failed: 1
+            },
+            repo.write_summary()
         );
     }
 }

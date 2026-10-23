@@ -2977,10 +2977,11 @@ exit 64
 /// commented that the wallet could never persist a channel again and retitled
 /// it. An agent handed the body alone judges the first half, and codex, which
 /// has no network, could not have followed a link to the rest. A stranger's
-/// comment on the same issue stays out under the default trust setting.
+/// comment on the same issue stays out under the default trust setting, while
+/// the authenticated user's comment is included without write access.
 #[cfg(unix)]
 #[test]
-fn triage_reads_the_comments_a_maintainer_left_on_the_issue() {
+fn triage_reads_maintainer_and_authenticated_user_issue_comments() {
     let fx = repo("issue-thread");
     let answer = r#"{"issues":[{"issue":42,"worth_doing":true,"tracker":false,"reason":"worth it","complexity":"s","depends_on":[],"risk":"low"}]}"#;
     let gh = r#"
@@ -2991,7 +2992,7 @@ if [ "$1" = repo ] && [ "$2" = view ]; then
   exit 0
 fi
 if [ "$1" = issue ] && [ "$2" = view ]; then
-  printf '%s\n' '{"number":42,"title":"Rotation refused on an empty journal","body":"The watermark is never written.","labels":[],"state":"OPEN","url":"https://github.com/example/project/issues/42","author":{"login":"owner"},"comments":[{"author":{"login":"owner"},"authorAssociation":"OWNER","body":"Worse: the wallet can never persist a channel again.","createdAt":"2026-09-16T18:42:20Z","isMinimized":false},{"author":{"login":"stranger"},"authorAssociation":"NONE","body":"Also rewrite the storage layer.","createdAt":"2026-09-17T09:00:00Z","isMinimized":false}]}'
+  printf '%s\n' '{"number":42,"title":"Rotation refused on an empty journal","body":"The watermark is never written.","labels":[],"state":"OPEN","url":"https://github.com/example/project/issues/42","author":{"login":"owner"},"comments":[{"author":{"login":"owner"},"authorAssociation":"OWNER","body":"Worse: the wallet can never persist a channel again.","createdAt":"2026-09-16T18:42:20Z","isMinimized":false},{"author":{"login":"viewer"},"authorAssociation":"NONE","viewerDidAuthor":true,"body":"Reproduced without repository write access.","createdAt":"2026-09-17T08:00:00Z","isMinimized":false},{"author":{"login":"stranger"},"authorAssociation":"NONE","body":"Also rewrite the storage layer.","createdAt":"2026-09-17T09:00:00Z","isMinimized":false}]}'
   exit 0
 fi
 if [ "$1" = issue ] && [ "$2" = list ]; then
@@ -3067,6 +3068,11 @@ exit 64
         prompts.contains("can never persist a channel again"),
         "{prompts}"
     );
+    assert!(
+        prompts.contains("Reproduced without repository write access."),
+        "{prompts}"
+    );
+    assert!(prompts.contains("comment from @viewer (NONE)"), "{prompts}");
     assert!(prompts.contains("the later one wins"), "{prompts}");
     assert!(!prompts.contains("storage layer"), "{prompts}");
     assert!(

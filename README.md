@@ -777,7 +777,8 @@ output is a `git push`, so it is worth saying exactly what the layers are.
   are answering your own contributors. Every comment the gate holds back is
   named in the log, so the setting is never silent. The same setting decides
   whose comments under an issue reach the prompts that implement, triage, and
-  review it.
+  review it. Issue comments from the person who filed the issue and the
+  authenticated GitHub user are included regardless of repository write access.
 - **Both agents have to agree.** A second opinion that never arrived is not
   agreement: if the checking agent and its fallback both fail, nothing is
   implemented that run. Disagreement always resolves toward saying something
@@ -1285,11 +1286,13 @@ who wrote it and when, and every prompt that carries an issue says a later
 comment can change what was asked. The body and its comments share
 `max_issue_chars`, and past it the oldest comments go first.
 
-What a comment says can become a commit, so `checkin_trust` decides whose are
-read, exactly as it does for `spar checkin`: by default somebody GitHub says can
-write to the repository, and always the person who filed the issue, since they
-wrote the body. Anybody passed over is named in the log. spar's own comments are
-carried, because one can be a finding a review added to an issue that already
+What a comment says can become a commit, so `checkin_trust` also decides whose
+issue comments are read: by default somebody GitHub says can write to the
+repository, plus the person who filed the issue and the
+authenticated GitHub user, regardless of their repository write access. GitHub
+identifies the latter with `viewerDidAuthor` on each comment. Anybody passed
+over is named in the log. spar's own comments are carried, because one can be
+a finding a review added to an issue that already
 covered it, and headed as spar's so no agent takes one for somebody deciding what
 was asked.
 

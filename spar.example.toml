@@ -216,8 +216,9 @@ max_issue_chars   = 60000    # most of ONE issue, its body and the comments
 checkin_trust     = "write"  # write | anyone. Whose comments `spar checkin`
                              # will act on, and whose comments under an issue
                              # reach the prompts that implement, triage, and
-                             # review it. The person who filed an issue is
-                             # always read under it, since they wrote the body.
+                             # review it. The person who filed an issue and
+                             # the authenticated GitHub user are always read
+                             # under it, regardless of repository write access.
                              # Answering is for everybody; making a change
                              # means a commit pushed to somebody's branch
                              # because a stranger typed a sentence, so by

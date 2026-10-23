@@ -1109,6 +1109,8 @@ impl IssueText {
 /// comment says here can become a commit. The person who filed the issue is
 /// read whatever the setting, because they wrote the body, and a comment of
 /// theirs can ask for nothing the body could not have.
+/// The authenticated GitHub user's comments are also read whatever the
+/// setting, using the viewer identity GitHub returns with each comment.
 ///
 /// The body and its comments share `max`. Past it the oldest comments go
 /// first, since a later comment is the one that supersedes, and only whole
@@ -1127,7 +1129,8 @@ pub fn issue_for_prompt(issue: &Issue, max: usize, trust: Trust) -> IssueText {
         let filed_it = filer
             .zip(real_login(comment.author.as_ref()))
             .is_some_and(|(filer, author)| same_login(filer, author));
-        if !filed_it && !trust.may_act_on(&comment.author_association) {
+        if !filed_it && !comment.viewer_did_author && !trust.may_act_on(&comment.author_association)
+        {
             untrusted.push(format!("@{}", comment.login()));
             continue;
         }
@@ -1578,6 +1581,7 @@ mod issue_thread_tests {
                 login: login.into(),
             }),
             author_association: association.into(),
+            viewer_did_author: false,
             body: body.into(),
             created_at: "2026-09-16T18:42:20Z".into(),
             is_minimized: false,
@@ -1653,6 +1657,74 @@ mod issue_thread_tests {
         );
         assert!(open.text.contains("auth check"), "{}", open.text);
         assert!(open.untrusted.is_empty());
+    }
+
+    #[test]
+    fn the_authenticated_users_comments_are_read_without_write_access() {
+        for association in ["NONE", "CONTRIBUTOR"] {
+            let mut own = said("viewer", association, "The batch parser rejects arrays.");
+            own.viewer_did_author = true;
+            let text = issue_for_prompt(
+                &issue(
+                    "Fix batching.",
+                    "reporter",
+                    vec![own, said("stranger", "NONE", "Rewrite storage too.")],
+                ),
+                60_000,
+                Trust::Write,
+            );
+            assert!(
+                text.text.contains("The batch parser rejects arrays."),
+                "{}",
+                text.text
+            );
+            assert!(!text.text.contains("Rewrite storage too."), "{}", text.text);
+            assert_eq!(text.untrusted, vec!["@stranger"]);
+        }
+    }
+
+    #[test]
+    fn viewer_comments_still_follow_content_filters_and_the_prompt_budget() {
+        let mut hidden = said("viewer", "NONE", "Off topic.");
+        hidden.is_minimized = true;
+        let mut comments = vec![
+            hidden,
+            said("viewer", "NONE", "  \n"),
+            said("viewer", "NONE", STATE_MARKER),
+            said("viewer", "NONE", &"old ".repeat(100)),
+            said("viewer", "NONE", "The newest finding."),
+        ];
+        for comment in &mut comments {
+            comment.viewer_did_author = true;
+        }
+        let text = issue_for_prompt(&issue("Fix it.", "reporter", comments), 140, Trust::Write);
+        assert!(text.text.contains("The newest finding."), "{}", text.text);
+        for excluded in ["Off topic.", STATE_MARKER, "old old"] {
+            assert!(!text.text.contains(excluded), "{}", text.text);
+        }
+        assert_eq!(text.comments_cut, 1);
+        assert!(text.untrusted.is_empty());
+    }
+
+    #[test]
+    fn missing_viewer_authorship_does_not_bypass_trust() {
+        for flag in [None, Some(false), Some(true)] {
+            let mut payload = serde_json::json!({
+                "author": {"login": "viewer"},
+                "authorAssociation": "NONE",
+                "body": "Reproduced with a one-element batch.",
+            });
+            if let Some(flag) = flag {
+                payload["viewerDidAuthor"] = flag.into();
+            }
+            let comment: IssueComment = serde_json::from_value(payload).unwrap();
+            let text = issue_for_prompt(
+                &issue("Fix batching.", "reporter", vec![comment]),
+                60_000,
+                Trust::Write,
+            );
+            assert_eq!(text.text.contains("one-element batch"), flag == Some(true));
+        }
     }
 
     /// The person who filed the issue wrote the body, and a comment of theirs

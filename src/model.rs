@@ -252,10 +252,9 @@ impl Severity {
 
     /// The graver of two judgements.
     ///
-    /// Two reviewers disagreeing about severity is resolved upward on purpose.
-    /// Nothing here gates a merge, it is all advice to a person, and advice
-    /// that under-reports a real defect is worse than advice that over-reports
-    /// a small one.
+    /// Two reviewers disagreeing about severity is resolved upward on purpose:
+    /// advice that under-reports a real defect is worse than advice that
+    /// over-reports a small one.
     pub fn graver(self, other: Self) -> Self {
         if self.rank() >= other.rank() {
             self
@@ -942,6 +941,10 @@ pub struct Judged {
     /// "the other says" turns the most valuable content in the comment into
     /// one unreadable sentence.
     pub defence: Option<String>,
+    /// The other reviewer's own severity, when the cross-check had it agree
+    /// the defect is real. Not kept in the review record: the counterpoint
+    /// says it in words, and nothing after the cross-check reads it.
+    pub rated: Option<Severity>,
 }
 
 string_enum! {
@@ -953,7 +956,8 @@ string_enum! {
         /// One raised it, the other read the code and agreed.
         Confirmed = "confirmed",
         /// One raised it, the other read the code and rejected it, and it survived
-        /// a rebuttal. A person decides.
+        /// a rebuttal. Or the other agreed it is real but not on whether it
+        /// blocks. A person decides.
         Disputed = "disputed",
         /// Raised, rejected, and withdrawn by the reviewer who raised it.
         Withdrawn = "withdrawn",
@@ -1314,6 +1318,7 @@ impl RecordedFinding {
             standing: self.standing,
             counterpoint: self.counterpoint.clone(),
             defence: self.defence.clone(),
+            rated: None,
         }
     }
 }
@@ -1946,6 +1951,7 @@ mod review_record_tests {
             standing: Standing::Corroborated,
             counterpoint: None,
             defence: Some("stands".into()),
+            rated: None,
         }
     }
 

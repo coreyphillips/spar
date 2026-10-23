@@ -253,6 +253,7 @@ fn main() {
         standing,
         counterpoint: None,
         defence: None,
+        rated: None,
     };
     let mut disputed = judged(
         FindingStanding::Disputed,

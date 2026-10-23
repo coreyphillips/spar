@@ -248,9 +248,21 @@ numbered items **at or above** #480, and spar says how many it skipped. A number
 you name explicitly is always honoured, floor or not, because naming it is the
 point.
 
-Works on any GitHub repo you have cloned with push access. It follows `gh`
-conventions: the repo comes from the checkout you point at, and the base branch
-is detected from `origin/HEAD` rather than assumed to be `main`.
+Works on any GitHub repo you have cloned. It follows `gh` conventions: the repo
+comes from the checkout you point at, and the base branch is detected from
+`origin/HEAD` rather than assumed to be `main`.
+
+Without push access, a new branch goes to your fork instead, made if you have
+none, and the pull request is opened from there. The fork is reached the way
+origin is, the same host alias, user, and port with only `owner/repo` swapped,
+and your checkout's remotes are left alone. A branch of the same name already
+on the fork is checked before any agent runs: one whose commits a pull request
+holds is replaced, and one with work nothing else has stops the run. Set
+`fork_when_denied = false` under `[loop]` to have the push fail instead.
+
+`spar resume` and `spar checkin` carry on a pull request from your own fork,
+pushing to the fork. One from anybody else's fork is reviewed without being
+changed.
 
 ```bash
 spar run --repo ~/projects/thing 42     # --repo belongs to the subcommand

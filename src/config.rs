@@ -575,6 +575,14 @@ pub struct LoopCfg {
     pub max_tracker_children: usize,
     /// Whether a pull request spar opens starts as a draft.
     pub drafts: Drafts,
+    /// Publish a new branch from the authenticated user's fork when origin
+    /// refuses the push, and open the pull request from there.
+    ///
+    /// On by default because the alternative is a run that implements an
+    /// issue, then fails at the push and throws the work away. A fork is how
+    /// anybody without write access contributes, and asking GitHub for one
+    /// returns the existing fork when there already is one.
+    pub fork_when_denied: bool,
     /// Extra instructions handed to both agents with every request.
     ///
     /// For what a person wants of this repository that the code cannot say and
@@ -659,6 +667,7 @@ impl Default for LoopCfg {
             decompose_trackers: false,
             max_tracker_children: 5,
             drafts: Drafts::Never,
+            fork_when_denied: true,
             instructions: String::new(),
             max_issue_chars: 60_000,
             max_triage_chars: 200_000,

@@ -30,7 +30,7 @@ use crate::model::{
     LedgerEntry, NextAction, OwnFix, OwnFixDoc, PersistedState, PlanItem, PrView, ResponseDoc,
     Review, Settled, Severity, SkippedItem, Status, Verdict, STATE_VERSION,
 };
-use crate::repo::Repo;
+use crate::repo::{PushTarget, Repo};
 use crate::style::{self, Style};
 use crate::{bail, log, logdim, logwarn, schema, spar_err};
 
@@ -893,8 +893,9 @@ fn implement_and_review(
     repo.rewrite_commits_if_needed(work_dir, &base, None)?;
     // A branch created in this invocation: there is no earlier remote head
     // to lease against, and `refuse_issue_branch_rebuild` already refused to
-    // build over one that existed.
-    repo.push(work_dir, branch, None)?;
+    // build over one that existed. Being new is also what lets it go to a
+    // fork when origin refuses it, since no pull request is on origin yet.
+    let target = repo.publish_new_branch(work_dir, branch, &base)?;
 
     let description = pr_body(number, &work, checked.as_deref(), &repo.style);
     let pr = match repo.pr_for_branch(branch) {
@@ -904,6 +905,7 @@ fn implement_and_review(
             repo.create_pr(
                 work_dir,
                 branch,
+                &target,
                 &base,
                 &format!("{} (#{number})", item.title),
                 &body,
@@ -917,6 +919,7 @@ fn implement_and_review(
     let ctx = LoopCtx {
         work_dir: work_dir.to_path_buf(),
         branch: branch.to_string(),
+        target,
         pr_number: pr.number,
         context: context_block(number, &issue.url, &body, &description),
         label: format!("#{number}"),
@@ -959,11 +962,13 @@ pub fn resume_pr(
         Err(e) => return failed(e),
     };
 
-    // A pull request from a fork cannot be pushed to, so the loop that fixes
-    // things cannot run on it. Reviewing it is still the useful thing, and it
-    // is what a maintainer wants from an outside contribution anyway, so do
-    // that rather than refusing.
-    if pr.is_cross_repository {
+    // A pull request from somebody else's fork cannot be pushed to, so the
+    // loop that fixes things cannot run on it. Reviewing it is still the
+    // useful thing, and it is what a maintainer wants from an outside
+    // contribution anyway, so do that rather than refusing. One from the
+    // authenticated user's own fork, such as one spar opened after origin
+    // refused it, carries on like any other.
+    let Some(target) = repo.pr_push_target(&pr) else {
         log!("PR #{pr_number} comes from a fork, reviewing it without changing it");
         return crate::review_only::review_pr(
             agents,
@@ -972,9 +977,9 @@ pub fn resume_pr(
             pr_number,
             crate::review_only::ReviewOpts::default(),
         );
-    }
+    };
 
-    match resume_inner(agents, cfg, repo, pr, holder_override) {
+    match resume_inner(agents, cfg, repo, pr, target, holder_override) {
         Ok(state) => state,
         Err(e) => failed(e),
     }
@@ -985,6 +990,7 @@ fn resume_inner(
     cfg: &Config,
     repo: &Repo,
     pr: PrView,
+    target: PushTarget,
     holder_override: Option<&str>,
 ) -> Result<IssueRun> {
     let pr_number = pr.number;
@@ -1006,7 +1012,7 @@ fn resume_inner(
             ));
         }
     }
-    let (work_dir, branch) = repo.worktree_for_pr(&pr)?;
+    let (work_dir, branch) = repo.worktree_for_pr(&pr, &target)?;
     let actual_head = checked_head(repo, &work_dir)?;
     let saved = repo.read_state_for_head(&pr, &actual_head);
     let saved_actor_known = saved
@@ -1107,6 +1113,7 @@ fn resume_inner(
     let ctx = LoopCtx {
         work_dir,
         branch,
+        target,
         pr_number,
         context: context_block(subject, &issue_url, &issue_body, &pr.body),
         label: format!("PR #{pr_number}"),
@@ -1150,6 +1157,9 @@ enum Release {
 struct LoopCtx {
     work_dir: PathBuf,
     branch: String,
+    /// Where the branch is published: origin, or the authenticated user's own
+    /// fork, which is where spar opens a pull request origin refused.
+    target: PushTarget,
     pr_number: i64,
     label: String,
     subject: i64,
@@ -1559,7 +1569,12 @@ fn review_loop(
         }
         if editor.is_some() {
             repo.rewrite_commits_if_needed(&ctx.work_dir, &base, Some(&published_head))?;
-            repo.push(&ctx.work_dir, &ctx.branch, Some(&published_head))?;
+            repo.push_to(
+                &ctx.work_dir,
+                &ctx.target,
+                &ctx.branch,
+                Some(&published_head),
+            )?;
             published_head = checked_head(repo, &ctx.work_dir)?;
         }
         holder = next_reviewer(cfg, &holder, editor.as_deref());

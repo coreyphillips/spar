@@ -22,7 +22,7 @@ use crate::model::{
     Answered, Ask, CheckDoc, CheckinDoc, CommentCheck, CommentVerdict, Dispute, FixReport,
     IssueRun, PrView, Status,
 };
-use crate::repo::Repo;
+use crate::repo::{PushTarget, Repo};
 use crate::style::{self, Style};
 use crate::{bail, log, logdim, logwarn, schema, spar_err};
 use regex::Regex;
@@ -652,16 +652,23 @@ fn inner_pr(
         return Ok(state);
     }
 
-    // A pull request from a fork cannot be pushed to, and `push` targets
-    // origin/<head>, so on a fork it would create a branch in this repository
-    // with the fork's branch name rather than updating the pull request.
-    let can_push = !pr.is_cross_repository;
-    let (work_dir, branch) = if can_push {
-        let (dir, branch) = repo.worktree_for_pr(&pr)?;
-        (dir, Some(branch))
-    } else {
-        log!("PR #{number} comes from a fork, so nothing can be pushed. Answering the comments.");
-        (repo.worktree_for_pr_head(number)?, None)
+    // A pull request from somebody else's fork cannot be pushed to, and
+    // pushing its branch name to origin would create a branch in this
+    // repository rather than update the pull request. One from the
+    // authenticated user's own fork is pushed to that fork.
+    let target = repo.pr_push_target(&pr);
+    let can_push = target.is_some();
+    let (work_dir, branch) = match target {
+        Some(target) => {
+            let (dir, branch) = repo.worktree_for_pr(&pr, &target)?;
+            (dir, Some((branch, target)))
+        }
+        None => {
+            log!(
+                "PR #{number} comes from a fork, so nothing can be pushed. Answering the comments."
+            );
+            (repo.worktree_for_pr_head(number)?, None)
+        }
     };
     let read_phase_checkpoint = repo.worktree_checkpoint(&work_dir)?;
     let read_only_checkpoint = (!can_push).then(|| read_phase_checkpoint.clone());
@@ -677,7 +684,9 @@ fn inner_pr(
         &found,
         &work_dir,
         &read_phase_checkpoint,
-        branch.as_deref(),
+        branch
+            .as_ref()
+            .map(|(name, target)| (name.as_str(), target)),
         can_push,
         mode,
         &mut state,
@@ -833,7 +842,7 @@ fn act(
     found: &Gathered,
     work_dir: &Path,
     read_phase_checkpoint: &crate::repo::WorktreeCheckpoint,
-    branch: Option<&str>,
+    branch: Option<(&str, &PushTarget)>,
     can_push: bool,
     mode: &Mode,
     state: &mut IssueRun,
@@ -1081,7 +1090,7 @@ fn implement(
     repo: &Repo,
     number: i64,
     work_dir: &Path,
-    branch: Option<&str>,
+    branch: Option<(&str, &PushTarget)>,
     items: &mut [Settled],
 ) -> Result<FixPublication> {
     let wanted: Vec<&Pending> = items
@@ -1197,7 +1206,7 @@ fn implement(
         downgrade(items, "nothing was committed");
         return Ok(FixPublication::NoCommit);
     }
-    let Some(branch) = branch else {
+    let Some((branch, target)) = branch else {
         downgrade(items, "the branch is on a fork, so spar cannot push to it");
         return Ok(FixPublication::Unpublished(
             "the local fix commit could not be pushed because the branch is on a fork".into(),
@@ -1207,7 +1216,7 @@ fn implement(
     // `before` is the pull request's own head as spar found it, so a
     // person's commit message on their own branch is never rewritten.
     repo.rewrite_commits_if_needed(work_dir, cfg.base_branch(), Some(before.as_str()))?;
-    match repo.push(work_dir, branch, Some(before.as_str())) {
+    match repo.push_to(work_dir, target, branch, Some(before.as_str())) {
         Ok(()) => {
             for item in items.iter_mut().filter(|i| i.ask == Ask::Implement) {
                 item.pushed = true;

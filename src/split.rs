@@ -39,7 +39,7 @@ use crate::model::{
     Implementation, Issue, IssueRun, ItemKind, PrRow, PrView, SplitCheck, SplitPart, SplitProposal,
     SplitScreen, SplitScreenDoc, Status,
 };
-use crate::repo::{Repo, SplitPushError, WorktreeCheckpoint};
+use crate::repo::{PushTarget, Repo, SplitPushError, WorktreeCheckpoint};
 use crate::style::{self, Style};
 use crate::{bail, log, logdim, logwarn, schema, spar_err};
 
@@ -1634,7 +1634,7 @@ fn build_one(
     // part needed to build, so what it carries is only knowable here, and this
     // list is what the comment on the original reports as taken.
     let files = repo.changed_files(dir, against);
-    match repo.create_pr(dir, branch, against, &title, &body) {
+    match repo.create_pr(dir, branch, &PushTarget::Origin, against, &title, &body) {
         Ok(pr) => Ok(BuildOne::Made(Built { pr, files })),
         Err(e) => Ok(BuildOne::Halted {
             reason: format!(

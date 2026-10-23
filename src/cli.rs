@@ -2009,7 +2009,7 @@ fn cmd_init(out: &Path, force: bool) -> Result<i32> {
 
     std::fs::write(out, text).map_err(|e| spar_err!("could not write {}: {e}", out.display()))?;
     println!("\nwrote {}", out.display());
-    println!("Next: `spar doctor` to check it, then `spar run` in a repo you have push access to.");
+    println!("Next: `spar doctor` to check it, then `spar run` in a GitHub checkout.");
     Ok(0)
 }
 
@@ -2070,6 +2070,7 @@ const LOOP_OPTIONS: &[Setting] = &[
     (true, "branch_prefix", "Namespace the branches spar creates, for example \"spar/\". Without it they are issue-N, pr-N, and split-N-I with a suffix on repeated split names."),
     (true, "state_store", "Where resume state is kept. local uses .spar/state and keeps it off the pull request."),
     (true, "drafts", "Whether a pull request starts as a draft. until_approved opens one and marks it ready when the review converges, which is what the draft was saying while two agents were still arguing about it. always opens one and leaves it, and cannot be combined with auto_merge."),
+    (true, "fork_when_denied", "Publish a new branch from your fork when origin refuses the push, and open the pull request from there. GitHub returns the existing fork when there is one. Off fails the push instead, after the work is done."),
     (true, "instructions", "Extra instructions handed to both agents with every request, for what this repository always wants that spar has no setting for. --instructions adds to this for one run."),
     (true, "max_issue_chars", "Most of one issue, its body and the comments on it, that reaches a prompt. Sized so nothing a person wrote is cut. Past it the oldest comments go first, and a cut is said out loud when it happens."),
     (true, "max_triage_chars", "Most every issue together, bodies and comments, may add to one triage prompt, or every recorded follow-up in one screening prompt. Past it, whole items wait for the next run rather than all of them losing their tails."),

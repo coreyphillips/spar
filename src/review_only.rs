@@ -3282,6 +3282,8 @@ mod recheck_tests {
             state: "OPEN".into(),
             closing_issues_references: Vec::new(),
             is_cross_repository: false,
+            head_repository_owner: None,
+            head_repository: None,
         }
     }
 

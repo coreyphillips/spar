@@ -192,6 +192,11 @@ drafts            = "never"  # never | until_approved | always. Whether a pull
                              # every pull request by hand. always cannot be
                              # combined with auto_merge, since merging a draft
                              # means promoting it first.
+fork_when_denied  = true     # publish a new branch from your fork when origin
+                             # refuses the push, and open the pull request from
+                             # there. GitHub returns the existing fork when
+                             # there is one. Off fails the push instead, after
+                             # the work is done.
 instructions      = ""       # extra instructions handed to both agents with
                              # every request, for what this repository always
                              # wants that spar has no setting for: how far to

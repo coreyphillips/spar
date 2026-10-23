@@ -1294,6 +1294,13 @@ fn review_payload(commit: &str, event: &str, body: &str, comments: &[InlineComme
     })
 }
 
+/// Whether GitHub looked at a write and refused it, rather than failing to
+/// answer. A refusal is final, so the same write changed is safe to send; a
+/// timeout or a gateway error says nothing about whether the first one landed.
+fn refused(e: &crate::error::SparError) -> bool {
+    e.to_string().contains("(HTTP 422)")
+}
+
 /// The lines of each file a pull request's diff shows on its new side, as
 /// first and last line of each hunk. GitHub takes a line comment only on one
 /// of these, and refuses the whole review over one that is not.
@@ -1325,6 +1332,13 @@ fn new_side_hunks(diff: &str) -> Hunks {
         if line.starts_with("diff --git ") {
             path = None;
         } else if let Some(rest) = line.strip_prefix("+++ ") {
+            // git ends the line with a tab when the path has a space in it,
+            // so that a patch tool can tell where the name stops.
+            let rest = if rest.contains(' ') {
+                rest.strip_suffix('\t').unwrap_or(rest)
+            } else {
+                rest
+            };
             path = rest
                 .strip_prefix("b/")
                 .filter(|p| !p.is_empty())
@@ -3816,10 +3830,14 @@ impl Repo {
     /// branch's three dot diff, which is the diff GitHub shows for a pull
     /// request.
     ///
-    /// Every flag that shapes the output is spelled out, so a user's
-    /// `diff.noprefix`, `diff.context` or external diff tool cannot change
-    /// what is parsed. A failure is no hunks, which only means every finding
-    /// stays in the summary.
+    /// Every flag that shapes the hunks is spelled out as git's own default,
+    /// which is what GitHub shows, so a user's `diff.noprefix`, `diff.context`,
+    /// `diff.interHunkContext` or `diff.algorithm` cannot move a line comment
+    /// onto a line GitHub does not show. `--no-ext-diff` and `--no-textconv`
+    /// also matter for more than the shape: the branch being reviewed is
+    /// somebody else's, and a diff driver or text converter would run a script
+    /// it changed. A failure is no hunks, which only means every finding stays
+    /// in the summary.
     pub fn diff_hunks(&self, cwd: &Path, base: &str) -> Hunks {
         let range = format!("{}...HEAD", self.base_ref(cwd, base));
         new_side_hunks(&self.git_try_at(
@@ -3830,7 +3848,11 @@ impl Repo {
                 "diff",
                 "--no-color",
                 "--no-ext-diff",
+                "--no-textconv",
                 "--unified=3",
+                "--inter-hunk-context=0",
+                "--diff-algorithm=myers",
+                "--indent-heuristic",
                 "--find-renames",
                 "--src-prefix=a/",
                 "--dst-prefix=b/",
@@ -4894,8 +4916,11 @@ impl Repo {
     ///
     /// `comments` go on their lines in the same review, so they arrive with
     /// it or not at all. GitHub refuses the whole review over one line its diff
-    /// does not show, so when the read back finds nothing landed, the review
-    /// goes up again without them: the body already says everything they do.
+    /// does not show, so when it refused this one and the read back finds
+    /// nothing landed, the review goes up again without them: the body already
+    /// says everything they do. Any other failure is reconciled as a review
+    /// without them would be, never retried: a gateway error can arrive while
+    /// GitHub is still saving a review that will land.
     pub fn submit_review(
         &self,
         number: i64,
@@ -4939,6 +4964,14 @@ impl Repo {
                 &payload,
             ) {
                 Ok(_) => Ok(()),
+                Err(post_error) if !refused(&post_error) => reconcile_review_post(
+                    number,
+                    &body,
+                    &viewer,
+                    commit,
+                    post_error,
+                    self.try_pr_reviews(number),
+                ),
                 Err(post_error) => match self.try_pr_reviews(number) {
                     Ok(reviews) if !has_viewer_review(&reviews, &viewer, &body, commit) => {
                         logwarn!(
@@ -8941,7 +8974,8 @@ mod tests {
     }
 
     /// The diff a line comment is checked against is parsed from git's output,
-    /// so a user setting that changes that output must not change the answer.
+    /// so a user setting that changes that output must not change the answer,
+    /// and a text converter the branch could have changed must never run.
     #[test]
     fn the_lines_a_comment_can_go_on_ignore_how_the_user_has_git_print_a_diff() {
         let root =
@@ -8949,6 +8983,7 @@ mod tests {
         let _cleanup = ReviewFixture { root: root.clone() };
         let origin = root.join("origin.git");
         let work = root.join("work");
+        let marker = root.join("textconv-ran");
         std::fs::create_dir_all(&origin).unwrap();
         std::fs::create_dir_all(&work).unwrap();
         test_git(&origin, &["init", "--bare", "-b", "main"]);
@@ -8958,7 +8993,18 @@ mod tests {
         test_git(&work, &["config", "commit.gpgsign", "false"]);
         test_git(&work, &["config", "diff.noprefix", "true"]);
         test_git(&work, &["config", "diff.context", "0"]);
+        test_git(&work, &["config", "diff.interHunkContext", "10"]);
+        test_git(&work, &["config", "diff.algorithm", "patience"]);
         test_git(&work, &["config", "color.diff", "always"]);
+        test_git(
+            &work,
+            &[
+                "config",
+                "diff.conv.textconv",
+                &format!("touch {}; cat", marker.display()),
+            ],
+        );
+        std::fs::write(work.join(".git/info/attributes"), "*.txt diff=conv\n").unwrap();
         let lines: String = (1..=20).map(|n| format!("line {n}\n")).collect();
         std::fs::write(work.join("src.txt"), &lines).unwrap();
         test_git(&work, &["add", "."]);
@@ -8971,10 +9017,13 @@ mod tests {
         test_git(&work, &["checkout", "-b", "feature"]);
         std::fs::write(
             work.join("src.txt"),
-            lines.replace("line 10\n", "changed 10\n"),
+            lines
+                .replace("line 5\n", "changed 5\n")
+                .replace("line 15\n", "changed 15\n"),
         )
         .unwrap();
         std::fs::write(work.join("new.txt"), "a\nb\n").unwrap();
+        std::fs::write(work.join("with space.txt"), "a\n").unwrap();
         test_git(&work, &["add", "."]);
         test_git(&work, &["commit", "-m", "change"]);
         let cfg = crate::config::parse(
@@ -8985,10 +9034,15 @@ mod tests {
         assert_eq!(
             Hunks::from([
                 ("new.txt".to_string(), vec![(1, 2)]),
-                ("src.txt".to_string(), vec![(7, 13)]),
+                ("src.txt".to_string(), vec![(2, 8), (12, 18)]),
+                ("with space.txt".to_string(), vec![(1, 1)]),
             ]),
             repo.diff_hunks(&work, "main")
         );
+        assert!(!marker.exists(), "the text converter ran");
+        // The converter is real: a plain diff with the same settings runs it.
+        test_git(&work, &["diff", "origin/main...HEAD"]);
+        assert!(marker.exists(), "the fixture's converter never runs at all");
     }
 
     fn review_fixture(
@@ -11621,9 +11675,15 @@ rename to renamed.rs
 +++ b/renamed.rs
 @@ -5,0 +6,1 @@
 +inserted
-diff --git "a/sp	ace.rs" "b/sp	ace.rs"
---- "a/sp	ace.rs"
-+++ "b/sp	ace.rs"
+diff --git a/with space.rs b/with space.rs
+--- a/with space.rs	
++++ b/with space.rs	
+@@ -2 +2 @@
+-x
++y
+diff --git "a/sp\tace.rs" "b/sp\tace.rs"
+--- "a/sp\tace.rs"
++++ "b/sp\tace.rs"
 @@ -1 +1 @@
 -x
 +y
@@ -11633,9 +11693,21 @@ diff --git "a/sp	ace.rs" "b/sp	ace.rs"
             Hunks::from([
                 ("renamed.rs".to_string(), vec![(6, 6)]),
                 ("src/a.rs".to_string(), vec![(1, 4), (21, 22)]),
+                ("with space.rs".to_string(), vec![(2, 2)]),
             ]),
             hunks
         );
+    }
+
+    #[test]
+    fn only_a_refusal_is_final_enough_to_send_a_review_again() {
+        let error = |text: &str| crate::error::SparError::new(text);
+        assert!(refused(&error(
+            "command failed (1): gh api\ngh: Validation Failed (HTTP 422)"
+        )));
+        assert!(!refused(&error("gh: Bad Gateway (HTTP 502)")));
+        assert!(!refused(&error("gh: HTTP 504: Gateway Timeout")));
+        assert!(!refused(&error("command timed out after 300s")));
     }
 
     #[test]

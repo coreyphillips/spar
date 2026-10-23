@@ -6342,7 +6342,8 @@ fn a_branch_with_no_commits_of_its_own_lists_nothing() {
 /// all empty, and a submitted review or comment is accepted and logged. A
 /// review sent as JSON on stdin, the shape that carries line comments, is
 /// saved to `$SPAR_FAKE_GH_STDIN`, and refused as GitHub refuses a line outside
-/// the diff when `SPAR_FAKE_INLINE_FAILS=1`.
+/// the diff when `SPAR_FAKE_INLINE_FAILS=1`, or lost to a gateway error when it
+/// is `502`.
 fn review_gh(number: i64, head: &str, author: &str) -> String {
     format!(
         r#"set -eu
@@ -6364,6 +6365,9 @@ case "$1 $2" in
         cat > "${{SPAR_FAKE_GH_STDIN:-/dev/null}}"
         if [ "${{SPAR_FAKE_INLINE_FAILS:-}}" = 1 ]; then
           printf 'gh: Validation Failed (HTTP 422)\n' >&2; exit 1
+        fi
+        if [ "${{SPAR_FAKE_INLINE_FAILS:-}}" = 502 ]; then
+          printf 'gh: Bad Gateway (HTTP 502)\n' >&2; exit 1
         fi ;;
     esac ;;
   "pr comment") : ;;
@@ -6765,6 +6769,40 @@ fn a_review_whose_line_comments_are_refused_goes_up_with_its_body_alone() {
         "{out}"
     );
     assert!(read_record(&fx, 5).posted);
+}
+
+/// Only a refusal is final. A gateway error can arrive while GitHub is still
+/// saving a review that will land, so sending it again could post it twice: it
+/// is reported as a failed write, as a review without line comments would be.
+#[test]
+#[cfg(unix)]
+fn a_review_with_line_comments_lost_to_a_gateway_error_is_not_sent_again() {
+    let (fx, head) = inline_fixture("reviewinlinegateway", None);
+    let sent = fx.dir.join("review.json");
+
+    let (ok, out, log) = review_run_with(
+        &fx,
+        &["5", "--verdict"],
+        ONE_BLOCKER_REVIEW,
+        ONE_BLOCKER_REVIEW,
+        &review_gh(5, &head, "someone-else"),
+        &[
+            ("SPAR_FAKE_GH_STDIN", sent.to_str().unwrap()),
+            ("SPAR_FAKE_INLINE_FAILS", "502"),
+        ],
+        "",
+    );
+
+    assert!(!ok, "a failed write is a failed run:\n{out}");
+    assert_eq!(1, log.matches(INLINE_POST).count(), "{log}");
+    assert!(!submitted_a_review(&log), "sent again:\n{log}");
+    assert!(!out.contains("did not go up"), "{out}");
+    assert!(out.contains("could not post the review"), "{out}");
+    assert!(
+        out.contains("writes: 1 attempted, 0 succeeded, 1 failed"),
+        "{out}"
+    );
+    assert!(!read_record(&fx, 5).posted);
 }
 
 /// `inline_comments = false` keeps every finding in the summary alone.

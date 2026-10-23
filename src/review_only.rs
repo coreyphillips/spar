@@ -40,9 +40,9 @@ use crate::config::{Call, Config, PrComments};
 use crate::error::{ErrorKind, Result};
 use crate::jsonx::exact_finding_key as finding_key;
 use crate::model::{
-    AdjudicationDoc, Finding, IssueRun, Judged, LiveHead, PrView, RecheckDoc, RecheckRuling,
-    RecordedFinding, Review, ReviewRecord, ReviewVerdict, Ruling, Severity, Standing, Status,
-    REVIEW_RECORD_VERSION,
+    Adjudication, AdjudicationDoc, Finding, IssueRun, Judged, LiveHead, PrView, RecheckDoc,
+    RecheckRuling, RecordedFinding, Review, ReviewRecord, ReviewVerdict, Ruling, Severity,
+    Standing, Status, REVIEW_RECORD_VERSION,
 };
 use crate::repo::{Repo, WorktreeCheckpoint};
 use crate::style::{self, Style};
@@ -413,7 +413,7 @@ fn cross_check(
     }
 
     // -- phase 3: whoever raised a rejected point defends it or drops it --
-    if budget >= 3 && judged.iter().any(|j| j.standing == Standing::Disputed) {
+    if budget >= 3 && judged.iter().any(rejected) {
         rebut(agents, cfg, repo, work_dir, checkpoint, judged, 3)?;
     }
 
@@ -453,6 +453,7 @@ fn corroborate(by_agent: &[(String, Vec<Finding>)]) -> Vec<Judged> {
                     standing: Standing::Unverified,
                     counterpoint: None,
                     defence: None,
+                    rated: None,
                 }),
             }
         }
@@ -617,20 +618,55 @@ fn adjudicate(
                     continue;
                 }
             };
-            target.counterpoint = Some(style::summary(&verdict.reasoning, &repo.style));
-            if verdict.agrees {
-                target.standing = Standing::Confirmed;
-                // A second reader who agrees it is real but calls it a nit is
-                // exactly the signal that stops a nitpick reaching a
-                // maintainer as a blocker.
-                target.finding.severity = target.finding.severity.graver(verdict.severity);
-            } else {
-                target.standing = Standing::Disputed;
-            }
+            rule_on(target, &verdict, &repo.style);
         }
     }
     repo.require_unchanged_worktree(work_dir, checkpoint, "read-only review worktree")?;
     Ok(())
+}
+
+/// What one reviewer's ruling makes of a finding only the other raised.
+///
+/// Agreeing a defect is real is not agreeing that it blocks. When only one of
+/// the two says it blocks, the finding is disputed rather than confirmed at
+/// either severity: a blocker one reviewer called a nit should not reach a
+/// maintainer with both names behind it, and a verdict should not request
+/// changes over it. A split short of blocking gates nothing, so it keeps the
+/// graver of the two, as corroboration does.
+fn rule_on(target: &mut Judged, verdict: &Adjudication, style: &Style) {
+    if !verdict.agrees {
+        target.standing = Standing::Disputed;
+        target.counterpoint = Some(style::summary(&verdict.reasoning, style));
+        return;
+    }
+    let raised = target.finding.severity;
+    let rated = verdict.severity;
+    target.rated = Some(rated);
+    let split =
+        target.finding.in_scope && (raised == Severity::Blocking) != (rated == Severity::Blocking);
+    if !split {
+        target.standing = Standing::Confirmed;
+        target.finding.severity = raised.graver(rated);
+        target.counterpoint = Some(style::summary(&verdict.reasoning, style));
+        return;
+    }
+    target.standing = Standing::Disputed;
+    target.finding.severity = Severity::Blocking;
+    let reason = verdict.reasoning.trim();
+    let objection = if reason.is_empty() {
+        format!("real, but {rated} rather than {raised}")
+    } else {
+        format!("real, but {rated} rather than {raised}: {reason}")
+    };
+    target.counterpoint = Some(style::summary(&objection, style));
+}
+
+/// Disputed because the other reviewer rejected it, which is what a rebuttal
+/// answers. A split over whether a real defect blocks is not sent back: the
+/// only way to concede there is to withdraw, and that would drop a defect both
+/// reviewers agree is real.
+fn rejected(j: &Judged) -> bool {
+    j.standing == Standing::Disputed && j.rated.is_none()
 }
 
 fn rebut(
@@ -645,7 +681,7 @@ fn rebut(
     let disputed: Vec<usize> = judged
         .iter()
         .enumerate()
-        .filter(|(_, j)| j.standing == Standing::Disputed)
+        .filter(|(_, j)| rejected(j))
         .map(|(i, _)| i)
         .collect();
     log!(
@@ -697,7 +733,7 @@ fn rebut(
         };
         for verdict in doc.verdicts {
             let found = matching_finding(judged, &verdict.title, &verdict.file, |j| {
-                j.raised_by == name && j.standing == Standing::Disputed
+                j.raised_by == name && rejected(j)
             });
             let target = match found {
                 Ok(index) => &mut judged[index],
@@ -2120,6 +2156,7 @@ mod tests {
             standing: Standing::Unverified,
             counterpoint: None,
             defence: None,
+            rated: None,
         }
     }
 
@@ -2200,6 +2237,7 @@ mod tests {
             standing: Standing::Disputed,
             counterpoint: Some("I read the code and it terminates".into()),
             defence: None,
+            rated: None,
         };
         let judged = vec![disputed("Retry loop never terminates")];
 
@@ -2235,6 +2273,7 @@ mod tests {
             standing: Standing::Unverified,
             counterpoint: None,
             defence: None,
+            rated: None,
         }];
         let two = verdict_comment_from(&judged, &Style::default(), 2);
         assert!(two.starts_with("Two independent reviews"), "{two}");
@@ -2372,7 +2411,7 @@ mod tests {
             .all(|finding| finding.standing == Standing::Unverified));
     }
 
-    /// Resolved upward on purpose. Nothing here gates a merge, so advice that
+    /// Resolved upward on purpose: both raised it on their own, and advice that
     /// under-reports a real defect is worse than advice that over-reports.
     #[test]
     fn disagreement_about_severity_keeps_the_graver_one() {
@@ -2403,6 +2442,117 @@ mod tests {
         );
         assert!(Severity::Blocking.rank() > Severity::NonBlocking.rank());
         assert!(Severity::NonBlocking.rank() > Severity::Nit.rank());
+    }
+
+    // -- the cross-check ---------------------------------------------------
+
+    fn ruling(agrees: bool, severity: Severity, reasoning: &str) -> Adjudication {
+        Adjudication {
+            title: "Retry loop never terminates".into(),
+            file: "src/net.rs".into(),
+            agrees,
+            severity,
+            reasoning: reasoning.into(),
+        }
+    }
+
+    fn ruled(raised: &str, verdict: Adjudication) -> Judged {
+        let mut j = unverified("Retry loop never terminates", "src/net.rs", "claude");
+        j.finding.severity = Severity::parse_lenient(raised).unwrap();
+        rule_on(&mut j, &verdict, &Style::default());
+        j
+    }
+
+    /// The confirmer was asked for its own severity and it used to count only
+    /// when it was graver, so a blocker it called a nit went out as a blocker
+    /// with both reviewers behind it, and a verdict requested changes over it.
+    #[test]
+    fn a_blocker_confirmed_as_a_nit_is_handed_to_a_person() {
+        let j = ruled(
+            "blocking",
+            ruling(true, Severity::Nit, "the caller's timeout bounds it"),
+        );
+        assert_eq!(Standing::Disputed, j.standing);
+        assert_eq!(Severity::Blocking, j.finding.severity);
+        assert!(
+            !rejected(&j),
+            "both say it is real, so there is nothing to withdraw"
+        );
+        assert_eq!(None, review_verdict(std::slice::from_ref(&j)));
+
+        let text = verdict_comment(&[j], &Style::default());
+        assert!(text.contains("the reviewers disagree, your call"), "{text}");
+        assert!(
+            text.contains(
+                "Objection: Real, but nit rather than blocking: the caller's timeout bounds it"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("needs changing before merge"), "{text}");
+    }
+
+    #[test]
+    fn a_nit_confirmed_as_a_blocker_is_handed_to_a_person() {
+        let j = ruled(
+            "nit",
+            ruling(
+                true,
+                Severity::Blocking,
+                "it spins forever on a refused connection",
+            ),
+        );
+        assert_eq!(Standing::Disputed, j.standing);
+        assert_eq!(Severity::Blocking, j.finding.severity);
+        assert!(!rejected(&j));
+        assert_eq!(None, review_verdict(std::slice::from_ref(&j)));
+        assert!(j
+            .counterpoint
+            .as_deref()
+            .is_some_and(|c| c.starts_with("real, but blocking rather than nit:")));
+    }
+
+    #[test]
+    fn a_blocker_confirmed_as_a_blocker_requests_changes() {
+        let j = ruled(
+            "blocking",
+            ruling(true, Severity::Blocking, "reproduced it"),
+        );
+        assert_eq!(Standing::Confirmed, j.standing);
+        assert_eq!(Severity::Blocking, j.finding.severity);
+        assert_eq!(Some("reproduced it"), j.counterpoint.as_deref());
+        assert_eq!(Some(ReviewVerdict::RequestChanges), review_verdict(&[j]));
+    }
+
+    /// Short of blocking nothing is gated, so the split resolves upward as it
+    /// does when both raise a point on their own. Out of scope is the same:
+    /// such a finding blocks nothing at any severity.
+    #[test]
+    fn a_split_that_gates_nothing_keeps_the_graver_severity() {
+        let j = ruled("nit", ruling(true, Severity::NonBlocking, "worth a fix"));
+        assert_eq!(Standing::Confirmed, j.standing);
+        assert_eq!(Severity::NonBlocking, j.finding.severity);
+
+        let j = ruled("non-blocking", ruling(true, Severity::Nit, "taste"));
+        assert_eq!(Standing::Confirmed, j.standing);
+        assert_eq!(Severity::NonBlocking, j.finding.severity);
+
+        let mut j = unverified("Retry loop never terminates", "src/net.rs", "claude");
+        j.finding.in_scope = false;
+        rule_on(
+            &mut j,
+            &ruling(true, Severity::Nit, "old code"),
+            &Style::default(),
+        );
+        assert_eq!(Standing::Confirmed, j.standing);
+    }
+
+    /// A rejection is still sent back to whoever raised it.
+    #[test]
+    fn a_rejected_finding_goes_to_the_rebuttal() {
+        let j = ruled("blocking", ruling(false, Severity::Nit, "it terminates"));
+        assert_eq!(Standing::Disputed, j.standing);
+        assert!(rejected(&j));
+        assert_eq!(Some("it terminates"), j.counterpoint.as_deref());
     }
 
     #[test]
@@ -2436,6 +2586,7 @@ mod tests {
             standing,
             counterpoint: None,
             defence: None,
+            rated: None,
         }
     }
 
@@ -2628,6 +2779,7 @@ mod recheck_tests {
             standing,
             counterpoint: (standing == Standing::Disputed).then(|| "not so".to_string()),
             defence: None,
+            rated: None,
         }
     }
 

@@ -695,6 +695,7 @@ pub struct StyleCfg {
     pub max_issue_body_chars: usize,
     pub max_title_chars: usize,
     pub pr_comments: PrComments,
+    pub inline_comments: bool,
 }
 
 impl Default for StyleCfg {
@@ -719,6 +720,7 @@ impl Default for StyleCfg {
             max_issue_body_chars: style.max_issue_body_chars,
             max_title_chars: style.max_title_chars,
             pr_comments: style.pr_comments,
+            inline_comments: style.inline_comments,
         }
     }
 }
@@ -735,6 +737,7 @@ impl StyleCfg {
             max_issue_body_chars: self.max_issue_body_chars,
             max_title_chars: self.max_title_chars,
             pr_comments: self.pr_comments,
+            inline_comments: self.inline_comments,
         }
     }
 }

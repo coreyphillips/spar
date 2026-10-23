@@ -40,11 +40,11 @@ use crate::config::{Call, Config, PrComments};
 use crate::error::{ErrorKind, Result};
 use crate::jsonx::exact_finding_key as finding_key;
 use crate::model::{
-    Adjudication, AdjudicationDoc, Finding, IssueRun, Judged, LiveHead, PrView, RecheckDoc,
-    RecheckRuling, RecordedFinding, Review, ReviewRecord, ReviewVerdict, Ruling, Severity,
-    Standing, Status, REVIEW_RECORD_VERSION,
+    Adjudication, AdjudicationDoc, Finding, InlineComment, IssueRun, Judged, LiveHead, PrView,
+    RecheckDoc, RecheckRuling, RecordedFinding, Review, ReviewRecord, ReviewVerdict, Ruling,
+    Severity, Standing, Status, REVIEW_RECORD_VERSION,
 };
-use crate::repo::{Repo, WorktreeCheckpoint};
+use crate::repo::{Hunks, Repo, WorktreeCheckpoint};
 use crate::style::{self, Style};
 use crate::{bail, log, logdim, logwarn, schema, spar_err};
 
@@ -299,7 +299,8 @@ fn run_phases(
         by_agent.len(),
         state,
     )?;
-    finish(repo, pr, state, &judged, by_agent.len(), reviewed)
+    let inline = inline_for(repo, work_dir, base, &judged);
+    finish(repo, pr, state, &judged, &inline, by_agent.len(), reviewed)
 }
 
 fn names_of(agents: &[Agent]) -> String {
@@ -764,6 +765,7 @@ fn finish(
     pr: &PrView,
     state: &mut IssueRun,
     judged: &[Judged],
+    inline: &[InlineComment],
     reviewers: usize,
     reviewed: Reviewed<'_>,
 ) -> Result<()> {
@@ -814,17 +816,21 @@ fn finish(
     let silent = dry_run || repo.style.pr_comments == PrComments::None;
     if silent {
         println!("\n{comment}\n");
+        say_unposted_lines(pr.number, inline);
         save_unposted(repo, pr.number, &comment, held_because(dry_run));
         record(state, false);
         return Ok(());
     }
+    // A line comment can only travel on a review, so findings that have a line
+    // make one even without --verdict. With no verdict it is a plain comment
+    // review, which approves nothing and asks for nothing.
     let posted = match repo.record_failed_write(moved_since(repo, pr, reviewed.head)) {
         Ok(Some(now)) => {
             hold_back(repo, state, pr.number, &comment, reviewed.head, &now);
             return Ok(());
         }
-        Ok(None) if reviewed.opts.verdict => {
-            repo.submit_review(pr.number, verdict, &comment, reviewed.head)
+        Ok(None) if reviewed.opts.verdict || !inline.is_empty() => {
+            repo.submit_review(pr.number, verdict, &comment, reviewed.head, inline)
         }
         Ok(None) => repo.comment_pr(pr.number, &comment),
         Err(e) => Err(e),
@@ -966,6 +972,125 @@ fn save_unposted(repo: &Repo, number: i64, text: &str, why: &str) {
         ),
         Err(e) => logdim!("{why}, nothing posted, and could not save it: {e}"),
     }
+}
+
+/// Say how many findings a review that was not posted would have put on their
+/// lines. The saved text is the summary alone, which `spar post` posts as a
+/// comment, so this is the only place they show.
+fn say_unposted_lines(number: i64, inline: &[InlineComment]) {
+    let n = inline.len();
+    if n > 0 {
+        log!(
+            "PR #{number}: {n} finding{} would also go on {} line{} in the diff",
+            plural(n),
+            if n == 1 { "its" } else { "their" },
+            plural(n)
+        );
+    }
+}
+
+/// The line comments a review carries, or none when `inline_comments` is off.
+fn inline_for(repo: &Repo, work_dir: &Path, base: &str, judged: &[Judged]) -> Vec<InlineComment> {
+    if !repo.style.inline_comments {
+        return Vec::new();
+    }
+    inline_comments(
+        judged,
+        &repo.diff_hunks(work_dir, base),
+        work_dir,
+        &repo.style,
+    )
+}
+
+/// Each finding the summary shows, on the line it is about when the pull
+/// request's diff shows that line.
+///
+/// Only those lines: GitHub refuses the whole review over a comment on one its
+/// diff does not show. A finding with no line, or a line outside the diff, is
+/// in the summary alone, as every finding was before.
+fn inline_comments(
+    judged: &[Judged],
+    hunks: &Hunks,
+    work_dir: &Path,
+    style: &Style,
+) -> Vec<InlineComment> {
+    judged
+        .iter()
+        .filter(|j| (j.standing.counts() && j.finding.in_scope) || j.standing == Standing::Disputed)
+        .filter_map(|j| {
+            let (path, start, end) = crate::jsonx::finding_location(&j.finding.file)?;
+            let path = repo_relative(&path, work_dir);
+            let (start_line, line) = anchor(hunks.get(&path)?, start, end)?;
+            Some(InlineComment {
+                path,
+                line,
+                start_line,
+                body: inline_body(j, style),
+            })
+        })
+        .collect()
+}
+
+/// A path as the diff names it. Agents work in the review worktree, so one
+/// that answers with an absolute path means a path inside it.
+fn repo_relative(path: &str, work_dir: &Path) -> String {
+    let root = work_dir.to_string_lossy();
+    let path = path
+        .strip_prefix(root.as_ref())
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(path);
+    path.trim_start_matches("./").to_string()
+}
+
+/// Where a finding's lines go: the whole range when one hunk shows all of it,
+/// otherwise whichever end a hunk shows, the first by preference. None when
+/// the diff shows neither.
+fn anchor(hunks: &[(u32, u32)], start: u32, end: u32) -> Option<(Option<u32>, u32)> {
+    let hunk_of = |line: u32| {
+        hunks
+            .iter()
+            .position(|&(first, last)| first <= line && line <= last)
+    };
+    match (hunk_of(start), hunk_of(end)) {
+        (Some(a), Some(b)) if a == b && end > start => Some((Some(start), end)),
+        (Some(_), _) => Some((None, start)),
+        (None, Some(_)) => Some((None, end)),
+        (None, None) => None,
+    }
+}
+
+/// A finding as its line comment says it: what kind of point it is, its title
+/// and how well attested, then the detail, and for a point the two dispute,
+/// both sides of the argument.
+fn inline_body(j: &Judged, style: &Style) -> String {
+    let disputed = j.standing == Standing::Disputed;
+    let kind = match j.finding.severity {
+        _ if disputed => "the reviewers disagree, your call",
+        Severity::Blocking => "needs changing before merge",
+        Severity::NonBlocking => "worth doing, does not block",
+        Severity::Nit => "nit",
+    };
+    let mut out = format!(
+        "{kind}: {}{}",
+        style::title(&j.finding.title, style),
+        attestation(j.standing)
+    );
+    let detail = style::detail(&j.finding.detail, style);
+    if !detail.is_empty() {
+        out.push_str(&format!("\n\n{detail}"));
+    }
+    if disputed {
+        if let Some(objection) = &j.counterpoint {
+            out.push_str(&format!(
+                "\n\nObjection: {}",
+                style::sentence(objection, style)
+            ));
+        }
+        if let Some(defence) = &j.defence {
+            out.push_str(&format!("\n\nAnswer: {}", style::sentence(defence, style)));
+        }
+    }
+    out
 }
 
 /// The verdict a first look earns, derived from the findings and never asked
@@ -1633,9 +1758,13 @@ fn recheck_phases(
     }
 
     let body = recheck_comment(look.delta, &rechecked, &judged, &repo.style, by_agent.len());
+    // The new points only. An earlier one already has its place, the first
+    // look's line comment or the summary, and this review says where it stands.
+    let inline = inline_for(repo, look.work_dir, look.base, &judged);
     let silent = look.mode.dry_run || repo.style.pr_comments == PrComments::None;
     if silent {
         println!("\n{body}\n");
+        say_unposted_lines(pr.number, &inline);
         save_unposted(repo, pr.number, &body, held_because(look.mode.dry_run));
         return Ok(());
     }
@@ -1644,7 +1773,7 @@ fn recheck_phases(
             hold_back(repo, state, pr.number, &body, look.head, &now);
             return Ok(());
         }
-        Ok(None) => repo.submit_review(pr.number, verdict, &body, look.head),
+        Ok(None) => repo.submit_review(pr.number, verdict, &body, look.head, &inline),
         Err(e) => Err(e),
     };
     match posted {
@@ -2727,6 +2856,188 @@ mod tests {
         let text = verdict_comment(&[j], &Style::default());
         assert!(!text.contains("needs changing before merge"), "{text}");
         assert!(text.contains("nothing blocking a merge"), "{text}");
+    }
+
+    // -- findings on their lines ------------------------------------------
+
+    fn at(standing: Standing, severity: &str, title: &str, file: &str) -> Judged {
+        let mut j = judged(standing, severity, title);
+        j.finding.file = file.into();
+        j
+    }
+
+    fn hunks() -> Hunks {
+        Hunks::from([
+            ("src/net.rs".to_string(), vec![(80, 100), (200, 210)]),
+            ("src/new.rs".to_string(), vec![(1, 40)]),
+        ])
+    }
+
+    fn placed(judged: &[Judged]) -> Vec<(String, Option<u32>, u32)> {
+        inline_comments(judged, &hunks(), Path::new("/work/pr-7"), &Style::default())
+            .into_iter()
+            .map(|c| (c.path, c.start_line, c.line))
+            .collect()
+    }
+
+    #[test]
+    fn a_finding_on_a_line_the_diff_shows_goes_on_that_line() {
+        let got = placed(&[
+            at(
+                Standing::Corroborated,
+                "blocking",
+                "Loop never ends",
+                "src/net.rs:88",
+            ),
+            at(Standing::Confirmed, "nit", "Name it", "src/new.rs:3"),
+        ]);
+        assert_eq!(
+            vec![
+                ("src/net.rs".to_string(), None, 88),
+                ("src/new.rs".to_string(), None, 3),
+            ],
+            got
+        );
+    }
+
+    #[test]
+    fn a_range_one_hunk_holds_is_a_range_and_one_it_does_not_is_the_end_shown() {
+        let got = placed(&[
+            at(
+                Standing::Corroborated,
+                "blocking",
+                "Whole range",
+                "src/net.rs:88-94",
+            ),
+            at(
+                Standing::Corroborated,
+                "blocking",
+                "Across hunks",
+                "src/net.rs:95-205",
+            ),
+            at(
+                Standing::Corroborated,
+                "blocking",
+                "Ends inside",
+                "src/net.rs:70-85",
+            ),
+        ]);
+        assert_eq!(
+            vec![
+                ("src/net.rs".to_string(), Some(88), 94),
+                ("src/net.rs".to_string(), None, 95),
+                ("src/net.rs".to_string(), None, 85),
+            ],
+            got
+        );
+    }
+
+    #[test]
+    fn a_finding_the_diff_does_not_show_stays_in_the_summary_alone() {
+        let got = placed(&[
+            at(
+                Standing::Corroborated,
+                "blocking",
+                "Outside the hunk",
+                "src/net.rs:150",
+            ),
+            at(
+                Standing::Corroborated,
+                "blocking",
+                "Untouched file",
+                "src/old.rs:3",
+            ),
+            at(Standing::Corroborated, "blocking", "No line", "src/net.rs"),
+            at(Standing::Corroborated, "blocking", "General", ""),
+        ]);
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn only_what_the_summary_shows_goes_on_a_line() {
+        let mut out_of_scope = at(
+            Standing::Corroborated,
+            "blocking",
+            "Not ours",
+            "src/net.rs:88",
+        );
+        out_of_scope.finding.in_scope = false;
+        let got = placed(&[
+            out_of_scope,
+            at(
+                Standing::Withdrawn,
+                "blocking",
+                "Taken back",
+                "src/net.rs:89",
+            ),
+            at(
+                Standing::Disputed,
+                "blocking",
+                "Argued over",
+                "src/net.rs:90",
+            ),
+        ]);
+        assert_eq!(vec![("src/net.rs".to_string(), None, 90)], got);
+    }
+
+    #[test]
+    fn an_absolute_or_dotted_path_is_read_as_the_diff_names_it() {
+        let got = placed(&[
+            at(
+                Standing::Corroborated,
+                "blocking",
+                "Absolute",
+                "/work/pr-7/src/net.rs:88",
+            ),
+            at(
+                Standing::Corroborated,
+                "blocking",
+                "Dotted",
+                "./src/new.rs:2",
+            ),
+        ]);
+        assert_eq!(
+            vec![
+                ("src/net.rs".to_string(), None, 88),
+                ("src/new.rs".to_string(), None, 2),
+            ],
+            got
+        );
+    }
+
+    #[test]
+    fn a_line_comment_says_what_kind_of_point_it_is_and_both_sides_of_a_dispute() {
+        let blocker = at(
+            Standing::Corroborated,
+            "blocking",
+            "Loop never ends",
+            "src/net.rs:88",
+        );
+        let body = inline_body(&blocker, &Style::default());
+        assert!(
+            body.starts_with("needs changing before merge: Loop never ends [both]"),
+            "{body}"
+        );
+        assert!(body.contains("why it matters"), "{body}");
+
+        let mut disputed = at(
+            Standing::Disputed,
+            "blocking",
+            "Swallows an error",
+            "src/net.rs:90",
+        );
+        disputed.counterpoint = Some("the caller validates first".into());
+        disputed.defence = Some("the validation runs after".into());
+        let body = inline_body(&disputed, &Style::default());
+        assert!(
+            body.starts_with("the reviewers disagree, your call: Swallows an error"),
+            "{body}"
+        );
+        assert!(
+            body.contains("Objection: The caller validates first"),
+            "{body}"
+        );
+        assert!(body.contains("Answer: The validation runs after"), "{body}");
     }
 }
 

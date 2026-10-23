@@ -6339,7 +6339,10 @@ fn a_branch_with_no_commits_of_its_own_lists_nothing() {
 
 /// A fake `gh` for a review of pull request `number` whose head GitHub reports
 /// as `head` and whose author is `author`. Reviews, comments and threads are
-/// all empty, and a submitted review or comment is accepted and logged.
+/// all empty, and a submitted review or comment is accepted and logged. A
+/// review sent as JSON on stdin, the shape that carries line comments, is
+/// saved to `$SPAR_FAKE_GH_STDIN`, and refused as GitHub refuses a line outside
+/// the diff when `SPAR_FAKE_INLINE_FAILS=1`.
 fn review_gh(number: i64, head: &str, author: &str) -> String {
     format!(
         r#"set -eu
@@ -6355,7 +6358,14 @@ case "$1 $2" in
   "api --paginate") printf '%s\n' '[]' ;;
   "api graphql") printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[]}}}}}}}}}}' ;;
   "api repos/{{owner}}/{{repo}}/issues/{number}") printf 'pr\n' ;;
-  "api -X") : ;;
+  "api -X")
+    case "$*" in
+      *"--input -"*)
+        cat > "${{SPAR_FAKE_GH_STDIN:-/dev/null}}"
+        if [ "${{SPAR_FAKE_INLINE_FAILS:-}}" = 1 ]; then
+          printf 'gh: Validation Failed (HTTP 422)\n' >&2; exit 1
+        fi ;;
+    esac ;;
   "pr comment") : ;;
   *) printf 'unexpected gh call: %s\n' "$*" >&2; exit 64 ;;
 esac"#
@@ -6404,20 +6414,36 @@ fn write_record(fx: &Fixture, number: i64, record: &serde_json::Value) {
 /// `spar review --verdict` with the fake pair, from the work tree. Returns
 /// success, stdout, and the gh log.
 fn review_run(fx: &Fixture, args: &[&str], a: &str, b: &str, gh: &str) -> (bool, String, String) {
+    review_run_with(fx, args, a, b, gh, &[], "")
+}
+
+/// `review_run`, with more environment for the fakes and more config after the
+/// agents.
+fn review_run_with(
+    fx: &Fixture,
+    args: &[&str],
+    a: &str,
+    b: &str,
+    gh: &str,
+    env: &[(&str, &str)],
+    more_config: &str,
+) -> (bool, String, String) {
     let (config, path) = brainstorm_commands(fx, a, b, gh);
+    if !more_config.is_empty() {
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("{text}\n{more_config}")).unwrap();
+    }
     let log = fx.dir.join("gh.log");
     let mut argv = vec!["review"];
     argv.extend_from_slice(args);
     argv.extend_from_slice(&["--config", config.to_str().unwrap(), "--repo"]);
     argv.push(fx.work.to_str().unwrap());
-    let (ok, stdout, stderr) = spar_with_env(
-        &argv,
-        &fx.dir,
-        &[
-            ("PATH", path.as_str()),
-            ("SPAR_FAKE_GH_LOG", log.to_str().unwrap()),
-        ],
-    );
+    let mut vars = vec![
+        ("PATH", path.as_str()),
+        ("SPAR_FAKE_GH_LOG", log.to_str().unwrap()),
+    ];
+    vars.extend_from_slice(env);
+    let (ok, stdout, stderr) = spar_with_env(&argv, &fx.dir, &vars);
     let log = std::fs::read_to_string(&log).unwrap_or_default();
     (ok, format!("{stdout}\n{stderr}"), log)
 }
@@ -6554,6 +6580,240 @@ fn a_plain_review_still_comments_and_now_leaves_a_record() {
     let record = read_record(&fx, 5);
     assert!(record.posted);
     assert_eq!(None, record.verdict);
+}
+
+/// Pull request 5, on a branch that adds `src/net.rs`, a hundred lines, to
+/// main. With `changed`, main has the file already and the branch changes only
+/// that line of it. Returns the fixture and the pull request's head.
+fn inline_fixture(tag: &str, changed: Option<usize>) -> (Fixture, String) {
+    let fx = repo(tag);
+    let net = |edit: Option<usize>| -> String {
+        (1..=100)
+            .map(|n| {
+                if Some(n) == edit {
+                    format!("changed {n}\n")
+                } else {
+                    format!("line {n}\n")
+                }
+            })
+            .collect()
+    };
+    std::fs::create_dir_all(fx.work.join("src")).unwrap();
+    if let Some(line) = changed {
+        commit(&fx.work, "src/net.rs", &net(None), "net");
+        git(&fx.work, &["push", "-q", "origin", "main"]);
+        git(&fx.work, &["checkout", "-q", "-b", "feature-5"]);
+        commit(&fx.work, "src/net.rs", &net(Some(line)), "change a line");
+    } else {
+        git(&fx.work, &["checkout", "-q", "-b", "feature-5"]);
+        commit(&fx.work, "src/net.rs", &net(None), "net");
+    }
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/5/head"]);
+    let head = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    (fx, head)
+}
+
+const INLINE_POST: &str = "api -X POST repos/{owner}/{repo}/pulls/5/reviews --input - --silent";
+
+fn sent_review(path: &Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("no review was sent on stdin to {}: {e}", path.display()));
+    serde_json::from_str(&text).expect("the review sent is JSON")
+}
+
+/// A finding on a line the diff shows goes on that line, in the same review as
+/// the summary, and the summary still says everything it did before.
+#[test]
+#[cfg(unix)]
+fn a_finding_on_a_line_the_diff_shows_goes_on_that_line() {
+    let (fx, head) = inline_fixture("reviewinline", None);
+    let sent = fx.dir.join("review.json");
+
+    let (ok, out, log) = review_run_with(
+        &fx,
+        &["5", "--verdict"],
+        ONE_BLOCKER_REVIEW,
+        ONE_BLOCKER_REVIEW,
+        &review_gh(5, &head, "someone-else"),
+        &[("SPAR_FAKE_GH_STDIN", sent.to_str().unwrap())],
+        "",
+    );
+
+    assert!(ok, "{out}");
+    assert!(log.contains(INLINE_POST), "{log}");
+    assert!(!submitted_a_review(&log), "one review, not two:\n{log}");
+    let review = sent_review(&sent);
+    assert_eq!(head, review["commit_id"]);
+    assert_eq!("REQUEST_CHANGES", review["event"]);
+    let body = review["body"].as_str().unwrap();
+    assert!(body.starts_with("Two independent reviews."), "{body}");
+    assert!(
+        body.contains("- Retry loop never terminates (src/net.rs:88) [both]."),
+        "{body}"
+    );
+    let comments = review["comments"].as_array().unwrap();
+    assert_eq!(1, comments.len(), "{review}");
+    assert_eq!("src/net.rs", comments[0]["path"]);
+    assert_eq!(88, comments[0]["line"]);
+    assert_eq!("RIGHT", comments[0]["side"]);
+    assert!(comments[0].get("start_line").is_none(), "{review}");
+    let said = comments[0]["body"].as_str().unwrap();
+    assert!(
+        said.starts_with("needs changing before merge: Retry loop never terminates [both]"),
+        "{said}"
+    );
+    assert!(
+        said.contains("the guard compares against Some(0)"),
+        "{said}"
+    );
+    assert!(said.contains("<!-- spar:comment -->"), "{said}");
+    let record = read_record(&fx, 5);
+    assert!(record.posted);
+    assert_eq!(head, record.head);
+}
+
+/// A line comment can only travel on a review, so without --verdict a finding
+/// with a line makes a plain comment review rather than a top level comment.
+#[test]
+#[cfg(unix)]
+fn without_a_verdict_a_finding_with_a_line_makes_a_comment_review() {
+    let (fx, head) = inline_fixture("reviewinlineplain", None);
+    let sent = fx.dir.join("review.json");
+
+    let (ok, out, log) = review_run_with(
+        &fx,
+        &["5"],
+        ONE_BLOCKER_REVIEW,
+        ONE_BLOCKER_REVIEW,
+        &review_gh(5, &head, "someone-else"),
+        &[("SPAR_FAKE_GH_STDIN", sent.to_str().unwrap())],
+        "",
+    );
+
+    assert!(ok, "{out}");
+    assert!(log.contains(INLINE_POST), "{log}");
+    assert!(!log.contains("pr comment"), "{log}");
+    let review = sent_review(&sent);
+    assert_eq!("COMMENT", review["event"]);
+    assert_eq!(1, review["comments"].as_array().unwrap().len(), "{review}");
+    let record = read_record(&fx, 5);
+    assert!(record.posted);
+    assert_eq!(None, record.verdict);
+}
+
+/// A finding on a line the diff does not show stays in the summary, and the
+/// review goes up exactly as it did before line comments existed.
+#[test]
+#[cfg(unix)]
+fn a_finding_the_diff_does_not_show_leaves_the_review_as_it_was() {
+    let (fx, head) = inline_fixture("reviewinlineoutside", Some(5));
+
+    let (ok, out, log) = review_run(
+        &fx,
+        &["5", "--verdict"],
+        ONE_BLOCKER_REVIEW,
+        ONE_BLOCKER_REVIEW,
+        &review_gh(5, &head, "someone-else"),
+    );
+
+    assert!(ok, "{out}");
+    assert!(
+        log.contains(&format!(
+            "{}Two independent reviews.",
+            review_post(5, &head, "REQUEST_CHANGES")
+        )),
+        "{log}"
+    );
+    assert!(!log.contains("--input"), "{log}");
+}
+
+/// GitHub refuses a whole review over one line it will not take. The review
+/// then goes up with its body alone, which already says everything, and that
+/// is one write that succeeded, not a failure and a success.
+#[test]
+#[cfg(unix)]
+fn a_review_whose_line_comments_are_refused_goes_up_with_its_body_alone() {
+    let (fx, head) = inline_fixture("reviewinlinerefused", None);
+    let sent = fx.dir.join("review.json");
+
+    let (ok, out, log) = review_run_with(
+        &fx,
+        &["5", "--verdict"],
+        ONE_BLOCKER_REVIEW,
+        ONE_BLOCKER_REVIEW,
+        &review_gh(5, &head, "someone-else"),
+        &[
+            ("SPAR_FAKE_GH_STDIN", sent.to_str().unwrap()),
+            ("SPAR_FAKE_INLINE_FAILS", "1"),
+        ],
+        "",
+    );
+
+    assert!(ok, "{out}");
+    let inline_at = log.find(INLINE_POST).expect("the line comments were tried");
+    let plain_at = log
+        .find(&format!(
+            "{}Two independent reviews.",
+            review_post(5, &head, "REQUEST_CHANGES")
+        ))
+        .expect("the body went up alone");
+    assert!(inline_at < plain_at, "{log}");
+    assert!(out.contains("did not go up"), "{out}");
+    assert!(out.contains("Validation Failed"), "{out}");
+    assert!(
+        out.contains("writes: 1 attempted, 1 succeeded, 0 failed"),
+        "{out}"
+    );
+    assert!(read_record(&fx, 5).posted);
+}
+
+/// `inline_comments = false` keeps every finding in the summary alone.
+#[test]
+#[cfg(unix)]
+fn with_inline_comments_off_every_finding_stays_in_the_summary() {
+    let (fx, head) = inline_fixture("reviewinlineoff", None);
+
+    let (ok, out, log) = review_run_with(
+        &fx,
+        &["5"],
+        ONE_BLOCKER_REVIEW,
+        ONE_BLOCKER_REVIEW,
+        &review_gh(5, &head, "someone-else"),
+        &[],
+        "[style]\ninline_comments = false\n",
+    );
+
+    assert!(ok, "{out}");
+    assert!(
+        log.contains("pr comment 5 --body Two independent reviews."),
+        "{log}"
+    );
+    assert!(!log.contains("--input"), "{log}");
+    assert!(!submitted_a_review(&log), "{log}");
+}
+
+/// A dry run posts nothing, line comments included, and says how many
+/// findings would have gone on their lines, since the saved summary cannot.
+#[test]
+#[cfg(unix)]
+fn a_dry_run_says_how_many_findings_would_go_on_their_lines() {
+    let (fx, head) = inline_fixture("reviewinlinedry", None);
+
+    let (ok, out, log) = review_run(
+        &fx,
+        &["5", "--dry-run"],
+        ONE_BLOCKER_REVIEW,
+        ONE_BLOCKER_REVIEW,
+        &review_gh(5, &head, "someone-else"),
+    );
+
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("1 finding would also go on its line in the diff"),
+        "{out}"
+    );
+    assert!(!log.contains("--input"), "{log}");
+    assert!(!log.contains("pr comment"), "{log}");
 }
 
 const RECHECK_FIXED: &str = r#"{"summary":"holds","rulings":[{"index":1,"outcome":"fixed","reasoning":"line 2 of file.txt now checks the bound"}],"findings":[]}"#;

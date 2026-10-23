@@ -96,7 +96,7 @@ pub fn review() -> Value {
                         },
                         "file": {
                             "type": "string",
-                            "description": "Path, with a line number if you have one. Empty string if the finding is general."
+                            "description": "Path from the repository root, then :line or :first-last for the line in the branch's version of the file when you have one, as src/net.rs:88. Empty string if the finding is general."
                         },
                         "problem": {
                             "type": ["string", "null"],

@@ -2084,6 +2084,7 @@ const STYLE_OPTIONS: &[Setting] = &[
     (false, "ban_ai_attribution", "Strip mentions of the tooling, and Co-Authored-By trailers, from everything spar posts."),
     (false, "terse", "Hold model prose to a length budget. false removes the valves entirely."),
     (true, "pr_comments", "How much of its own working spar narrates into a pull request thread. outcome is one comment at the end, rounds is an audit trail, none never comments at all."),
+    (true, "inline_comments", "Put each finding of `spar review` on the line it is about as well as in the summary, when the pull request's diff shows that line. The summary is unchanged either way. false keeps every finding in the summary alone."),
     (true, "max_title_chars", "A finding, issue, or pull request title. Never ellipsised: a title ending in three dots reads as broken."),
     (true, "max_summary_chars", "A one line verdict, or a refutation's argument."),
     (true, "max_detail_chars", "A blocking finding's explanation, as it appears in the pull request thread."),

@@ -610,7 +610,8 @@ pub struct LoopCfg {
     ///
     /// One setting, because both are the same question: whether what somebody
     /// typed can become a commit. The person who filed an issue is read under
-    /// it whatever this says, since they wrote the body.
+    /// it whatever this says, since they wrote the body. The authenticated
+    /// GitHub user is also read under an issue regardless of write access.
     pub checkin_trust: Trust,
     /// Mark a review thread resolved when spar made the change it asked for.
     ///

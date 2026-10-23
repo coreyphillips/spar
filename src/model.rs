@@ -1421,6 +1421,9 @@ pub struct IssueComment {
     pub author: Option<Author>,
     #[serde(default)]
     pub author_association: String,
+    /// Whether the authenticated GitHub user wrote this comment.
+    #[serde(default)]
+    pub viewer_did_author: bool,
     #[serde(default)]
     pub body: String,
     #[serde(default)]

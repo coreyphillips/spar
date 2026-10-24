@@ -5748,6 +5748,7 @@ fn every_config_option_is_documented_in_the_example() {
     expected.extend(keys_of(&spar::config::LoopCfg::default()));
     expected.extend(keys_of(&spar::config::StyleCfg::default()));
     expected.extend(keys_of(&spar::config::EffortSchedule {
+        code: Some("high".into()),
         round_1: Some("high".into()),
         rest: Some("low".into()),
         triage: Some("low".into()),
@@ -8577,4 +8578,315 @@ fn listen_stops_a_running_agent_on_ctrl_c_and_exits_130() {
         .success();
     assert!(gone, "the agent (pid {agent_pid}) kept running:\n{err}");
     assert!(!l.lock_exists(), "the lock was left behind:\n{err}");
+}
+
+// ---------------------------------------------------------------------------
+// Starting from a project prompt
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+struct CodeFixture {
+    fx: Fixture,
+    config: PathBuf,
+    path: String,
+}
+
+#[cfg(unix)]
+impl CodeFixture {
+    fn new() -> Self {
+        let fx = repo("code");
+        let (config, path) = fake_commands(
+            &fx,
+            "{}",
+            r#"
+set -eu
+printf '%s\n' "$*" >> "$SPAR_CODE_DIR/gh.log"
+case "$1 $2" in
+  "issue create")
+    if [ "${SPAR_CODE_MODE:-}" = create-failure ]; then exit 1; fi
+    printf '%s\n' 'https://github.com/example/project/issues/42'
+    ;;
+  "issue list") printf '%s\n' '[]' ;;
+  "issue view")
+    if [ "${SPAR_CODE_MODE:-}" = issue-fetch-failure ]; then exit 1; fi
+    printf '%s\n' '{"number":42,"title":"Add CSV export","body":"Export the current rows as CSV.","state":"OPEN","labels":[],"url":"https://github.com/example/project/issues/42"}'
+    ;;
+  "pr list")
+    if [ -f "$SPAR_CODE_DIR/pr-created" ]; then
+      printf '%s\n' '[{"number":43,"url":"https://github.com/example/project/pull/43","title":"Add CSV export","baseRefName":"main"}]'
+    else
+      printf '%s\n' '[]'
+    fi
+    ;;
+  "pr create")
+    touch "$SPAR_CODE_DIR/pr-created"
+    printf '%s\n' 'https://github.com/example/project/pull/43'
+    ;;
+  "pr view")
+    case "$*" in
+      *headRefOid*) printf '{"headRefOid":"%s"}\n' "$(git rev-parse origin/issue-42)" ;;
+      *state*) printf '%s\n' '{"state":"OPEN"}' ;;
+      *) exit 64 ;;
+    esac
+    ;;
+  "pr comment"|"issue comment") : ;;
+  "repo view") printf '%s\n' '{"name":"project"}' ;;
+  "api repos/{owner}/{repo}/issues/42") printf '%s\n' 'issue' ;;
+  *) printf 'unexpected gh call: %s\n' "$*" >&2; exit 64 ;;
+esac
+"#,
+        );
+        let agent = fx.dir.join("fake-bin/code-agent");
+        executable(
+            &agent,
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$SPAR_CODE_DIR/prompts.log"
+case "$*" in
+  *"Draft one detailed GitHub issue"*)
+    printf '%s\n' "draft:$1" >> "$SPAR_CODE_DIR/stages.log"
+    pwd > "$SPAR_CODE_DIR/draft-cwd"
+    if [ "${SPAR_CODE_MODE:-}" = edit ]; then printf 'unexpected edit\n' > README.md; fi
+    if [ "${SPAR_CODE_MODE:-}" = draft-failure ]; then exit 1; fi
+    printf '%s\n' "$SPAR_CODE_DRAFT"
+    ;;
+  *"You are triaging GitHub issues"*)
+    printf '%s\n' "triage:$1" >> "$SPAR_CODE_DIR/stages.log"
+    if [ "${SPAR_CODE_MODE:-}" = triage-failure ]; then exit 1; fi
+    printf '%s\n' '{"issues":[{"issue":42,"worth_doing":true,"tracker":false,"reason":"Useful export","complexity":"s","depends_on":[],"risk":"low"}]}'
+    ;;
+  *"Implement GitHub issue #42"*)
+    printf '%s\n' "implement:$1" >> "$SPAR_CODE_DIR/stages.log"
+    printf 'CSV export\n' > export.txt
+    printf '%s\n' '{"summary":"Add CSV export","problem":"Rows cannot be exported","changes":["Export rows"],"testing":["Checked the fixture"],"notes":null}'
+    ;;
+  *"Review the changes on this branch"*)
+    printf '%s\n' "review:$1" >> "$SPAR_CODE_DIR/stages.log"
+    printf '%s\n' '{"verdict":"approve","next_action":"merge","summary":"Export works","findings":[]}'
+    ;;
+  *) printf 'unexpected prompt\n' >&2; exit 64 ;;
+esac
+"#,
+        );
+        let bin = serde_json::to_string(agent.to_str().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                "[agents.a]\ncommand = [{bin}, \"a\", \"{{prompt}}\"]\n\n\
+             [agents.b]\ncommand = [{bin}, \"b\", \"{{prompt}}\"]\n\n\
+             [loop]\nfirst_implementor = \"a\"\ninstructions = \"Preserve compatibility\"\n"
+            ),
+        )
+        .unwrap();
+        Self { fx, config, path }
+    }
+
+    fn run(&self, extra: &[&str], draft: &str, mode: &str) -> (bool, String, String) {
+        let mut args = vec![
+            "code",
+            "Add CSV export",
+            "--config",
+            self.config.to_str().unwrap(),
+            "--repo",
+            self.fx.work.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        spar_with_env(
+            &args,
+            &self.fx.dir,
+            &[
+                ("PATH", &self.path),
+                ("SPAR_CODE_DIR", self.fx.dir.to_str().unwrap()),
+                ("SPAR_CODE_DRAFT", draft),
+                ("SPAR_CODE_MODE", mode),
+            ],
+        )
+    }
+
+    fn log(&self, file: &str) -> String {
+        std::fs::read_to_string(self.fx.dir.join(file)).unwrap_or_default()
+    }
+}
+
+const CODE_DRAFT: &str = r###"{"title":"Add CSV export","body":"## Context\nRows cannot be exported.\n\n## Requested behavior\nExport the current rows as CSV.\n\n## Acceptance criteria\n- [ ] Preserve column order.\n\n## Test plan\nCheck an export with quoted fields."}"###;
+
+#[cfg(unix)]
+#[test]
+fn code_preview_reads_the_target_repo_and_inherits_instructions() {
+    let test = CodeFixture::new();
+    let (ok, out, err) = test.run(
+        &[
+            "--dry-run",
+            "--first",
+            "b",
+            "--instructions",
+            "Keep existing flags",
+            "--quiet",
+        ],
+        CODE_DRAFT,
+        "",
+    );
+    assert!(ok, "{out}\n{err}");
+    assert!(out.starts_with("# Add CSV export\n"), "{out}");
+    assert!(out.contains("## Acceptance criteria"), "{out}");
+    assert_eq!("draft:b\n", test.log("stages.log"));
+    assert_eq!(
+        std::fs::canonicalize(&test.fx.work).unwrap(),
+        PathBuf::from(test.log("draft-cwd").trim())
+    );
+    let prompts = test.log("prompts.log");
+    for text in [
+        "Add CSV export",
+        "Preserve compatibility",
+        "Keep existing flags",
+    ] {
+        assert!(prompts.contains(text), "{prompts}");
+    }
+    assert!(test.log("gh.log").is_empty());
+    assert!(!test.fx.dir.join("plan.json").exists());
+    assert_eq!(
+        "seed\n",
+        std::fs::read_to_string(test.fx.work.join("README.md")).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn code_file_only_creates_one_cleaned_issue_without_triage() {
+    let test = CodeFixture::new();
+    let draft = CODE_DRAFT.replace("Add CSV export", "Add CSV\\u2014export");
+    let (ok, out, err) = test.run(&["--file-only", "--quiet"], &draft, "");
+    assert!(ok, "{out}\n{err}");
+    assert!(
+        out.contains("https://github.com/example/project/issues/42"),
+        "{out}"
+    );
+    assert!(out.contains("spar run 42"), "{out}");
+    let calls = test.log("gh.log");
+    assert_eq!(1, calls.matches("issue create ").count(), "{calls}");
+    assert!(calls.contains("## Acceptance criteria"), "{calls}");
+    assert!(!calls.contains('\u{2014}'), "{calls}");
+    assert_eq!("draft:a\n", test.log("stages.log"));
+    assert!(!test.fx.dir.join("plan.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn code_rejects_invalid_drafts_before_filing_or_running() {
+    for draft in [
+        "not JSON",
+        r#"{"title":"Only a title"}"#,
+        r#"{"title":" ","body":"Body"}"#,
+        r#"{"title":"Title","body":"\n "}"#,
+    ] {
+        let test = CodeFixture::new();
+        let (ok, out, err) = test.run(&[], draft, "");
+        assert!(!ok, "invalid draft succeeded: {draft}\n{out}\n{err}");
+        assert!(test.log("gh.log").is_empty());
+        assert!(!test.log("stages.log").contains("triage:"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn code_drafting_failures_and_edits_do_not_file_an_issue() {
+    for mode in ["draft-failure", "edit"] {
+        let test = CodeFixture::new();
+        let (ok, out, err) = test.run(&[], CODE_DRAFT, mode);
+        assert!(!ok, "{mode} succeeded: {out}\n{err}");
+        assert!(test.log("gh.log").is_empty());
+        assert!(!test.log("stages.log").contains("triage:"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn code_stops_when_issue_creation_fails() {
+    let test = CodeFixture::new();
+    let (ok, out, err) = test.run(&[], CODE_DRAFT, "create-failure");
+    assert!(!ok, "{out}\n{err}");
+    assert!(!out.contains("spar run 42"), "{out}");
+    assert_eq!("draft:a\n", test.log("stages.log"));
+    assert_eq!(1, test.log("gh.log").matches("issue create ").count());
+}
+
+#[cfg(unix)]
+#[test]
+fn code_keeps_the_created_issue_visible_when_triage_fails() {
+    let test = CodeFixture::new();
+    let (ok, out, err) = test.run(&["--quiet"], CODE_DRAFT, "triage-failure");
+    assert!(!ok, "{out}\n{err}");
+    assert!(
+        out.contains("https://github.com/example/project/issues/42"),
+        "{out}"
+    );
+    assert!(out.contains("spar run 42"), "{out}");
+    assert!(!test.log("gh.log").contains("pr create"));
+}
+
+#[cfg(unix)]
+#[test]
+fn code_reports_failure_when_the_created_issue_cannot_be_read() {
+    let test = CodeFixture::new();
+    let (ok, out, err) = test.run(&["--quiet"], CODE_DRAFT, "issue-fetch-failure");
+    assert!(!ok, "{out}\n{err}");
+    assert!(out.contains("spar run 42"), "{out}");
+    assert!(out.contains("could not read #42"), "{out}");
+    assert_eq!("draft:a\n", test.log("stages.log"));
+}
+
+#[cfg(unix)]
+#[test]
+fn code_runs_only_its_new_issue_through_to_an_approved_pr() {
+    let test = CodeFixture::new();
+    let (ok, out, err) = test.run(
+        &[
+            "--limit",
+            "0",
+            "--min-number",
+            "500",
+            "--plan-out",
+            "code-plan.json",
+            "--max-rounds",
+            "1",
+            "--keep-worktrees",
+            "--first",
+            "b",
+        ],
+        CODE_DRAFT,
+        "",
+    );
+    assert!(ok, "{out}\n{err}");
+    assert!(
+        out.contains("https://github.com/example/project/pull/43"),
+        "{out}"
+    );
+    let stages = test.log("stages.log");
+    for stage in ["draft:b", "triage:a", "triage:b", "implement:b", "review:a"] {
+        assert!(stages.contains(stage), "missing {stage}: {stages}");
+    }
+    let calls = test.log("gh.log");
+    assert_eq!(1, calls.matches("issue create ").count(), "{calls}");
+    assert_eq!(1, calls.matches("pr create ").count(), "{calls}");
+    assert!(!calls.contains("issue list"), "{calls}");
+    assert!(!calls.contains("pr merge"), "{calls}");
+    let plan: spar::model::Plan = serde_json::from_str(&test.log("code-plan.json")).unwrap();
+    assert_eq!(1, plan.order.len());
+    assert_eq!(42, plan.order[0].issue);
+    assert!(git(&test.fx.work, &["ls-remote", "--heads", "origin"]).contains("issue-42"));
+    assert!(test
+        .fx
+        .work
+        .join(".spar-worktrees/issue-42/export.txt")
+        .is_file());
+}
+
+#[test]
+fn code_rejects_whitespace_before_loading_a_config() {
+    let (ok, _, err) = spar(
+        &["code", " \n\t", "--config", "/nonexistent/spar.toml"],
+        &std::env::temp_dir(),
+    );
+    assert!(!ok);
+    assert!(err.contains("nonempty project prompt"), "{err}");
 }

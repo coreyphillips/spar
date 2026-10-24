@@ -10,6 +10,7 @@ use crate::agent::{self, Agent};
 use crate::brainstorm;
 use crate::checkin;
 use crate::clock;
+use crate::code;
 use crate::config::{self, Config};
 use crate::error::Result;
 use crate::followups;
@@ -45,7 +46,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
                   .spar/followups.md, and an entry there has no number to name. `brainstorm` \
                   takes words rather than numbers: the subject to brainstorm, or nothing to \
                   brainstorm the repository itself. `listen` takes issue or pull request \
-                  numbers to watch, or nothing to watch the whole repository.",
+                  numbers to watch, or nothing to watch the whole repository. `code` takes a \
+                  project prompt, files it as a detailed issue, and runs that issue.",
     max_term_width = 96
 )]
 pub struct Cli {
@@ -69,6 +71,36 @@ pub enum Command {
         loop_flags: LoopFlags,
         #[command(flatten)]
         triage_flags: TriageFlags,
+        /// Where to write the triage plan.
+        #[arg(long, default_value = "plan.json")]
+        plan_out: PathBuf,
+        /// Work in the main checkout instead of an isolated worktree per issue.
+        #[arg(long)]
+        no_worktrees: bool,
+    },
+
+    /// Turn a project prompt into a detailed issue, then run it through triage
+    /// and the implementation and review loop to open a pull request.
+    ///
+    /// One agent reads the repository and drafts the issue. Both agents then
+    /// triage it just as they do for `spar run`. --limit and --min-number do
+    /// not affect the newly filed issue.
+    Code {
+        /// What to build, fix, or improve. Quote a prompt containing flags.
+        #[arg(required = true, value_name = "PROMPT")]
+        prompt: Vec<String>,
+        #[command(flatten)]
+        common: Common,
+        #[command(flatten)]
+        loop_flags: LoopFlags,
+        #[command(flatten)]
+        triage_flags: TriageFlags,
+        /// Print the drafted issue without filing it or starting a run.
+        #[arg(long)]
+        dry_run: bool,
+        /// File the issue and stop, leaving it for a later `spar run`.
+        #[arg(long, conflicts_with = "dry_run")]
+        file_only: bool,
         /// Where to write the triage plan.
         #[arg(long, default_value = "plan.json")]
         plan_out: PathBuf,
@@ -765,69 +797,52 @@ fn dispatch(cli: Cli) -> Result<i32> {
             if numbers.is_empty() {
                 return Ok(0);
             }
-            let sorted = classify(&repo, &numbers)?;
-            let mut results = Vec::new();
-            let mut stopped = Vec::new();
-            let mut parked = Vec::new();
-            let mut progress = Progress::new(sorted.prs.len());
-
-            // Work already on a pull request is finished before any new work
-            // starts. These ran last, behind every named issue's full implement
-            // and review loop, so naming the pull request a previous run had
-            // opened looked exactly like spar refusing to touch it. They do not
-            // depend on triage either, so there is nothing to wait for.
-            let mut issues = sorted.issues.clone();
-            if !sorted.prs.is_empty() {
-                log!(
-                    "continuing {} pull request(s) before starting new work: {}",
-                    sorted.prs.len(),
-                    self::numbers(&sorted.prs)
-                );
-                let covered = issues_covered_by(&repo, &sorted.prs);
-                for (issue, pr) in covered.iter().filter(|(i, _)| issues.contains(i)) {
-                    log!(
-                        "#{issue} is what PR #{pr} closes, and both were given, so it is \
-                         continued there rather than implemented again"
-                    );
-                }
-                issues = issues_not_on_named_prs(&issues, &covered);
-                for number in &sorted.prs {
-                    let run = review::resume_pr(&agents, &cfg, &repo, *number, None);
-                    progress.finished(&run);
-                    results.push(run);
-                }
-            }
-
-            if let Err(e) = work_issues(
+            run_targets(
                 &agents,
                 &cfg,
                 &repo,
-                issues,
+                &numbers,
                 &plan_out,
-                &mut results,
-                &mut stopped,
-                &mut parked,
-                &mut progress,
                 triage_flags.retriage,
-            ) {
-                // A pull request that already finished is not thrown away
-                // because the issue queue stopped afterwards.
-                if results.is_empty() {
-                    return Err(e);
-                }
-                stopped.push(format!("the issue queue stopped: {e}"));
+            )
+        }
+        Command::Code {
+            prompt,
+            common,
+            loop_flags,
+            triage_flags,
+            dry_run,
+            file_only,
+            plan_out,
+            no_worktrees,
+        } => {
+            let prompt = prompt.join(" ");
+            code::validate_prompt(&prompt)?;
+            let overrides = Overrides::for_working(&loop_flags, &triage_flags, no_worktrees);
+            let (cfg, repo, agents) = prepare(&common, Some(overrides))?;
+            let draft = code::draft(&agents, &cfg, &repo, &prompt)?;
+            if dry_run {
+                println!("# {}\n\n{}", draft.title, draft.body);
+                return Ok(0);
             }
-
-            if results.is_empty() {
-                // Nothing was worked, so the table would be an empty banner.
-                // What was parked or stopped still has to reach the person.
-                log!("nothing scheduled");
-                for line in parked.iter().chain(stopped.iter()) {
-                    println!("{line}");
-                }
-                return Ok(report_writes(&repo).max(i32::from(!stopped.is_empty())));
+            let url = repo.create_issue(&draft.title, &draft.body)?;
+            // Keep the recovery target visible even with --quiet, before any
+            // triage or implementation call can fail.
+            println!("issue: {url}");
+            let number = review::filed_issue_number(&url)
+                .ok_or_else(|| spar_err!("could not read the issue number from {url}"))?;
+            println!("continue this issue later with: spar run {number}");
+            if file_only {
+                return Ok(report_writes(&repo));
             }
-            Ok(report_with(&results, &cfg, &repo, &stopped, &parked))
+            run_targets(
+                &agents,
+                &cfg,
+                &repo,
+                &[number],
+                &plan_out,
+                triage_flags.retriage,
+            )
         }
         Command::Followup {
             common,
@@ -979,9 +994,83 @@ impl From<&LoopFlags> for Overrides {
     }
 }
 
+/// The existing `run` path, also used after `code` files an issue.
+fn run_targets(
+    agents: &[Agent],
+    cfg: &Config,
+    repo: &Repo,
+    numbers: &[i64],
+    plan_out: &Path,
+    retriage: bool,
+) -> Result<i32> {
+    let sorted = classify(repo, numbers)?;
+    let mut results = Vec::new();
+    let mut stopped = Vec::new();
+    let mut parked = Vec::new();
+    let mut progress = Progress::new(sorted.prs.len());
+
+    // Work already on a pull request is finished before any new work
+    // starts. These ran last, behind every named issue's full implement
+    // and review loop, so naming the pull request a previous run had
+    // opened looked exactly like spar refusing to touch it. They do not
+    // depend on triage either, so there is nothing to wait for.
+    let mut issues = sorted.issues.clone();
+    if !sorted.prs.is_empty() {
+        log!(
+            "continuing {} pull request(s) before starting new work: {}",
+            sorted.prs.len(),
+            self::numbers(&sorted.prs)
+        );
+        let covered = issues_covered_by(repo, &sorted.prs);
+        for (issue, pr) in covered.iter().filter(|(i, _)| issues.contains(i)) {
+            log!(
+                "#{issue} is what PR #{pr} closes, and both were given, so it is \
+                 continued there rather than implemented again"
+            );
+        }
+        issues = issues_not_on_named_prs(&issues, &covered);
+        for number in &sorted.prs {
+            let run = review::resume_pr(agents, cfg, repo, *number, None);
+            progress.finished(&run);
+            results.push(run);
+        }
+    }
+
+    if let Err(e) = work_issues(
+        agents,
+        cfg,
+        repo,
+        issues,
+        plan_out,
+        &mut results,
+        &mut stopped,
+        &mut parked,
+        &mut progress,
+        retriage,
+    ) {
+        // A pull request that already finished is not thrown away
+        // because the issue queue stopped afterwards.
+        if results.is_empty() {
+            return Err(e);
+        }
+        stopped.push(format!("the issue queue stopped: {e}"));
+    }
+
+    if results.is_empty() {
+        // Nothing was worked, so the table would be an empty banner.
+        // What was parked or stopped still has to reach the person.
+        log!("nothing scheduled");
+        for line in parked.iter().chain(stopped.iter()) {
+            println!("{line}");
+        }
+        return Ok(report_writes(repo).max(i32::from(!stopped.is_empty())));
+    }
+    Ok(report_with(&results, cfg, repo, &stopped, &parked))
+}
+
 impl Overrides {
-    /// What `run` and `followup` share past the loop flags: both triage, so
-    /// both can decline, and both work issues in a worktree apiece.
+    /// What `run`, `code`, and `followup` share past the loop flags: all triage,
+    /// can decline, and work issues in a worktree apiece.
     fn for_working(loop_flags: &LoopFlags, triage: &TriageFlags, no_worktrees: bool) -> Self {
         let mut over = Overrides::from(loop_flags);
         over.worktrees = if no_worktrees { Some(false) } else { None };
@@ -997,10 +1086,10 @@ impl Overrides {
 /// Triage a set of issues, work them in dependency order, and fold each wave of
 /// newly filed follow-ups back in as the absorb budget allows.
 ///
-/// Shared by `run` and `followup`, which differ only in where the first wave
-/// comes from: `run` takes it from the tracker, `followup` from the issues it
-/// just filed out of the local queue. Everything after that is the same
-/// pipeline, and it has to stay the same. An issue spar filed for itself gets
+/// Shared by `run`, `code`, and `followup`. The first wave differs:
+/// `run` takes it from the tracker, `followup` from the issues it
+/// just filed out of the local queue, and `code` from a prompt. The rest is
+/// the same pipeline, and it has to stay the same. An issue spar filed for itself gets
 /// no easier a ride through triage than one a person opened, which is the whole
 /// reason the screening pass is one agent and this is two.
 #[allow(clippy::too_many_arguments)]
@@ -1091,6 +1180,10 @@ fn work_issues(
             Ok(fetched) => fetched,
             Err(e) => {
                 logdim!("could not read the next wave: {e}");
+                stopped.push(format!(
+                    "could not read {}, so it was not worked: {e}",
+                    numbers(&wave.numbers)
+                ));
                 continue;
             }
         };
@@ -2130,6 +2223,7 @@ fn settings_block(first_implementor: &str) -> String {
         "# round_1 or rest, and then to the effort the agent's own block asked\n",
         "# for. Where the two CLIs do not share a vocabulary, put the schedule\n",
         "# under [agents.NAME.effort_schedule] instead, with the same keys.\n",
+        "# code        = \"high\"   # drafting an issue from a project prompt\n",
         "# triage      = \"low\"    # both agents, over the whole queue, per wave\n",
         "# implement   = \"high\"   # writing the first draft\n",
         "# review_1    = \"high\"   # the deep first review\n",
@@ -3437,6 +3531,84 @@ mod run_targets_tests {
         let kept = issues_not_on_named_prs(&[771, 772, 783], &covered(&[(771, 786), (772, 786)]));
 
         assert_eq!(vec![783], kept);
+    }
+}
+
+#[cfg(test)]
+mod code_tests {
+    use super::*;
+
+    #[test]
+    fn code_requires_a_prompt_and_exclusive_preview_modes() {
+        assert!(Cli::try_parse_from(["spar", "code"]).is_err());
+        assert!(
+            Cli::try_parse_from(["spar", "code", "Add export", "--dry-run", "--file-only"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["spar", "code", "Add export", "--dry-run"]).is_ok());
+        assert!(Cli::try_parse_from(["spar", "code", "Add export", "--file-only"]).is_ok());
+    }
+
+    #[test]
+    fn code_takes_words_and_the_normal_run_options() {
+        let cli = Cli::parse_from([
+            "spar",
+            "code",
+            "Add",
+            "CSV",
+            "export",
+            "--repo",
+            "/tmp/project",
+            "--config",
+            "project.toml",
+            "--first",
+            "b",
+            "--base",
+            "develop",
+            "--instructions",
+            "Keep the format stable",
+            "--max-rounds",
+            "5",
+            "--auto-merge",
+            "--absorb",
+            "1",
+            "--keep-worktrees",
+            "--no-worktrees",
+            "--no-close-skipped",
+            "--retriage",
+            "--plan-out",
+            "code-plan.json",
+        ]);
+        match cli.command {
+            Command::Code {
+                prompt,
+                common,
+                loop_flags,
+                triage_flags,
+                plan_out,
+                no_worktrees,
+                dry_run,
+                file_only,
+            } => {
+                assert_eq!(prompt, ["Add", "CSV", "export"]);
+                assert_eq!(common.repo, PathBuf::from("/tmp/project"));
+                assert_eq!(common.config, Some(PathBuf::from("project.toml")));
+                assert_eq!(common.first.as_deref(), Some("b"));
+                assert_eq!(common.base.as_deref(), Some("develop"));
+                assert_eq!(
+                    common.instructions.as_deref(),
+                    Some("Keep the format stable")
+                );
+                assert_eq!(loop_flags.max_rounds, Some(5));
+                assert_eq!(loop_flags.absorb, Some(1));
+                assert!(loop_flags.auto_merge && loop_flags.keep_worktrees);
+                assert!(triage_flags.no_close_skipped && triage_flags.retriage);
+                assert_eq!(plan_out, PathBuf::from("code-plan.json"));
+                assert!(no_worktrees);
+                assert!(!dry_run && !file_only);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
 

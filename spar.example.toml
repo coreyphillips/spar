@@ -273,6 +273,7 @@ max_triage_chars  = 200000   # most every issue TOGETHER, bodies and comments,
 # with exactly these keys. `spar doctor` says when a value is not one the agent
 # that would receive it is known to accept.
 [loop.effort_schedule]
+code        = "high"         # drafting an issue from a project prompt
 triage      = "low"          # both agents, over the whole queue, once per wave.
                              # The most expensive call in a run, and the one the
                              # two key schedule never mentioned.

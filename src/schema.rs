@@ -12,6 +12,19 @@
 
 use serde_json::{json, Value};
 
+/// A single actionable issue, drafted against the repository.
+pub fn code_issue() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "title": {"type": "string", "description": "A concise, specific issue title."},
+            "body": {"type": "string", "description": "A detailed Markdown issue with context, requested behavior, scope, acceptance criteria, and a test plan. Distinguish verified facts from assumptions."}
+        },
+        "required": ["title", "body"]
+    })
+}
+
 pub fn triage() -> Value {
     json!({
         "type": "object",
@@ -817,6 +830,7 @@ pub fn brainstorm_converge() -> Value {
 
 pub fn all() -> Vec<(&'static str, Value)> {
     vec![
+        ("code_issue", code_issue()),
         ("triage", triage()),
         ("implementation", implementation()),
         ("review", review()),

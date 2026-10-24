@@ -10,6 +10,7 @@ pub mod brainstorm;
 pub mod checkin;
 pub mod cli;
 pub mod clock;
+pub mod code;
 pub mod comments;
 pub mod config;
 pub mod error;

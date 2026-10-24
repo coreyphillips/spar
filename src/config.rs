@@ -315,6 +315,8 @@ impl Trust {
 /// for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Call {
+    /// Drafting one issue from a project prompt.
+    Code,
     /// Both agents, over the whole queue, once per wave.
     Triage,
     /// Writing the first draft.
@@ -342,6 +344,7 @@ impl Call {
     /// The schedule key this call reads.
     pub fn key(self) -> &'static str {
         match self {
+            Call::Code => "code",
             Call::Triage => "triage",
             Call::Implement => "implement",
             Call::Review(round) if round <= 1 => "review_1",
@@ -360,7 +363,7 @@ impl Call {
     /// the keys existed behaves exactly as it did.
     fn legacy_round(self) -> u32 {
         match self {
-            Call::Triage | Call::Implement | Call::Screen => 1,
+            Call::Code | Call::Triage | Call::Implement | Call::Screen => 1,
             Call::Review(round) | Call::Respond(round) => round,
             Call::Checkin(round) | Call::Split(round) | Call::Brainstorm(round) => round,
             Call::Close | Call::Recheck => 2,
@@ -368,8 +371,9 @@ impl Call {
     }
 
     /// Every kind, for `doctor` to check a configuration against.
-    pub fn every() -> [Call; 11] {
+    pub fn every() -> [Call; 12] {
         [
+            Call::Code,
             Call::Triage,
             Call::Implement,
             Call::Review(1),
@@ -388,6 +392,8 @@ impl Call {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffortSchedule {
+    /// Drafting an issue for `spar code`.
+    pub code: Option<String>,
     /// The deep first review.
     ///
     /// Kept, and still read by every call that has no key of its own, so an
@@ -426,6 +432,7 @@ impl EffortSchedule {
     /// What this schedule says about one call, if anything.
     pub fn get(&self, call: Call) -> Option<String> {
         let value = match call.key() {
+            "code" => &self.code,
             "triage" => &self.triage,
             "implement" => &self.implement,
             "review_1" => &self.review_1,
@@ -1142,6 +1149,7 @@ pub fn known_options() -> Vec<OptionInfo> {
         &EffortSchedule {
             round_1: Some("high".into()),
             rest: Some("low".into()),
+            code: Some("high".into()),
             triage: Some("low".into()),
             implement: Some("high".into()),
             review_1: Some("high".into()),
@@ -1633,7 +1641,8 @@ model = "gpt-5.6-sol"
     #[test]
     fn every_call_kind_is_in_every() {
         let every = Call::every();
-        assert_eq!(11, every.len());
+        assert_eq!(12, every.len());
+        assert!(every.contains(&Call::Code));
         assert!(every.contains(&Call::Recheck));
         assert_eq!("recheck", Call::Recheck.key());
     }

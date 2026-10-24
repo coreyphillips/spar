@@ -83,14 +83,16 @@ spar triage 42              # judges the issue, writes plan.json, touches nothin
 spar review 108 --dry-run   # full two agent review, printed, nothing posted
 spar checkin 108 --dry-run  # every reply and every change, posted nowhere
 spar followup --screen-only # judges the queue, writes nothing, files nothing
+spar code "Add CSV export" --dry-run # drafts an issue, printed, nothing filed
 spar split 10 --dry-run     # the parts it would make, filed and branched nowhere
 spar run 42 --no-close-skipped   # will not close an issue it declines
 spar listen --dry-run       # every event and what it would trigger, nothing triggered
 ```
 
-`--dry-run` is on `review`, `checkin`, `split` and `listen`. The first two are the
+`--dry-run` is on `review`, `checkin`, `code`, `split` and `listen`. The first two are the
 commands whose whole output is a comment; `split` writes more kinds of thing than
-any other command, which is why its read-only half exists. `listen --dry-run` is
+any other command, which is why its read-only half exists. `code --dry-run`
+previews the issue before it is filed or implemented. `listen --dry-run` is
 different in kind: it calls no agent at all, since what it would have run is the
 thing being previewed, and `spar review N --dry-run` is how to see a review's text.
 There is no `--dry-run` on `run`, since `run` writes code: `triage` is its
@@ -140,6 +142,7 @@ cd ~/projects/thing
 spar init      # detects your installed CLIs, writes spar.toml
 spar doctor    # confirms it works
 spar run 478   # triage issue 478, and open a PR if it is worth doing
+spar code "Add a JSON output option to the status command"
 ```
 
 ## Use
@@ -158,6 +161,10 @@ closes and that is one piece of work, not two: the issue is dropped from the
 queue and the pull request carries it.
 
 ```bash
+spar code "Fix retries when the server returns 429" # draft, file, and work an issue
+spar code "Add CSV export" --dry-run   # preview the issue without filing it
+spar code "Add CSV export" --file-only # file the issue for a later run
+
 spar run                    # triage every open issue, then work them in order
 spar run 42 51 60           # or name the ones you care about
 spar triage                 # triage only, write plan.json, touch nothing
@@ -219,7 +226,7 @@ spar run 42 --quiet         # suppress progress; warnings and errors still print
 
 `--quiet` works before or after the subcommand.
 
-`spar run` and `spar followup` print a progress line each time an item
+`spar run`, `spar code`, and `spar followup` print a progress line each time an item
 finishes, so a long run says how far along it is:
 
 ```
@@ -309,6 +316,47 @@ on.
 Note that spar itself never waits on CI, and never reads it: an agent that
 waits is doing it on its own initiative, which is why that example is an
 instruction rather than a setting.
+
+## Starting from a prompt
+
+`spar code` takes a feature request, bug report, or enhancement in your own
+words, turns it into one detailed GitHub issue, and runs that issue through the
+same pipeline as `spar run`.
+
+```bash
+spar code "Add JSON output to status, keeping the current text output as the default"
+spar code "Fix the retry loop when the server returns 429" --max-rounds 5
+spar code "Add CSV export" --dry-run
+spar code "Add CSV export" --file-only
+spar code "Add CSV export" --repo ~/projects/thing --config ~/projects/thing/spar.toml
+```
+
+The configured first implementor reads the checkout and drafts the title and
+body, including the motivation, current and requested behavior, scope,
+acceptance criteria, and a test plan. Reproduction steps and file references
+must come from the request or the code; assumptions and open questions are
+called out. The drafting step only reads the project. Both the config's
+instructions and `--instructions` apply to drafting and the subsequent run.
+
+By default, Spar files the issue and immediately hands its number to normal
+triage, implementation, and alternating review. Both agents must still agree
+that it is worth doing. The usual run settings apply, including the base
+branch, worktrees, draft PRs, checks, review budget, follow-ups, and merge policy.
+`--limit` and `--min-number` do not filter out the new issue or select other open
+issues. The triage plan is written to `plan.json`, or the path in `--plan-out`.
+
+`--dry-run` prints the cleaned title and body without filing or implementing.
+`--file-only` files the issue and stops. These two flags cannot be combined.
+A nonempty prompt is required. Quote prompts containing command-line flags,
+newlines, or shell punctuation, or put `--` before the prompt after any options.
+
+The issue URL and a `spar run <number>` recovery command print before triage,
+even with `--quiet`. If a later step fails, use that issue number to continue.
+Running `spar code` again drafts and files a new issue.
+
+Issue drafting adds one structured call before the usual run. Its effort can be
+set with `code` under `[loop.effort_schedule]` or an agent's own effort schedule.
+When unset, it falls back to `round_1` and then the agent's configured effort.
 
 ## How a run goes
 
@@ -1638,7 +1686,7 @@ abandoned.
 Every review round is a repo-aware pass at the configured effort. A full ultra
 review of a three-line round-3 delta is money on fire, which is what
 `effort_schedule` exists to prevent. It has one key per kind of call, so a value
-means what its name says: `triage`, `implement`, `review_1`, `review_rest`,
+means what its name says: `code`, `triage`, `implement`, `review_1`, `review_rest`,
 `respond`, `close`, `screen`, `checkin`, `split`, `brainstorm`, `recheck`. A call with no key
 set falls back to `round_1` or `rest`, which is what the schedule used to be, and
 then to the agent's own `effort`. `recheck` reads `review_rest` first, since a

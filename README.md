@@ -1457,11 +1457,20 @@ structured report is accepted. A command that already runs in a sandbox can
 therefore edit a linked worktree without being granted direct write access to
 the repository's objects, refs, config, or hooks. Commands without their own
 sandbox keep their normal host permissions. Managed commits disable signing and
-commit hooks; the eventual merge can still be signed. On Unix, spar also stops
-remaining descendants when the direct command exits before inspecting the
-worktree. On other platforms, a command must not return until its children have
-finished writing. Spar refuses to stage a changed `.gitattributes` or gitlink,
-since attributes can select an external Git filter and nested repository
+commit hooks; the eventual merge can still be signed. On macOS and Linux, spar
+also stops every process a call started before inspecting the worktree,
+whether the direct command exited, timed out, or was interrupted. That includes
+processes that moved to a process group or session of their own, which is
+where agent CLIs run their shells: a process belongs to the call when it
+inherited the call's `SPAR_CALLS` variable, is in a session a descendant
+created, or was seen below the call while it ran. A daemon the call started,
+such as a Gradle daemon or an ssh control master, is stopped with it. Work
+handed to a service that was already running, such as Docker or a tmux server,
+is not the call's to stop. On other Unix systems only the call's own process
+group is stopped. On other platforms, a command must not return until its
+children have finished writing. Spar refuses to stage a changed
+`.gitattributes` or gitlink, since attributes can select an external Git
+filter and nested repository
 objects may exist only in that worktree. If a call leaves uncommitted output or
 unsafe Git state, spar keeps the worktree and reports its path for recovery. A
 custom editing command that commits before its report fails has its clean,

@@ -12,7 +12,7 @@ use spar::agent::Agent;
 use spar::config::CommandPart;
 use spar::config::{self, Config, Followups};
 use spar::model::{Complexity, Followup, Issue, IssueRun, PlanItem, PrView, Risk, Status};
-use spar::repo::{PushTarget, Repo};
+use spar::repo::{BaseSync, BehindReason, PushTarget, Repo};
 use spar::review::{drop_uncommitted, file_followup, park, run_issue, snapshot, undo_edits};
 
 const SPAR_BIN: &str = env!("CARGO_BIN_EXE_spar");
@@ -204,6 +204,275 @@ fn the_base_a_prompt_names_is_the_base_spar_compares_against() {
         git(&fx.work, &["rev-parse", "origin/main"]),
         "the two refs have to differ for this to prove anything"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Bringing the local base branch up to date after a run
+// ---------------------------------------------------------------------------
+
+/// Somebody else's commit on origin's main, pushed from a second clone, so the
+/// work clone's main and its tracking ref both stay where they were.
+fn push_from_elsewhere(fx: &Fixture, file: &str) {
+    let other = fx.dir.join("other");
+    if !other.exists() {
+        git(&fx.dir, &["clone", "-q", "origin.git", "other"]);
+        git(&other, &["config", "user.email", "other@example.invalid"]);
+        git(&other, &["config", "user.name", "somebody else"]);
+        git(&other, &["config", "commit.gpgsign", "false"]);
+    }
+    commit(&other, file, &format!("{file}\n"), &format!("add {file}"));
+    git(&other, &["push", "-q", "origin", "main"]);
+}
+
+fn rev(work: &Path, refname: &str) -> String {
+    git(work, &["rev-parse", refname]).trim().to_string()
+}
+
+#[test]
+fn a_base_branch_nothing_has_checked_out_is_fast_forwarded() {
+    let fx = repo("syncfree");
+    git(&fx.work, &["checkout", "-q", "-b", "topic"]);
+    std::fs::write(fx.work.join("README.md"), "mine, uncommitted\n").unwrap();
+    push_from_elsewhere(&fx, "one.txt");
+    push_from_elsewhere(&fx, "two.txt");
+
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    assert_eq!(
+        BaseSync::FastForwarded { commits: 2 },
+        repo.sync_local_base("main", true)
+    );
+    assert_eq!(rev(&fx.work, "origin/main"), rev(&fx.work, "main"));
+    assert_eq!(
+        "refs/heads/topic",
+        git(&fx.work, &["symbolic-ref", "HEAD"]).trim()
+    );
+    assert_eq!(
+        "mine, uncommitted\n",
+        std::fs::read_to_string(fx.work.join("README.md")).unwrap()
+    );
+    assert!(!fx.work.join("one.txt").exists());
+}
+
+#[test]
+fn a_clean_checked_out_base_branch_is_fast_forwarded_with_its_files() {
+    let fx = repo("syncclean");
+    push_from_elsewhere(&fx, "upstream.txt");
+
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    assert_eq!(
+        BaseSync::FastForwarded { commits: 1 },
+        repo.sync_local_base("main", true)
+    );
+    assert_eq!(rev(&fx.work, "origin/main"), rev(&fx.work, "HEAD"));
+    assert_eq!(
+        "refs/heads/main",
+        git(&fx.work, &["symbolic-ref", "HEAD"]).trim()
+    );
+    assert_eq!("", git(&fx.work, &["status", "--porcelain"]));
+    assert_eq!(
+        "upstream.txt\n",
+        std::fs::read_to_string(fx.work.join("upstream.txt")).unwrap()
+    );
+}
+
+/// A modified tracked file and a new untracked one are both work that a
+/// person has not committed, and neither is spar's to step around.
+#[test]
+fn a_checked_out_base_branch_with_uncommitted_changes_is_left_alone() {
+    for (tag, file) in [("syncdirty", "README.md"), ("syncuntracked", "notes.txt")] {
+        let fx = repo(tag);
+        std::fs::write(fx.work.join(file), "mine, uncommitted\n").unwrap();
+        push_from_elsewhere(&fx, "upstream.txt");
+        let before = rev(&fx.work, "main");
+
+        let repo = Repo::open(&fx.work, &cfg()).unwrap();
+        assert_eq!(
+            BaseSync::Behind {
+                commits: 1,
+                reason: BehindReason::Uncommitted
+            },
+            repo.sync_local_base("main", true),
+            "{file}"
+        );
+        assert_eq!(before, rev(&fx.work, "main"), "{file}");
+        assert_eq!(
+            "mine, uncommitted\n",
+            std::fs::read_to_string(fx.work.join(file)).unwrap()
+        );
+        assert!(!fx.work.join("upstream.txt").exists(), "{file}");
+    }
+}
+
+/// Git lets a fast-forward overwrite an ignored file, and an ignored file can
+/// be the only copy of something. The merge is refused rather than allowed to.
+#[test]
+fn a_fast_forward_that_would_overwrite_an_ignored_file_is_refused() {
+    let fx = repo("syncignored");
+    std::fs::write(fx.work.join(".git/info/exclude"), "local.env\n").unwrap();
+    std::fs::write(fx.work.join("local.env"), "mine\n").unwrap();
+    push_from_elsewhere(&fx, "local.env");
+    let before = rev(&fx.work, "main");
+
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let outcome = repo.sync_local_base("main", true);
+    assert!(matches!(outcome, BaseSync::Failed(_)), "{outcome:?}");
+    assert_eq!(before, rev(&fx.work, "main"));
+    assert_eq!(
+        "mine\n",
+        std::fs::read_to_string(fx.work.join("local.env")).unwrap()
+    );
+}
+
+#[test]
+fn a_base_branch_checked_out_in_another_worktree_is_left_alone() {
+    let fx = repo("syncworktree");
+    git(&fx.work, &["checkout", "-q", "-b", "topic"]);
+    let linked = fx.dir.join("linked");
+    git(
+        &fx.work,
+        &["worktree", "add", "-q", linked.to_str().unwrap(), "main"],
+    );
+    push_from_elsewhere(&fx, "upstream.txt");
+    let before = rev(&fx.work, "main");
+
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let outcome = repo.sync_local_base("main", true);
+    let BaseSync::Behind {
+        commits: 1,
+        reason: BehindReason::OtherWorktree(path),
+    } = &outcome
+    else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(
+        std::fs::canonicalize(&linked).unwrap(),
+        std::fs::canonicalize(path).unwrap()
+    );
+    assert_eq!(before, rev(&fx.work, "main"));
+    assert_eq!(before, rev(&linked, "HEAD"));
+    assert!(!linked.join("upstream.txt").exists());
+}
+
+/// Rebase and bisect detach HEAD, so the branch they will write when they
+/// finish is not listed as checked out anywhere. Moving it underneath them
+/// makes the rebase fail at the very end.
+#[test]
+fn a_base_branch_in_the_middle_of_a_rebase_is_left_alone() {
+    let fx = repo("syncrebase");
+    commit(&fx.work, "mine.txt", "mine\n", "mine");
+    git(&fx.work, &["push", "-q", "origin", "main"]);
+    push_from_elsewhere(&fx, "upstream.txt");
+    let stopped = Command::new("git")
+        .args([
+            "rebase",
+            "-q",
+            "--force-rebase",
+            "--exec",
+            "false",
+            "HEAD~1",
+        ])
+        .current_dir(&fx.work)
+        .output()
+        .unwrap();
+    assert!(!stopped.status.success(), "the rebase had to stop");
+    let before = rev(&fx.work, "refs/heads/main");
+
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    assert_eq!(
+        BaseSync::Behind {
+            commits: 1,
+            reason: BehindReason::InProgress
+        },
+        repo.sync_local_base("main", true)
+    );
+    assert_eq!(before, rev(&fx.work, "refs/heads/main"));
+    git(&fx.work, &["rebase", "--abort"]);
+}
+
+/// Ahead or diverged, the local commits are somebody's work and the branch is
+/// never moved. Strictly ahead is nothing to report; diverged gives both counts.
+#[test]
+fn a_base_branch_with_commits_origin_lacks_is_never_moved() {
+    let fx = repo("syncdiverged");
+    git(&fx.work, &["checkout", "-q", "-b", "topic"]);
+    git(&fx.work, &["checkout", "-q", "main"]);
+    commit(&fx.work, "mine.txt", "mine\n", "mine");
+    git(&fx.work, &["checkout", "-q", "topic"]);
+    let before = rev(&fx.work, "main");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+
+    assert_eq!(
+        BaseSync::Diverged {
+            ahead: 1,
+            behind: 0
+        },
+        repo.sync_local_base("main", true)
+    );
+    assert_eq!(before, rev(&fx.work, "main"));
+
+    push_from_elsewhere(&fx, "one.txt");
+    push_from_elsewhere(&fx, "two.txt");
+    assert_eq!(
+        BaseSync::Diverged {
+            ahead: 1,
+            behind: 2
+        },
+        repo.sync_local_base("main", true)
+    );
+    assert_eq!(before, rev(&fx.work, "main"));
+}
+
+#[test]
+fn an_up_to_date_or_missing_base_branch_is_left_quietly() {
+    let fx = repo("syncnoop");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    assert_eq!(BaseSync::UpToDate, repo.sync_local_base("main", true));
+
+    git(&fx.work, &["checkout", "-q", "-b", "topic"]);
+    git(&fx.work, &["branch", "-q", "-D", "main"]);
+    push_from_elsewhere(&fx, "upstream.txt");
+    assert_eq!(BaseSync::NoLocalBranch, repo.sync_local_base("main", true));
+    assert!(git(&fx.work, &["branch", "--list", "main"])
+        .trim()
+        .is_empty());
+}
+
+#[test]
+fn with_sync_base_off_a_branch_left_behind_is_still_reported() {
+    let fx = repo("syncoff");
+    git(&fx.work, &["checkout", "-q", "-b", "topic"]);
+    push_from_elsewhere(&fx, "upstream.txt");
+    let before = rev(&fx.work, "main");
+
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    assert_eq!(
+        BaseSync::Behind {
+            commits: 1,
+            reason: BehindReason::Disabled
+        },
+        repo.sync_local_base("main", false)
+    );
+    assert_eq!(before, rev(&fx.work, "main"));
+}
+
+/// The tracking ref is already ahead here, so a fast-forward would have been
+/// possible from what is on disk. Without a fresh fetch it is not attempted.
+#[test]
+fn an_unreachable_origin_fails_without_moving_anything() {
+    let fx = repo("syncgone");
+    git(&fx.work, &["checkout", "-q", "-b", "topic"]);
+    push_from_elsewhere(&fx, "upstream.txt");
+    git(&fx.work, &["fetch", "-q", "origin"]);
+    std::fs::rename(fx.dir.join("origin.git"), fx.dir.join("moved.git")).unwrap();
+    let before = rev(&fx.work, "main");
+
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let outcome = repo.sync_local_base("main", true);
+    let BaseSync::Failed(why) = &outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(why.contains("could not fetch main from origin"), "{why}");
+    assert_eq!(before, rev(&fx.work, "main"));
 }
 
 #[test]

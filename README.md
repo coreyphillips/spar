@@ -447,6 +447,18 @@ all pull request comments. A failure before the closing pass ends in an error
 with the reason and posts no final outcome comment. A closing-pass failure
 keeps the review record and reports that the last changes remain unread.
 
+**Afterwards.** Worktrees are built from `origin/<base>` and merges happen on
+GitHub, so nothing in a run moves your local `<base>` branch. Once `run`,
+`code`, `followup`, or `resume` finishes, spar fetches the base and
+fast-forwards the local branch when that cannot cost local work. A branch
+nothing has checked out is moved directly. One checked out where spar was
+started, with no uncommitted changes, is moved with `git merge --ff-only`, with
+hooks off and without overwriting ignored files. A branch with commits origin
+lacks, a checkout with uncommitted changes, and a branch checked out in another
+worktree are left alone, and the report says so in one line. `sync_base =
+false` turns the fast-forward off and keeps that line. A failed fetch is a
+warning and does not change the exit status.
+
 ## Resuming work someone else started
 
 `spar resume <pr>` picks up any open PR, whether or not spar created it. Human

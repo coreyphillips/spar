@@ -518,6 +518,13 @@ pub struct LoopCfg {
     pub base_branch: String,
     pub worktrees: bool,
     pub keep_worktrees: bool,
+    /// Fast-forward the local base branch to origin once a run that builds on
+    /// it finishes.
+    ///
+    /// Only ever a fast-forward, and refused whenever local work is present,
+    /// so it is on by default. Off still reports a branch left behind, since
+    /// checking is read only.
+    pub sync_base: bool,
     pub state_store: StateStore,
     pub branch_prefix: String,
     pub followups: Followups,
@@ -660,6 +667,7 @@ impl Default for LoopCfg {
             base_branch: "main".into(),
             worktrees: true,
             keep_worktrees: false,
+            sync_base: true,
             state_store: StateStore::Local,
             branch_prefix: String::new(),
             followups: Followups::Local,

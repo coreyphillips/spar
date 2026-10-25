@@ -18,7 +18,7 @@ use crate::listen;
 use crate::model::{Issue, IssueRun, ItemKind, Plan, PlanItem, Status};
 use crate::proc::{self, ExecOpts};
 use crate::progress::Progress;
-use crate::repo::{Repo, WriteSummary};
+use crate::repo::{BaseSync, BehindReason, Repo, WriteSummary};
 use crate::review;
 use crate::review_only;
 use crate::spend;
@@ -962,7 +962,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             if results.is_empty() {
                 return Ok(0);
             }
-            Ok(report(&results, &cfg, &repo))
+            Ok(report_with(&results, &cfg, &repo, &[], &[]))
         }
     }
 }
@@ -2153,6 +2153,7 @@ const LOOP_OPTIONS: &[Setting] = &[
     (true, "max_split_parts", "Most parts `spar split` will make out of one issue or pull request. A backstop against a queue nobody asked for, not a target, and what it holds back is said out loud. A part is never itself split, so if one is still too big, `spar split <part>` is one command away."),
     (true, "check", "A command spar runs in the worktree after an editing call committed and before the branch is pushed, as an argv list or a string split on whitespace. Unset runs nothing. \"I ran the tests\" is the one claim in a report that nothing else checks, and a broken push costs the reviewer's round on a tree that does not build. On failure the output goes back to the same agent once; a second failure ends the round with the worktree kept and nothing pushed."),
     (true, "keep_worktrees", "Keep worktrees after a run, for inspection."),
+    (true, "sync_base", "Fast-forward the local base branch to origin once run, code, followup, or resume finishes. It is left alone, and the report says why, when it has commits origin lacks, when its checkout has uncommitted changes, or when another worktree has it checked out. Off still says when it is behind."),
     (true, "min_number", "Ignore issues and pull requests numbered below this when spar picks for itself. 0 is no floor, and a number you name explicitly is always honoured."),
     (true, "parallel_triage", "Ask both agents to triage at once. They only read during triage, so there is nothing to serialise."),
     (true, "absorb_new_issues", "Waves of newly filed follow-ups to fold back into this run rather than leaving them for the next one. Multiplies what a run costs."),
@@ -2564,22 +2565,38 @@ fn first_line(text: &str) -> String {
 // Reporting
 // ---------------------------------------------------------------------------
 
+/// For `review`, `checkin`, and `split`, which neither build on the base branch
+/// nor merge into it, so they leave the local one alone.
 fn report(results: &[IssueRun], cfg: &Config, repo: &Repo) -> i32 {
-    report_with(results, cfg, repo, &[], &[])
+    print_report(results, cfg, repo, &[], &[], false)
 }
 
-/// The same, plus what needs a person: waves that never ran, and the issues
-/// triage parked or declined.
-///
-/// `stopped` is work that did not happen and makes the run non-zero. `parked`
-/// is an outcome rather than a failure, and is the record of what is waiting on
-/// a decision, which used to reach a person only through plan.json.
+/// For `run`, `code`, `followup`, and `resume`, which build on the base branch
+/// and can merge into it, so the report ends by bringing the local one up to
+/// date.
 fn report_with(
     results: &[IssueRun],
     cfg: &Config,
     repo: &Repo,
     stopped: &[String],
     parked: &[String],
+) -> i32 {
+    print_report(results, cfg, repo, stopped, parked, true)
+}
+
+/// The outcome table, plus what needs a person: waves that never ran, and the
+/// issues triage parked or declined.
+///
+/// `stopped` is work that did not happen and makes the run non-zero. `parked`
+/// is an outcome rather than a failure, and is the record of what is waiting on
+/// a decision, which used to reach a person only through plan.json.
+fn print_report(
+    results: &[IssueRun],
+    cfg: &Config,
+    repo: &Repo,
+    stopped: &[String],
+    parked: &[String],
+    sync_base: bool,
 ) -> i32 {
     // What the run spent, recorded as it happened. Kept beside the run so a
     // resume adds to it rather than starting the count again.
@@ -2610,6 +2627,17 @@ fn report_with(
              Set followups = \"issues\" to file them."
         );
     }
+    if sync_base {
+        let base = cfg.base_branch();
+        let outcome = repo.sync_local_base(base, cfg.loop_cfg.sync_base);
+        // Never part of the exit status or the write count: nothing the run
+        // produced depends on the local branch, and it is the person's.
+        match base_sync_line(base, &outcome) {
+            Some(line) if matches!(outcome, BaseSync::Failed(_)) => logwarn!("{line}"),
+            Some(line) => println!("\n{line}"),
+            None => {}
+        }
+    }
     if let Some(summary) = spend::summary(&spent) {
         println!("\n{summary}");
     }
@@ -2624,6 +2652,47 @@ fn report_with(
     }
     let issue_exit = i32::from(!results.iter().all(IssueRun::succeeded) || !stopped.is_empty());
     issue_exit.max(report_writes(repo))
+}
+
+/// What the report says about the local base branch. Nothing when it did not
+/// move and is not behind.
+fn base_sync_line(base: &str, outcome: &BaseSync) -> Option<String> {
+    let commits = |n: usize| match n {
+        1 => "1 commit".to_string(),
+        n => format!("{n} commits"),
+    };
+    match outcome {
+        BaseSync::NoLocalBranch | BaseSync::UpToDate | BaseSync::Diverged { behind: 0, .. } => None,
+        BaseSync::FastForwarded { commits: n } => Some(format!(
+            "local {base} fast-forwarded to origin/{base} ({})",
+            commits(*n)
+        )),
+        BaseSync::Behind { commits: n, reason } => {
+            let why = match reason {
+                BehindReason::Disabled => "sync_base is off".to_string(),
+                BehindReason::Uncommitted => "the checkout has uncommitted changes. Run \
+                                              `git pull --ff-only` when ready"
+                    .to_string(),
+                BehindReason::OtherWorktree(path) => format!(
+                    "it is checked out in {}. Run `git pull --ff-only` there when ready",
+                    path.display()
+                ),
+                BehindReason::InProgress => "a rebase or bisect of it is in progress".to_string(),
+            };
+            Some(format!(
+                "local {base} is {} behind origin/{base} and was left alone: {why}.",
+                commits(*n)
+            ))
+        }
+        BaseSync::Diverged { ahead, behind } => Some(format!(
+            "local {base} has {} origin/{base} does not, and is {behind} behind. It was left \
+             alone.",
+            commits(*ahead)
+        )),
+        BaseSync::Failed(why) => Some(format!(
+            "could not bring local {base} up to date with origin/{base}: {why}"
+        )),
+    }
 }
 
 /// One item's outcome, as the report prints it.
@@ -2874,6 +2943,155 @@ review_1 = \"ultra\"
 
         assert_eq!(1, write_exit_code(writes));
         assert_eq!(2, writes.succeeded());
+    }
+
+    #[test]
+    fn the_report_says_what_became_of_the_local_base_branch() {
+        for quiet in [
+            BaseSync::NoLocalBranch,
+            BaseSync::UpToDate,
+            BaseSync::Diverged {
+                ahead: 2,
+                behind: 0,
+            },
+        ] {
+            assert_eq!(None, base_sync_line("main", &quiet), "{quiet:?}");
+        }
+
+        let line = |outcome| base_sync_line("main", &outcome).expect("a line");
+        assert_eq!(
+            "local main fast-forwarded to origin/main (3 commits)",
+            line(BaseSync::FastForwarded { commits: 3 })
+        );
+        assert_eq!(
+            "local main fast-forwarded to origin/main (1 commit)",
+            line(BaseSync::FastForwarded { commits: 1 })
+        );
+        assert_eq!(
+            "local main is 3 commits behind origin/main and was left alone: the checkout has \
+             uncommitted changes. Run `git pull --ff-only` when ready.",
+            line(BaseSync::Behind {
+                commits: 3,
+                reason: BehindReason::Uncommitted,
+            })
+        );
+        assert_eq!(
+            "local main has 2 commits origin/main does not, and is 4 behind. It was left alone.",
+            line(BaseSync::Diverged {
+                ahead: 2,
+                behind: 4,
+            })
+        );
+        let elsewhere = line(BaseSync::Behind {
+            commits: 1,
+            reason: BehindReason::OtherWorktree(PathBuf::from("/src/linked")),
+        });
+        assert!(elsewhere.contains("1 commit behind"), "{elsewhere}");
+        assert!(elsewhere.contains("/src/linked"), "{elsewhere}");
+        let off = line(BaseSync::Behind {
+            commits: 2,
+            reason: BehindReason::Disabled,
+        });
+        assert!(off.contains("sync_base is off"), "{off}");
+        let busy = line(BaseSync::Behind {
+            commits: 2,
+            reason: BehindReason::InProgress,
+        });
+        assert!(busy.contains("rebase or bisect"), "{busy}");
+        let failed = line(BaseSync::Failed("origin went away".into()));
+        assert!(failed.contains("local main"), "{failed}");
+        assert!(failed.contains("origin went away"), "{failed}");
+    }
+
+    /// Only the commands that build on the base sync it, and a sync that fails
+    /// is neither a failed write nor a failed run.
+    #[test]
+    fn only_the_working_report_syncs_the_base_and_a_failure_keeps_the_exit_code() {
+        fn git(cwd: &Path, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "spar-cli-sync-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let origin = dir.join("origin.git");
+        let work = dir.join("work");
+        let other = dir.join("other");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+        git(&work, &["init", "-q", "-b", "main"]);
+        git(&work, &["config", "user.email", "spar@example.invalid"]);
+        git(&work, &["config", "user.name", "spar test"]);
+        git(&work, &["config", "commit.gpgsign", "false"]);
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "seed"]);
+        git(
+            &work,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&work, &["push", "-q", "-u", "origin", "main"]);
+        git(&work, &["checkout", "-q", "-b", "topic"]);
+        git(&dir, &["clone", "-q", "origin.git", "other"]);
+        let upstream = |message: &str| {
+            git(
+                &other,
+                &[
+                    "-c",
+                    "user.email=other@example.invalid",
+                    "-c",
+                    "user.name=other",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    message,
+                ],
+            );
+            git(&other, &["push", "-q", "origin", "main"]);
+        };
+        upstream("one");
+
+        let cfg =
+            config::parse("[agents.a]\ncommand = [\"true\"]\n\n[agents.b]\ncommand = [\"true\"]\n")
+                .unwrap();
+        let repo = Repo::open(&work, &cfg).unwrap();
+        let before = git(&work, &["rev-parse", "main"]);
+
+        assert_eq!(0, report(&[], &cfg, &repo));
+        assert_eq!(before, git(&work, &["rev-parse", "main"]));
+
+        assert_eq!(0, report_with(&[], &cfg, &repo, &[], &[]));
+        let synced = git(&work, &["rev-parse", "main"]);
+        assert_eq!(git(&other, &["rev-parse", "HEAD"]), synced);
+
+        upstream("two");
+        std::fs::rename(&origin, dir.join("moved.git")).unwrap();
+        assert_eq!(0, report_with(&[], &cfg, &repo, &[], &[]));
+        assert_eq!(synced, git(&work, &["rev-parse", "main"]));
+        assert_eq!(WriteSummary::default(), repo.write_summary());
     }
 
     #[test]

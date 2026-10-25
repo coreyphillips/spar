@@ -217,6 +217,42 @@ impl PushTarget {
     }
 }
 
+/// What became of the local base branch once a run finished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaseSync {
+    NoLocalBranch,
+    UpToDate,
+    FastForwarded {
+        commits: usize,
+    },
+    /// Strictly behind origin, and left there.
+    Behind {
+        commits: usize,
+        reason: BehindReason,
+    },
+    /// Has commits origin does not, so it is never moved.
+    Diverged {
+        ahead: usize,
+        behind: usize,
+    },
+    /// The fetch, a probe, or the update failed. The branch is where it was.
+    Failed(String),
+}
+
+/// Why a base branch that could have been fast-forwarded was not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BehindReason {
+    /// `sync_base` is off.
+    Disabled,
+    /// Checked out where spar was started, and that checkout has uncommitted
+    /// changes.
+    Uncommitted,
+    /// Checked out in another worktree, whose state is not spar's to judge.
+    OtherWorktree(PathBuf),
+    /// A rebase or bisect in some worktree will write the branch when it ends.
+    InProgress,
+}
+
 #[derive(Debug)]
 pub struct Repo {
     root: PathBuf,
@@ -1757,6 +1793,143 @@ impl Repo {
             Some(name) if !name.is_empty() => name.to_string(),
             _ => configured.to_string(),
         }
+    }
+
+    /// Fast-forward the local base branch to origin, when that cannot cost
+    /// local work.
+    ///
+    /// Worktrees are built from `origin/<base>` and merges happen on GitHub,
+    /// so nothing else moves the local branch. A branch with commits origin
+    /// lacks, a checkout with uncommitted changes, and a branch another
+    /// worktree holds are left alone. With `fast_forward` off this only looks.
+    pub fn sync_local_base(&self, base: &str, fast_forward: bool) -> BaseSync {
+        self.sync_local_base_checked(base, fast_forward)
+            .unwrap_or_else(|e| BaseSync::Failed(git_complaint(&e).to_string()))
+    }
+
+    fn sync_local_base_checked(&self, base: &str, fast_forward: bool) -> Result<BaseSync> {
+        let local_ref = format!("refs/heads/{base}");
+        if !self.exact_ref_exists_checked(&self.root, &local_ref)? {
+            return Ok(BaseSync::NoLocalBranch);
+        }
+        let tracking_ref = format!("refs/remotes/origin/{base}");
+        let refspec = format!("+{local_ref}:{tracking_ref}");
+        self.git(&["fetch", "--no-tags", "origin", &refspec])
+            .map_err(|e| spar_err!("could not fetch {base} from origin: {}", git_complaint(&e)))?;
+
+        let commit = |refname: &str| -> Result<String> {
+            let spec = format!("{refname}^{{commit}}");
+            let oid = self.git_at(Some(&self.root), &["rev-parse", "--verify", &spec])?;
+            Ok(oid.trim().to_string())
+        };
+        let old = commit(&local_ref)?;
+        let new = commit(&tracking_ref)?;
+        let ahead = self.commits_not_in_checked(&self.root, &old, &new)?;
+        let behind = self.commits_not_in_checked(&self.root, &new, &old)?;
+        if ahead > 0 {
+            return Ok(BaseSync::Diverged { ahead, behind });
+        }
+        if behind == 0 {
+            return Ok(BaseSync::UpToDate);
+        }
+        let left = |reason| {
+            Ok(BaseSync::Behind {
+                commits: behind,
+                reason,
+            })
+        };
+        if !fast_forward {
+            return left(BehindReason::Disabled);
+        }
+        if self.branch_mid_operation(base)? {
+            return left(BehindReason::InProgress);
+        }
+
+        let toplevel = self.git_at(Some(&self.root), &["rev-parse", "--show-toplevel"])?;
+        let here = std::fs::canonicalize(toplevel.trim())
+            .map_err(|e| spar_err!("could not resolve {}: {e}", toplevel.trim()))?;
+        let holders = self.worktrees_holding_checked(base)?;
+        let elsewhere = holders
+            .iter()
+            .find(|path| !std::fs::canonicalize(path).is_ok_and(|path| path == here));
+        if let Some(path) = elsewhere {
+            return left(BehindReason::OtherWorktree(path.clone()));
+        }
+
+        // Hooks and fsmonitor stay off: an editing call could have planted
+        // either, and here they would run outside its sandbox.
+        if holders.is_empty() {
+            let message = format!("fast-forward to origin/{base}");
+            self.git_at_without_automation(
+                &self.root,
+                &["update-ref", "-m", &message, &local_ref, &new, &old],
+            )
+            .map_err(|e| spar_err!("could not move {base}: {}", git_complaint(&e)))?;
+        } else {
+            if self.has_uncommitted_changes(&here)? {
+                return left(BehindReason::Uncommitted);
+            }
+            // Git lets a merge overwrite an ignored file by default, and an
+            // ignored file can still be somebody's only copy of something.
+            let merge = [
+                "merge",
+                "--ff-only",
+                "--no-overwrite-ignore",
+                "--quiet",
+                &new,
+            ];
+            self.git_at_without_automation(&here, &merge)
+                .map_err(|e| spar_err!("could not fast-forward {base}: {}", git_complaint(&e)))?;
+        }
+        Ok(BaseSync::FastForwarded { commits: behind })
+    }
+
+    /// Whether a rebase or bisect in any worktree will write `branch` when it
+    /// finishes.
+    ///
+    /// Git lists such a checkout as detached, so it does not show up as holding
+    /// the branch, but moving the branch under it makes the rebase fail at the
+    /// end. `git branch -f` refuses for the same reason.
+    fn branch_mid_operation(&self, branch: &str) -> Result<bool> {
+        let common = self.git_at(
+            Some(&self.root),
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let common = PathBuf::from(common.trim());
+        let mut admin = vec![common.clone()];
+        match std::fs::read_dir(common.join("worktrees")) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry =
+                        entry.map_err(|e| spar_err!("could not list linked worktrees: {e}"))?;
+                    if entry.path().is_dir() {
+                        admin.push(entry.path());
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => bail!("could not list linked worktrees: {e}"),
+        }
+
+        let read = |path: PathBuf| -> Result<Option<String>> {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => Ok(Some(text.trim().to_string())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(spar_err!("could not read {}: {e}", path.display())),
+            }
+        };
+        let full = format!("refs/heads/{branch}");
+        for dir in admin {
+            for state in ["rebase-merge/head-name", "rebase-apply/head-name"] {
+                if read(dir.join(state))?.as_deref() == Some(full.as_str()) {
+                    return Ok(true);
+                }
+            }
+            if read(dir.join("BISECT_START"))?.as_deref() == Some(branch) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     // -- branch naming and ownership --------------------------------------
@@ -5405,19 +5578,27 @@ impl Repo {
 
     /// The worktree that has `branch` checked out, if one does.
     fn worktree_holding(&self, branch: &str) -> Option<PathBuf> {
-        let listed = self
-            .git_at(Some(&self.root), &["worktree", "list", "--porcelain"])
-            .ok()?;
+        self.worktrees_holding_checked(branch)
+            .ok()?
+            .into_iter()
+            .next()
+    }
+
+    /// Every worktree that has `branch` checked out. More than one is possible
+    /// when a worktree was added with `--force`.
+    fn worktrees_holding_checked(&self, branch: &str) -> Result<Vec<PathBuf>> {
+        let listed = self.git_at(Some(&self.root), &["worktree", "list", "--porcelain"])?;
         let wanted = format!("branch refs/heads/{branch}");
         let mut current: Option<PathBuf> = None;
+        let mut holders = Vec::new();
         for line in listed.lines() {
             if let Some(path) = line.strip_prefix("worktree ") {
                 current = Some(PathBuf::from(path));
             } else if line == wanted {
-                return current;
+                holders.extend(current.clone());
             }
         }
-        None
+        Ok(holders)
     }
 
     /// Finish the local cleanup a merge could not.
@@ -6565,6 +6746,15 @@ fn git_without_maintenance_argv(args: &[&str]) -> Vec<String> {
     ];
     argv.extend(args.iter().map(|arg| (*arg).to_string()));
     argv
+}
+
+/// What a failed git call said went wrong, on one line. Git often closes with
+/// advice ("and the repository exists."), so its last line can say nothing.
+fn git_complaint(e: &crate::error::SparError) -> &str {
+    e.message()
+        .lines()
+        .find(|line| line.starts_with("fatal:") || line.starts_with("error:"))
+        .unwrap_or_else(|| e.last_line())
 }
 
 fn git_without_automation_argv(args: &[&str]) -> Vec<String> {

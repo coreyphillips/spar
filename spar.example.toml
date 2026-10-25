@@ -118,6 +118,15 @@ first_implementor = "claude" # who writes the first draft. "alternate" swaps it
 base_branch       = "main"   # only a fallback; origin/HEAD wins when it exists
 worktrees         = true     # isolate each issue in its own git worktree
 keep_worktrees    = false    # keep them after a run, for inspection
+sync_base         = true     # once run, code, followup, or resume finishes,
+                             # fast-forward the local base branch to origin.
+                             # Worktrees build from origin/<base> and merges
+                             # happen on GitHub, so nothing else moves it. Left
+                             # alone, with the reason in the report, when it has
+                             # commits origin lacks, when its checkout has
+                             # uncommitted changes, or when another worktree has
+                             # it checked out. false still says when it is
+                             # behind.
 branch_prefix     = ""       # branches are issue-N, pr-N, and split-N-I, with
                              # a suffix on repeats. Set e.g. "spar/" to namespace.
 close_skipped     = true     # close an issue both agents independently declined,

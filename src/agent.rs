@@ -61,6 +61,19 @@ titles, issue bodies, review comments, and the comments in code you write):
 Write as a human engineer would, because the reader neither knows nor cares what
 produced the work.";
 
+/// When the call will be stopped. A model that does not know starts a half
+/// hour test suite forty minutes in, and the call is lost with its report.
+fn deadline_rule(timeout_secs: u64, now_secs: u64) -> String {
+    format!(
+        "This call is stopped at {}, {} after it started, and a call stopped \
+         before it answers loses its whole answer. Leave time to answer. When a \
+         full test suite or a benchmark would not finish well before then, run \
+         the tests that cover the change instead and say what you left out.",
+        crate::clock::date_line(now_secs.saturating_add(timeout_secs)),
+        crate::spend::clock(std::time::Duration::from_secs(timeout_secs)),
+    )
+}
+
 const JSON_INSTRUCTION: &str = "Respond with ONLY a JSON object matching this \
 schema. No prose, no markdown fences, no commentary before or after:";
 
@@ -621,13 +634,17 @@ impl Agent {
         schema: Option<&str>,
         access: Access,
     ) -> Result<String> {
+        let system = format!(
+            "{STYLE_RULES}\n\n{}",
+            deadline_rule(self.spec.timeout, crate::clock::now_secs())
+        );
         let body = match self.spec.system_via {
             SystemVia::Placeholder => prompt.to_string(),
-            SystemVia::Prompt => format!("{STYLE_RULES}\n\n{prompt}"),
+            SystemVia::Prompt => format!("{system}\n\n{prompt}"),
         };
         let values = Placeholders {
             prompt: Some(body),
-            system: Some(STYLE_RULES.to_string()),
+            system: Some(system),
             model: self.spec.model.clone(),
             effort: effort
                 .asked()
@@ -1944,6 +1961,45 @@ mod tests {
             lower.contains("comment code for the reason"),
             "no rule for it"
         );
+    }
+
+    #[test]
+    fn the_deadline_names_the_moment_and_how_long_the_call_has() {
+        // 2026-10-25 01:44:33 UTC.
+        let rule = deadline_rule(3600, 1_792_892_673);
+        assert!(rule.contains("stopped at 2026-10-25 02:44 UTC"), "{rule}");
+        assert!(rule.contains("60m00s after it started"), "{rule}");
+        assert!(rule.contains("tests that cover the change"), "{rule}");
+        assert!(!rule.contains(['\u{2013}', '\u{2014}']), "{rule}");
+    }
+
+    /// The deadline is the timeout of whichever agent answers, so a fallback
+    /// with a shorter one is told its own.
+    #[test]
+    fn the_deadline_reaches_the_cli_whichever_way_it_takes_the_system_text() {
+        let echo = |what: &str, via: SystemVia, timeout: u64| {
+            let mut spec = spec(vec![
+                one("sh"),
+                one("-c"),
+                one("printf %s \"$1\""),
+                one("sh"),
+                one(what),
+            ]);
+            spec.system_via = via;
+            spec.timeout = timeout;
+            Agent::with_bin(spec, "/bin/sh")
+                .ask("the prompt", Path::new("."), &Effort::default())
+                .unwrap()
+        };
+
+        let prompted = echo("{prompt}", SystemVia::Prompt, 60);
+        assert!(prompted.starts_with("Style rules"), "{prompted}");
+        assert!(prompted.contains("60s after it started"), "{prompted}");
+        assert!(prompted.ends_with("the prompt"), "{prompted}");
+
+        let placed = echo("{system}", SystemVia::Placeholder, 1800);
+        assert!(placed.starts_with("Style rules"), "{placed}");
+        assert!(placed.contains("30m00s after it started"), "{placed}");
     }
 
     // -- a failure said in the agent's own terms ---------------------------

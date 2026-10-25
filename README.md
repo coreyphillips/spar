@@ -1599,7 +1599,9 @@ choice when a certain reply matters more than an independent one.
 
 Every option a preset supplies can be overridden per agent, including `timeout`
 (seconds one call may take before spar gives up), `search_paths`, and
-`system_via`. [`spar.example.toml`](spar.example.toml) lists the full set.
+`system_via`. [`spar.example.toml`](spar.example.toml) lists the full set. Every
+call is told when its own agent's timeout will stop it, so a model can run the
+tests that cover a change rather than start a suite it cannot finish.
 
 Presets are embedded in the binary, and a file on disk of the same name wins
 over the built-in copy. So when a CLI's flags drift you can fix it without

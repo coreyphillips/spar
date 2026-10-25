@@ -584,18 +584,16 @@ impl Descendants {
             )
         })?;
         let mut frozen = std::collections::BTreeSet::new();
-        let mut groups = std::collections::BTreeSet::new();
         let mut root_group = true;
-        let searched = self.freeze(root, root_alive, &mut frozen, &mut groups, &mut root_group);
+        let searched = self.freeze(root, root_alive, &mut frozen, &mut root_group);
 
         // Whatever the search managed, everything it froze is killed: a
-        // stopped process left behind would hold its files open for good.
+        // stopped process left behind would hold its files open for good. The
+        // group goes first and once, because a second signal to it finds only
+        // the zombies the first one made.
         let mut killed = Ok(());
         if root_group {
-            killed = killed.and(signal(-root, libc::SIGKILL));
-        }
-        for group in &groups {
-            killed = killed.and(signal(-group, libc::SIGKILL));
+            killed = signal_group(root, libc::SIGKILL);
         }
         for pid in &frozen {
             killed = killed.and(signal(*pid, libc::SIGKILL));
@@ -611,13 +609,12 @@ impl Descendants {
         root: libc::pid_t,
         root_alive: bool,
         frozen: &mut std::collections::BTreeSet<libc::pid_t>,
-        groups: &mut std::collections::BTreeSet<libc::pid_t>,
         root_group: &mut bool,
     ) -> std::io::Result<()> {
         let mut refused: std::collections::BTreeSet<libc::pid_t> = Default::default();
         let mut failure = None;
         if root_alive {
-            if let Err(error) = signal(-root, libc::SIGSTOP) {
+            if let Err(error) = signal_group(root, libc::SIGSTOP) {
                 failure.get_or_insert(error);
             }
         }
@@ -657,12 +654,6 @@ impl Descendants {
                     }
                 }
             }
-            groups.extend(
-                procs
-                    .iter()
-                    .filter(|p| p.pgid == p.pid && frozen.contains(&p.pid))
-                    .map(|p| p.pid),
-            );
         }
         Err(failure.unwrap_or_else(|| {
             std::io::Error::other(
@@ -761,6 +752,20 @@ fn signal(target: libc::pid_t, sig: libc::c_int) -> std::io::Result<()> {
         return Ok(());
     }
     Err(error)
+}
+
+/// Signal a process group. macOS refuses with EPERM, not ESRCH, when every
+/// member left is a zombie, so a refusal counts only if a member still visible
+/// in the process table refuses on its own.
+#[cfg(unix)]
+fn signal_group(group: libc::pid_t, sig: libc::c_int) -> std::io::Result<()> {
+    match signal(-group, sig) {
+        Err(error) if error.raw_os_error() == Some(libc::EPERM) => table::list()?
+            .iter()
+            .filter(|p| p.pgid == group)
+            .try_for_each(|p| signal(p.pid, sig)),
+        other => other,
+    }
 }
 
 /// One row of the process table.
@@ -1618,6 +1623,26 @@ mod tests {
         let _ = stranger.kill();
         let _ = stranger.wait();
         assert!(alive, "the sweep killed a process the call did not start");
+    }
+
+    /// A group that has just been killed holds only zombies, and macOS
+    /// answers a signal to it with EPERM. Treated as a refusal, it turned a
+    /// timeout into an uncertain write.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_of_zombies_is_not_a_refusal() {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        // Exited and not yet reaped, so the group is still there.
+        std::thread::sleep(Duration::from_millis(300));
+        let result = signal_group(pid, libc::SIGKILL);
+        let _ = child.wait();
+        result.unwrap();
     }
 
     #[cfg(unix)]

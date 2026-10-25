@@ -37,9 +37,12 @@ pub struct ExecOpts {
     pub check: bool,
     pub env: Vec<(String, String)>,
     pub stdin: Option<String>,
-    /// On Unix, put the command in its own process group and stop descendants
-    /// when the direct child exits. Agent calls use this to establish a quiet
-    /// point before their working tree is inspected or committed.
+    /// On Unix, put the command in its own process group, and stop every
+    /// descendant when the direct child exits, times out, or is interrupted.
+    /// That includes descendants that moved to a group or session of their
+    /// own, which is where agent CLIs run their shells. Agent calls use this
+    /// to establish a quiet point before their working tree is inspected or
+    /// committed.
     pub stop_descendants: bool,
 }
 
@@ -239,14 +242,23 @@ fn exec_until(
     }
 
     #[cfg(unix)]
-    if opts.stop_descendants {
+    let token = opts.stop_descendants.then(call_token);
+    #[cfg(unix)]
+    if let Some(token) = &token {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
+        let outer = std::env::var(CALLS_VAR).ok();
+        command.env(CALLS_VAR, calls_value(outer.as_deref(), token));
     }
 
     let mut child = command
         .spawn()
         .map_err(|e| SparError::new(format!("could not run `{}`: {e}", abbreviate(argv))))?;
+
+    #[cfg(unix)]
+    let mut tree = token.map(|token| Descendants::new(child.id(), token));
+    #[cfg(not(unix))]
+    let tree: Option<Descendants> = None;
 
     // Readers first, writer second, and the writer on its own thread.
     //
@@ -283,18 +295,22 @@ fn exec_until(
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if stop.load(Ordering::SeqCst) {
-                    if let Err(error) = stop_and_reap(&mut child, opts.stop_descendants) {
+                    if let Err(error) = stop_and_reap(&mut child, tree.as_ref()) {
                         quiet_error = Some(error);
                     }
                     stopped = true;
                     break None;
                 }
                 if Instant::now() >= deadline {
-                    if let Err(error) = stop_and_reap(&mut child, opts.stop_descendants) {
+                    if let Err(error) = stop_and_reap(&mut child, tree.as_ref()) {
                         quiet_error = Some(error);
                     }
                     timed_out = true;
                     break None;
+                }
+                #[cfg(unix)]
+                if let Some(tree) = tree.as_mut() {
+                    tree.sample_if_due();
                 }
                 std::thread::sleep(poll);
                 // Back off so a long agent run is not a busy loop, but stay
@@ -303,15 +319,16 @@ fn exec_until(
             }
             Err(error) => {
                 return Err(poll_failure(error, argv, || {
-                    stop_and_reap(&mut child, opts.stop_descendants)
+                    stop_and_reap(&mut child, tree.as_ref())
                 }));
             }
         }
     };
 
+    // A stopped or timed out call was swept while its child was still alive.
     #[cfg(unix)]
-    if !timed_out && opts.stop_descendants {
-        if let Err(error) = stop_process_group(child.id()) {
+    if let (Some(_), Some(tree)) = (status, &tree) {
+        if let Err(error) = tree.stop(false) {
             quiet_error = Some(error);
         }
     }
@@ -367,17 +384,20 @@ fn exec_until(
     })
 }
 
-fn stop_and_reap(child: &mut std::process::Child, stop_descendants: bool) -> std::io::Result<()> {
+fn stop_and_reap(
+    child: &mut std::process::Child,
+    tree: Option<&Descendants>,
+) -> std::io::Result<()> {
     #[cfg(not(unix))]
-    let _ = stop_descendants;
+    let _ = tree;
 
     #[cfg(unix)]
-    if stop_descendants {
-        if let Err(group_error) = stop_process_group(child.id()) {
+    if let Some(tree) = tree {
+        if let Err(tree_error) = tree.stop(true) {
             if child.kill().is_ok() {
                 let _ = child.wait();
             }
-            return Err(group_error);
+            return Err(tree_error);
         }
         return child.wait().map(|_| ());
     }
@@ -420,18 +440,320 @@ fn quiet_point_failure(error: std::io::Error, argv: &[String]) -> SparError {
     ))
 }
 
+/// The variable every process below a call inherits, whatever process group
+/// or session it moves to.
+///
+/// The call's own process group is not enough to find them. Agent CLIs start
+/// each shell in a new group and session, so a signal to the call's group
+/// reaches the CLI and none of the test suites it started, and those keep
+/// running under init once the call is over. The value is a list, so a spar
+/// started inside an agent call marks its own calls without unmarking the one
+/// it runs in.
+///
+/// macOS does not show the environment of Apple's own binaries, `/bin/sh` and
+/// `/bin/zsh` among them, to another process. There the variable finds the
+/// test runner a shell started and not the shell, and the session and the
+/// samples below find the shell.
 #[cfg(unix)]
-fn stop_process_group(id: u32) -> std::io::Result<()> {
-    let id = i32::try_from(id).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "the child process id does not fit a platform process-group id",
-        )
-    })?;
-    // The child was placed in a new process group whose id is its pid. A
-    // negative pid sends the signal to that group, including descendants that
-    // kept running after the direct command exited.
-    if unsafe { libc::kill(-id, libc::SIGKILL) } == 0 {
+const CALLS_VAR: &str = "SPAR_CALLS";
+
+/// How often a running call's descendants are noted down. One that leaves the
+/// tree by outliving its parent is still recognised later if a sample saw it
+/// while it was in it. A call shorter than this is never sampled at all.
+#[cfg(unix)]
+const SAMPLE_EVERY: Duration = Duration::from_millis(500);
+
+/// How many times a sweep looks again for processes that started while it was
+/// freezing the ones it had already found.
+#[cfg(unix)]
+const FREEZE_ROUNDS: usize = 8;
+
+#[cfg(unix)]
+static NEXT_CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A token no other call has used, in this spar or in an earlier one that had
+/// the same pid.
+#[cfg(unix)]
+fn call_token() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{}.{nanos}.{}",
+        std::process::id(),
+        NEXT_CALL.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+#[cfg(unix)]
+fn calls_value(outer: Option<&str>, token: &str) -> String {
+    match outer {
+        Some(outer) if !outer.is_empty() => format!("{outer}:{token}"),
+        _ => token.to_string(),
+    }
+}
+
+/// Whether a NUL separated environment block marks its process as one of the
+/// call's.
+#[cfg(unix)]
+fn carries(environment: &[u8], token: &str) -> bool {
+    let prefix = format!("{CALLS_VAR}=");
+    environment
+        .split(|&b| b == 0)
+        .filter_map(|entry| entry.strip_prefix(prefix.as_bytes()))
+        .any(|value| value.split(|&b| b == b':').any(|t| t == token.as_bytes()))
+}
+
+/// The processes one call started.
+#[cfg(unix)]
+struct Descendants {
+    root: u32,
+    token: String,
+    /// When the direct child started, in the process table's own units.
+    /// Nothing that started earlier can descend from it, which spares reading
+    /// the environment of every other process on the machine.
+    floor: Option<u64>,
+    /// What the last sample found, with when each started, which tells one
+    /// from a stranger that was later given its pid.
+    seen: std::collections::BTreeMap<libc::pid_t, u64>,
+    /// Sessions the last sample found a descendant in, other than spar's own,
+    /// with when each one's leader started if it was still running. A session
+    /// outlives its leader, and the start tells the leader from a stranger
+    /// later given its pid, which would lead a session of its own.
+    sessions: std::collections::BTreeMap<libc::pid_t, Option<u64>>,
+    sampled: Instant,
+}
+
+#[cfg(not(unix))]
+struct Descendants;
+
+#[cfg(unix)]
+impl Descendants {
+    fn new(root: u32, token: String) -> Self {
+        let floor = libc::pid_t::try_from(root)
+            .ok()
+            .and_then(table::entry)
+            .map(|entry| entry.start);
+        Self {
+            root,
+            token,
+            floor,
+            seen: Default::default(),
+            sessions: Default::default(),
+            sampled: Instant::now(),
+        }
+    }
+
+    /// Note down what is below the call now, once `SAMPLE_EVERY` has passed
+    /// since the last look. A failed sample leaves the last one standing.
+    fn sample_if_due(&mut self) {
+        if self.sampled.elapsed() < SAMPLE_EVERY {
+            return;
+        }
+        self.sampled = Instant::now();
+        let (Ok(root), Ok(procs)) = (libc::pid_t::try_from(self.root), table::list()) else {
+            return;
+        };
+        // The child has not been reaped, so its pid is still its own even if
+        // it has just exited.
+        let found = self.find(&procs, root, true, true, false);
+        let my_session = unsafe { libc::getsid(0) };
+        let start_of = |pid: libc::pid_t| procs.iter().find(|p| p.pid == pid).map(|p| p.start);
+        let found: Vec<&Entry> = procs.iter().filter(|p| found.contains(&p.pid)).collect();
+        self.seen = found.iter().map(|p| (p.pid, p.start)).collect();
+        self.sessions = found
+            .iter()
+            .filter(|p| p.sid != my_session)
+            .map(|p| (p.sid, start_of(p.sid)))
+            .collect();
+    }
+
+    /// Freeze the call's process group and every process found below it, then
+    /// kill all of them.
+    ///
+    /// Freezing first is what lets the search end. A stopped process cannot
+    /// start another, so each round finds only what started before its parent
+    /// was frozen. `root_alive` is false once the child has been reaped, since
+    /// its pid may then belong to somebody else.
+    fn stop(&self, root_alive: bool) -> std::io::Result<()> {
+        let root = libc::pid_t::try_from(self.root).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the child process id does not fit a platform process-group id",
+            )
+        })?;
+        let mut frozen = std::collections::BTreeSet::new();
+        let mut groups = std::collections::BTreeSet::new();
+        let mut root_group = true;
+        let searched = self.freeze(root, root_alive, &mut frozen, &mut groups, &mut root_group);
+
+        // Whatever the search managed, everything it froze is killed: a
+        // stopped process left behind would hold its files open for good.
+        let mut killed = Ok(());
+        if root_group {
+            killed = killed.and(signal(-root, libc::SIGKILL));
+        }
+        for group in &groups {
+            killed = killed.and(signal(-group, libc::SIGKILL));
+        }
+        for pid in &frozen {
+            killed = killed.and(signal(*pid, libc::SIGKILL));
+        }
+        searched.and(killed)
+    }
+
+    /// Every process it could not stop is left out of the kill and reported
+    /// once the rest are stopped, rather than ending the search: one setuid
+    /// descendant must not leave its siblings running.
+    fn freeze(
+        &self,
+        root: libc::pid_t,
+        root_alive: bool,
+        frozen: &mut std::collections::BTreeSet<libc::pid_t>,
+        groups: &mut std::collections::BTreeSet<libc::pid_t>,
+        root_group: &mut bool,
+    ) -> std::io::Result<()> {
+        let mut refused: std::collections::BTreeSet<libc::pid_t> = Default::default();
+        let mut failure = None;
+        if root_alive {
+            if let Err(error) = signal(-root, libc::SIGSTOP) {
+                failure.get_or_insert(error);
+            }
+        }
+        // A fork under way when its parent was frozen can finish after the
+        // next listing, so a round that froze something is always followed by
+        // one more look.
+        let mut busy = false;
+        for _ in 0..FREEZE_ROUNDS {
+            let procs = table::list()?;
+            // A reaped child's pid is free again, and a process holding it now
+            // leads a group that has nothing to do with this call.
+            if !root_alive && procs.iter().any(|p| p.pid == root) {
+                *root_group = false;
+            }
+            let found = self.find(&procs, root, root_alive, *root_group, true);
+            let fresh: Vec<libc::pid_t> = found
+                .iter()
+                .filter(|&&pid| !frozen.contains(&pid) && !refused.contains(&pid))
+                .copied()
+                .collect();
+            if fresh.is_empty() {
+                if !busy {
+                    return failure.map_or(Ok(()), Err);
+                }
+                busy = false;
+                continue;
+            }
+            busy = true;
+            for pid in fresh {
+                match signal(pid, libc::SIGSTOP) {
+                    Ok(()) => {
+                        frozen.insert(pid);
+                    }
+                    Err(error) => {
+                        refused.insert(pid);
+                        failure.get_or_insert(error);
+                    }
+                }
+            }
+            groups.extend(
+                procs
+                    .iter()
+                    .filter(|p| p.pgid == p.pid && frozen.contains(&p.pid))
+                    .map(|p| p.pid),
+            );
+        }
+        Err(failure.unwrap_or_else(|| {
+            std::io::Error::other(
+                "processes below the call kept starting while they were being stopped",
+            )
+        }))
+    }
+
+    /// Everything in `procs` that belongs to the call.
+    ///
+    /// It starts from the child while it is alive, the child's process group,
+    /// whatever the last sample saw that is still the same process, and, with
+    /// `marks`, whatever carries the call's token. From there it spreads to
+    /// children, to the members of any group one of them leads, and to the
+    /// members of any session one of them is in other than spar's own. A
+    /// process cannot join a session it did not inherit, so a session that
+    /// holds a descendant and is not spar's was created by a descendant, and
+    /// everything in it descends from that one.
+    fn find(
+        &self,
+        procs: &[Entry],
+        root: libc::pid_t,
+        root_alive: bool,
+        root_group: bool,
+        marks: bool,
+    ) -> std::collections::BTreeSet<libc::pid_t> {
+        let me = unsafe { libc::getpid() };
+        let uid = unsafe { libc::geteuid() };
+        let my_session = unsafe { libc::getsid(0) };
+        let by_pid: std::collections::HashMap<libc::pid_t, &Entry> =
+            procs.iter().map(|p| (p.pid, p)).collect();
+        // The session a sample recorded, unless its id now belongs to a
+        // stranger that made a session of its own.
+        let recorded = |sid: libc::pid_t| match self.sessions.get(&sid) {
+            None => false,
+            Some(leader) => by_pid
+                .get(&sid)
+                .is_none_or(|now| *leader == Some(now.start)),
+        };
+        let marked = |p: &Entry| {
+            marks
+                && p.uid == uid
+                && self.floor.is_none_or(|floor| p.start >= floor)
+                && table::environment(p.pid).is_some_and(|env| carries(&env, &self.token))
+        };
+        let mut ours: std::collections::BTreeSet<libc::pid_t> = procs
+            .iter()
+            .filter(|p| p.pid != me)
+            .filter(|p| {
+                (root_alive && p.pid == root)
+                    || (root_group && p.pgid == root)
+                    || self.seen.get(&p.pid) == Some(&p.start)
+                    || recorded(p.sid)
+                    || marked(p)
+            })
+            .map(|p| p.pid)
+            .collect();
+        loop {
+            let sessions: std::collections::BTreeSet<libc::pid_t> = procs
+                .iter()
+                .filter(|p| ours.contains(&p.pid) && p.sid != my_session)
+                .map(|p| p.sid)
+                .collect();
+            let before = ours.len();
+            for p in procs {
+                if p.pid != me
+                    && (ours.contains(&p.ppid)
+                        || ours.contains(&p.pgid)
+                        || sessions.contains(&p.sid))
+                {
+                    ours.insert(p.pid);
+                }
+            }
+            if ours.len() == before {
+                return ours;
+            }
+        }
+    }
+}
+
+/// Send `sig` to a process, or to a process group when `target` is negative.
+/// One that has already gone is not an error. Never this process, its group,
+/// or the broadcast targets, whatever a search turned up.
+#[cfg(unix)]
+fn signal(target: libc::pid_t, sig: libc::c_int) -> std::io::Result<()> {
+    let me = unsafe { libc::getpid() };
+    let my_group = unsafe { libc::getpgrp() };
+    if target == 0 || target == -1 || target == me || target == -my_group {
+        return Ok(());
+    }
+    if unsafe { libc::kill(target, sig) } == 0 {
         return Ok(());
     }
     let error = std::io::Error::last_os_error();
@@ -439,6 +761,210 @@ fn stop_process_group(id: u32) -> std::io::Result<()> {
         return Ok(());
     }
     Err(error)
+}
+
+/// One row of the process table.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Entry {
+    pid: libc::pid_t,
+    ppid: libc::pid_t,
+    pgid: libc::pid_t,
+    sid: libc::pid_t,
+    uid: libc::uid_t,
+    /// When it started, comparable only with another start from the same table.
+    start: u64,
+}
+
+#[cfg(target_os = "macos")]
+mod table {
+    use super::Entry;
+
+    pub(super) fn list() -> std::io::Result<Vec<Entry>> {
+        // Asked with no buffer, the kernel estimates how many there are.
+        let estimate = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        let mut room = usize::try_from(estimate).unwrap_or(0) + 256;
+        loop {
+            let mut pids: Vec<libc::pid_t> = vec![0; room];
+            let bytes = libc::c_int::try_from(room * std::mem::size_of::<libc::pid_t>())
+                .map_err(std::io::Error::other)?;
+            let listed = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+            let Ok(listed) = usize::try_from(listed) else {
+                return Err(std::io::Error::last_os_error());
+            };
+            // A full buffer may have cut the list short.
+            if listed >= room {
+                room *= 2;
+                continue;
+            }
+            pids.truncate(listed);
+            return Ok(pids.into_iter().filter_map(entry).collect());
+        }
+    }
+
+    /// None for a process that has gone, and for one of another user's, which
+    /// the kernel will not describe.
+    pub(super) fn entry(pid: libc::pid_t) -> Option<Entry> {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+        let filled = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if filled != size {
+            return None;
+        }
+        // SAFETY: the kernel filled every byte it was given, and zeroed is a
+        // valid value of this plain C struct in any case.
+        let info = unsafe { info.assume_init() };
+        let sid = unsafe { libc::getsid(pid) };
+        if sid < 0 {
+            return None;
+        }
+        Some(Entry {
+            pid,
+            ppid: libc::pid_t::try_from(info.pbi_ppid).ok()?,
+            pgid: libc::pid_t::try_from(info.pbi_pgid).ok()?,
+            sid,
+            uid: info.pbi_uid,
+            start: info
+                .pbi_start_tvsec
+                .saturating_mul(1_000_000)
+                .saturating_add(info.pbi_start_tvusec),
+        })
+    }
+
+    pub(super) fn environment(pid: libc::pid_t) -> Option<Vec<u8>> {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mut size: libc::size_t = 0;
+        // Asked with no buffer, the kernel says how much room the answer needs.
+        let sized = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                std::ptr::null_mut(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if sized != 0 || size == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size];
+        let read = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buf.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if read != 0 {
+            return None;
+        }
+        buf.truncate(size);
+        super::procargs_environment(&buf).map(<[u8]>::to_vec)
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod table {
+    use super::Entry;
+    use std::os::unix::fs::MetadataExt;
+
+    pub(super) fn list() -> std::io::Result<Vec<Entry>> {
+        let mut procs = Vec::new();
+        for item in std::fs::read_dir("/proc")? {
+            let Ok(item) = item else { continue };
+            // Only the numbered entries are processes.
+            let Some(pid) = item.file_name().to_str().and_then(|name| name.parse().ok()) else {
+                continue;
+            };
+            procs.extend(entry(pid));
+        }
+        Ok(procs)
+    }
+
+    /// None for a process that exited after the listing.
+    pub(super) fn entry(pid: libc::pid_t) -> Option<Entry> {
+        let dir = format!("/proc/{pid}");
+        let uid = std::fs::metadata(&dir).ok()?.uid();
+        let stat = std::fs::read(format!("{dir}/stat")).ok()?;
+        super::parse_stat(pid, &String::from_utf8_lossy(&stat), uid)
+    }
+
+    pub(super) fn environment(pid: libc::pid_t) -> Option<Vec<u8>> {
+        std::fs::read(format!("/proc/{pid}/environ")).ok()
+    }
+}
+
+/// No process table is read here, so a sweep stops the call's own process
+/// group and nothing that left it.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+mod table {
+    use super::Entry;
+
+    pub(super) fn list() -> std::io::Result<Vec<Entry>> {
+        Ok(Vec::new())
+    }
+
+    pub(super) fn entry(_: libc::pid_t) -> Option<Entry> {
+        None
+    }
+
+    pub(super) fn environment(_: libc::pid_t) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// The environment in a macOS `KERN_PROCARGS2` answer: an argument count, the
+/// executable path and its padding, the arguments, then the environment up to
+/// an empty string.
+#[cfg(any(target_os = "macos", test))]
+fn procargs_environment(buf: &[u8]) -> Option<&[u8]> {
+    let argc = usize::try_from(i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?)).ok()?;
+    let rest = &buf[4..];
+    let path_end = rest.iter().position(|&b| b == 0)?;
+    let rest = &rest[path_end..];
+    let args_start = rest.iter().position(|&b| b != 0)?;
+    let mut rest = &rest[args_start..];
+    for _ in 0..argc {
+        let end = rest.iter().position(|&b| b == 0)?;
+        rest = &rest[end + 1..];
+    }
+    let mut end = 0;
+    for entry in rest.split(|&b| b == 0) {
+        if entry.is_empty() {
+            break;
+        }
+        end += entry.len() + 1;
+    }
+    Some(&rest[..end.min(rest.len())])
+}
+
+/// A Linux `/proc/<pid>/stat` line. The command name sits in parentheses and
+/// may itself hold spaces and parentheses, so the fields are counted from the
+/// last closing one.
+#[cfg(all(unix, any(target_os = "linux", test)))]
+fn parse_stat(pid: libc::pid_t, stat: &str, uid: libc::uid_t) -> Option<Entry> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    Some(Entry {
+        pid,
+        ppid: fields.get(1)?.parse().ok()?,
+        pgid: fields.get(2)?.parse().ok()?,
+        sid: fields.get(3)?.parse().ok()?,
+        uid,
+        start: fields.get(19)?.parse().ok()?,
+    })
 }
 
 /// How long to keep waiting for output after the child has exited, when a
@@ -892,6 +1418,253 @@ mod tests {
         assert!(out.contains("done"), "{out:?}");
         std::thread::sleep(Duration::from_millis(1_200));
         assert!(!late.exists(), "a descendant edited after the quiet point");
+    }
+
+    /// A file a descendant would write too late, unique to the test.
+    #[cfg(unix)]
+    fn late_file(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("spar-late-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// A descendant that leaves for a session of its own, the way an agent CLI
+    /// starts every shell, and writes the file named by `$1` after `secs`.
+    #[cfg(unix)]
+    fn leaves_then_writes(secs: u32) -> String {
+        format!(
+            "perl -MPOSIX -e 'POSIX::setsid() or die; sleep {secs}; \
+             open(my $f, \">\", $ARGV[0]) or die' \"$1\""
+        )
+    }
+
+    #[cfg(unix)]
+    fn run_shell(script: &str, late: &Path, opts: &ExecOpts) -> Result<String> {
+        run(
+            &argv(&["/bin/sh", "-c", script, "sh", late.to_str().unwrap()]),
+            opts,
+        )
+    }
+
+    /// A sample sees the descendant while its parent is alive, which is what
+    /// finds it afterwards on macOS, where perl does not show its environment
+    /// to anybody else.
+    #[cfg(unix)]
+    #[test]
+    fn a_descendant_in_a_session_of_its_own_cannot_edit_after_the_parent_exits() {
+        let late = late_file("session");
+        let script = format!("{} & sleep 1.5; echo done", leaves_then_writes(3));
+        let out = run_shell(&script, &late, &ExecOpts::new().stop_descendants(true)).unwrap();
+
+        assert!(out.contains("done"), "{out:?}");
+        std::thread::sleep(Duration::from_millis(2_500));
+        assert!(!late.exists(), "a descendant edited after the quiet point");
+    }
+
+    /// A sample sees perl in its own session. perl then starts a shell that no
+    /// sample sees and exits, so on macOS, where neither shows its
+    /// environment, only the session ties that shell to the call.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_no_sample_saw_is_found_through_the_session_it_was_born_in() {
+        let late = late_file("born");
+        let perl = r#"perl -MPOSIX -e 'POSIX::setsid() or die; select(undef, undef, undef, 0.8); if (fork() == 0) { exec("/bin/sh", "-c", "sleep 2; : > \"\$0\"", $ARGV[0]) or die }' "$1""#;
+        let script = format!("{perl} & sleep 0.9; echo done");
+        let out = run_shell(&script, &late, &ExecOpts::new().stop_descendants(true)).unwrap();
+
+        assert!(out.contains("done"), "{out:?}");
+        std::thread::sleep(Duration::from_millis(2_500));
+        assert!(
+            !late.exists(),
+            "a shell born in a descendant's session survived"
+        );
+    }
+
+    /// Two calls can run at once, as both triage calls do, and one ending must
+    /// not reach into the other.
+    #[cfg(unix)]
+    #[test]
+    fn one_call_ending_leaves_another_calls_descendants_alone() {
+        let proof = late_file("concurrent");
+        let other = {
+            let proof = proof.clone();
+            std::thread::spawn(move || {
+                let script = format!("{} & sleep 3; echo done", leaves_then_writes(2));
+                run_shell(&script, &proof, &ExecOpts::new().stop_descendants(true))
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        run(
+            &argv(&["/bin/sh", "-c", "sleep 1"]),
+            &ExecOpts::new().stop_descendants(true),
+        )
+        .unwrap();
+
+        let out = other.join().unwrap().unwrap();
+        assert!(out.contains("done"), "{out:?}");
+        assert!(
+            proof.exists(),
+            "one call's sweep stopped another call's descendant"
+        );
+        let _ = std::fs::remove_file(&proof);
+    }
+
+    /// What every one of the four timed out implementations did: the test
+    /// suite an agent started kept running into the next issue's hour.
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_stops_a_descendant_in_a_session_of_its_own() {
+        let late = late_file("timeout");
+        let script = format!("{} & sleep 30", leaves_then_writes(2));
+        let err = run_shell(
+            &script,
+            &late,
+            &ExecOpts::new().timeout_secs(1).stop_descendants(true),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("timed out"), "{err}");
+        std::thread::sleep(Duration::from_millis(2_500));
+        assert!(!late.exists(), "a descendant outlived the timeout");
+    }
+
+    /// Without the variable, a descendant is still found by its parent while
+    /// the call it belongs to is alive.
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_stops_a_descendant_that_dropped_its_environment() {
+        let late = late_file("bare");
+        let script = format!("env -i {} & sleep 30", leaves_then_writes(2));
+        let err = run_shell(
+            &script,
+            &late,
+            &ExecOpts::new().timeout_secs(1).stop_descendants(true),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("timed out"), "{err}");
+        std::thread::sleep(Duration::from_millis(2_500));
+        assert!(!late.exists(), "a descendant without the variable survived");
+    }
+
+    /// The parent exits before the first sample, so only the variable can
+    /// find what it left behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_descendant_no_sample_saw_is_found_by_its_environment() {
+        let late = late_file("marked");
+        let script = format!("{} & sleep 0.1; echo done", leaves_then_writes(1));
+        let out = run_shell(&script, &late, &ExecOpts::new().stop_descendants(true)).unwrap();
+
+        assert!(out.contains("done"), "{out:?}");
+        std::thread::sleep(Duration::from_millis(1_500));
+        assert!(
+            !late.exists(),
+            "an unsampled descendant edited after the quiet point"
+        );
+    }
+
+    /// A spar started inside an agent call adds its own token to the list, and
+    /// what it starts still belongs to the outer call.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_descendant_of_a_nested_call_still_belongs_to_the_outer_one() {
+        let late = late_file("nested");
+        let script = format!(
+            "SPAR_CALLS=\"$SPAR_CALLS:inner\" {} & sleep 0.1; echo done",
+            leaves_then_writes(1)
+        );
+        let out = run_shell(&script, &late, &ExecOpts::new().stop_descendants(true)).unwrap();
+
+        assert!(out.contains("done"), "{out:?}");
+        std::thread::sleep(Duration::from_millis(1_500));
+        assert!(
+            !late.exists(),
+            "a nested call's descendant edited after the quiet point"
+        );
+    }
+
+    /// The marker is only worth anything if another process's environment can
+    /// be read, and this binary is not one of Apple's.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_process_environment_can_be_read_back() {
+        let env = table::environment(unsafe { libc::getpid() }).expect("readable");
+        assert!(
+            env.split(|&b| b == 0)
+                .any(|entry| entry.starts_with(b"PATH=")),
+            "{}",
+            String::from_utf8_lossy(&env)
+        );
+    }
+
+    /// The sweep goes by ancestry, group, and the inherited variable, never by
+    /// start time alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_that_only_started_during_the_call_is_left_alone() {
+        let stranger = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(200));
+            Command::new("sleep").arg("30").spawn()
+        });
+        run(
+            &argv(&["/bin/sh", "-c", "sleep 1"]),
+            &ExecOpts::new().stop_descendants(true),
+        )
+        .unwrap();
+
+        let mut stranger = stranger.join().unwrap().unwrap();
+        let alive = stranger.try_wait().unwrap().is_none();
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        assert!(alive, "the sweep killed a process the call did not start");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_nested_call_extends_the_list_rather_than_replacing_it() {
+        assert_eq!("a", calls_value(None, "a"));
+        assert_eq!("a", calls_value(Some(""), "a"));
+        assert_eq!("outer:a", calls_value(Some("outer"), "a"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_whole_token_in_the_variable_marks_a_process() {
+        let env = b"HOME=/h\0SPAR_CALLS=1.2.3:9.8.7\0PATH=/bin\0";
+        assert!(carries(env, "1.2.3"));
+        assert!(carries(env, "9.8.7"));
+        assert!(!carries(env, "1.2"));
+        assert!(!carries(env, "2.3"));
+        assert!(!carries(b"XSPAR_CALLS=1.2.3\0", "1.2.3"));
+        assert!(!carries(b"OTHER=SPAR_CALLS=1.2.3\0", "1.2.3"));
+    }
+
+    #[test]
+    fn the_environment_is_read_past_the_arguments_and_stops_at_the_apple_strings() {
+        let mut buf = 2i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/bin/sh\0\0\0\0sh\0SPAR_CALLS=in-an-argument\0");
+        buf.extend_from_slice(b"SPAR_CALLS=t\0HOME=/h\0\0executable_path=/bin/sh\0");
+
+        assert_eq!(
+            Some(&b"SPAR_CALLS=t\0HOME=/h\0"[..]),
+            procargs_environment(&buf)
+        );
+        assert_eq!(None, procargs_environment(b"\x01\0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stat_line_is_read_past_a_command_name_with_spaces_and_parentheses() {
+        let stat = "4242 (a) (b c) S 17 4242 4242 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 \
+                    987654 0 0";
+        let entry = parse_stat(4242, stat, 501).unwrap();
+
+        assert_eq!(17, entry.ppid);
+        assert_eq!(4242, entry.pgid);
+        assert_eq!(4242, entry.sid);
+        assert_eq!(501, entry.uid);
+        assert_eq!(987_654, entry.start);
     }
 
     #[test]

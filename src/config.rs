@@ -461,7 +461,8 @@ impl EffortSchedule {
     }
 }
 
-/// A command spar runs itself, before it pushes.
+/// A command spar runs itself: the check before a push, or the setup of a new
+/// worktree.
 ///
 /// A string is split on whitespace, which covers `cargo test` and `npm test`.
 /// A list is taken as it is, for anything that needs an argument with a space
@@ -638,6 +639,17 @@ pub struct LoopCfg {
     /// A backstop against a long argument being read back to somebody, not a
     /// target. What it held back is said out loud.
     pub max_checkin_comments: usize,
+    /// A command spar runs in every worktree it creates, before any agent works
+    /// there or the check runs. Unset means nothing is run.
+    ///
+    /// A worktree holds only what git tracks, so a project that needs
+    /// `npm ci` or `uv sync` before it builds got a checkout that could not.
+    /// Whether it ever built then rested on an agent happening to install
+    /// dependencies on its own: an issue whose agent did passed the check, and
+    /// the next one failed it twice over types it could not find, spending the
+    /// one fix on a tree it was never asked to repair. The shared checkout is
+    /// left alone, since it is the person's own and already set up.
+    pub setup: CheckCommand,
     /// A command spar runs in the worktree after an editing call committed and
     /// before the branch is pushed. Unset means nothing is run.
     ///
@@ -681,6 +693,7 @@ impl Default for LoopCfg {
             checkin_trust: Trust::Write,
             checkin_resolve: true,
             max_checkin_comments: 20,
+            setup: CheckCommand::default(),
             check: CheckCommand::default(),
             effort_schedule: EffortSchedule::default(),
         }
@@ -1687,6 +1700,20 @@ model = "gpt-5.6-sol"
         let bare = parse(TWO_AGENTS).unwrap();
         assert!(!bare.loop_cfg.check.is_set());
         assert!(bare.loop_cfg.check.argv().is_empty());
+    }
+
+    #[test]
+    fn a_setup_is_read_like_a_check_and_runs_nothing_unset() {
+        let line = format!("{TWO_AGENTS}\n[loop]\nsetup = \"npm ci --no-audit\"\n");
+        let cfg = parse(&line).unwrap();
+        assert_eq!(vec!["npm", "ci", "--no-audit"], cfg.loop_cfg.setup.argv());
+        assert!(
+            !cfg.loop_cfg.check.is_set(),
+            "setting up a worktree is not checking it"
+        );
+
+        let bare = parse(TWO_AGENTS).unwrap();
+        assert!(!bare.loop_cfg.setup.is_set());
     }
 
     #[test]

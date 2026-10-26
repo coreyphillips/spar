@@ -14,7 +14,7 @@ use serde_json::Value;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, Drafts, Followups, StateStore};
+use crate::config::{CheckCommand, Config, Drafts, Followups, StateStore};
 use crate::error::Result;
 use crate::model::{
     Contested, ContestedItem, Followup, InlineComment, Issue, IssueRef, ItemKind, LiveHead,
@@ -133,6 +133,10 @@ pub(crate) fn is_spar_own_path(path: &Path) -> bool {
 /// looping.
 const SPLIT_SLOTS: u32 = 20;
 
+/// The longest `[loop] setup` may run, as long as the check gets. An install
+/// that has not finished in half an hour is stuck rather than slow.
+const SETUP_TIMEOUT_SECS: u64 = 1800;
+
 #[derive(Debug, Clone)]
 pub struct SplitPushError {
     message: String,
@@ -227,6 +231,8 @@ pub struct Repo {
     pub drafts: Drafts,
     /// Publish a new branch from a fork when origin refuses the push.
     pub fork_when_denied: bool,
+    /// What `[loop] setup` runs in each worktree spar creates.
+    setup: CheckCommand,
     /// The fork new branches go to once origin has refused one, found at most
     /// once.
     fork: OnceLock<Fork>,
@@ -1542,6 +1548,7 @@ impl Repo {
             followups: cfg.loop_cfg.followups,
             drafts: cfg.loop_cfg.drafts,
             fork_when_denied: cfg.loop_cfg.fork_when_denied,
+            setup: cfg.loop_cfg.setup.clone(),
             fork: OnceLock::new(),
             viewer: OnceLock::new(),
             checkpoints: Mutex::new(BTreeMap::new()),
@@ -1827,6 +1834,40 @@ impl Repo {
         self.root.join(WORKTREE_DIR).join(name)
     }
 
+    /// Run `[loop] setup` in a worktree spar has just created.
+    ///
+    /// Before anything else looks at the tree, so the baseline an editing call
+    /// is measured against already holds what setup wrote, and a setup that
+    /// fails costs no agent call. The worktree is kept as it is: what an
+    /// install writes is build output, which the next run rebuilds over.
+    fn set_up_worktree(&self, path: &Path, label: &str) -> Result<()> {
+        let argv = self.setup.argv();
+        if argv.is_empty() {
+            return Ok(());
+        }
+        let command = self.setup.describe();
+        logdim!("setting up the {label}: {command}");
+        let out = proc::exec(
+            &argv,
+            &ExecOpts::new()
+                .cwd(path)
+                .check(false)
+                .timeout_secs(SETUP_TIMEOUT_SECS)
+                .stop_descendants(true),
+        )
+        .map_err(|e| spar_err!("could not run the setup `{command}` for the {label}: {e}"))?;
+        if !out.ok() {
+            let text = format!("{}\n{}", out.stdout.trim_end(), out.stderr.trim_end());
+            bail!(
+                "the setup `{command}` failed in the {label} at {}, so no agent was asked to \
+                 work in it.\n{}",
+                path.display(),
+                style::clip(text.trim(), 4000)
+            );
+        }
+        Ok(())
+    }
+
     /// Isolate an issue so a failed run cannot poison the next one's base.
     pub fn worktree_add(&self, issue: i64, base: &str) -> Result<(PathBuf, String)> {
         let branch = self.branch_for_issue(issue);
@@ -1881,6 +1922,7 @@ impl Repo {
             )
         })?;
         self.record_branch(&branch, "issue", issue);
+        self.set_up_worktree(&path, &format!("worktree for issue #{issue}"))?;
         Ok((path, branch))
     }
 
@@ -2500,6 +2542,7 @@ impl Repo {
         let path_str = path.display().to_string();
         self.git(&["worktree", "add", "-B", &local, &path_str, &start])?;
         self.record_branch(&local, "pr", pr.number);
+        self.set_up_worktree(&path, &format!("worktree for PR #{}", pr.number))?;
         Ok((path, head))
     }
 
@@ -2605,6 +2648,7 @@ impl Repo {
 
         let path_str = path.display().to_string();
         self.git(&["worktree", "add", "--detach", &path_str, &local_ref])?;
+        self.set_up_worktree(&path, &format!("review worktree for PR #{number}"))?;
         Ok(path)
     }
 
@@ -2722,6 +2766,7 @@ impl Repo {
         // Recorded before anything else can fail. An unrecorded branch is one
         // `prune_branches` will never remove.
         self.record_branch(&branch, "split", parent);
+        self.set_up_worktree(&path, &format!("worktree for part {index} of PR #{parent}"))?;
         Ok((path, branch))
     }
 
@@ -8816,6 +8861,7 @@ mod tests {
             followups: crate::config::Followups::Issues,
             drafts: Drafts::Never,
             fork_when_denied: true,
+            setup: CheckCommand::default(),
             fork: OnceLock::new(),
             viewer: OnceLock::new(),
             checkpoints: Mutex::new(BTreeMap::new()),

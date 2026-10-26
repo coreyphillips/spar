@@ -609,6 +609,79 @@ fn a_branch_prefix_namespaces_the_branch() {
     repo.worktree_remove(7);
 }
 
+/// A worktree holds only what git tracks. Without a setup step, whether a
+/// project's check could even find its dependencies rested on an agent
+/// happening to install them.
+#[cfg(unix)]
+#[test]
+fn a_new_worktree_is_set_up_before_anything_works_in_it() {
+    let fx = repo("setup");
+    commit(
+        &fx.work,
+        ".gitignore",
+        "node_modules/\n",
+        "ignore dependencies",
+    );
+    git(&fx.work, &["push", "origin", "main"]);
+    let mut c = cfg();
+    c.loop_cfg.setup = spar::config::CheckCommand::Argv(
+        [
+            "sh",
+            "-c",
+            "mkdir -p node_modules/dep && echo ok > node_modules/dep/index.js",
+        ]
+        .map(String::from)
+        .to_vec(),
+    );
+    let repo = Repo::open(&fx.work, &c).unwrap();
+
+    let (path, _) = repo.worktree_add(42, "main").unwrap();
+    assert!(path.join("node_modules/dep/index.js").is_file());
+
+    // What setup installed is build output, so the next run rebuilds over it
+    // rather than refusing the worktree as somebody's work.
+    let (path, _) = repo.worktree_add(42, "main").unwrap();
+    assert!(path.join("node_modules/dep/index.js").is_file());
+    assert!(repo.worktree_remove(42));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_setup_stops_before_any_agent_and_does_not_block_the_next_run() {
+    let fx = repo("setup-fails");
+    commit(
+        &fx.work,
+        ".gitignore",
+        "node_modules/\n",
+        "ignore dependencies",
+    );
+    git(&fx.work, &["push", "origin", "main"]);
+    let mut c = cfg();
+    c.loop_cfg.setup = spar::config::CheckCommand::Argv(
+        [
+            "sh",
+            "-c",
+            "mkdir -p node_modules && echo 'registry unreachable' >&2; exit 1",
+        ]
+        .map(String::from)
+        .to_vec(),
+    );
+    let repo = Repo::open(&fx.work, &c).unwrap();
+
+    let err = repo.worktree_add(42, "main").unwrap_err().to_string();
+    assert!(err.contains("the setup `sh -c"), "{err}");
+    assert!(err.contains("no agent was asked"), "{err}");
+    assert!(
+        err.contains("registry unreachable"),
+        "the output is the reason: {err}"
+    );
+
+    c.loop_cfg.setup = spar::config::CheckCommand::Line("true".into());
+    let repo = Repo::open(&fx.work, &c).unwrap();
+    let (path, _) = repo.worktree_add(42, "main").unwrap();
+    assert!(path.is_dir());
+}
+
 /// The data loss guard. `issue-9` here belongs to a person, not to spar, and
 /// even `--all` must not remove it. Ownership comes from the ledger, never from
 /// the name, because `issue-9` is exactly what somebody would call a branch.

@@ -1326,6 +1326,14 @@ once; a second failure ends the round with the worktree kept, the output in the
 report, and nothing pushed. The pull request body then carries a line saying the
 check passed, which is spar's claim rather than the model's. Unset, nothing runs.
 
+**A worktree that can build.** A worktree holds only what git tracks, so a
+project that needs `npm ci` or `uv sync` first gets a checkout whose check fails
+on modules it cannot find, unless an agent happens to install them. `[loop]
+setup = "npm ci"` runs one command in every worktree spar creates, before any
+agent works there or the check runs. A failure stops that issue before any agent
+call, with the output in the report, and the next run rebuilds the worktree. The
+shared checkout used with `--no-worktrees` is never touched. Unset, nothing runs.
+
 **Style rules models forget.** Prompting alone is unreliable over a long run.
 Every commit message, PR body, and comment is scrubbed deterministically and
 then re-verified. The gate looks for more than the scrub can fix, so a form it

@@ -238,6 +238,16 @@ checkin_resolve   = true     # mark a review thread resolved when spar made the
                              # change it asked for. A thread spar disagreed
                              # with is left open whatever this says: the person
                              # who raised it has not had their say yet.
+setup             = []       # a command spar runs in every worktree it creates,
+                             # before any agent works there or the check runs:
+                             # `setup = "npm ci"`, `uv sync`, `bundle install`,
+                             # or an argv list. Empty runs nothing. A worktree
+                             # holds only what git tracks, so without this the
+                             # dependencies are there only if an agent happens
+                             # to install them, and the check fails on types or
+                             # modules it cannot find. A failure stops that
+                             # issue before any agent call, with the output.
+                             # The shared checkout is never touched.
 check             = []       # a command spar runs in the worktree after an
                              # editing call committed and before the branch is
                              # pushed: `check = "cargo test"`, or an argv list

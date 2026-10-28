@@ -645,6 +645,99 @@ pub fn checkin_fix() -> Value {
     })
 }
 
+/// One agent drafting answers to what an issue asks of the viewer.
+///
+/// The line the whole command rests on travels with the request: a question
+/// of fact is spar's to answer, and anything that commits the viewer is never
+/// answered in their name.
+pub fn answer() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "questions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "ref_id": {
+                            "type": "string",
+                            "description": "The handle printed beside the mention the question is in, copied across exactly."
+                        },
+                        "question": {
+                            "type": "string",
+                            "description": "The question as it was put to the viewer, quoted from the issue where it reads on its own, and restated as briefly as possible where it does not."
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["answer", "yours"],
+                            "description": "answer: a question of fact or of how something works that the code, the issue, or what it links settles, and that you checked. yours: anything that asks the viewer to decide, agree, commit, own, schedule, approve, review, or give a view or a preference, and anything you could not check. Posted answers speak as the viewer, so a wrong answer is worse than none: when in doubt, yours."
+                        },
+                        "answer": {
+                            "type": "string",
+                            "description": "For answer, the reply as it would be posted under the viewer's name: direct, specific, citing what it rests on, and no longer than the question needs. For yours, what you found that would help the viewer answer it themselves, which is never posted."
+                        },
+                        "evidence": {
+                            "type": "string",
+                            "description": "What the answer rests on: repository paths with line numbers, commits, or links you read. Empty only for yours when there was nothing to check."
+                        },
+                        "reasoning": {
+                            "type": "string",
+                            "description": "One sentence saying why this kind. For yours, what makes it the viewer's to answer."
+                        }
+                    },
+                    "required": ["ref_id", "question", "kind", "answer", "evidence", "reasoning"]
+                }
+            }
+        },
+        "required": ["questions"]
+    })
+}
+
+/// The second agent ruling on the drafted answers.
+pub fn answer_check() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "checks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "The handle printed beside the question, q1 and so on, copied across exactly."
+                        },
+                        "agrees": {
+                            "type": "boolean",
+                            "description": "True only if you checked the drafted answer yourself and it is right, complete, and fit to post under the viewer's name. Do not agree to be agreeable: anything you agree to is posted as the viewer's own words."
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["answer", "yours"],
+                            "description": "Who you say should answer it, on the same terms as the draft: yours for anything that asks the viewer to decide, commit, or give a view, and for anything you could not check."
+                        },
+                        "reasoning": {
+                            "type": "string",
+                            "description": "One or two sentences saying what you checked and what it showed. Required when you disagree."
+                        }
+                    },
+                    "required": ["id", "agrees", "kind", "reasoning"]
+                }
+            },
+            "missed": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Questions the mentions put to the viewer that the draft left out, one per entry, quoted. Empty when it left none out. Never a question put to somebody else."
+            }
+        },
+        "required": ["checks", "missed"]
+    })
+}
+
 /// A reviewer's report on fixing its own findings.
 ///
 /// Same shape as a response, minus the parts that only make sense from the
@@ -841,6 +934,8 @@ pub fn all() -> Vec<(&'static str, Value)> {
         ("checkin", checkin()),
         ("checkin_check", checkin_check()),
         ("checkin_fix", checkin_fix()),
+        ("answer", answer()),
+        ("answer_check", answer_check()),
         ("split_screen", split_screen()),
         ("split_proposal", split_proposal()),
         ("split_check", split_check()),

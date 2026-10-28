@@ -5725,6 +5725,23 @@ impl Repo {
             .join(format!("checkin-{number}.json"))
     }
 
+    /// Where `spar answer` records which mentions on an issue it judged.
+    pub fn answer_state_path(&self, number: i64) -> PathBuf {
+        self.root
+            .join(STATE_DIR)
+            .join("state")
+            .join(format!("answer-{number}.json"))
+    }
+
+    /// Where `spar answer` keeps what it left for a person to answer. Notes,
+    /// never posted.
+    pub fn answer_notes_path(&self, number: i64) -> PathBuf {
+        self.root
+            .join(STATE_DIR)
+            .join("answers")
+            .join(format!("issue-{number}.md"))
+    }
+
     /// Where `spar review` records what it reviewed, and a second look reads it.
     pub fn review_record_path(&self, number: i64) -> PathBuf {
         self.root
@@ -6032,6 +6049,51 @@ impl Repo {
     pub fn try_issue_comments(&self, number: i64) -> Result<Vec<Value>> {
         let path = format!("repos/{{owner}}/{{repo}}/issues/{number}/comments");
         try_parse_comment_pages(&self.gh(&["api", "--paginate", &path])?)
+    }
+
+    /// An issue as the REST API returns it, which is the one read that says
+    /// who filed it in the shape a comment has: `user` with its `type`, and
+    /// `author_association`, neither of which `gh issue view` gives.
+    pub fn issue_row(&self, number: i64) -> Result<Value> {
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{number}");
+        let text = self
+            .gh(&["api", &path])
+            .map_err(|e| spar_err!("could not read issue #{number}: {}", e.last_line()))?;
+        serde_json::from_str(&text)
+            .map_err(|e| spar_err!("unexpected shape for issue #{number}: {e}"))
+    }
+
+    /// Open issues in this repository that mention `login`, lowest numbered
+    /// first.
+    pub fn open_issues_mentioning(&self, login: &str, limit: usize) -> Result<Vec<i64>> {
+        #[derive(Deserialize)]
+        struct Row {
+            number: i64,
+        }
+        // `{owner}/{repo}` is filled in by `gh api` alone.
+        let name = self
+            .repo_name()
+            .ok_or_else(|| spar_err!("could not find out which repository this is"))?;
+        let text = self.gh(&[
+            "search",
+            "issues",
+            "--repo",
+            &name,
+            "--mentions",
+            login,
+            "--state",
+            "open",
+            "--limit",
+            &FETCH_CEILING.to_string(),
+            "--json",
+            "number",
+        ])?;
+        let rows: Vec<Row> = serde_json::from_str(text.trim())
+            .map_err(|e| spar_err!("unexpected shape for the issues mentioning @{login}: {e}"))?;
+        let mut numbers: Vec<i64> = rows.into_iter().map(|r| r.number).collect();
+        numbers.sort_unstable();
+        numbers.truncate(limit);
+        Ok(numbers)
     }
 
     /// spar's own state comments on a pull request, newest last.

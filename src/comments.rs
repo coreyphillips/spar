@@ -828,13 +828,48 @@ pub fn said_since(repo: &Repo, number: i64, since: &str) -> Result<Vec<Said>> {
 /// it does for a review request. An `@` inside a word is an email address or
 /// code, and a login that runs on past the viewer's is somebody else's.
 pub fn mentions(text: &str, viewer: &str, in_team: &dyn Fn(&str) -> Option<bool>) -> bool {
+    mention_spans(text).iter().any(|span| match &span.team {
+        Some(team) => in_team(&format!("{}/{team}", span.login)).unwrap_or(true),
+        None => same_login(&span.login, viewer),
+    })
+}
+
+/// One `@login` or `@org/team` in a text, by char index, `end` exclusive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MentionSpan {
+    start: usize,
+    end: usize,
+    login: String,
+    team: Option<String>,
+    /// Inside inline code or a fenced block, where GitHub notifies nobody.
+    in_code: bool,
+}
+
+/// Every mention in `text`, as `mentions` reads one.
+fn mention_spans(text: &str) -> Vec<MentionSpan> {
     let chars: Vec<char> = text.chars().collect();
     let name_char = |c: char| c.is_ascii_alphanumeric() || c == '-';
-    for (i, c) in chars.iter().enumerate() {
-        if *c != '@' {
+    let mut out = Vec::new();
+    // The length of the backtick run that opened the code we are in, if any.
+    // A fenced block opens with three and closes with three, and inline code
+    // the same with one, so a run of another length inside either is content.
+    let mut fence: Option<usize> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '`' {
+            let run = chars[i..].iter().take_while(|c| **c == '`').count();
+            fence = match fence {
+                None => Some(run),
+                Some(open) if open == run => None,
+                open => open,
+            };
+            i += run;
             continue;
         }
-        if i > 0 && (chars[i - 1].is_alphanumeric() || "_.-/@`".contains(chars[i - 1])) {
+        if chars[i] != '@'
+            || (i > 0 && (chars[i - 1].is_alphanumeric() || "_.-/@`".contains(chars[i - 1])))
+        {
+            i += 1;
             continue;
         }
         let login: String = chars[i + 1..]
@@ -842,59 +877,101 @@ pub fn mentions(text: &str, viewer: &str, in_team: &dyn Fn(&str) -> Option<bool>
             .take_while(|c| name_char(**c))
             .collect();
         if login.is_empty() {
+            i += 1;
             continue;
         }
         let after = i + 1 + login.chars().count();
-        if chars.get(after) == Some(&'/') {
+        let (team, end) = if chars.get(after) == Some(&'/') {
             let team: String = chars[after + 1..]
                 .iter()
                 .take_while(|c| name_char(**c) || **c == '_')
                 .collect();
-            if !team.is_empty() && in_team(&format!("{login}/{team}")).unwrap_or(true) {
-                return true;
+            if team.is_empty() {
+                // `@login/` followed by nothing a team could be named: an
+                // ordinary path, not a mention of anybody.
+                i = after;
+                continue;
             }
-            continue;
-        }
-        if same_login(&login, viewer) {
-            return true;
-        }
+            let end = after + 1 + team.chars().count();
+            (Some(team), end)
+        } else {
+            (None, after)
+        };
+        out.push(MentionSpan {
+            start: i,
+            end,
+            login,
+            team,
+            in_code: fence.is_some(),
+        });
+        i = end;
     }
-    false
+    out
+}
+
+/// The same text with every mention that would notify somebody put in a code
+/// span, where GitHub notifies nobody.
+///
+/// For a reply spar posts on its own: quoting a question that names three
+/// people would otherwise ping all three, and somebody whose own tooling
+/// answers a ping would answer this one. The thread's participants are told
+/// anyway, since they are subscribed to it.
+pub fn defuse_mentions(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut at = 0;
+    for span in mention_spans(text).into_iter().filter(|s| !s.in_code) {
+        out.extend(&chars[at..span.start]);
+        out.push('`');
+        out.extend(&chars[span.start..span.end]);
+        out.push('`');
+        at = span.end;
+    }
+    out.extend(&chars[at..]);
+    out
+}
+
+/// Whether one row, as the REST API returns an issue, a comment, or a review,
+/// is a person asking for the viewer by name. The viewer's own words do not
+/// count, nor a bot's, nor anything spar composed, whoever's spar it was: none
+/// of them is somebody asking, and two of them answering each other is a loop.
+pub fn asks_viewer(row: &Value, viewer: &str, in_team: &dyn Fn(&str) -> Option<bool>) -> bool {
+    let user = row.get("user");
+    let login = user
+        .and_then(|u| u.get("login"))
+        .and_then(Value::as_str)
+        .unwrap_or("ghost");
+    let bot = login.ends_with("[bot]")
+        || user
+            .and_then(|u| u.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.eq_ignore_ascii_case("bot"));
+    let body = row.get("body").and_then(Value::as_str).unwrap_or("");
+    !same_login(login, viewer)
+        && !bot
+        && !crate::repo::is_spar_comment(body)
+        && mentions(body, viewer, in_team)
+}
+
+/// When a REST row was written: `created_at`, or a review's `submitted_at`.
+pub fn row_at(row: &Value) -> &str {
+    row.get("created_at")
+        .or_else(|| row.get("submitted_at"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
 }
 
 /// Whether a person asked for the viewer by name after `since`, in any of
 /// `rows`: review comments, reviews, or comments as the REST API returns them.
-/// The viewer's own words do not count, nor a bot's, nor a spar review: none
-/// of them is somebody asking.
 pub fn mentioned_in(
     rows: &[Value],
     viewer: &str,
     since: &str,
     in_team: &dyn Fn(&str) -> Option<bool>,
 ) -> bool {
-    rows.iter().any(|row| {
-        let user = row.get("user");
-        let login = user
-            .and_then(|u| u.get("login"))
-            .and_then(Value::as_str)
-            .unwrap_or("ghost");
-        let bot = login.ends_with("[bot]")
-            || user
-                .and_then(|u| u.get("type"))
-                .and_then(Value::as_str)
-                .is_some_and(|t| t.eq_ignore_ascii_case("bot"));
-        let body = row.get("body").and_then(Value::as_str).unwrap_or("");
-        let at = row
-            .get("created_at")
-            .or_else(|| row.get("submitted_at"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        !same_login(login, viewer)
-            && !bot
-            && !crate::repo::is_spar_comment(body)
-            && later_than(at, since)
-            && mentions(body, viewer, in_team)
-    })
+    // The time first: checking a team can cost a call to GitHub.
+    rows.iter()
+        .any(|row| later_than(row_at(row), since) && asks_viewer(row, viewer, in_team))
 }
 
 /// When the viewer answered on this pull request, in their own words.
@@ -905,7 +982,7 @@ pub fn mentioned_in(
 /// one as an answer is how `checkin`, whose whole reason for existing is that
 /// "somebody who leaves a review comment is talking to nobody", made that true
 /// again for anyone who commented before a round ran.
-fn viewer_answer_times(comments: &[Value], viewer: &str) -> Vec<String> {
+pub(crate) fn viewer_answer_times(comments: &[Value], viewer: &str) -> Vec<String> {
     comments
         .iter()
         .filter(|c| {
@@ -2068,5 +2145,43 @@ mod said_since_tests {
             later,
         )];
         assert!(mentioned_in(&asked, "viewer", since, &ours));
+    }
+
+    #[test]
+    fn a_defused_mention_notifies_nobody_and_reads_the_same() {
+        assert_eq!(
+            "`@dzdidi` `@Jasonvdb`: is signing with the routing key acceptable?",
+            defuse_mentions("@dzdidi @Jasonvdb: is signing with the routing key acceptable?")
+        );
+        assert_eq!(
+            "over to `@example/ours`, thanks",
+            defuse_mentions("over to @example/ours, thanks")
+        );
+        for untouched in [
+            "mail me at a@viewer.com",
+            "`@viewer` is already code",
+            "run `npm i @types/node` first",
+            "```\nlet x = @alice;\n```",
+            "a bare @ sign",
+        ] {
+            assert_eq!(untouched, defuse_mentions(untouched), "{untouched}");
+        }
+        // Code that closes is code no longer: the mention after it is live.
+        assert_eq!("`x` then `@alice`", defuse_mentions("`x` then @alice"));
+        let defused = defuse_mentions("@viewer: does `swap/1` match main? cc @bob");
+        assert!(!mentions(&defused, "viewer", &ours), "{defused}");
+        assert!(!mentions(&defused, "bob", &ours), "{defused}");
+    }
+
+    #[test]
+    fn an_issue_body_asks_the_viewer_as_a_comment_does() {
+        let body = serde_json::json!({
+            "user": {"login": "BitcoinErrorLog", "type": "User"},
+            "body": "@dzdidi @viewer\n\n5. @viewer: does the mapping match main?",
+            "created_at": "2026-10-20T10:00:00Z",
+        });
+        assert!(asks_viewer(&body, "viewer", &ours));
+        assert!(!asks_viewer(&body, "someone-else", &ours));
+        assert_eq!("2026-10-20T10:00:00Z", row_at(&body));
     }
 }

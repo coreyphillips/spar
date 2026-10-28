@@ -616,6 +616,90 @@ pub struct Answered {
     pub seen: BTreeMap<String, String>,
 }
 
+string_enum! {
+    /// Who answers one question an issue puts to the viewer.
+    pub enum QuestionKind {
+        /// A question of fact that the code, the issue, or what it links can
+        /// settle. spar may answer it, once both agents have checked it.
+        Answer = "answer" | "factual" | "fact" | "spar",
+        /// It asks the viewer to decide, commit, own, schedule, approve, or
+        /// give a view, or it could not be checked. Only the viewer answers it.
+        Yours = "yours" | "person" | "decision" | "human" | "unverified",
+    }
+}
+
+/// One question an issue puts to the viewer, as the drafting agent read it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Question {
+    /// The handle spar printed beside the mention it came from.
+    #[serde(default, deserialize_with = "de_string")]
+    pub ref_id: String,
+    /// The question, quoted from the issue, or as close to it as reads alone.
+    #[serde(default, deserialize_with = "de_string")]
+    pub question: String,
+    pub kind: QuestionKind,
+    /// The reply as it would be posted. For a question that is the viewer's,
+    /// a starting point for them, which spar never posts.
+    #[serde(default, deserialize_with = "de_string")]
+    pub answer: String,
+    /// What the answer rests on: paths with lines, or links.
+    #[serde(default, deserialize_with = "de_string")]
+    pub evidence: String,
+    #[serde(default, deserialize_with = "de_string")]
+    pub reasoning: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnswerDoc {
+    #[serde(default)]
+    pub questions: Vec<Question>,
+}
+
+/// The second agent's ruling on one drafted answer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestionCheck {
+    /// The handle spar gave the question: q1, q2.
+    #[serde(default, deserialize_with = "de_string")]
+    pub id: String,
+    /// True only when this agent checked the answer and it is right, complete,
+    /// and fit to post as the viewer's.
+    #[serde(deserialize_with = "de_bool")]
+    pub agrees: bool,
+    /// Who this agent says should answer it. Both agents have to say answer
+    /// before spar does: the two coming apart resolves toward the viewer.
+    pub kind: QuestionKind,
+    #[serde(default, deserialize_with = "de_string")]
+    pub reasoning: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnswerCheckDoc {
+    #[serde(default)]
+    pub checks: Vec<QuestionCheck>,
+    /// Questions put to the viewer that the draft left out.
+    #[serde(default, deserialize_with = "de_string_vec")]
+    pub missed: Vec<String>,
+}
+
+/// What `spar answer` has done on one issue, in `.spar/state/answer-N.json`.
+///
+/// Every mention that was judged is kept, whether it was answered, left for
+/// the viewer, or asked nothing, keyed `body` or `comment:{id}`. A mention is
+/// judged once: an edit to it, or the thread moving under spar's own reply,
+/// is not a new question, and treating either as one is how a reply answers
+/// itself. A mention whose run failed is not kept, so it is tried again.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnswerRecord {
+    #[serde(default)]
+    pub version: u32,
+    /// Mention key to what became of it.
+    #[serde(default)]
+    pub judged: BTreeMap<String, String>,
+    /// Runs `spar listen` started since a person last ran `spar answer` here.
+    #[serde(default)]
+    pub automatic: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     pub severity: Severity,

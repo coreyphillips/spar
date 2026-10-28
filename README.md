@@ -82,6 +82,7 @@ spar triage 42              # judges the issue, writes plan.json, touches nothin
                             # decompose_trackers on
 spar review 108 --dry-run   # full two agent review, printed, nothing posted
 spar checkin 108 --dry-run  # every reply and every change, posted nowhere
+spar answer 229 --dry-run   # what it would answer for you, posted nowhere
 spar followup --screen-only # judges the queue, writes nothing, files nothing
 spar code "Add CSV export" --dry-run # drafts an issue, printed, nothing filed
 spar split 10 --dry-run     # the parts it would make, filed and branched nowhere
@@ -89,8 +90,8 @@ spar run 42 --no-close-skipped   # will not close an issue it declines
 spar listen --dry-run       # every event and what it would trigger, nothing triggered
 ```
 
-`--dry-run` is on `review`, `checkin`, `code`, `split` and `listen`. The first two are the
-commands whose whole output is a comment; `split` writes more kinds of thing than
+`--dry-run` is on `review`, `checkin`, `answer`, `code`, `split` and `listen`. The first
+three are the commands whose whole output is a comment; `split` writes more kinds of thing than
 any other command, which is why its read-only half exists. `code --dry-run`
 previews the issue before it is filed or implemented. `listen --dry-run` is
 different in kind: it calls no agent at all, since what it would have run is the
@@ -190,6 +191,10 @@ spar checkin 108            # answer the unanswered comments on a PR
 spar checkin                # every open PR
 spar checkin 108 --dry-run  # every reply and every change, posted nowhere
 spar checkin 108 --reply-only    # answer in words, never touch the code
+
+spar answer 229             # answer what issue 229 asks of you by name
+spar answer                 # every open issue that mentions you
+spar answer 229 --dry-run   # print the answer, post nothing
 
 spar split 42               # break an issue into smaller issues, and stop
 spar split 108              # break a PR into smaller PRs, leaving it untouched
@@ -893,6 +898,73 @@ what makes leaving a disputed thread open terminate rather than re-arguing it
 once a run forever. A fresh clone has no record, so it will answer a previously
 declined point once more.
 
+## Answering what an issue asks of you
+
+`checkin` answers everybody on a thread. An issue that names you and asks you
+something is different: a design review that mentions five people and asks each
+of them their own question is waiting on you for yours, and on nobody for the
+rest. `spar answer` answers what is asked of you, and only that.
+
+```bash
+spar answer 229             # one issue
+spar answer                 # every open issue that mentions you, up to --limit
+spar answer 229 --dry-run   # print it, save it for `spar post`, post nothing
+spar answer 229 --again     # judge mentions spar already judged
+```
+
+It reads the places on the issue that mention you, its body and its comments,
+and that nobody has answered. One agent lists the questions they put to you,
+by name or as one of a group that names you, and drafts an answer to each with
+the code open. The other checks every answer itself. Two outcomes:
+
+- **A question of fact**, one the code, the issue, or what it links settles, is
+  answered when both agents agree the answer is right and both call it a
+  question of fact. Every one of them goes up in a single comment, each answer
+  under the question it answers, quoted.
+- **Anything else is yours.** A question that asks you to decide, agree,
+  commit, own, schedule, approve, review, or give a view is never answered in
+  your name, and neither is one either agent could not check or one they
+  disagree about. Spar posts nothing about it. It is listed in the terminal and
+  added to `.spar/answers/issue-N.md` with what the agents found and what it
+  rests on, for you to write your own reply from.
+
+A mention that asks you nothing, a cc or a thank you, gets no reply. A question
+put to somebody else is left out, even one the agents could answer.
+
+`spar post 229` posts what a dry run saved, on the issue, without running the
+agents again, the same way it posts a saved review.
+
+### What stops it answering itself
+
+`spar listen` runs this unattended, and every comment it posts is under your
+account. A thread you are part of keeps the reason it was raised for, so spar's
+own answer on a thread that began with a mention comes back as a mention. These
+are what keep that from turning into a conversation with itself, or with
+somebody else's bot:
+
+- **A mention is judged once.** Every mention judged is recorded in
+  `.spar/state/answer-N.json`, whatever became of it, and the comment spar posts
+  names the mentions it judged in a hidden line, so a fresh clone or a second
+  machine reads the same off the thread. An edit to a mention spar judged, or
+  the thread moving under spar's reply, is not a new question. `--again` reads
+  them all again, by hand.
+- **Only a person asks.** Your own words, a bot's, and anything spar composed,
+  on anybody's account, are never taken for a question. Somebody else's spar
+  mentioning you does not start one, and yours mentioning them does not either.
+- **The reply mentions nobody.** Every `@name` in it, the quoted questions
+  included, goes in a code span, where GitHub notifies nobody. The people on
+  the thread are notified anyway, since they are subscribed to it.
+- **A reply you wrote yourself answers it.** A mention older than something you
+  said in your own words on the issue is taken as answered.
+- **Nothing asked, nothing said.** A reply saying there is nothing to answer
+  invites one back.
+- **A cap.** `spar listen` answers on one issue `max_answers` times, 3 by
+  default, and then leaves it to you, saying so once. Running `spar answer N`
+  yourself sets the count back to zero. A run counts whether or not it posted,
+  so a run that fails every time still stops.
+- **Two agents or nothing.** A check that never arrived is not agreement:
+  nothing is posted, nothing is recorded, and it is tried again later.
+
 ## Listening for what happens next
 
 Every command above does one pass and exits, so a review asked for again after
@@ -950,11 +1022,15 @@ What an event leads to is a table, not a judgement:
   nothing. A push to your own branch is never news.
 - A pull request in the custody loop's hands, with `.spar/state/pr-N.json` and
   no review record, is left to `spar resume`, and the log says so once.
-- A mention on an issue is logged and left alone, unless the issue has an open
-  pull request spar reviewed and the mention came after that review, in which
-  case that pull request gets a second look on the same terms as its own: none
-  once it has had `max_rechecks`, and none when it is yours. Nothing else on an
-  issue asks for one.
+- A mention on an issue that has an open pull request spar reviewed, made after
+  that review, gives that pull request a second look on the same terms as its
+  own: none once it has had `max_rechecks`, and none when it is yours.
+- A mention on any other issue runs `spar answer` under `on_mention`: `answer`
+  posts what both agents agree on and leaves the rest for you, `draft` saves it
+  for `spar post`, `ignore` does nothing. Only a mention spar has not judged
+  counts, so its own answer moving the thread is an update, and after
+  `max_answers` runs on one issue it is left for you. Nothing else on an issue
+  asks for anything.
 - Anything closed or merged is dropped. Anything below `min_number` is ignored
   unless you named it.
 

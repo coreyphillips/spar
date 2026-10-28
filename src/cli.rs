@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 
 use crate::agent::{self, Agent};
+use crate::answer;
 use crate::brainstorm;
 use crate::checkin;
 use crate::clock;
@@ -198,6 +199,29 @@ pub enum Command {
         keep_worktrees: bool,
     },
 
+    /// Answer what an issue asks of you by name, and leave the rest to you.
+    ///
+    /// Finds the places on the issue, its body and its comments, that mention
+    /// you and have not been answered. One agent drafts an answer to each
+    /// question put to you, with the code open; the other checks every one. A
+    /// question of fact both agree on is answered in one comment, which
+    /// mentions nobody. Anything that asks you to decide, commit, or give a
+    /// view is never answered for you: it is listed, with what was found, in
+    /// .spar/answers/issue-N.md. A mention is judged once.
+    Answer {
+        /// Issue numbers. Omit to take the open issues that mention you, up to
+        /// --limit.
+        items: Vec<i64>,
+        #[command(flatten)]
+        common: Common,
+        /// Print the answer instead of posting it, and save it for `spar post`.
+        #[arg(long)]
+        dry_run: bool,
+        /// Judge mentions spar already judged, ignoring what it recorded.
+        #[arg(long)]
+        again: bool,
+    },
+
     /// Review pull requests without changing them, including from a fork.
     ///
     /// Both agents review independently, then rule on each other's findings,
@@ -309,8 +333,9 @@ pub enum Command {
     /// and for mentions of you. A reviewed pull request gets a second look
     /// and a verdict when your review is requested again or you are mentioned
     /// on it, never for a push or a comment alone; a new one gets a review; a
-    /// comment on a pull request you wrote gets `spar checkin`. Waiting costs
-    /// no agent calls: only a review, a second look, or a check-in does.
+    /// comment on a pull request you wrote gets `spar checkin`; a mention of
+    /// you on an issue gets `spar answer`. Waiting costs no agent calls: only
+    /// a review, a second look, a check-in, or an answer does.
     ///
     /// With numbers, watches only those issues and pull requests and exits
     /// once every one is closed. Ctrl-C stops it after the call in flight is
@@ -661,6 +686,13 @@ fn dispatch(cli: Cli) -> Result<i32> {
             }
             Ok(report(&results, &cfg, &repo))
         }
+
+        Command::Answer {
+            items,
+            common,
+            dry_run,
+            again,
+        } => cmd_answer(&common, items, dry_run, again),
 
         Command::Split {
             items,
@@ -1851,8 +1883,9 @@ fn cmd_post(
                 Some(text) => text,
                 None => {
                     logging::error(format!(
-                        "no saved review for PR #{number}. `spar review {number} --dry-run` \
-                         produces one, or pass --file."
+                        "no saved review or answer for #{number}. `spar review {number} \
+                         --dry-run` or `spar answer {number} --dry-run` produces one, or pass \
+                         --file."
                     ));
                     failed = true;
                     continue;
@@ -1867,6 +1900,21 @@ fn cmd_post(
         if dry_run {
             println!("\n{}\n", text.trim());
             log!("would post the above to PR #{number}");
+            continue;
+        }
+        // A saved answer names the mentions it judged, and it belongs on its
+        // issue, which `gh pr comment` refuses.
+        if !answer::answered_keys(&text).is_empty() {
+            match repo.comment_issue(*number, &text) {
+                Ok(()) => {
+                    log!("posted to #{number}");
+                    answer::note_posted(&repo, *number, &text);
+                }
+                Err(e) => {
+                    logging::error(format!("could not post to #{number}: {e}"));
+                    failed = true;
+                }
+            }
             continue;
         }
         // Through the style gate like anything else spar sends, so an edit that
@@ -1892,6 +1940,49 @@ fn cmd_post(
         }
     }
     Ok(i32::from(failed).max(report_writes(&repo)))
+}
+
+/// `spar answer`: the named issues, or the open ones that mention the viewer.
+fn cmd_answer(common: &Common, items: Vec<i64>, dry_run: bool, again: bool) -> Result<i32> {
+    let (cfg, repo, agents) = prepare(common, None)?;
+    let mode = answer::Mode {
+        dry_run,
+        draft: false,
+        again,
+        auto: false,
+        posts: checkin::posts(&cfg),
+    };
+    let numbers = if items.is_empty() {
+        let viewer = repo.viewer_login()?.to_string();
+        let floor = cfg.loop_cfg.min_number;
+        let found: Vec<i64> = repo
+            .open_issues_mentioning(&viewer, usize::MAX)?
+            .into_iter()
+            .filter(|n| *n >= floor)
+            .take(common.limit)
+            .collect();
+        if found.is_empty() {
+            log!("no open issues mention @{viewer}");
+            return Ok(0);
+        }
+        log!(
+            "no issues given, answering {} that mention @{viewer}: {}",
+            found.len(),
+            found
+                .iter()
+                .map(|n| format!("#{n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        found
+    } else {
+        items
+    };
+    let results: Vec<IssueRun> = numbers
+        .iter()
+        .map(|number| answer::answer_issue(&agents, &cfg, &repo, *number, &mode))
+        .collect();
+    Ok(report(&results, &cfg, &repo))
 }
 
 /// Run a brainstorm, or file the ideas from a saved one.
@@ -2196,6 +2287,8 @@ const LISTEN_OPTIONS: &[Setting] = &[
     (true, "on_assigned", "What a pull request assigned to you gets: review or ignore."),
     (false, "on_own_pr", "What activity on a pull request you authored gets, since the same account cannot approve it: checkin may push a change both agents agree on, reply answers in words only, ignore does nothing."),
     (false, "verdicts", "Whether a review `spar listen` starts submits a formal verdict, approve or request changes, rather than a comment. A recheck always does."),
+    (false, "on_mention", "What a mention of you on an issue gets, when the issue has no pull request spar reviewed: answer runs `spar answer`, which posts what both agents agree on and can check and leaves anything that asks you to decide for you; draft saves that for `spar post` instead; ignore does nothing."),
+    (true, "max_answers", "Times `spar listen` answers on one issue before a person has to run `spar answer` on it again. A cap against two bots talking to each other, not a target. 0 turns automatic answers off."),
 ];
 
 /// The `[loop]` and `[style]` blocks of a generated config.
@@ -2236,6 +2329,7 @@ fn settings_block(first_implementor: &str) -> String {
         "# split       = \"high\"   # proposing and checking a split\n",
         "# brainstorm  = \"high\"   # every brainstorm round\n",
         "# recheck     = \"low\"    # a second look after commits or replies\n",
+        "# answer      = \"high\"   # drafting and checking answers to a mention\n",
         "# round_1     = \"high\"   # read by any call above with no key set\n",
         "# rest        = \"low\"    # the same, for later rounds and the close\n\n",
     ));

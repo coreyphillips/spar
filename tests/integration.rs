@@ -682,6 +682,243 @@ fn a_failed_setup_stops_before_any_agent_and_does_not_block_the_next_run() {
     assert!(path.is_dir());
 }
 
+// ---------------------------------------------------------------------------
+// The checkout read-only calls run in
+// ---------------------------------------------------------------------------
+
+const DRAFT: &str = r#"{"title":"Fix the default Tor URL","body":"The primary fails to set up."}"#;
+
+fn drafting_agent(config: &mut Config, script: String) -> Vec<Agent> {
+    config.agents[0].command = vec![
+        CommandPart::One("/bin/sh".into()),
+        CommandPart::One("-c".into()),
+        CommandPart::One(format!("{script}; printf '%s\\n' '{DRAFT}'")),
+    ];
+    config.agents.iter().cloned().map(Agent::new).collect()
+}
+
+fn read_checkouts(fx: &Fixture) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(fx.work.join(".spar-worktrees")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("read-"))
+        .map(|e| e.path())
+        .collect()
+}
+
+fn has_marker(dir: &Path) -> bool {
+    std::fs::read_dir(dir).unwrap().flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".spar-recovery-needed-")
+    })
+}
+
+/// The reason the checkout exists. A draft that had only read was thrown away
+/// because another agent repinned a dependency in the shared checkout while it
+/// ran, and the call was blamed for it.
+#[cfg(unix)]
+#[test]
+fn an_edit_in_the_shared_checkout_does_not_fail_a_read_only_call() {
+    let fx = repo("read-neighbour");
+    let mut config = cfg();
+    let agents = drafting_agent(
+        &mut config,
+        format!(
+            "printf 'another agent was here\\n' > '{}'",
+            fx.work.join("README.md").display()
+        ),
+    );
+    let repo = Repo::open(&fx.work, &config).unwrap();
+
+    let draft = spar::code::draft(&agents, &config, &repo, "fix the default tor url").unwrap();
+
+    assert_eq!("Fix the default Tor URL", draft.title);
+    assert_eq!(
+        "another agent was here\n",
+        std::fs::read_to_string(fx.work.join("README.md")).unwrap(),
+        "somebody else's edit is theirs to keep"
+    );
+    assert!(!has_marker(&fx.work));
+    assert!(read_checkouts(&fx).is_empty());
+}
+
+/// The checkout holds what HEAD commits, set up like any other worktree, and
+/// it goes when the call is done, ignored output and all.
+#[cfg(unix)]
+#[test]
+fn a_read_only_call_runs_in_a_checkout_of_head_that_goes_when_it_is_done() {
+    let fx = repo("read-checkout");
+    commit(
+        &fx.work,
+        ".gitignore",
+        "node_modules/\n.env.local\n",
+        "ignore dependencies",
+    );
+    let seen = fx.dir.join("seen");
+    std::fs::create_dir_all(&seen).unwrap();
+    let mut config = cfg();
+    config.loop_cfg.setup = spar::config::CheckCommand::Argv(
+        [
+            "sh",
+            "-c",
+            "mkdir -p node_modules/dep && echo ok > node_modules/dep/index.js",
+        ]
+        .map(String::from)
+        .to_vec(),
+    );
+    let agents = drafting_agent(
+        &mut config,
+        format!(
+            "pwd -P > '{seen}/cwd'; cat README.md > '{seen}/readme'; \
+             cat node_modules/dep/index.js > '{seen}/setup'; echo local > .env.local",
+            seen = seen.display()
+        ),
+    );
+    std::fs::write(fx.work.join("README.md"), "not committed yet\n").unwrap();
+    let repo = Repo::open(&fx.work, &config).unwrap();
+
+    spar::code::draft(&agents, &config, &repo, "write it down").unwrap();
+
+    let cwd = PathBuf::from(std::fs::read_to_string(seen.join("cwd")).unwrap().trim());
+    let checkouts = fx.work.canonicalize().unwrap().join(".spar-worktrees");
+    assert!(
+        cwd.starts_with(&checkouts)
+            && cwd
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("read-")),
+        "the call ran in {}",
+        cwd.display()
+    );
+    assert_eq!(
+        "seed\n",
+        std::fs::read_to_string(seen.join("readme")).unwrap(),
+        "the checkout holds HEAD, not the edit in progress"
+    );
+    assert_eq!("ok\n", std::fs::read_to_string(seen.join("setup")).unwrap());
+    assert!(!cwd.exists(), "the checkout outlived its call");
+    let listed = git(&fx.work, &["worktree", "list", "--porcelain"]);
+    assert_eq!(
+        1,
+        listed
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count(),
+        "{listed}"
+    );
+    assert_eq!(
+        "not committed yet\n",
+        std::fs::read_to_string(fx.work.join("README.md")).unwrap()
+    );
+}
+
+/// In a checkout of its own, a change is the call's, so its answer is refused
+/// and the checkout stays for whoever reads the marker.
+#[cfg(unix)]
+#[test]
+fn a_read_checkout_a_call_wrote_in_is_kept_for_recovery() {
+    let fx = repo("read-wrote");
+    let mut config = cfg();
+    let agents = drafting_agent(&mut config, "printf 'rewritten\\n' > README.md".into());
+    let repo = Repo::open(&fx.work, &config).unwrap();
+
+    let err = spar::code::draft(&agents, &config, &repo, "fix the default tor url")
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("a read-only call changed the worktree"),
+        "{err}"
+    );
+    let kept = read_checkouts(&fx);
+    assert_eq!(1, kept.len(), "{kept:?}");
+    assert_eq!(
+        "rewritten\n",
+        std::fs::read_to_string(kept[0].join("README.md")).unwrap()
+    );
+    assert!(has_marker(&kept[0]));
+    assert_eq!(
+        "seed\n",
+        std::fs::read_to_string(fx.work.join("README.md")).unwrap()
+    );
+    assert!(!has_marker(&fx.work));
+}
+
+/// One still here at the next sweep was either kept for recovery or left by a
+/// run that was killed before it could release it. Only the second goes, and
+/// only once its process has.
+#[cfg(unix)]
+#[test]
+fn the_sweep_removes_a_read_checkout_only_once_its_run_is_gone() {
+    let fx = repo("read-sweep");
+    commit(&fx.work, ".gitignore", "build/\n", "ignore build output");
+    let repo = Repo::open(&fx.work, &cfg()).unwrap();
+    let mut child = Command::new("true").spawn().unwrap();
+    let gone = child.id();
+    child.wait().unwrap();
+    let checkouts = fx.work.join(".spar-worktrees");
+    std::fs::create_dir_all(&checkouts).unwrap();
+    let add = |name: String| {
+        let path = checkouts.join(name);
+        git(
+            &fx.work,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                path.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        path
+    };
+    let abandoned = add(format!("read-{gone}-0"));
+    std::fs::create_dir_all(abandoned.join("build")).unwrap();
+    std::fs::write(abandoned.join("build/out"), "output\n").unwrap();
+    let recovering = add(format!("read-{gone}-1"));
+    std::fs::write(
+        recovering.join(".spar-recovery-needed-1-0"),
+        "a read-only call changed the worktree\n",
+    )
+    .unwrap();
+    let running = add(format!("read-{}-0", std::process::id()));
+
+    let removed = repo.prune_worktrees(false);
+
+    assert_eq!(vec![format!("read-{gone}-0")], removed);
+    assert!(!abandoned.exists());
+    assert!(recovering.exists(), "kept for recovery");
+    assert!(running.exists(), "still in use");
+
+    repo.prune_worktrees(true);
+    assert!(read_checkouts(&fx).is_empty());
+}
+
+/// `worktrees = false` asks every call to work in the shared checkout, and a
+/// repository with nothing committed has no commit to check out.
+#[test]
+fn a_read_only_call_stays_in_the_shared_checkout_when_there_is_nothing_to_isolate() {
+    let fx = repo("read-off");
+    let mut config = cfg();
+    config.loop_cfg.worktrees = false;
+    let repo = Repo::open(&fx.work, &config).unwrap();
+    let checkout = repo.read_checkout("test").unwrap();
+    assert_eq!(repo.root(), checkout.path());
+    drop(checkout);
+    assert!(read_checkouts(&fx).is_empty());
+    assert!(fx.work.join("README.md").is_file());
+
+    let empty = fx.dir.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    git(&empty, &["init", "-b", "main"]);
+    let repo = Repo::open(&empty, &cfg()).unwrap();
+    assert_eq!(repo.root(), repo.read_checkout("test").unwrap().path());
+    assert!(!empty.join(".spar-worktrees").exists());
+}
+
 /// The data loss guard. `issue-9` here belongs to a person, not to spar, and
 /// even `--all` must not remove it. Ownership comes from the ledger, never from
 /// the name, because `issue-9` is exactly what somebody would call a branch.
@@ -9070,10 +9307,22 @@ fn code_preview_reads_the_target_repo_and_inherits_instructions() {
     assert!(out.starts_with("# Add CSV export\n"), "{out}");
     assert!(out.contains("## Acceptance criteria"), "{out}");
     assert_eq!("draft:b\n", test.log("stages.log"));
+    // A checkout of the target repository's HEAD, made for the draft and gone
+    // once it is done.
+    let cwd = PathBuf::from(test.log("draft-cwd").trim());
     assert_eq!(
-        std::fs::canonicalize(&test.fx.work).unwrap(),
-        PathBuf::from(test.log("draft-cwd").trim())
+        std::fs::canonicalize(&test.fx.work)
+            .unwrap()
+            .join(".spar-worktrees"),
+        cwd.parent().unwrap()
     );
+    assert!(
+        cwd.file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("read-")),
+        "{}",
+        cwd.display()
+    );
+    assert!(!cwd.exists());
     let prompts = test.log("prompts.log");
     for text in [
         "Add CSV export",

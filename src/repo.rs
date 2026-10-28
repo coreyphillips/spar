@@ -63,6 +63,9 @@ pub const FOLLOWUP_MARKER: &str = "<!-- spar:followup -->";
 
 const WORKTREE_DIR: &str = ".spar-worktrees";
 const STATE_DIR: &str = ".spar";
+/// A read checkout is named for the process that made it, then a serial, so
+/// the sweep can tell one still in use from one a killed run left behind.
+const READ_CHECKOUT_PREFIX: &str = "read-";
 
 /// Files SPAR writes into a worktree itself, which no agent ever authors.
 pub(crate) const RECOVERY_MARKER_PREFIX: &str = ".spar-recovery-needed-";
@@ -81,6 +84,10 @@ pub(crate) enum Disposable {
     /// write over it regardless. Refusing instead left the command unusable on
     /// any project whose build writes outside `target/`, since a single
     /// lockfile beside a generator's manifest blocked every later run.
+    ///
+    /// A read checkout qualifies too, once it is shown unchanged and holds no
+    /// marker. Nobody works in it, and the only calls that ran there were
+    /// allowed to leave ignored files and nothing else.
     ReviewOutput,
 }
 
@@ -221,6 +228,40 @@ impl PushTarget {
     }
 }
 
+/// A throwaway checkout of HEAD for calls that are only allowed to read.
+///
+/// The shared checkout is where a person, their editor, and any other agent
+/// work, and a read-only call is judged on what changed while it ran. Run
+/// there, an edit somebody else made in those minutes counted as the call's: a
+/// draft that had only ever read was thrown away because another agent bumped
+/// a dependency beside it. Nothing works in this checkout but the calls spar
+/// starts in it, so whatever changes in it is theirs.
+///
+/// It holds what HEAD commits, after `[loop] setup`, and nothing uncommitted.
+/// Dropping it removes it, unless something in it changed that a read-only
+/// call was not allowed to change, in which case it is kept for recovery.
+pub struct ReadCheckout<'a> {
+    repo: &'a Repo,
+    path: PathBuf,
+    /// What the checkout held once it was set up, or `None` when the calls run
+    /// in the shared checkout after all.
+    checkpoint: Option<WorktreeCheckpoint>,
+}
+
+impl ReadCheckout<'_> {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ReadCheckout<'_> {
+    fn drop(&mut self) {
+        if let Some(checkpoint) = self.checkpoint.take() {
+            self.repo.release_read_checkout(&self.path, &checkpoint);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Repo {
     root: PathBuf,
@@ -233,6 +274,11 @@ pub struct Repo {
     pub fork_when_denied: bool,
     /// What `[loop] setup` runs in each worktree spar creates.
     setup: CheckCommand,
+    /// Whether read-only calls get a checkout of their own, which is what
+    /// `[loop] worktrees` says for every other call.
+    isolate_reads: bool,
+    /// Leave each read checkout in place after its calls, for inspection.
+    keep_worktrees: bool,
     /// The fork new branches go to once origin has refused one, found at most
     /// once.
     fork: OnceLock<Fork>,
@@ -1549,6 +1595,8 @@ impl Repo {
             drafts: cfg.loop_cfg.drafts,
             fork_when_denied: cfg.loop_cfg.fork_when_denied,
             setup: cfg.loop_cfg.setup.clone(),
+            isolate_reads: cfg.loop_cfg.worktrees,
+            keep_worktrees: cfg.loop_cfg.keep_worktrees,
             fork: OnceLock::new(),
             viewer: OnceLock::new(),
             checkpoints: Mutex::new(BTreeMap::new()),
@@ -2711,6 +2759,106 @@ impl Repo {
                 Ok(detail) => logwarn!("an earlier run left {name}: {}", detail.trim()),
                 Err(e) => logdim!("could not read {}: {e}", entry.path().display()),
             }
+        }
+    }
+
+    /// A checkout of HEAD for calls that only read, made fresh for them.
+    ///
+    /// With `[loop] worktrees` off the calls stay in the shared checkout,
+    /// which is what that setting asks of every call, and so they do when
+    /// nothing is committed yet, since there is no commit to check out.
+    pub fn read_checkout(&self, label: &str) -> Result<ReadCheckout<'_>> {
+        let shared = || ReadCheckout {
+            repo: self,
+            path: self.root.clone(),
+            checkpoint: None,
+        };
+        if !self.isolate_reads {
+            return Ok(shared());
+        }
+        let Some(head) = resolve_optional_commit(&self.root, "HEAD")? else {
+            return Ok(shared());
+        };
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = loop {
+            let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = self.worktree_path(&format!(
+                "{READ_CHECKOUT_PREFIX}{}-{serial}",
+                std::process::id()
+            ));
+            if !path
+                .try_exists()
+                .map_err(|e| spar_err!("could not inspect {}: {e}", path.display()))?
+            {
+                break path;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| spar_err!("could not create {}: {e}", parent.display()))?;
+        }
+        let path_str = path.display().to_string();
+        self.git(&["worktree", "add", "--detach", &path_str, &head])
+            .map_err(|e| {
+                spar_err!(
+                    "could not check HEAD out for the {label}: {}",
+                    e.last_line()
+                )
+            })?;
+        let ready = self
+            .set_up_worktree(&path, &format!("read-only checkout for the {label}"))
+            .and_then(|()| self.worktree_checkpoint(&path));
+        match ready {
+            Ok(checkpoint) => Ok(ReadCheckout {
+                repo: self,
+                path,
+                checkpoint: Some(checkpoint),
+            }),
+            Err(e) => {
+                // No call has run in it yet, so nothing in it is anybody's.
+                self.discard_read_checkout(&path);
+                Err(e)
+            }
+        }
+    }
+
+    /// Remove a read checkout once nothing in it has changed since setup.
+    ///
+    /// What can be left after that is ignored output from calls that were
+    /// allowed to leave it, in a checkout nobody else works in, so it goes
+    /// with the checkout. A recovery marker means a call's answer was already
+    /// refused over what it did there, and that error said where to look.
+    fn release_read_checkout(&self, path: &Path, checkpoint: &WorktreeCheckpoint) {
+        if self.keep_worktrees {
+            logdim!("kept the read-only checkout at {}", path.display());
+            return;
+        }
+        if has_recovery_marker(path) {
+            logdim!(
+                "kept the read-only checkout at {} for recovery",
+                path.display()
+            );
+            return;
+        }
+        if let Err(e) = self.require_unchanged_worktree(path, checkpoint, "read-only checkout") {
+            logwarn!("{e}");
+            return;
+        }
+        self.discard_read_checkout(path);
+    }
+
+    fn discard_read_checkout(&self, path: &Path) {
+        match self.remove_worktree_at_checked(path, Disposable::ReviewOutput) {
+            Ok(true) => {}
+            Ok(false) => logdim!(
+                "kept the read-only checkout at {} because it was still there after removal",
+                path.display()
+            ),
+            Err(e) => logdim!(
+                "kept the read-only checkout at {}: {}",
+                path.display(),
+                e.last_line()
+            ),
         }
     }
 
@@ -6266,6 +6414,26 @@ impl Repo {
             names.sort();
 
             for name in names {
+                // A read checkout is released by the run that made it, so one
+                // still here was either kept for recovery or left by a run
+                // that never got to release it.
+                if let Some(owner) = read_checkout_owner(&name) {
+                    let path = base.join(&name);
+                    if force_all {
+                        self.remove_worktree_at_force(&path);
+                    } else if process_is_running(owner) {
+                        continue;
+                    } else if has_recovery_marker(&path) {
+                        logdim!("kept {} for recovery", path.display());
+                        continue;
+                    } else {
+                        self.discard_read_checkout(&path);
+                    }
+                    if !path.exists() {
+                        removed.push(name);
+                    }
+                    continue;
+                }
                 // A review worktree is detached and owns no branch, so it is
                 // tied to the pull request only by its directory name.
                 if let Some(rest) = name.strip_prefix("review-") {
@@ -6618,6 +6786,50 @@ pub(crate) fn uncertain_worktree_change(
         ),
     };
     crate::error::SparError::uncertain_write(format!("{message}{note}"))
+}
+
+fn has_recovery_marker(cwd: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(cwd) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(RECOVERY_MARKER_PREFIX))
+    })
+}
+
+/// The process a read checkout's directory name says made it.
+fn read_checkout_owner(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix(READ_CHECKOUT_PREFIX)?;
+    let (pid, serial) = rest.split_once('-')?;
+    serial.parse::<usize>().ok()?;
+    pid.parse().ok()
+}
+
+/// Whether a process may still be running.
+///
+/// Anything short of proof that it is gone says yes. A wrong yes leaves a
+/// checkout for `spar clean --all`; a wrong no deletes one under a running
+/// call.
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    if pid <= 0 {
+        return true;
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn process_is_running(_pid: u32) -> bool {
+    true
 }
 
 fn write_recovery_marker(cwd: &Path, detail: &str) -> Result<PathBuf> {
@@ -8924,11 +9136,24 @@ mod tests {
             drafts: Drafts::Never,
             fork_when_denied: true,
             setup: CheckCommand::default(),
+            isolate_reads: true,
+            keep_worktrees: false,
             fork: OnceLock::new(),
             viewer: OnceLock::new(),
             checkpoints: Mutex::new(BTreeMap::new()),
             writes: WriteStats::default(),
         }
+    }
+
+    /// The sweep deletes on what this says, so a name it does not recognise
+    /// is no read checkout at all.
+    #[test]
+    fn only_a_read_checkout_name_names_its_owner() {
+        assert_eq!(Some(4242), read_checkout_owner("read-4242-0"));
+        assert_eq!(None, read_checkout_owner("read-4242"));
+        assert_eq!(None, read_checkout_owner("read-me-0"));
+        assert_eq!(None, read_checkout_owner("read-4242-x"));
+        assert_eq!(None, read_checkout_owner("review-4242"));
     }
 
     #[test]

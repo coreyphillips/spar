@@ -492,10 +492,11 @@ pub fn screen(
             "{deferred} item(s) did not fit in one screening prompt and were left for a later run"
         );
     }
+    let checkout = repo.read_checkout("split screen")?;
     let answer: SplitScreenDoc = agent.ask_json(
         &format!("{SCREEN_PROMPT}{text}"),
         &schema::split_screen(),
-        repo.root(),
+        checkout.path(),
         &agent.effort(cfg, Call::Split(1)),
     )?;
     Ok(answer.items)
@@ -560,14 +561,16 @@ fn issue_inner(
         .replace("{url}", &issue.url)
         .replace("{body}", &body);
 
+    let checkout = repo.read_checkout(&format!("split of #{number}"))?;
     let decision = propose_and_check(
         agents,
         cfg,
-        repo.root(),
+        checkout.path(),
         &format!("#{number}"),
         &prompt,
         &format!("issue #{number}"),
     )?;
+    drop(checkout);
 
     for note in &decision.dropped {
         log!("  dropped {note}");

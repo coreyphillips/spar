@@ -678,8 +678,9 @@ if you like: `--from` files what it says, calls no agent, and the same duplicate
 search that guards every other filed issue applies. The agents' names stay in
 the file and never reach an issue.
 
-A brainstorm is read only, and it runs both agents in the repository root at
-once, the same way triage does. Commit or stash anything you care about first.
+A brainstorm is read only, and it runs both agents at once in a throwaway
+checkout of HEAD, the same way triage does. What you have not committed is not
+in it.
 
 ## Working the follow-up queue
 
@@ -1405,10 +1406,11 @@ check passed, which is spar's claim rather than the model's. Unset, nothing runs
 **A worktree that can build.** A worktree holds only what git tracks, so a
 project that needs `npm ci` or `uv sync` first gets a checkout whose check fails
 on modules it cannot find, unless an agent happens to install them. `[loop]
-setup = "npm ci"` runs one command in every worktree spar creates, before any
-agent works there or the check runs. A failure stops that issue before any agent
-call, with the output in the report, and the next run rebuilds the worktree. The
-shared checkout used with `--no-worktrees` is never touched. Unset, nothing runs.
+setup = "npm ci"` runs one command in every worktree spar creates, including
+the throwaway checkout read-only calls run in, before any agent works there or
+the check runs. A failure stops that issue before any agent call, with the
+output in the report, and the next run rebuilds the worktree. The shared
+checkout used with `--no-worktrees` is never touched. Unset, nothing runs.
 
 **Style rules models forget.** Prompting alone is unreliable over a long run.
 Every commit message, PR body, and comment is scrubbed deterministically and
@@ -1588,15 +1590,32 @@ recovery before rebuilding.
 A call asked only to read likewise allows changes to project-ignored files.
 Tracked changes and ordinary untracked writes still fail that call.
 
-The read-only rule is that wide because the call is not the only writer. Triage
-runs for minutes in your primary checkout, where Finder rewrites `.DS_Store` and
-an editor rewrites its own state, and it asks both agents at once against that
-same directory, so one ambient write used to discard two good answers and end the
-run with nothing scheduled. Nothing is silent, though: an ignored path that moved
-and is not recognized build output is named in a warning, and every error that
-does stop a call now names the paths that stopped it. spar leaves its own run
-state under `.spar/` out of the comparison entirely, since writing it mid-run is
-spar's doing rather than an agent's.
+Those calls do not run in your primary checkout. Triage, drafting an issue for
+`spar code`, screening follow-ups or split candidates, proposing a split of an
+issue, brainstorming, answering an issue, and checking in on an issue each get a
+throwaway checkout of HEAD under `.spar-worktrees/read-<pid>-<n>`, set up with
+`[loop] setup` like any other worktree. The primary checkout is where you, your
+editor, and any other agent are working, and a read-only call is judged on what
+changed while it ran: a dependency bump another agent made there during a
+seven-minute draft counted as the draft's, and the answer was thrown away.
+Nothing works in the throwaway checkout but the calls spar started there, so a
+change in it is theirs. It holds what HEAD commits and none of your uncommitted
+edits. When the calls finish it is removed, ignored output and all, unless
+something in it changed that a read-only call was not allowed to change, in
+which case it is kept with a recovery marker. One a killed run never released
+is swept by the next run once its process is gone. With `worktrees = false`
+these calls run in the shared checkout instead.
+
+The read-only rule is that wide because the call is not the only writer. Builds
+and test runs write ignored output wherever a call runs, and in a shared
+checkout Finder rewrites `.DS_Store` and an editor rewrites its own state. Triage
+asks both agents at once against the same directory, so one ambient write used
+to discard two good answers and end the run with nothing scheduled. Nothing is
+silent, though: an ignored path that moved and is not recognized build output is
+named in a warning, and every error that does stop a call now names the paths
+that stopped it. spar leaves its own run state under `.spar/` out of the
+comparison entirely, since writing it mid-run is spar's doing rather than an
+agent's.
 
 Include `{schema}` or `{schema_file}` and spar uses the CLI's native structured
 output. This is worth doing rather than optional: without it spar asks for JSON
@@ -1730,7 +1749,10 @@ state. An `escalated` or `error` outcome keeps it for inspection. Commands that
 expose the run flags accept `--keep-worktrees` to hold on to them regardless,
 or `--no-worktrees` to work directly in the main checkout. `split` takes neither
 lifecycle flag; set `[loop] keep_worktrees = true` when its successful part
-worktrees should remain.
+worktrees should remain. The throwaway checkouts read-only calls run in follow
+the same two settings: `keep_worktrees` leaves them for inspection until the
+next run sweeps them, and `worktrees = false` runs those calls in the main
+checkout instead.
 
 Managed commits require the isolated worktree. In `--no-worktrees` mode, an
 editing command that leaves files uncommitted stops the run and keeps them in

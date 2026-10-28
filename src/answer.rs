@@ -620,7 +620,9 @@ fn inner(
         mentions.len()
     );
 
-    let checkpoint = repo.worktree_checkpoint(repo.root())?;
+    let checkout = repo.read_checkout(&format!("answers on #{number}"))?;
+    let work_dir = checkout.path();
+    let checkpoint = repo.worktree_checkpoint(work_dir)?;
     let fence = Fence::new();
     let rendered = render_thread(
         &fence,
@@ -638,7 +640,7 @@ fn inner(
             .replace("{fence}", NOT_INSTRUCTION)
             .replace("{thread}", &rendered),
         &schema::answer(),
-        repo.root(),
+        work_dir,
         &drafter.effort(cfg, Call::Answer(1)).about(number),
     )?;
 
@@ -673,7 +675,7 @@ fn inner(
                 ),
             ),
         &schema::answer_check(),
-        repo.root(),
+        work_dir,
         &checker.effort(cfg, Call::Answer(2)).about(number),
     ) {
         Ok(doc) => Some(doc),
@@ -686,7 +688,8 @@ fn inner(
             None
         }
     };
-    repo.require_unchanged_worktree(repo.root(), &checkpoint, "read-only answer phase")?;
+    repo.require_unchanged_worktree(work_dir, &checkpoint, "read-only answer phase")?;
+    drop(checkout);
     let Some(checked) = checked else {
         // Without a second opinion nothing was judged, so nothing is posted,
         // nothing is recorded, and it is judged again on the next run.

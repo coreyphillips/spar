@@ -50,10 +50,11 @@ pub fn draft(agents: &[Agent], cfg: &Config, repo: &Repo, request: &str) -> Resu
     validate_prompt(request)?;
     let agent = agent::find(agents, &cfg.first_implementor)?;
     log!("drafting an issue from the project prompt");
+    let checkout = repo.read_checkout("issue draft")?;
     let answer: Draft = agent.ask_json(
         &format!("{PROMPT}{}", request.trim()),
         &schema::code_issue(),
-        repo.root(),
+        checkout.path(),
         &agent.effort(cfg, Call::Code),
     )?;
     let title = repo.clean_title(&answer.title)?;

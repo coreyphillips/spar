@@ -802,6 +802,45 @@ pub struct Review {
     pub summary: String,
     #[serde(default)]
     pub findings: Vec<Finding>,
+    /// A ruling on each acceptance criterion, asked for only when the issue
+    /// has some.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub criteria: Vec<CriterionStatus>,
+}
+
+string_enum! {
+    /// Where one acceptance criterion stands. The author says done and the
+    /// reviewer says met, and both mean the branch does what the line asks.
+    pub enum Mark {
+        Met = "met" | "done",
+        NotMet = "not_met" | "not_done" | "unmet",
+        NeedsPerson = "needs_person" | "needs_a_person" | "manual",
+    }
+}
+
+/// One agent's word on one numbered acceptance criterion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CriterionStatus {
+    pub number: u32,
+    pub status: Mark,
+    #[serde(default, deserialize_with = "de_string")]
+    pub reason: String,
+}
+
+/// An acceptance criterion and the signing review's ruling on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ruled {
+    /// The line exactly as it stood, which is what a tick finds it by.
+    pub raw: String,
+    /// Where it stood when it was read, so a criterion moved since is skipped
+    /// rather than ticked in its new place.
+    #[serde(default)]
+    pub line: usize,
+    pub text: String,
+    /// None when the review said nothing about this one.
+    pub status: Option<Mark>,
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1084,6 +1123,11 @@ pub struct Implementation {
     /// omission, a decision worth defending, a risk. Usually nothing.
     #[serde(default)]
     pub notes: Option<String>,
+    /// The author's status on each acceptance criterion. A claim for the PR
+    /// body, and never what ticks a box. Asked for only when the issue has
+    /// criteria, which is why an empty list is not written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub criteria: Vec<CriterionStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1279,6 +1323,15 @@ pub struct IssueRun {
     pub noted: Vec<Finding>,
     #[serde(default)]
     pub notes: Vec<String>,
+    /// The issue's acceptance criteria as the review that signed the pull
+    /// request off ruled them. Set only on that path, so a ruling from a review
+    /// that did not sign off never reaches a tick.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub criteria: Vec<Ruled>,
+    /// Whether a met criterion will be ticked once the work lands. When not,
+    /// the outcome comment is the only record of the rulings.
+    #[serde(skip)]
+    pub ticks_criteria: bool,
     /// Runtime circuit breaker after an external follow-up write could not be
     /// verified. A later invocation rechecks GitHub before any new write.
     #[serde(skip)]
@@ -1297,6 +1350,8 @@ impl IssueRun {
             filed: Vec::new(),
             noted: Vec::new(),
             notes: Vec::new(),
+            criteria: Vec::new(),
+            ticks_criteria: false,
             followup_writes_uncertain: false,
         }
     }
@@ -1634,6 +1689,10 @@ pub struct PrRef {
 #[derive(Debug, Clone, Deserialize)]
 pub struct IssueRef {
     pub number: i64,
+    /// What tells this repository's issue from one of the same number in
+    /// another, since a closing link can cross repositories.
+    #[serde(default)]
+    pub url: String,
 }
 
 /// An open pull request's size, as one listing call reports it.

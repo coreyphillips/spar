@@ -142,6 +142,14 @@ absorb_new_issues = 0        # waves of newly filed follow-ups to fold back into
                              # next one. 0 is off. Each wave is triaged like any
                              # other issue, so both agents still have to agree.
                              # Multiplies what a run costs.
+tick_criteria     = true     # after spar merges a pull request, tick each
+                             # unchecked task list item in the issue that the
+                             # signing review ruled met. Only on the ruling of
+                             # the agent that did not write the head, never on
+                             # the author's claim, never after a person merges,
+                             # and a box is never unchecked. Off, or with
+                             # auto_merge off, the outcome comment lists every
+                             # ruling instead.
 decompose_trackers = false   # read the checklist in a tracking issue as work:
                              # file an issue for each unchecked item that has
                              # none, link one to the issue that already covers

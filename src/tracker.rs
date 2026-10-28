@@ -973,7 +973,7 @@ fn apply(repo: &Repo, tracker: i64, steps: &[Step]) -> Vec<i64> {
                 let Some(change) = step.action.change() else {
                     continue;
                 };
-                if write(repo, tracker, &step.item.raw, &change) {
+                if write(repo, tracker, &step.item.raw, &change, None) {
                     log!("  ticked '{what}' off, #{number} is finished");
                 }
             }
@@ -988,7 +988,7 @@ fn apply(repo: &Repo, tracker: i64, steps: &[Step]) -> Vec<i64> {
                 let Some(change) = step.action.change() else {
                     continue;
                 };
-                if write(repo, tracker, &step.item.raw, &change) && *open {
+                if write(repo, tracker, &step.item.raw, &change, None) && *open {
                     children.push(*number);
                 }
             }
@@ -1024,6 +1024,7 @@ fn apply(repo: &Repo, tracker: i64, steps: &[Step]) -> Vec<i64> {
                             tracker,
                             &step.item.raw,
                             &Change::Reference(format!("#{number}")),
+                            None,
                         );
                         match linked {
                             true if filed.number().is_some() => children.push(number),
@@ -1062,6 +1063,29 @@ fn still_an_item(body: &str, raw: &str) -> bool {
     lines == 1 && parse(body).iter().filter(|item| item.raw == raw).count() == 1
 }
 
+/// Why `still_an_item` said no, for the log line.
+fn why_not_an_item(body: &str, raw: &str) -> String {
+    let lines = split_keep(body)
+        .into_iter()
+        .filter(|line| without_eol(line) == raw)
+        .count();
+    match lines {
+        0 => "that line changed or is gone".to_string(),
+        1 => "that line is no longer a checklist item in it".to_string(),
+        n => format!("that line appears {n} times, so the edit could go to either"),
+    }
+}
+
+/// The unchecked task list items in an issue body, which a run treats as the
+/// issue's acceptance criteria. Parsed from the whole body rather than from the
+/// prompt's copy, which may be shortened.
+pub fn criteria(body: &str) -> Vec<Item> {
+    parse(body)
+        .into_iter()
+        .filter(|item| !item.checked)
+        .collect()
+}
+
 /// The same question, asked of the tracker as it stands.
 ///
 /// Unreadable counts as no: this gates filing, and an issue filed against a
@@ -1082,8 +1106,14 @@ fn still_asked_for(repo: &Repo, tracker: i64, raw: &str) -> bool {
 /// parsed. A run is long, and somebody editing the tracker while it goes must
 /// not lose that edit: if the line has moved or changed, or the markdown around
 /// it has stopped making it an item, this is a skip with a log line, never a
-/// write.
-fn write(repo: &Repo, tracker: i64, raw: &str, change: &Change) -> bool {
+/// write. `at`, when given, is the 1-based line it has to still be on.
+pub(crate) fn write(
+    repo: &Repo,
+    tracker: i64,
+    raw: &str,
+    change: &Change,
+    at: Option<usize>,
+) -> bool {
     let body = match repo.record_failed_write(repo.read_issue(tracker)) {
         Ok(issue) => issue.body_text().to_string(),
         Err(e) => {
@@ -1092,8 +1122,18 @@ fn write(repo: &Repo, tracker: i64, raw: &str, change: &Change) -> bool {
         }
     };
     if !still_an_item(&body, raw) {
-        logdim!("  not editing #{tracker}: that line is no longer a checklist item in it");
+        logdim!("  not editing #{tracker}: {}", why_not_an_item(&body, raw));
         return false;
+    }
+    if let Some(at) = at {
+        let now = split_keep(&body)
+            .iter()
+            .position(|line| without_eol(line) == raw)
+            .map_or(0, |index| index + 1);
+        if now != at {
+            logdim!("  not editing #{tracker}: that line moved from line {at} to line {now}");
+            return false;
+        }
     }
     let updated = match rewrite(&body, raw, change) {
         Ok(updated) => updated,
@@ -1270,6 +1310,39 @@ fn diff(before: &str, after: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_criterion_line_that_moved_out_or_doubled_is_not_ticked_and_says_why() {
+        let raw = "- [ ] Preserve column order.";
+        let twice = "- [ ] Preserve column order.\n- [ ] Preserve column order.\n";
+        assert!(!still_an_item(twice, raw));
+        assert!(why_not_an_item(twice, raw).contains("appears 2 times"));
+        let changed = "- [ ] Preserve the column order.\n";
+        assert!(!still_an_item(changed, raw));
+        assert!(why_not_an_item(changed, raw).contains("changed or is gone"));
+        let fenced = "```\n- [ ] Preserve column order.\n```\n";
+        assert!(!still_an_item(fenced, raw));
+        assert!(why_not_an_item(fenced, raw).contains("no longer a checklist item"));
+        // Ticked by somebody already: nothing to do, and never an untick.
+        assert!(rewrite(
+            "- [x] Preserve column order.\n",
+            "- [x] Preserve column order.",
+            &Change::Tick
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_tick_leaves_every_other_byte_alone() {
+        let body = "Intro\r\n- [ ] Preserve column order.\r\n- [ ] Connects on a device\r\n";
+        let ticked = rewrite(body, "- [ ] Preserve column order.", &Change::Tick).unwrap();
+        assert_eq!(
+            "Intro\r\n- [x] Preserve column order.\r\n- [ ] Connects on a device\r\n",
+            ticked
+        );
+        assert_eq!(2, criteria(body).len());
+        assert_eq!(1, criteria(&ticked).len());
+    }
 
     /// Where the tests' own repository lives, as `read` would work it out.
     const HOME: &str = "https://github.com/me/mine";

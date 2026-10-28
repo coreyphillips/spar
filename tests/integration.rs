@@ -6626,7 +6626,7 @@ fn a_pr_body_is_assembled_from_the_commits_when_the_report_never_came() {
         "oldest first, as the branch reads"
     );
 
-    let body = spar::review::pr_body(42, &work, None, &repo.style);
+    let body = spar::review::pr_body(42, &work, None, &[], &repo.style);
     assert!(body.contains("Closes #42"), "{body}");
     assert!(body.contains("- Add the parser"), "{body}");
     assert!(body.contains("- Cover the empty input case"), "{body}");
@@ -9186,7 +9186,22 @@ case "$1 $2" in
   "issue list") printf '%s\n' '[]' ;;
   "issue view")
     if [ "${SPAR_CODE_MODE:-}" = issue-fetch-failure ]; then exit 1; fi
-    printf '%s\n' '{"number":42,"title":"Add CSV export","body":"Export the current rows as CSV.","state":"OPEN","labels":[],"url":"https://github.com/example/project/issues/42"}'
+    if [ -n "${SPAR_CODE_BODY:-}" ]; then
+      body=$SPAR_CODE_BODY
+      if [ -f "$SPAR_CODE_DIR/pr-merged" ]; then body=${SPAR_CODE_BODY_MERGED:-$body}; fi
+      printf '{"number":42,"title":"Add CSV export","body":%s,"state":"OPEN","labels":[],"url":"https://github.com/example/project/issues/42"}\n' "$body"
+    else
+      printf '%s\n' '{"number":42,"title":"Add CSV export","body":"Export the current rows as CSV.","state":"OPEN","labels":[],"url":"https://github.com/example/project/issues/42"}'
+    fi
+    ;;
+  "issue edit") cat > "$SPAR_CODE_DIR/issue-edit-body" ;;
+  "pr merge")
+    if [ "${SPAR_CODE_MODE:-}" = merged-elsewhere ]; then
+      git update-ref refs/remotes/origin/issue-42 origin/issue-42^
+      touch "$SPAR_CODE_DIR/pr-merged"
+      exit 1
+    fi
+    if [ "${SPAR_CODE_MODE:-}" != queued ]; then touch "$SPAR_CODE_DIR/pr-merged"; fi
     ;;
   "pr list")
     if [ -f "$SPAR_CODE_DIR/pr-created" ]; then
@@ -9202,13 +9217,20 @@ case "$1 $2" in
   "pr view")
     case "$*" in
       *headRefOid*) printf '{"headRefOid":"%s"}\n' "$(git rev-parse origin/issue-42)" ;;
-      *state*) printf '%s\n' '{"state":"OPEN"}' ;;
+      *state*)
+        if [ -f "$SPAR_CODE_DIR/pr-merged" ]; then
+          printf '%s\n' '{"state":"MERGED"}'
+        else
+          printf '%s\n' '{"state":"OPEN"}'
+        fi
+        ;;
       *) exit 64 ;;
     esac
     ;;
   "pr comment"|"issue comment") : ;;
   "repo view") printf '%s\n' '{"name":"project"}' ;;
   "api repos/{owner}/{repo}/issues/42") printf '%s\n' 'issue' ;;
+  "api --paginate") printf '%s\n' '[]' ;;
   *) printf 'unexpected gh call: %s\n' "$*" >&2; exit 64 ;;
 esac
 "#,
@@ -9235,11 +9257,15 @@ case "$*" in
   *"Implement GitHub issue #42"*)
     printf '%s\n' "implement:$1" >> "$SPAR_CODE_DIR/stages.log"
     printf 'CSV export\n' > export.txt
-    printf '%s\n' '{"summary":"Add CSV export","problem":"Rows cannot be exported","changes":["Export rows"],"testing":["Checked the fixture"],"notes":null}'
+    printf '%s\n' '{"summary":"Add CSV export","problem":"Rows cannot be exported","changes":["Export rows"],"testing":["Checked the fixture"],"notes":null,"criteria":[{"number":1,"status":"done","reason":"Columns keep their order"}]}'
     ;;
   *"Review the changes on this branch"*)
     printf '%s\n' "review:$1" >> "$SPAR_CODE_DIR/stages.log"
-    printf '%s\n' '{"verdict":"approve","next_action":"merge","summary":"Export works","findings":[]}'
+    if [ -n "${SPAR_CODE_RULING:-}" ]; then
+      printf '{"verdict":"approve","next_action":"merge","summary":"Export works","findings":[],"criteria":[{"number":1,"status":"%s","reason":"Checked the header row"}]}\n' "$SPAR_CODE_RULING"
+    else
+      printf '%s\n' '{"verdict":"approve","next_action":"merge","summary":"Export works","findings":[]}'
+    fi
     ;;
   *) printf 'unexpected prompt\n' >&2; exit 64 ;;
 esac
@@ -9259,6 +9285,23 @@ esac
     }
 
     fn run(&self, extra: &[&str], draft: &str, mode: &str) -> (bool, String, String) {
+        self.run_with(extra, draft, mode, &[])
+    }
+
+    /// Settings appended to the `[loop]` table.
+    fn set_loop(&self, lines: &str) {
+        let mut text = std::fs::read_to_string(&self.config).unwrap();
+        text.push_str(lines);
+        std::fs::write(&self.config, text).unwrap();
+    }
+
+    fn run_with(
+        &self,
+        extra: &[&str],
+        draft: &str,
+        mode: &str,
+        env: &[(&str, &str)],
+    ) -> (bool, String, String) {
         let mut args = vec![
             "code",
             "Add CSV export",
@@ -9268,16 +9311,14 @@ esac
             self.fx.work.to_str().unwrap(),
         ];
         args.extend_from_slice(extra);
-        spar_with_env(
-            &args,
-            &self.fx.dir,
-            &[
-                ("PATH", &self.path),
-                ("SPAR_CODE_DIR", self.fx.dir.to_str().unwrap()),
-                ("SPAR_CODE_DRAFT", draft),
-                ("SPAR_CODE_MODE", mode),
-            ],
-        )
+        let mut vars = vec![
+            ("PATH", self.path.as_str()),
+            ("SPAR_CODE_DIR", self.fx.dir.to_str().unwrap()),
+            ("SPAR_CODE_DRAFT", draft),
+            ("SPAR_CODE_MODE", mode),
+        ];
+        vars.extend_from_slice(env);
+        spar_with_env(&args, &self.fx.dir, &vars)
     }
 
     fn log(&self, file: &str) -> String {
@@ -9468,6 +9509,139 @@ fn code_runs_only_its_new_issue_through_to_an_approved_pr() {
         .work
         .join(".spar-worktrees/issue-42/export.txt")
         .is_file());
+}
+
+/// The drafted issue's body as `gh issue view` returns it, JSON encoded.
+#[cfg(unix)]
+fn code_body() -> String {
+    let draft: serde_json::Value = serde_json::from_str(CODE_DRAFT).unwrap();
+    draft["body"].to_string()
+}
+
+#[cfg(unix)]
+fn code_criteria_run(auto_merge: bool, ruling: &str) -> (CodeFixture, String) {
+    code_criteria_run_with(auto_merge, ruling, "", &[])
+}
+
+#[cfg(unix)]
+fn code_criteria_run_with(
+    auto_merge: bool,
+    ruling: &str,
+    mode: &str,
+    env: &[(&str, &str)],
+) -> (CodeFixture, String) {
+    let test = CodeFixture::new();
+    test.set_loop(&format!("auto_merge = {auto_merge}\n"));
+    let body = code_body();
+    let mut vars = vec![
+        ("SPAR_CODE_BODY", body.as_str()),
+        ("SPAR_CODE_RULING", ruling),
+    ];
+    vars.extend_from_slice(env);
+    let (ok, out, err) = test.run_with(
+        &["--max-rounds", "1", "--first", "b"],
+        CODE_DRAFT,
+        mode,
+        &vars,
+    );
+    assert!(ok, "{out}\n{err}");
+    (test, format!("{out}{err}"))
+}
+
+#[cfg(unix)]
+#[test]
+fn code_ticks_a_criterion_the_review_ruled_met_after_merging() {
+    let (test, out) = code_criteria_run(true, "met");
+    let calls = test.log("gh.log");
+    assert_eq!(1, calls.matches("pr merge ").count(), "{calls}");
+    assert_eq!(1, calls.matches("issue edit 42").count(), "{calls}");
+    let draft: serde_json::Value = serde_json::from_str(CODE_DRAFT).unwrap();
+    let expected = draft["body"].as_str().unwrap().replace(
+        "- [ ] Preserve column order.",
+        "- [x] Preserve column order.",
+    );
+    assert_eq!(expected, test.log("issue-edit-body"), "{out}");
+    // Both agents were handed the criterion, numbered.
+    let prompts = test.log("prompts.log");
+    assert!(prompts.contains("1. Preserve column order."), "{prompts}");
+    assert!(
+        prompts.contains("Rule on each one in criteria"),
+        "{prompts}"
+    );
+    // The PR body carries the author's account, said to be the author's, and
+    // a clean approval with every criterion met and ticked says nothing.
+    assert!(
+        calls.contains("Done: Preserve column order. Columns keep their order."),
+        "{calls}"
+    );
+    assert!(calls.contains("The author's account."), "{calls}");
+    assert!(!calls.contains("pr comment"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn code_leaves_a_criterion_ruled_not_met_unchecked_and_names_it() {
+    let (test, out) = code_criteria_run(true, "not_met");
+    let calls = test.log("gh.log");
+    assert_eq!(1, calls.matches("pr merge ").count(), "{calls}");
+    assert!(!calls.contains("issue edit"), "{calls}");
+    assert!(!test.fx.dir.join("issue-edit-body").exists());
+    assert!(calls.contains("pr comment 43"), "{calls}");
+    assert!(
+        calls.contains("- Not met: Preserve column order. Checked the header row."),
+        "{calls}\n{out}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn code_ticks_nothing_while_the_merge_is_only_queued() {
+    let (test, out) = code_criteria_run_with(true, "met", "queued", &[]);
+    let calls = test.log("gh.log");
+    assert_eq!(1, calls.matches("pr merge ").count(), "{calls}");
+    assert!(!calls.contains("issue edit"), "{calls}");
+    assert!(out.contains("not merged yet"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn code_ticks_nothing_when_a_failed_merge_landed_another_head() {
+    let (test, out) = code_criteria_run_with(true, "met", "merged-elsewhere", &[]);
+    let calls = test.log("gh.log");
+    assert_eq!(1, calls.matches("pr merge ").count(), "{calls}");
+    assert!(!calls.contains("issue edit"), "{calls}");
+    assert!(out.contains("not merged yet at the reviewed head"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn code_skips_a_criterion_that_moved_before_the_tick() {
+    let draft: serde_json::Value = serde_json::from_str(CODE_DRAFT).unwrap();
+    let moved = draft["body"]
+        .as_str()
+        .unwrap()
+        .replace("- [ ] Preserve column order.\n", "")
+        + "\n\n## Separate follow-up\n- [ ] Preserve column order.";
+    let moved = serde_json::Value::from(moved).to_string();
+    let (test, out) = code_criteria_run_with(true, "met", "", &[("SPAR_CODE_BODY_MERGED", &moved)]);
+    let calls = test.log("gh.log");
+    assert_eq!(1, calls.matches("pr merge ").count(), "{calls}");
+    assert!(!calls.contains("issue edit"), "{calls}");
+    assert!(out.contains("that line moved from line"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn code_ticks_nothing_without_auto_merge() {
+    let (test, out) = code_criteria_run(false, "met");
+    let calls = test.log("gh.log");
+    assert!(!calls.contains("pr merge"), "{calls}");
+    assert!(!calls.contains("issue edit"), "{calls}");
+    assert!(calls.contains("pr comment 43"), "{calls}");
+    assert!(
+        calls.contains("- Met: Preserve column order. Checked the header row."),
+        "{calls}\n{out}"
+    );
 }
 
 #[test]

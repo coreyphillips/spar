@@ -355,6 +355,11 @@ issues. The triage plan is written to `plan.json`, or the path in `--plan-out`.
 A nonempty prompt is required. Quote prompts containing command-line flags,
 newlines, or shell punctuation, or put `--` before the prompt after any options.
 
+The drafted acceptance criteria are `- [ ]` checkboxes, and the run treats them
+as a list: each agent is asked about every one by number, and a box is ticked
+when spar merges a pull request the review ruled met it. See "Acceptance
+criteria" under "How a run goes".
+
 The issue URL and a `spar run <number>` recovery command print before triage,
 even with `--quiet`. If a later step fails, use that issue number to continue.
 Running `spar code` again drafts and files a new issue.
@@ -417,6 +422,30 @@ the calls used by the rounds, on a run that spends its whole budget and has
 something new to read. A run that converges before the budget, or whose last
 round changed nothing, buys none.
 
+**Acceptance criteria.** Every unchecked task list item in the issue body is an
+acceptance criterion, wherever it sits in the body. The implementor is handed
+them numbered and reports done, not done, or needs a person on each, with one
+line of reason. "Needs a person" is for what the repository cannot show, such as
+a run on a device. That goes in the pull request body under `## Acceptance
+criteria`, labelled as the author's account. Each review, and the closing pass,
+rules on the same list: met, not met, or needs a person, and what it checked.
+The ruling that counts is the one from the pass that signs the pull request off,
+so a tick always comes from the agent that did not write the head, never from
+the author's claim. A ruling does not gate the merge.
+
+When spar merges the pull request itself, it ticks each criterion ruled met on
+the issue, the same way the tracker checklist is ticked: the body is read again
+before each write, a line that changed, moved or now appears twice is skipped
+with the reason in the log, every other byte is left alone, and a box is never
+unchecked. A merge that only joined a merge queue ticks nothing. The outcome
+comment names every criterion not ruled met, with the ruling and its reason,
+even on an otherwise clean approval. With `auto_merge` off, or
+`tick_criteria = false`, nothing is ticked, because a tick means the work
+landed, and the outcome comment lists every ruling instead. Ticks count in the
+`writes:` line like any other GitHub write. Resuming a pull request that closes
+an issue in this repository does the same. A person merging does not tick
+anything.
+
 **Follow-ups.** A review that finds something real but out of scope files it as
 its own issue. Before filing, spar looks for an issue that already describes the
 same defect, comparing titles and bodies rather than matching strings, because
@@ -447,7 +476,8 @@ label costs, so it chooses one knowing where the point ends up.
 
 A run that reaches an ending reports unresolved points, deadlocks, unchanged
 branches, and unread closing work on the pull request when comments are
-enabled. A clean approval stays silent, and `pr_comments = "none"` suppresses
+enabled. A clean approval stays silent unless an acceptance criterion was not
+ruled met, and `pr_comments = "none"` suppresses
 all pull request comments. A failure before the closing pass ends in an error
 with the reason and posts no final outcome comment. A closing-pass failure
 keeps the review record and reports that the last changes remain unread.
@@ -776,8 +806,9 @@ it. `triage` never calls the acting path, so this is the dry run:
 spar triage 42    # what it would file, link, and tick, and the lines it would write
 ```
 
-Three restraints worth knowing, because this is the only thing spar does that
-rewrites text a person wrote:
+Three restraints worth knowing, because this and ticking an issue's acceptance
+criteria after a merge are the only things spar does that rewrite text a person
+wrote. Both go through the same line surgery:
 
 - **Only a checklist.** Task list items, never an agent's reading of your prose.
   A tracker with no checklist behaves exactly as it did before. Anything GitHub

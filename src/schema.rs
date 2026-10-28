@@ -246,6 +246,53 @@ pub fn response() -> Value {
     })
 }
 
+/// Who is answering for the acceptance criteria: the author, whose word is a
+/// claim, or a reviewer, whose word is what ticks a box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CriteriaVoice {
+    Author,
+    Reviewer,
+}
+
+/// `schema` with a status asked for on each numbered acceptance criterion.
+///
+/// Added only when the issue has criteria, so an issue without any is asked
+/// exactly what it was asked before.
+pub fn with_criteria(mut schema: Value, voice: CriteriaVoice) -> Value {
+    let (statuses, description) = match voice {
+        CriteriaVoice::Author => (
+            json!(["done", "not_done", "needs_person"]),
+            "One entry per numbered acceptance criterion. done: the change does it. not_done: it does not. needs_person: the repository cannot show it, such as a run on a device. This is your account for the pull request body, and the reviewer rules on each one.",
+        ),
+        CriteriaVoice::Reviewer => (
+            json!(["met", "not_met", "needs_person"]),
+            "One entry per numbered acceptance criterion. met: you checked the branch does it. not_met: it does not, or you could not confirm it. needs_person: the repository cannot show it, such as a run on a device. A criterion ruled met is ticked on the issue when spar merges.",
+        ),
+    };
+    let property = json!({
+        "type": "array",
+        "description": description,
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "number": {"type": "integer", "description": "The criterion's number as listed."},
+                "status": {"type": "string", "enum": statuses},
+                "reason": {
+                    "type": "string",
+                    "description": "One line: what you did or checked, or what is missing."
+                }
+            },
+            "required": ["number", "status", "reason"]
+        }
+    });
+    schema["properties"]["criteria"] = property;
+    if let Some(required) = schema["required"].as_array_mut() {
+        required.push(json!("criteria"));
+    }
+    schema
+}
+
 /// One reviewer judging the other reviewer's findings.
 ///
 /// Used only in review only mode, where nobody is going to fix anything and the
@@ -927,6 +974,14 @@ pub fn all() -> Vec<(&'static str, Value)> {
         ("triage", triage()),
         ("implementation", implementation()),
         ("review", review()),
+        (
+            "implementation_with_criteria",
+            with_criteria(implementation(), CriteriaVoice::Author),
+        ),
+        (
+            "review_with_criteria",
+            with_criteria(review(), CriteriaVoice::Reviewer),
+        ),
         ("recheck", recheck()),
         ("response", response()),
         ("own_fix", own_fix()),
@@ -1000,6 +1055,38 @@ mod tests {
                 assert_eq!(props.len(), required.len(), "{path}: required has extras");
             }
         }
+    }
+
+    /// Asked only when there are criteria, and then of both voices in the
+    /// spelling each one's statuses parse back from.
+    #[test]
+    fn criteria_are_asked_only_when_added_and_parse_back() {
+        use crate::model::{Implementation, Mark, Review};
+        assert!(implementation()["properties"].get("criteria").is_none());
+        assert!(review()["properties"].get("criteria").is_none());
+        for (voice, met) in [
+            (CriteriaVoice::Author, "done"),
+            (CriteriaVoice::Reviewer, "met"),
+        ] {
+            let schema = with_criteria(review(), voice);
+            let statuses =
+                &schema["properties"]["criteria"]["items"]["properties"]["status"]["enum"];
+            for status in statuses.as_array().unwrap() {
+                assert!(Mark::parse_lenient(status.as_str().unwrap()).is_some());
+            }
+            assert_eq!(Some(Mark::Met), Mark::parse_lenient(met));
+        }
+        let work: Implementation = serde_json::from_value(json!({
+            "criteria": [{"number": 1, "status": "needs_person", "reason": "a device"}]
+        }))
+        .unwrap();
+        assert_eq!(Mark::NeedsPerson, work.criteria[0].status);
+        let review: Review = serde_json::from_value(json!({
+            "verdict": "approve", "next_action": "merge", "summary": "", "findings": [],
+            "criteria": [{"number": 2, "status": "not_met", "reason": "no test"}]
+        }))
+        .unwrap();
+        assert_eq!(Mark::NotMet, review.criteria[0].status);
     }
 
     /// The guard that was missing. A schema field can be added to the struct

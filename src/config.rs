@@ -592,6 +592,14 @@ pub struct LoopCfg {
     /// Most items from one tracker's checklist that one run may take on. A cap,
     /// not a target, and what it left is named out loud.
     pub max_tracker_children: usize,
+    /// Tick an acceptance criterion on the issue once spar merges a pull
+    /// request the signing review ruled met it.
+    ///
+    /// On by default, unlike `decompose_trackers`, because nothing here
+    /// multiplies: a tick follows only a merge spar performed and only the
+    /// ruling of the agent that did not write the head, and a box is never
+    /// unchecked.
+    pub tick_criteria: bool,
     /// Whether a pull request spar opens starts as a draft.
     pub drafts: Drafts,
     /// Publish a new branch from the authenticated user's fork when origin
@@ -696,6 +704,7 @@ impl Default for LoopCfg {
             absorb_new_issues: 0,
             decompose_trackers: false,
             max_tracker_children: 5,
+            tick_criteria: true,
             drafts: Drafts::Never,
             fork_when_denied: true,
             instructions: String::new(),

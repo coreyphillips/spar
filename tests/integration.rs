@@ -5835,6 +5835,7 @@ fn every_config_option_is_documented_in_the_example() {
         split: Some("high".into()),
         brainstorm: Some("high".into()),
         recheck: Some("low".into()),
+        answer: Some("high".into()),
     }));
     expected.extend(keys_of(&spar::config::ListenCfg::default()));
     // Per-agent options, which a preset normally supplies but a user may set.
@@ -7154,7 +7155,9 @@ fn a_recheck_without_a_posted_review_on_record_reviews_afresh() {
 /// list a linked pull request is looked for in; `$SPAR_FAKE_REQUESTS` is
 /// who the pull request asks for a review, nobody when it is missing; and
 /// `$SPAR_FAKE_REQUESTED` is its timeline of review requests, empty when it is
-/// missing. The viewer is in team `ours` and in no other.
+/// missing. `$SPAR_FAKE_ISSUE_ROW` is issue 42 as the REST API gives it, bob
+/// asking for nothing when it is missing. The viewer is in team `ours` and in
+/// no other.
 fn listen_gh(number: i64, head: &str, author: &str, state: &str) -> String {
     format!(
         r#"set -eu
@@ -7202,6 +7205,9 @@ case "$*" in
   "pr view {number} "*) printf '%s\n' '{{"number":{number},"url":"https://github.com/example/project/pull/{number}","title":"PR {number}","body":"","headRefName":"feature-{number}","baseRefName":"main","state":"{state}","closingIssuesReferences":[],"isCrossRepository":false}}' ;;
   "api repos/{{owner}}/{{repo}}/issues/{number} --jq"*) printf 'pr\n' ;;
   "api repos/{{owner}}/{{repo}}/issues/42 --jq"*) printf 'issue\n' ;;
+  "api repos/{{owner}}/{{repo}}/issues/42")
+    if [ -f "${{SPAR_FAKE_ISSUE_ROW:-/nonexistent}}" ]; then cat "$SPAR_FAKE_ISSUE_ROW"
+    else printf '%s\n' '{{"number":42,"title":"Retry smarter","state":"open","html_url":"https://github.com/example/project/issues/42","user":{{"login":"bob","type":"User"}},"author_association":"NONE","body":"please","created_at":"2026-10-20T09:00:00Z"}}'; fi ;;
   "issue comment 42 "*) : ;;
   "issue view 42 "*) printf '{{"number":42,"title":"Retry smarter","body":"please","labels":[],"state":"%s","url":"https://github.com/example/project/issues/42","author":{{"login":"bob"}},"comments":[]}}\n' "${{SPAR_FAKE_ISSUE_STATE:-OPEN}}" ;;
   "api repos/{{owner}}/{{repo}}/compare/"*) printf '3\n' ;;
@@ -7487,7 +7493,13 @@ fn listen_once_dry_run_names_what_each_event_would_trigger_and_triggers_nothing(
     );
     assert!(out.contains("#42: mentioned"), "{out}");
     assert!(
-        out.contains("#42: ignoring an issue with no reviewed pull request"),
+        out.contains(
+            "#42: nothing on it asks you anything spar has not judged, so that was only an update"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("#42: ignoring nothing on the issue asked for spar"),
         "{out}"
     );
     assert_eq!(0, l.agent_calls(), "{out}");
@@ -8476,6 +8488,219 @@ fn checkin_on_an_issue_posts_its_answer_on_the_issue() {
         "{log}"
     );
     assert!(!log.contains("pr comment"), "{log}");
+}
+
+// ---------------------------------------------------------------------------
+// Answering what an issue asks of you
+// ---------------------------------------------------------------------------
+
+/// One question of fact and one that only the viewer can answer, as the
+/// drafting agent reads issue 42's body.
+const ANSWER_DRAFT: &str = r#"{"questions":[{"ref_id":"m1","question":"@viewer: does the retry loop stop at max_attempts? cc @carol","kind":"answer","answer":"Yes. The loop checks the attempt count before every retry.","evidence":"src/net.rs:88","reasoning":"a question of fact"},{"ref_id":"m1","question":"Will you own the retry module?","kind":"yours","answer":"Nobody owns it today.","evidence":"","reasoning":"it asks you to commit"}]}"#;
+
+/// The checking agent stands behind the first and agrees the second is the
+/// viewer's.
+const ANSWER_CHECK: &str = r#"{"checks":[{"id":"q1","agrees":true,"kind":"answer","reasoning":"checked src/net.rs"},{"id":"q2","agrees":true,"kind":"yours","reasoning":"a commitment"}],"missed":[]}"#;
+
+fn asking_issue(l: &Listening) -> PathBuf {
+    let row = l.fx.dir.join("issue-42.json");
+    std::fs::write(
+        &row,
+        serde_json::json!({
+            "number": 42,
+            "title": "Retry smarter",
+            "state": "open",
+            "html_url": "https://github.com/example/project/issues/42",
+            "user": {"login": "bob", "type": "User"},
+            "author_association": "NONE",
+            "body": "@viewer: does the retry loop stop at max_attempts? cc @carol\n\nWill you own the retry module?",
+            "created_at": "2026-10-20T09:00:00Z"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    row
+}
+
+/// The whole of it under the listener: a mention in an issue body is answered
+/// with what both agents stand behind, the reply notifies nobody, and the
+/// question that asks the viewer to commit is left for the viewer. Then spar's
+/// own answer moves the thread, which comes back as a mention, and costs
+/// nothing, even on a checkout that never recorded answering it.
+#[test]
+#[cfg(unix)]
+fn listen_answers_a_mention_in_an_issue_body_once() {
+    let l = Listening::new(
+        "listenanswer",
+        ANSWER_DRAFT,
+        ANSWER_CHECK,
+        &listen_gh(7, "aaa", "alice", "OPEN"),
+    );
+    let row = asking_issue(&l);
+    l.with_notifications(&[notification("1", "mention", "Issue", 42)]);
+    let row = row.to_str().unwrap().to_string();
+
+    let (ok, out, log) = l.run_with(&["--once"], &[("SPAR_FAKE_ISSUE_ROW", &row)]);
+
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("#42: about to answer what it asks of you after a mention"),
+        "{out}"
+    );
+    assert_eq!(2, l.agent_calls(), "{out}");
+    // The fake gh logs a multi-line body over several lines, and nothing else
+    // it logs carries the answer's text.
+    assert_eq!(
+        1,
+        log.lines()
+            .filter(|c| c.starts_with("issue comment 42"))
+            .count(),
+        "{log}"
+    );
+    assert!(
+        log.contains("> `@viewer`: does the retry loop stop at max_attempts? cc `@carol`"),
+        "{log}"
+    );
+    assert!(
+        log.contains("Yes. The loop checks the attempt count"),
+        "{log}"
+    );
+    assert!(!log.contains("own the retry module"), "{log}");
+    assert!(log.contains("<!-- spar:answered body -->"), "{log}");
+    let notes = std::fs::read_to_string(l.fx.work.join(".spar/answers/issue-42.md")).unwrap();
+    assert!(
+        notes.contains("### Will you own the retry module?"),
+        "{notes}"
+    );
+    assert!(
+        notes.contains("Why it is yours: it asks you to commit"),
+        "{notes}"
+    );
+    let record = std::fs::read_to_string(l.fx.work.join(".spar/state/answer-42.json")).unwrap();
+    let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+    assert_eq!("answered", record["judged"]["body"], "{record}");
+    assert_eq!(1, record["automatic"], "{record}");
+
+    // The answer is on the thread now, and moved it. A checkout with no
+    // record reads the answer's own marker.
+    std::fs::remove_file(l.fx.work.join(".spar/state/answer-42.json")).unwrap();
+    let comments = l.with_comments(serde_json::json!([{
+        "id": 900,
+        "user": {"login": "viewer", "type": "User"},
+        "body": "> `@viewer`: does it stop?\n\nYes.\n\n<!-- spar:answered body -->\n\n<!-- spar:comment -->",
+        "created_at": "2026-10-20T11:00:00Z"
+    }]));
+    l.with_notifications(&[notification("1", "mention", "Issue", 42)
+        .replace("2026-10-20T10:01:00Z", "2026-10-20T11:00:00Z")]);
+    let bin = l.fx.dir.join("fake-bin");
+    for agent in ["agent-a", "agent-b"] {
+        executable(&bin.join(agent), &format!("#!/bin/sh\n{REFUSING_AGENT}\n"));
+    }
+
+    let (ok, out, log) = l.run_with(
+        &["--once"],
+        &[
+            ("SPAR_FAKE_ISSUE_ROW", &row),
+            ("SPAR_FAKE_COMMENTS", comments.to_str().unwrap()),
+        ],
+    );
+
+    assert!(ok, "{out}");
+    assert!(
+        out.contains(
+            "#42: nothing on it asks you anything spar has not judged, so that was only an update"
+        ),
+        "{out}"
+    );
+    assert_eq!(2, l.agent_calls(), "{out}");
+    assert_eq!(
+        1,
+        log.lines()
+            .filter(|c| c.starts_with("issue comment 42"))
+            .count(),
+        "{log}"
+    );
+}
+
+/// The cap holds even when every mention is new: two bots that mention each
+/// other on every reply stop after `max_answers`.
+#[test]
+#[cfg(unix)]
+fn listen_leaves_an_issue_answered_max_answers_times_to_a_person() {
+    let l = Listening::refusing("listenanswercap", &listen_gh(7, "aaa", "alice", "OPEN"));
+    let row = asking_issue(&l);
+    std::fs::create_dir_all(l.fx.work.join(".spar/state")).unwrap();
+    std::fs::write(
+        l.fx.work.join(".spar/state/answer-42.json"),
+        r#"{"version":1,"judged":{},"automatic":3}"#,
+    )
+    .unwrap();
+    l.with_notifications(&[notification("1", "mention", "Issue", 42)]);
+
+    let (ok, out, log) = l.run_with(
+        &["--once"],
+        &[("SPAR_FAKE_ISSUE_ROW", row.to_str().unwrap())],
+    );
+
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("#42: answered 3 times already; run `spar answer 42` to answer again"),
+        "{out}"
+    );
+    assert_eq!(0, l.agent_calls(), "{out}");
+    assert!(!log.contains("issue comment"), "{log}");
+}
+
+/// A dry run prints the answer and posts nothing, and `spar post` puts up
+/// exactly that, on the issue, without running an agent again.
+#[test]
+#[cfg(unix)]
+fn answer_dry_run_posts_nothing_and_post_puts_it_on_the_issue() {
+    let l = Listening::new(
+        "answerdry",
+        ANSWER_DRAFT,
+        ANSWER_CHECK,
+        &listen_gh(7, "aaa", "alice", "OPEN"),
+    );
+    let row = asking_issue(&l);
+    let row = row.to_str().unwrap();
+
+    let (ok, out, log) = l.command(
+        "answer",
+        &["42", "--dry-run"],
+        &[("SPAR_FAKE_ISSUE_ROW", row)],
+    );
+
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("Yes. The loop checks the attempt count"),
+        "{out}"
+    );
+    assert!(out.contains("### Will you own the retry module?"), "{out}");
+    assert!(out.contains("dry run, nothing posted"), "{out}");
+    assert!(!log.contains("issue comment"), "{log}");
+    assert!(!l.fx.work.join(".spar/state/answer-42.json").exists());
+    assert_eq!(2, l.agent_calls(), "{out}");
+
+    let (ok, out, log) = l.command("post", &["42"], &[("SPAR_FAKE_ISSUE_ROW", row)]);
+
+    assert!(ok, "{out}");
+    assert!(out.contains("posted to #42"), "{out}");
+    assert_eq!(
+        1,
+        log.lines()
+            .filter(|c| c.starts_with("issue comment 42"))
+            .count(),
+        "{log}"
+    );
+    assert!(
+        log.contains("Yes. The loop checks the attempt count"),
+        "{log}"
+    );
+    assert!(!log.contains("pr comment"), "{log}");
+    assert_eq!(2, l.agent_calls(), "{out}");
+    let record = std::fs::read_to_string(l.fx.work.join(".spar/state/answer-42.json")).unwrap();
+    assert!(record.contains("\"body\": \"answered\""), "{record}");
 }
 
 /// A poll is all or nothing. A second page that failed used to be skipped

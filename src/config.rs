@@ -338,6 +338,9 @@ pub enum Call {
     Brainstorm(u32),
     /// A second look at a reviewed pull request after commits or replies.
     Recheck,
+    /// Answering what an issue asks of you: the drafter is round 1, the
+    /// checker round 2.
+    Answer(u32),
 }
 
 impl Call {
@@ -356,6 +359,7 @@ impl Call {
             Call::Split(_) => "split",
             Call::Brainstorm(_) => "brainstorm",
             Call::Recheck => "recheck",
+            Call::Answer(_) => "answer",
         }
     }
 
@@ -365,13 +369,16 @@ impl Call {
         match self {
             Call::Code | Call::Triage | Call::Implement | Call::Screen => 1,
             Call::Review(round) | Call::Respond(round) => round,
-            Call::Checkin(round) | Call::Split(round) | Call::Brainstorm(round) => round,
+            Call::Checkin(round)
+            | Call::Split(round)
+            | Call::Brainstorm(round)
+            | Call::Answer(round) => round,
             Call::Close | Call::Recheck => 2,
         }
     }
 
     /// Every kind, for `doctor` to check a configuration against.
-    pub fn every() -> [Call; 12] {
+    pub fn every() -> [Call; 13] {
         [
             Call::Code,
             Call::Triage,
@@ -385,6 +392,7 @@ impl Call {
             Call::Checkin(1),
             Call::Split(1),
             Call::Brainstorm(1),
+            Call::Answer(1),
         ]
     }
 }
@@ -421,6 +429,8 @@ pub struct EffortSchedule {
     /// to check, so it sits with the later review rounds and reads
     /// `review_rest` when it has no word of its own.
     pub recheck: Option<String>,
+    /// Answering what an issue asks of you, both the draft and the check.
+    pub answer: Option<String>,
 }
 
 /// A schedule entry that was actually written, blank meaning unset.
@@ -442,6 +452,7 @@ impl EffortSchedule {
             "screen" => &self.screen,
             "checkin" => &self.checkin,
             "brainstorm" => &self.brainstorm,
+            "answer" => &self.answer,
             "recheck" => {
                 return set(&self.recheck).or_else(|| set(&self.review_rest));
             }
@@ -810,6 +821,30 @@ impl std::fmt::Display for OwnPr {
     }
 }
 
+/// What `spar listen` does when somebody mentions you on an issue with no pull
+/// request spar reviewed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnMention {
+    /// `spar answer`: what both agents agree on and can check is posted, and
+    /// anything that asks you to decide is left for you.
+    Answer,
+    /// The same, saved for `spar post` rather than posted.
+    Draft,
+    /// Say so in the log and do nothing.
+    Ignore,
+}
+
+impl std::fmt::Display for OnMention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            OnMention::Answer => "answer",
+            OnMention::Draft => "draft",
+            OnMention::Ignore => "ignore",
+        })
+    }
+}
+
 /// What `spar listen` watches for and what it does about it. As with `LoopCfg`,
 /// every field takes its value from `ListenCfg::default()` when a config does
 /// not mention it.
@@ -839,6 +874,11 @@ pub struct ListenCfg {
     /// Whether a review `spar listen` starts submits a formal verdict, approve
     /// or request changes, rather than a comment. A recheck always does.
     pub verdicts: bool,
+    pub on_mention: OnMention,
+    /// Times `spar listen` runs `spar answer` on one issue before a person has
+    /// to run it by hand. A cap against two bots talking to each other, not a
+    /// target. 0 turns automatic answers off.
+    pub max_answers: u32,
 }
 
 impl Default for ListenCfg {
@@ -853,6 +893,8 @@ impl Default for ListenCfg {
             on_assigned: ReviewOrIgnore::Review,
             on_own_pr: OwnPr::Checkin,
             verdicts: true,
+            on_mention: OnMention::Answer,
+            max_answers: 3,
         }
     }
 }
@@ -1174,6 +1216,7 @@ pub fn known_options() -> Vec<OptionInfo> {
             split: Some("high".into()),
             brainstorm: Some("high".into()),
             recheck: Some("low".into()),
+            answer: Some("high".into()),
         },
     ));
     out.extend(lines("listen", &ListenCfg::default()));
@@ -1617,6 +1660,20 @@ model = "gpt-5.6-sol"
             assert_eq!(want, cfg.listen.on_own_pr);
             assert_eq!(text, want.to_string());
         }
+        for (text, want) in [
+            ("answer", OnMention::Answer),
+            ("draft", OnMention::Draft),
+            ("ignore", OnMention::Ignore),
+        ] {
+            let cfg = parse(&format!(
+                "{TWO_AGENTS}\n[listen]\non_mention = \"{text}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(want, cfg.listen.on_mention);
+            assert_eq!(text, want.to_string());
+        }
+        assert_eq!(OnMention::Answer, ListenCfg::default().on_mention);
+        assert_eq!(3, ListenCfg::default().max_answers);
         let err = parse(&format!("{TWO_AGENTS}\n[listen]\non_own_pr = \"push\"\n"))
             .unwrap_err()
             .to_string();
@@ -1654,10 +1711,12 @@ model = "gpt-5.6-sol"
     #[test]
     fn every_call_kind_is_in_every() {
         let every = Call::every();
-        assert_eq!(12, every.len());
+        assert_eq!(13, every.len());
         assert!(every.contains(&Call::Code));
         assert!(every.contains(&Call::Recheck));
+        assert!(every.contains(&Call::Answer(1)));
         assert_eq!("recheck", Call::Recheck.key());
+        assert_eq!("answer", Call::Answer(2).key());
     }
 
     #[test]

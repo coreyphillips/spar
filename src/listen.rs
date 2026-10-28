@@ -34,9 +34,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::Agent;
+use crate::answer;
 use crate::checkin;
 use crate::clock;
-use crate::config::{Config, ListenCfg, OwnPr, ReviewOrIgnore};
+use crate::config::{Config, ListenCfg, OnMention, OwnPr, ReviewOrIgnore};
 use crate::error::Result;
 use crate::model::{IssueRun, ItemKind, Login, PrSweepRow, ReviewRequested, Status};
 use crate::proc;
@@ -633,6 +634,12 @@ pub enum Action {
     Review,
     /// `spar checkin`, with or without the power to push.
     Checkin { reply_only: bool },
+    /// `spar answer` on an issue, posting what it may, or saving it as a
+    /// draft for `spar post`.
+    Answer { draft: bool },
+    /// This issue was answered as often as the config allows; a person runs
+    /// `spar answer`.
+    AnswersCapped,
     /// This pull request was rechecked as often as the config allows; a person
     /// runs `spar review`. An issue names its pull request.
     Capped(i64),
@@ -653,7 +660,11 @@ impl Action {
             Action::Review => "review it".to_string(),
             Action::Checkin { reply_only: false } => "check in on it".to_string(),
             Action::Checkin { reply_only: true } => "answer the comments on it".to_string(),
-            Action::Capped(_) | Action::BelongsToResume => "leave it".to_string(),
+            Action::Answer { draft: false } => "answer what it asks of you".to_string(),
+            Action::Answer { draft: true } => "draft an answer to what it asks of you".to_string(),
+            Action::Capped(_) | Action::AnswersCapped | Action::BelongsToResume => {
+                "leave it".to_string()
+            }
             Action::Drop => "drop it".to_string(),
             Action::Ignore(_) => "ignore it".to_string(),
         }
@@ -662,7 +673,7 @@ impl Action {
     fn runs(&self) -> bool {
         matches!(
             self,
-            Action::Recheck(_) | Action::Review | Action::Checkin { .. }
+            Action::Recheck(_) | Action::Review | Action::Checkin { .. } | Action::Answer { .. }
         )
     }
 }
@@ -695,6 +706,13 @@ pub struct Facts {
     /// or for an issue since its pull request's. Read only when a mention is
     /// pending.
     pub mentioned: bool,
+    /// For an issue with no reviewed pull request: a mention of the viewer on
+    /// it that `spar answer` has not judged. Read only when a mention is
+    /// pending.
+    pub asks_open: bool,
+    /// For the same issue: `spar answer` ran on it `max_answers` times
+    /// without a person running it since.
+    pub answers_capped: bool,
 }
 
 /// Whether a pull request's `reviewRequests` ask the viewer now: by name, or
@@ -758,13 +776,16 @@ pub fn settle(p: &mut Pending, f: &Facts) -> bool {
 /// says so on every later update. On a pull request spar reviewed, or an issue
 /// whose pull request it reviewed, only a mention made since that review asks
 /// for a second look; any other is only something happening on a thread the
-/// viewer is part of. True when it was.
+/// viewer is part of. On any other issue only a mention `spar answer` has not
+/// judged asks anything, which is what keeps spar's own answer, moving the
+/// thread it was raised on, from asking for another. True when it was.
 pub fn settle_mention(p: &mut Pending, f: &Facts) -> bool {
-    let reviewed = match p.kind {
-        ItemKind::Pr => f.has_posted_record,
-        ItemKind::Issue => f.linked_pr_with_record.is_some(),
+    let asked = match p.kind {
+        ItemKind::Pr => !f.has_posted_record || f.mentioned,
+        ItemKind::Issue if f.linked_pr_with_record.is_some() => f.mentioned,
+        ItemKind::Issue => f.asks_open,
     };
-    let stale = reviewed && !f.mentioned && p.triggers.remove(&Trigger::Mentioned);
+    let stale = !asked && p.triggers.remove(&Trigger::Mentioned);
     if stale {
         p.triggers.insert(Trigger::Replied);
     }
@@ -791,10 +812,19 @@ pub fn plan(p: &Pending, f: &Facts, cfg: &ListenCfg) -> Action {
             // The pull request's own guards hold whichever way its second look
             // was asked for, or a mention on the issue would be a way round them.
             match f.linked_pr_with_record {
-                None => Action::Ignore("an issue with no reviewed pull request"),
                 Some(_) if f.author_is_viewer => Action::Ignore("its pull request is your own"),
                 Some(pr) if f.recheck_capped => Action::Capped(pr),
                 Some(pr) => Action::Recheck(pr),
+                // What a mention asks on an issue is answered on the issue,
+                // and only what nobody has answered: the thread moving under
+                // spar's own reply is not a question.
+                None => match cfg.on_mention {
+                    OnMention::Ignore => Action::Ignore("on_mention is ignore"),
+                    _ if !f.asks_open => Action::Ignore("a mention spar has already judged"),
+                    _ if f.answers_capped => Action::AnswersCapped,
+                    OnMention::Answer => Action::Answer { draft: false },
+                    OnMention::Draft => Action::Answer { draft: true },
+                },
             }
         }
         ItemKind::Pr => {
@@ -1250,6 +1280,8 @@ fn facts(
                 review_pending: pending,
                 request_answered: answered,
                 mentioned,
+                asks_open: false,
+                answers_capped: false,
             })
         }
         ItemKind::Issue => {
@@ -1285,6 +1317,13 @@ fn facts(
                 ),
                 _ => false,
             };
+            let (asks_open, answers_capped) = match &linked {
+                None if mention => {
+                    let (open, automatic) = answer::outstanding(repo, number, &viewer, &in_team)?;
+                    (open > 0, automatic >= cfg.listen.max_answers)
+                }
+                _ => (false, false),
+            };
             Ok(Facts {
                 number,
                 named,
@@ -1298,6 +1337,8 @@ fn facts(
                 review_pending: false,
                 request_answered: false,
                 mentioned,
+                asks_open,
+                answers_capped,
             })
         }
     }
@@ -1344,6 +1385,19 @@ fn dispatch(
                 trust: cfg.loop_cfg.checkin_trust,
                 again: false,
                 resolve: cfg.loop_cfg.checkin_resolve,
+                posts: checkin::posts(cfg),
+            },
+        ),
+        Action::Answer { draft } => answer::answer_issue(
+            agents,
+            cfg,
+            repo,
+            number,
+            &answer::Mode {
+                dry_run: false,
+                draft: *draft,
+                again: false,
+                auto: true,
                 posts: checkin::posts(cfg),
             },
         ),
@@ -1634,10 +1688,17 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                 }
             }
             if settle_mention(&mut p, &f) {
-                log!(
-                    "#{number}: nobody mentioned you since the review on record, so that was only \
-                     an update"
-                );
+                if p.kind == ItemKind::Issue && f.linked_pr_with_record.is_none() {
+                    log!(
+                        "#{number}: nothing on it asks you anything spar has not judged, so that \
+                         was only an update"
+                    );
+                } else {
+                    log!(
+                        "#{number}: nobody mentioned you since the review on record, so that was \
+                         only an update"
+                    );
+                }
             }
             if p.triggers.contains(&Trigger::ReviewRequested) || f.request_answered {
                 // Answered now, or by the review on record, whichever way it
@@ -1671,6 +1732,26 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                             cfg.listen.max_rechecks,
                             plural(cfg.listen.max_rechecks as usize)
                         );
+                        w.said_capped = true;
+                    }
+                    state.pending.remove(&number);
+                }
+                Action::AnswersCapped => {
+                    let w = state.watched(number, p.kind);
+                    if !w.said_capped {
+                        if cfg.listen.max_answers == 0 {
+                            log!(
+                                "#{number}: max_answers is 0, so spar listen answers nothing; run \
+                                 `spar answer {number}` to answer it"
+                            );
+                        } else {
+                            log!(
+                                "#{number}: answered {} time{} already; run `spar answer {number}` \
+                                 to answer again",
+                                cfg.listen.max_answers,
+                                plural(cfg.listen.max_answers as usize)
+                            );
+                        }
                         w.said_capped = true;
                     }
                     state.pending.remove(&number);
@@ -2593,6 +2674,33 @@ mod tests {
         assert_eq!(Action::Recheck(108), plan(&p, &asked, &cfg()));
     }
 
+    /// spar's own answer moves the thread it answered, and the thread keeps
+    /// the reason it was raised for, so it comes back as a mention. Only a
+    /// mention `spar answer` has not judged is one.
+    #[test]
+    fn an_issue_thread_moved_by_spars_own_answer_is_only_an_update() {
+        let judged = Facts {
+            number: 229,
+            open: true,
+            ..Default::default()
+        };
+        let mut p = pending(ItemKind::Issue, &[Trigger::Mentioned], 0);
+        assert!(settle_mention(&mut p, &judged));
+        assert_eq!(
+            [Trigger::Replied].into_iter().collect::<BTreeSet<_>>(),
+            p.triggers
+        );
+        assert!(matches!(plan(&p, &judged, &cfg()), Action::Ignore(_)));
+
+        let asked = Facts {
+            asks_open: true,
+            ..judged
+        };
+        let mut p = pending(ItemKind::Issue, &[Trigger::Mentioned], 0);
+        assert!(!settle_mention(&mut p, &asked));
+        assert_eq!(Action::Answer { draft: false }, plan(&p, &asked, &cfg()));
+    }
+
     #[test]
     fn a_review_request_or_an_assignment_on_an_unreviewed_pull_request_follows_the_config() {
         let f = open_pr();
@@ -2778,12 +2886,13 @@ mod tests {
     }
 
     #[test]
-    fn an_issue_mention_without_a_pull_request_is_ignored_and_with_one_rechecks_it() {
+    fn an_issue_mention_without_a_pull_request_is_answered_and_with_one_rechecks_it() {
         let issue = Facts {
             number: 42,
             open: true,
             ..Default::default()
         };
+        // Every mention on it judged already: nothing asks.
         assert!(matches!(
             plan(
                 &pending(ItemKind::Issue, &[Trigger::Mentioned], 0),
@@ -2792,6 +2901,49 @@ mod tests {
             ),
             Action::Ignore(_)
         ));
+        let asks = Facts {
+            asks_open: true,
+            ..issue.clone()
+        };
+        assert_eq!(
+            Action::Answer { draft: false },
+            plan(
+                &pending(ItemKind::Issue, &[Trigger::Mentioned], 0),
+                &asks,
+                &cfg()
+            )
+        );
+        let mut c = cfg();
+        c.on_mention = OnMention::Draft;
+        assert_eq!(
+            Action::Answer { draft: true },
+            plan(
+                &pending(ItemKind::Issue, &[Trigger::Mentioned], 0),
+                &asks,
+                &c
+            )
+        );
+        c.on_mention = OnMention::Ignore;
+        assert_eq!(
+            Action::Ignore("on_mention is ignore"),
+            plan(
+                &pending(ItemKind::Issue, &[Trigger::Mentioned], 0),
+                &asks,
+                &c
+            )
+        );
+        let capped = Facts {
+            answers_capped: true,
+            ..asks.clone()
+        };
+        assert_eq!(
+            Action::AnswersCapped,
+            plan(
+                &pending(ItemKind::Issue, &[Trigger::Mentioned], 0),
+                &capped,
+                &cfg()
+            )
+        );
         assert!(matches!(
             plan(
                 &pending(ItemKind::Issue, &[Trigger::Replied], 0),

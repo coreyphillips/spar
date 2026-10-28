@@ -323,7 +323,7 @@ pub fn may_resolve(item: &Settled, posted: bool, mode: &Mode) -> bool {
 /// in all of those, so all of them are stripped out of quoted text.
 static FENCE_LINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)[-\x{2010}-\x{2015}\x{2212}]{3,}\s*(?:end\s+)?(?:comment|review|resolved|commits|pull request)\b",
+        r"(?i)[-\x{2010}-\x{2015}\x{2212}]{3,}\s*(?:end\s+)?(?:comment|review|resolved|commits|pull request|issue|mention)\b",
     )
         .expect("fence line pattern")
 });
@@ -432,7 +432,7 @@ impl Fence {
 }
 
 /// Drop every line that reads as a fence marker.
-fn strip_fence_lines(text: &str) -> String {
+pub(crate) fn strip_fence_lines(text: &str) -> String {
     text.lines()
         .filter(|line| !FENCE_LINE.is_match(line))
         .collect::<Vec<_>>()

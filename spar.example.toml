@@ -300,6 +300,8 @@ brainstorm  = "high"         # every brainstorm round: proposing, building on
 recheck     = "high"         # a second look at a reviewed pull request after
                              # commits or replies: rulings on the earlier
                              # points, and a review of what is new
+answer      = "high"         # drafting and checking answers to what an issue
+                             # asks of you, for `spar answer`
 # round_1   = "ultra"        # read by any call above with no key of its own
 # rest      = "high"         # the same, for later rounds and the close
 
@@ -337,6 +339,16 @@ on_own_pr           = "checkin"
 verdicts            = true     # a review `spar listen` starts approves or
                                # requests changes rather than commenting. A
                                # recheck always does.
+on_mention          = "answer" # a mention of you on an issue with no pull
+                               # request spar reviewed. answer runs `spar
+                               # answer`: what both agents agree on and can
+                               # check is posted, and anything that asks you to
+                               # decide is left for you. draft saves it for
+                               # `spar post` instead. ignore does nothing.
+max_answers         = 3        # times `spar listen` answers on one issue
+                               # before a person has to run `spar answer` on it
+                               # again. A cap against two bots talking to each
+                               # other. 0 turns automatic answers off.
 
 [style]
 ban_em_dash        = true

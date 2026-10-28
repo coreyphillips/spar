@@ -1975,9 +1975,13 @@ fn approve(
         let some_met = state.criteria.iter().any(|c| c.status == Some(Mark::Met));
         if state.ticks_criteria && ctx.subject != ctx.pr_number && some_met {
             // A merge queue takes the command and merges later, or not at all.
-            if repo.pr_state(ctx.pr_number) != "MERGED" {
+            // And a merge that reported failure counts as done once the PR
+            // reads MERGED, which someone else may have done at a later head.
+            let landed = repo.pr_state(ctx.pr_number) == "MERGED"
+                && repo.pr_head_oid(ctx.pr_number).ok().as_deref() == Some(published_head);
+            if !landed {
                 log!(
-                    "{}: not merged yet, so no acceptance criteria were ticked on #{}",
+                    "{}: not merged yet at the reviewed head, so no acceptance criteria were ticked on #{}",
                     ctx.label,
                     ctx.subject
                 );

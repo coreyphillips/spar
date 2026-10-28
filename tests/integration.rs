@@ -9196,6 +9196,11 @@ case "$1 $2" in
     ;;
   "issue edit") cat > "$SPAR_CODE_DIR/issue-edit-body" ;;
   "pr merge")
+    if [ "${SPAR_CODE_MODE:-}" = merged-elsewhere ]; then
+      git update-ref refs/remotes/origin/issue-42 origin/issue-42^
+      touch "$SPAR_CODE_DIR/pr-merged"
+      exit 1
+    fi
     if [ "${SPAR_CODE_MODE:-}" != queued ]; then touch "$SPAR_CODE_DIR/pr-merged"; fi
     ;;
   "pr list")
@@ -9596,6 +9601,16 @@ fn code_ticks_nothing_while_the_merge_is_only_queued() {
     assert_eq!(1, calls.matches("pr merge ").count(), "{calls}");
     assert!(!calls.contains("issue edit"), "{calls}");
     assert!(out.contains("not merged yet"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn code_ticks_nothing_when_a_failed_merge_landed_another_head() {
+    let (test, out) = code_criteria_run_with(true, "met", "merged-elsewhere", &[]);
+    let calls = test.log("gh.log");
+    assert_eq!(1, calls.matches("pr merge ").count(), "{calls}");
+    assert!(!calls.contains("issue edit"), "{calls}");
+    assert!(out.contains("not merged yet at the reviewed head"), "{out}");
 }
 
 #[cfg(unix)]

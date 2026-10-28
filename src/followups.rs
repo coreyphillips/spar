@@ -338,8 +338,9 @@ pub fn screen(
     }
     let prompt = format!("{SCREEN_PROMPT}{}", rendered.text);
     let effort = agent.effort(cfg, Call::Screen);
+    let checkout = repo.read_checkout("follow-up screen")?;
     let answer: ScreenResponse =
-        agent.ask_json(&prompt, &schema::screen(), repo.root(), &effort)?;
+        agent.ask_json(&prompt, &schema::screen(), checkout.path(), &effort)?;
     Ok(answer.entries)
 }
 

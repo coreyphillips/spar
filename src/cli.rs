@@ -2236,7 +2236,7 @@ const LOOP_OPTIONS: &[Setting] = &[
     (false, "max_rounds", "In the custody loop, review rounds one invocation may spend asking for changes. A full-budget run may then use one extra closing pass. In `spar review`, this selects up to three phases: independent review, cross-adjudication, and rebuttal. Resuming a custody run grants a fresh budget, so this is not a lifetime cap."),
     (false, "auto_merge", "Merge when no blocking findings remain. Off on purpose: two models agreeing is not the same as being right, and neither carries the consequences."),
     (false, "first_implementor", "Which agent takes the first pass. The other one reviews it."),
-    (false, "worktrees", "Isolate each issue in its own git worktree. Set false to work in the main checkout."),
+    (false, "worktrees", "Isolate each issue in its own git worktree, and run each read-only call, such as triage or drafting an issue, in a throwaway checkout of HEAD so another agent working in the main checkout cannot fail it. Set false to work in the main checkout."),
     (false, "close_skipped", "Close an issue both reviewers declined, after posting the shared reasoning. A tracking issue is left open whatever this says."),
     (false, "followups", "Where a follow-up goes. issues files them, local writes .spar/followups.md and leaves the tracker alone, none drops them. `spar followup` works that file."),
     (true, "file_non_blocking", "File a non-blocking finding as a follow-up. Off, because not gating a merge is not the same as deserving somebody's triage queue."),

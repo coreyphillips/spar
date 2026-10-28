@@ -243,7 +243,8 @@ pub struct Outcome {
 /// Run the rounds and settle the set.
 pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, session: &Session) -> Result<Outcome> {
     let budget = session.budget.max(1);
-    let work_dir = repo.root();
+    let checkout = repo.read_checkout("brainstorm")?;
+    let work_dir = checkout.path();
     let subject = session.subject();
     let names: Vec<String> = agents.iter().map(|a| a.name().to_string()).collect();
     let mut notes = Vec::new();

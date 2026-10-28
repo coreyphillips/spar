@@ -788,7 +788,8 @@ fn inner_issue(
         "#{number} is an issue with no open pull request, so nothing can be changed. Answering \
          the comments."
     );
-    let checkpoint = repo.worktree_checkpoint(repo.root())?;
+    let checkout = repo.read_checkout(&format!("check-in on #{number}"))?;
+    let checkpoint = repo.worktree_checkpoint(checkout.path())?;
     let _ = act(
         agents,
         cfg,
@@ -797,7 +798,7 @@ fn inner_issue(
         &issue.title,
         issue.body_text(),
         &found,
-        repo.root(),
+        checkout.path(),
         &checkpoint,
         None,
         false,

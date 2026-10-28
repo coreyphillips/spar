@@ -7,6 +7,7 @@
 //! competent reviewers is information, not noise to be averaged away.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use crate::agent::Agent;
 use crate::comments::{issue_for_prompt, THREAD_RULE};
@@ -161,10 +162,12 @@ pub fn triage(agents: &[Agent], cfg: &Config, repo: &Repo, issues: &[Issue]) -> 
     );
     let schema = schema::triage();
 
+    let checkout = repo.read_checkout("triage")?;
+    let work_dir = checkout.path();
     let answers = if cfg.loop_cfg.parallel_triage && agents.len() > 1 {
-        ask_together(agents, cfg, repo, &prompt, &schema)
+        ask_together(agents, cfg, work_dir, &prompt, &schema)
     } else {
-        ask_in_turn(agents, cfg, repo, &prompt, &schema)
+        ask_in_turn(agents, cfg, work_dir, &prompt, &schema)
     };
 
     let mut verdicts: Vec<(String, BTreeMap<i64, TriageVerdict>)> = Vec::new();
@@ -185,12 +188,12 @@ type Answer = (String, Result<TriageResponse>);
 fn ask_one(
     agent: &Agent,
     cfg: &Config,
-    repo: &Repo,
+    work_dir: &Path,
     prompt: &str,
     schema: &serde_json::Value,
 ) -> Answer {
     let effort = agent.effort(cfg, Call::Triage);
-    let out = agent.ask_json::<TriageResponse>(prompt, schema, repo.root(), &effort);
+    let out = agent.ask_json::<TriageResponse>(prompt, schema, work_dir, &effort);
     (agent.name().to_string(), out)
 }
 
@@ -199,7 +202,7 @@ fn ask_one(
 fn ask_together(
     agents: &[Agent],
     cfg: &Config,
-    repo: &Repo,
+    work_dir: &Path,
     prompt: &str,
     schema: &serde_json::Value,
 ) -> Vec<Answer> {
@@ -207,7 +210,7 @@ fn ask_together(
     std::thread::scope(|scope| {
         let handles: Vec<_> = agents
             .iter()
-            .map(|agent| scope.spawn(move || ask_one(agent, cfg, repo, prompt, schema)))
+            .map(|agent| scope.spawn(move || ask_one(agent, cfg, work_dir, prompt, schema)))
             .collect();
         handles
             .into_iter()
@@ -227,7 +230,7 @@ fn ask_together(
 fn ask_in_turn(
     agents: &[Agent],
     cfg: &Config,
-    repo: &Repo,
+    work_dir: &Path,
     prompt: &str,
     schema: &serde_json::Value,
 ) -> Vec<Answer> {
@@ -239,7 +242,7 @@ fn ask_in_turn(
                 agent.name(),
                 agent.spec.describe()
             );
-            ask_one(agent, cfg, repo, prompt, schema)
+            ask_one(agent, cfg, work_dir, prompt, schema)
         })
         .collect()
 }

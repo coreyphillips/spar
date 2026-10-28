@@ -26,12 +26,14 @@ use crate::config::{Call, Config, Drafts, Followups, PrComments};
 use crate::error::{ErrorKind, Result, SparError};
 use crate::jsonx::{exact_finding_key as finding_key, finding_file, stable_finding_key};
 use crate::model::{
-    Action, Disposition, Dispute, Finding, Followup, Implementation, Issue, IssueRun, Ledger,
-    LedgerEntry, NextAction, OwnFix, OwnFixDoc, PersistedState, PlanItem, PrView, ResponseDoc,
-    Review, Settled, Severity, SkippedItem, Status, Verdict, STATE_VERSION,
+    Action, CriterionStatus, Disposition, Dispute, Finding, Followup, Implementation, Issue,
+    IssueRun, Ledger, LedgerEntry, Mark, NextAction, OwnFix, OwnFixDoc, PersistedState, PlanItem,
+    PrView, ResponseDoc, Review, Ruled, Settled, Severity, SkippedItem, Status, Verdict,
+    STATE_VERSION,
 };
 use crate::repo::{PushTarget, Repo};
 use crate::style::{self, Style};
+use crate::tracker::{self, Item};
 use crate::{bail, log, logdim, logwarn, schema, spar_err};
 
 // ---------------------------------------------------------------------------
@@ -47,7 +49,7 @@ URL: {url}
 {body}
 
 That is the issue as filed, followed by any comments on it since, oldest first.
-{thread_rule}
+{thread_rule}{criteria}
 
 Do the work and run the relevant tests. Leave the changes uncommitted. Do not
 commit, push, open a PR, or merge; the harness validates and commits the working
@@ -64,7 +66,7 @@ make no changes and set not_worth_doing, with the reason.";
 const REVIEW_PROMPT: &str = "\
 Review the changes on this branch against `{base}`. They implement issue
 #{number}: {title}
-{context}
+{context}{criteria}
 Review thoroughly: correctness, edge cases, error handling, security, and
 whether the change actually resolves the issue. Read surrounding code, do not
 only read the diff.
@@ -123,7 +125,7 @@ accepts every review comment to get approved produces worse code, not better.
 
 const CLOSE_PROMPT: &str = "\
 This closes the review of issue #{number}: {title}
-{context}
+{context}{criteria}
 This is the final merge-safety audit. Read the full branch against `{base}` and
 answer one question: does the branch still contain anything that must not
 merge. Do not spend this pass on optional improvements or style.
@@ -776,11 +778,17 @@ fn implement_and_review(
     );
     issue_text.report(&format!("#{number}"));
     let body = issue_text.text;
-    let prompt = implement_prompt(number, &item.title, &issue.url, &body);
+    let criteria = tracker::criteria(issue.body_text());
+    let prompt = implement_prompt(number, &item.title, &issue.url, &body, &criteria);
+    let implementation_schema = if criteria.is_empty() {
+        schema::implementation()
+    } else {
+        schema::with_criteria(schema::implementation(), schema::CriteriaVoice::Author)
+    };
     let worktree_baseline = repo.worktree_baseline(work_dir)?;
     let answer: Result<Implementation> = implementor.edit_json(
         &prompt,
-        &schema::implementation(),
+        &implementation_schema,
         work_dir,
         &implementor.effort(cfg, Call::Implement).about(number),
     );
@@ -897,7 +905,7 @@ fn implement_and_review(
     // fork when origin refuses it, since no pull request is on origin yet.
     let target = repo.publish_new_branch(work_dir, branch, &base)?;
 
-    let description = pr_body(number, &work, checked.as_deref(), &repo.style);
+    let description = pr_body(number, &work, checked.as_deref(), &criteria, &repo.style);
     let pr = match repo.pr_for_branch(branch) {
         Some(existing) => existing,
         None => {
@@ -928,6 +936,7 @@ fn implement_and_review(
         start_round: 1,
         holder: cfg.other(&holder),
         release: Release::Issue(number),
+        criteria,
     };
     review_loop(agents, cfg, repo, &ctx, state, ledger, Vec::new())
 }
@@ -1122,6 +1131,10 @@ fn resume_inner(
         start_round,
         holder,
         release: Release::Pr(pr_number),
+        criteria: issue
+            .as_ref()
+            .map(|issue| tracker::criteria(issue.body_text()))
+            .unwrap_or_default(),
     };
 
     let outcome = review_loop(
@@ -1170,6 +1183,8 @@ struct LoopCtx {
     start_round: u32,
     holder: String,
     release: Release,
+    /// The issue's unchecked task list items, read from its whole body.
+    criteria: Vec<Item>,
 }
 
 impl LoopCtx {
@@ -1246,6 +1261,7 @@ fn review_loop(
             &open_findings,
             round,
             last_allowed,
+            &ctx.criteria,
         );
         let before_review = snapshot(repo, &ctx.work_dir);
         let review_baseline = repo.worktree_baseline(&ctx.work_dir)?;
@@ -1255,7 +1271,7 @@ fn review_loop(
         let review = reviewer.review::<Review>(
             &base_ref,
             &prompt,
-            &schema::review(),
+            &review_schema(&ctx.criteria),
             &ctx.work_dir,
             &effort,
         );
@@ -1341,6 +1357,7 @@ fn review_loop(
 
         if approval_stands(&blocking, review_wrote) {
             open_findings.clear();
+            state.criteria = ruled(&ctx.criteria, &review.criteria);
             return approve(
                 cfg,
                 repo,
@@ -1701,13 +1718,19 @@ fn close_out(
         ledger,
         open_findings,
         round,
+        &ctx.criteria,
     );
     let before = snapshot(repo, &ctx.work_dir);
     let closing_baseline = repo.worktree_baseline(&ctx.work_dir)?;
     // `ask_json` rather than `Agent::review`: this prompt already defines the
     // full merge-safety scope and calls out the unread delta and carried points.
     // Appending a second scope would make the closing instructions compete.
-    let pass = closer.ask_json(&prompt, &schema::review(), &ctx.work_dir, &effort);
+    let pass = closer.ask_json(
+        &prompt,
+        &review_schema(&ctx.criteria),
+        &ctx.work_dir,
+        &effort,
+    );
     if let Err(e) = &pass {
         if e.kind() == crate::error::ErrorKind::UncertainWrite {
             return Err(e.clone());
@@ -1832,6 +1855,7 @@ fn close_out(
 
     if approval_stands(&blocking, false) {
         open_findings.clear();
+        state.criteria = ruled(&ctx.criteria, &pass.criteria);
         return approve(cfg, repo, ctx, state, ledger, published_head, round, &next);
     }
 
@@ -1919,6 +1943,8 @@ fn approve(
     )?;
     let live_head = repo.pr_head_oid(ctx.pr_number)?;
     ensure_reviewed_head(ctx.pr_number, published_head, &live_head)?;
+    // A tick says the work landed, so only a merge spar performs earns one.
+    state.ticks_criteria = cfg.loop_cfg.auto_merge && cfg.loop_cfg.tick_criteria;
     post_outcome(repo, ctx.pr_number, state, ledger, Ending::Approved);
     // Before the merge, not after: a draft cannot be merged, and the state the
     // draft was signalling, that two agents were still arguing about it, has
@@ -1942,6 +1968,17 @@ fn approve(
         state.status = Status::Merged;
         repo.clear_state(ctx.pr_number); // nothing left to resume
         log!("{}: merged", ctx.label);
+        if state.ticks_criteria && ctx.subject != ctx.pr_number {
+            let ticked = tick_met(repo, ctx.subject, &state.criteria);
+            if ticked > 0 {
+                let noun = if ticked == 1 { "criterion" } else { "criteria" };
+                log!(
+                    "{}: ticked {ticked} acceptance {noun} on #{}",
+                    ctx.label,
+                    ctx.subject
+                );
+            }
+        }
     } else {
         log!("{}: approved, awaiting human merge", ctx.label);
     }
@@ -3498,15 +3535,22 @@ fn outcome_comment_with_unread(
 
     match ending {
         Ending::Approved => {
-            if state.disputes.is_empty() && state.filed.is_empty() && state.noted.is_empty() {
+            let criteria = criteria_rulings(state, style);
+            if state.disputes.is_empty()
+                && state.filed.is_empty()
+                && state.noted.is_empty()
+                && criteria.is_none()
+            {
                 // A clean approval with nothing outstanding needs no comment.
                 // The absence of objections is the message. `noted` is in that
                 // condition because the message has to be true: a reviewer that
                 // found six real problems and gated on none of them did not find
-                // nothing, and silence would say it did.
+                // nothing, and silence would say it did. So is a criterion not
+                // ruled met, for the same reason.
                 return None;
             }
             out.push("Reviewed, nothing blocking a merge.".into());
+            out.extend(criteria);
         }
         Ending::OutOfRounds => {
             out.push(
@@ -3654,6 +3698,38 @@ fn outcome_comment_with_unread(
     Some(out.join("\n\n"))
 }
 
+/// The signing review's rulings on the acceptance criteria, for the outcome
+/// comment.
+///
+/// When met criteria are about to be ticked, the issue records those, so only
+/// the rest are named. When nothing will be ticked, this comment is the only
+/// record of any ruling, so every one is.
+fn criteria_rulings(state: &IssueRun, style: &Style) -> Option<String> {
+    let shown: Vec<String> = state
+        .criteria
+        .iter()
+        .filter(|c| !state.ticks_criteria || c.status != Some(Mark::Met))
+        .map(|c| {
+            let label = match c.status {
+                Some(Mark::Met) => "Met",
+                Some(Mark::NotMet) => "Not met",
+                Some(Mark::NeedsPerson) => "Needs a person",
+                None => "Not ruled on",
+            };
+            criterion_line(label, &c.text, Some(&c.reason), style)
+        })
+        .collect();
+    if shown.is_empty() {
+        return None;
+    }
+    let lead = if state.ticks_criteria {
+        "Acceptance criteria not ruled met, left unchecked on the issue:"
+    } else {
+        "Acceptance criteria as the review ruled them. Nothing was ticked on the issue:"
+    };
+    Some(format!("{lead}\n{}", bullets(&shown)))
+}
+
 /// What the closing pass is asked, with the last delta called out inside the
 /// full merge-safety audit.
 ///
@@ -3673,6 +3749,7 @@ fn close_prompt(
     ledger: &Ledger,
     open_findings: &[Finding],
     round: u32,
+    criteria: &[Item],
 ) -> String {
     let landed = match landed {
         Some([]) => "\nNothing landed after the last round of review. What it asked for was \
@@ -3699,6 +3776,7 @@ fn close_prompt(
         .replace("{number}", &number.to_string())
         .replace("{title}", title)
         .replace("{context}", context)
+        .replace("{criteria}", &criteria_to_rule(criteria))
         .replace("{base}", base)
         .replace("{landed}", &landed)
         .replace("{open}", &open_findings_block(open_findings))
@@ -3748,12 +3826,14 @@ fn review_prompt(
     open_findings: &[Finding],
     round: u32,
     last: u32,
+    criteria: &[Item],
 ) -> String {
     REVIEW_PROMPT
         .replace("{base}", base)
         .replace("{number}", &number.to_string())
         .replace("{title}", title)
         .replace("{context}", context)
+        .replace("{criteria}", &criteria_to_rule(criteria))
         .replace("{open}", &open_findings_block(open_findings))
         .replace("{answers}", &answers_block(ledger, round))
         .replace("{settled}", &settled_block(ledger))
@@ -3767,9 +3847,22 @@ fn review_prompt(
 /// which has no network at all, so a URL alone would leave it judging the title.
 /// And an agent that can follow it has no reason to when the body reads as
 /// complete, which is exactly when a comment that superseded it matters most.
-fn implement_prompt(number: i64, title: &str, url: &str, body: &str) -> String {
+fn implement_prompt(number: i64, title: &str, url: &str, body: &str, criteria: &[Item]) -> String {
+    let criteria = if criteria.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nThe issue's acceptance criteria, numbered:\n{}\n\nReport a status on each one \
+             in criteria, by its number: done, not_done, or needs_person for anything the \
+             repository cannot show, such as a run on a device. Give one line of reason. This is \
+             your account and goes in the pull request body as yours. Only the reviewer's ruling \
+             ticks a box on the issue.",
+            numbered(criteria)
+        )
+    };
     IMPLEMENT_PROMPT
         .replace("{thread_rule}", THREAD_RULE)
+        .replace("{criteria}", &criteria)
         .replace("{number}", &number.to_string())
         .replace("{title}", title)
         .replace("{url}", url)
@@ -3785,7 +3878,13 @@ fn implement_prompt(number: i64, title: &str, url: &str, body: &str) -> String {
 ///
 /// GitHub renders the file count and the plus and minus figures immediately
 /// above this, so neither appears here.
-pub fn pr_body(issue: i64, work: &Implementation, checked: Option<&str>, style: &Style) -> String {
+pub fn pr_body(
+    issue: i64,
+    work: &Implementation,
+    checked: Option<&str>,
+    criteria: &[Item],
+    style: &Style,
+) -> String {
     let mut parts = vec![format!("Closes #{issue}")];
 
     for lead in [&work.summary, &work.problem] {
@@ -3802,6 +3901,7 @@ pub fn pr_body(issue: i64, work: &Implementation, checked: Option<&str>, style: 
         testing.push(format!("`{command}` passed on this branch, run by spar."));
     }
     parts.extend(section("How to test", &testing, style));
+    parts.extend(claimed_criteria(criteria, &work.criteria, style));
 
     let notes = style::sentence(work.notes.as_deref().unwrap_or_default(), style);
     if !notes.is_empty() {
@@ -3809,6 +3909,142 @@ pub fn pr_body(issue: i64, work: &Implementation, checked: Option<&str>, style: 
     }
 
     style::body(&parts.join("\n\n"), style)
+}
+
+/// The author's status on each acceptance criterion, said to be the author's.
+///
+/// A reviewer reads the body as a claim already, and a person reading the pull
+/// request has to be told this is not what ticks a box.
+fn claimed_criteria(
+    criteria: &[Item],
+    claims: &[CriterionStatus],
+    style: &Style,
+) -> Option<String> {
+    if criteria.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = criteria
+        .iter()
+        .enumerate()
+        .map(|(at, item)| {
+            let status = status_for(claims, at + 1);
+            let label = match status.map(|s| s.status) {
+                Some(Mark::Met) => "Done",
+                Some(Mark::NotMet) => "Not done",
+                Some(Mark::NeedsPerson) => "Needs a person",
+                None => "No status given",
+            };
+            criterion_line(label, &item.text, status.map(|s| s.reason.as_str()), style)
+        })
+        .collect();
+    Some(format!(
+        "## Acceptance criteria\n\nThe author's account. A box on the issue is ticked only on \
+         the review's ruling, after spar merges.\n\n{}",
+        bullets(&lines)
+    ))
+}
+
+/// `Label: criterion. Reason.` on one line.
+fn criterion_line(label: &str, text: &str, reason: Option<&str>, style: &Style) -> String {
+    let stop = |text: String| {
+        if text.is_empty() || text.ends_with(['.', '!', '?']) {
+            text
+        } else {
+            text + "."
+        }
+    };
+    let mut line = format!("{label}: {}", stop(style::one_line(text.trim())));
+    let reason = stop(style::sentence(reason.unwrap_or_default(), style));
+    if !reason.is_empty() {
+        line.push(' ');
+        line.push_str(&reason);
+    }
+    line
+}
+
+/// The criteria, numbered from one, each as the issue words it.
+fn numbered(criteria: &[Item]) -> String {
+    criteria
+        .iter()
+        .enumerate()
+        .map(|(at, item)| format!("{}. {}", at + 1, item.text.trim()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// What a review or the closing pass is asked about the criteria, or nothing
+/// when the issue has none.
+fn criteria_to_rule(criteria: &[Item]) -> String {
+    if criteria.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\nThe issue's acceptance criteria, numbered:\n{}\n\nRule on each one in criteria, by its \
+         number: met when you checked that the branch does it, not_met when it does not or you \
+         could not confirm it, needs_person when the repository cannot show it, such as a run on \
+         a device. Say what you checked. A criterion ruled met is ticked on the issue when spar \
+         merges this pull request, so do not rule met on the author's word. A ruling is not a \
+         finding: an unmet criterion holds nothing unless it is also a defect you would block \
+         for.\n",
+        numbered(criteria)
+    )
+}
+
+/// The schema a review or the closing pass answers, asking for rulings only
+/// when there is something to rule on.
+fn review_schema(criteria: &[Item]) -> serde_json::Value {
+    if criteria.is_empty() {
+        schema::review()
+    } else {
+        schema::with_criteria(schema::review(), schema::CriteriaVoice::Reviewer)
+    }
+}
+
+/// One agent's word on criterion `number`, matched by number. A criterion
+/// answered twice counts as met only when every answer says so, since a tick
+/// is the one outcome here that is hard to take back.
+fn status_for(statuses: &[CriterionStatus], number: usize) -> Option<&CriterionStatus> {
+    let answers: Vec<&CriterionStatus> = statuses
+        .iter()
+        .filter(|s| s.number as usize == number)
+        .collect();
+    answers
+        .iter()
+        .find(|s| s.status != Mark::Met)
+        .or_else(|| answers.first())
+        .copied()
+}
+
+/// The signing review's ruling on each criterion, with the line it is about.
+fn ruled(criteria: &[Item], rulings: &[CriterionStatus]) -> Vec<Ruled> {
+    criteria
+        .iter()
+        .enumerate()
+        .map(|(at, item)| {
+            let status = status_for(rulings, at + 1);
+            Ruled {
+                raw: item.raw.clone(),
+                text: item.text.trim().to_string(),
+                status: status.map(|s| s.status),
+                reason: status.map(|s| s.reason.clone()).unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
+/// Tick each criterion the signing review ruled met, once the work has landed.
+///
+/// Each write re-reads the body and goes through the tracker's line surgery,
+/// so a line that changed or now appears twice is skipped with a log line, a
+/// box is never unchecked, and every other byte of the body comes through.
+fn tick_met(repo: &Repo, issue: i64, criteria: &[Ruled]) -> usize {
+    let mut ticked = 0;
+    for criterion in criteria.iter().filter(|c| c.status == Some(Mark::Met)) {
+        if tracker::write(repo, issue, &criterion.raw, &tracker::Change::Tick) {
+            ticked += 1;
+        }
+    }
+    ticked
 }
 
 /// A headed list, or nothing at all when there is nothing to list.
@@ -4191,6 +4427,7 @@ mod tests {
             next_action: NextAction::Merge,
             summary: summary.into(),
             findings,
+            criteria: Vec::new(),
         }
     }
 
@@ -4495,6 +4732,7 @@ mod tests {
             next_action: NextAction::HandBack,
             summary: "one blocker".into(),
             findings: vec![blocker],
+            criteria: Vec::new(),
         };
         let said = verdict_disagreement(&approve_with_blocker, 1).expect("noticed");
         assert!(said.contains("approve"), "{said}");
@@ -4505,6 +4743,7 @@ mod tests {
             next_action: NextAction::Merge,
             summary: "nothing blocking".into(),
             findings: vec![],
+            criteria: Vec::new(),
         };
         assert!(verdict_disagreement(&changes_but_merge, 0).is_some());
 
@@ -4514,6 +4753,7 @@ mod tests {
             next_action: NextAction::Merge,
             summary: "good".into(),
             findings: vec![],
+            criteria: Vec::new(),
         };
         assert!(verdict_disagreement(&clean, 0).is_none());
         let blocked = Review {
@@ -4521,6 +4761,7 @@ mod tests {
             next_action: NextAction::HandBack,
             summary: "one blocker".into(),
             findings: vec![],
+            criteria: Vec::new(),
         };
         assert!(verdict_disagreement(&blocked, 1).is_none());
     }
@@ -5452,6 +5693,7 @@ mod tests {
             &fixed_ledger(),
             &[],
             1,
+            &[],
         );
         assert!(prompt.contains("Unbounded loop"), "{prompt}");
         assert!(prompt.contains("bounded it on max_attempts"), "{prompt}");
@@ -5475,6 +5717,7 @@ mod tests {
             &Ledger::new(),
             &[],
             1,
+            &[],
         );
         assert!(
             prompt.contains("Nothing landed after the last round"),
@@ -5500,6 +5743,7 @@ mod tests {
             &fixed_ledger(),
             &[],
             1,
+            &[],
         );
         assert!(prompt.contains("were rewritten"), "{prompt}");
         assert!(prompt.contains("git diff origin/main...HEAD"), "{prompt}");
@@ -5521,6 +5765,7 @@ mod tests {
             &Ledger::new(),
             &[],
             1,
+            &[],
         );
         assert!(prompt.contains("do not commit"), "{prompt}");
     }
@@ -5538,6 +5783,7 @@ mod tests {
             &Ledger::new(),
             &[],
             1,
+            &[],
         );
         assert!(
             prompt.contains("serious defect an\nearlier round missed"),
@@ -5568,6 +5814,7 @@ mod tests {
             &Ledger::new(),
             &[],
             1,
+            &[],
         );
         assert!(
             prompt.contains("Minor defects and improvements are\nnon-blocking"),
@@ -5686,6 +5933,7 @@ mod tests {
             &[],
             1,
             3,
+            &[],
         );
         assert!(!empty.contains('{'), "{empty}");
         assert!(
@@ -5702,7 +5950,17 @@ mod tests {
                 entry.round = 2;
             }
         }
-        let full = review_prompt("origin/main", 42, "Retry a 429", "", &ledger, &[], 3, 3);
+        let full = review_prompt(
+            "origin/main",
+            42,
+            "Retry a 429",
+            "",
+            &ledger,
+            &[],
+            3,
+            3,
+            &[],
+        );
         assert!(!full.contains('{'), "{full}");
         assert!(full.contains("fixed point") && full.contains("refuted point"));
         assert!(full.contains("last round"), "{full}");
@@ -5746,6 +6004,7 @@ mod tests {
             &[],
             1,
             3,
+            &[],
         );
         let close = close_prompt(
             "origin/main",
@@ -5757,6 +6016,7 @@ mod tests {
             &Ledger::new(),
             &[],
             1,
+            &[],
         );
         let respond = RESPOND_PROMPT
             .replace("{number}", "42")
@@ -5873,6 +6133,7 @@ mod tests {
             &open,
             2,
             3,
+            &[],
         );
         let close = close_prompt(
             "origin/main",
@@ -5884,6 +6145,7 @@ mod tests {
             &Ledger::new(),
             &open,
             2,
+            &[],
         );
         for prompt in [review, close] {
             assert!(prompt.contains("Retry bypasses the limit"), "{prompt}");
@@ -5978,6 +6240,7 @@ mod tests {
             "Retry a 429",
             "https://github.com/o/r/issues/42",
             "A rate limited response was treated as fatal.",
+            &[],
         );
         assert!(
             prompt.contains("https://github.com/o/r/issues/42"),
@@ -6000,7 +6263,7 @@ mod tests {
     /// it. Built from the body alone, the change fixes the first half.
     #[test]
     fn the_prompt_says_a_later_comment_can_change_what_was_asked() {
-        let prompt = implement_prompt(1, "t", "u", "b");
+        let prompt = implement_prompt(1, "t", "u", "b", &[]);
         // Flattened, so the assertion does not turn on where the prompt wraps.
         let lower = prompt
             .split_whitespace()
@@ -6036,7 +6299,7 @@ mod tests {
     /// GitHub renders the file count and the plus and minus figures in the
     /// header, immediately above whatever spar writes, so neither is here.
     fn a_pr_body_is_what_it_closes_and_what_changed() {
-        let body = pr_body(42, &worked(), None, &style());
+        let body = pr_body(42, &worked(), None, &[], &style());
         assert_eq!(
             "Closes #42\n\n\
              Retry a 429 instead of failing the run.\n\n\
@@ -6062,7 +6325,7 @@ mod tests {
         };
         assert_eq!(
             "Closes #42\n\nRetry a 429 instead of failing the run.",
-            pr_body(42, &work, None, &style())
+            pr_body(42, &work, None, &[], &style())
         );
     }
 
@@ -6070,7 +6333,7 @@ mod tests {
     fn a_pr_body_survives_an_implementor_that_said_nothing() {
         assert_eq!(
             "Closes #7",
-            pr_body(7, &Implementation::default(), None, &style())
+            pr_body(7, &Implementation::default(), None, &[], &style())
         );
     }
 
@@ -6083,16 +6346,16 @@ mod tests {
             changes: vec![String::new(), "   ".into()],
             ..Implementation::default()
         };
-        let body = pr_body(42, &work, None, &style());
+        let body = pr_body(42, &work, None, &[], &style());
         assert!(!body.contains("What changed"), "{body}");
     }
 
     #[test]
     fn notes_appear_only_when_there_is_something_to_note() {
         let mut work = worked();
-        assert!(!pr_body(42, &work, None, &style()).contains("## Notes"));
+        assert!(!pr_body(42, &work, None, &[], &style()).contains("## Notes"));
         work.notes = Some("The retry is not applied to streaming calls.".into());
-        let body = pr_body(42, &work, None, &style());
+        let body = pr_body(42, &work, None, &[], &style());
         assert!(body.contains("## Notes"), "{body}");
         assert!(body.contains("streaming calls"), "{body}");
     }
@@ -6172,6 +6435,205 @@ mod tests {
     #[test]
     fn findings_for_a_model_are_never_empty() {
         assert_eq!("(none)", findings_for_prompt(&[]));
+    }
+
+    const CRITERIA_BODY: &str = "## Acceptance criteria\n- [ ] Preserve column order.\n- [x] Already done.\n- [ ] Connects on a device\n";
+
+    fn status(number: u32, mark: Mark, reason: &str) -> CriterionStatus {
+        CriterionStatus {
+            number,
+            status: mark,
+            reason: reason.into(),
+        }
+    }
+
+    #[test]
+    fn criteria_are_the_unchecked_items_only() {
+        let criteria = tracker::criteria(CRITERIA_BODY);
+        let texts: Vec<&str> = criteria.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(
+            vec!["Preserve column order.", "Connects on a device"],
+            texts
+        );
+    }
+
+    #[test]
+    fn prompts_without_criteria_are_unchanged() {
+        assert!(!implement_prompt(1, "t", "u", "b", &[]).contains("{criteria}"));
+        assert!(implement_prompt(1, "t", "u", "b", &[])
+            .contains("oldest first.\n".to_string().as_str()));
+        let review = review_prompt("main", 1, "t", "\nctx\n", &Ledger::new(), &[], 1, 3, &[]);
+        assert!(
+            review.contains("#1: t\n\nctx\n\nReview thoroughly"),
+            "{review}"
+        );
+        let close = close_prompt(
+            "main",
+            1,
+            "t",
+            "\nctx\n",
+            "",
+            None,
+            &Ledger::new(),
+            &[],
+            1,
+            &[],
+        );
+        assert!(
+            close.contains("#1: t\n\nctx\n\nThis is the final"),
+            "{close}"
+        );
+        let body = pr_body(1, &Implementation::default(), None, &[], &style());
+        assert!(!body.contains("Acceptance criteria"), "{body}");
+    }
+
+    #[test]
+    fn prompts_number_each_criterion_verbatim() {
+        let criteria = tracker::criteria(CRITERIA_BODY);
+        let implement = implement_prompt(1, "t", "u", "b", &criteria);
+        let review = review_prompt("main", 1, "t", "", &Ledger::new(), &[], 1, 3, &criteria);
+        let close = close_prompt(
+            "main",
+            1,
+            "t",
+            "",
+            "",
+            None,
+            &Ledger::new(),
+            &[],
+            1,
+            &criteria,
+        );
+        for prompt in [&implement, &review, &close] {
+            assert!(
+                prompt.contains("1. Preserve column order.\n2. Connects on a device\n"),
+                "{prompt}"
+            );
+            assert!(!prompt.contains("Already done"), "{prompt}");
+        }
+        assert!(implement.contains("done, not_done, or needs_person"));
+        assert!(review.contains("met when you checked"));
+        assert!(close.contains("met when you checked"));
+    }
+
+    #[test]
+    fn the_pr_body_gives_the_authors_account_of_each_criterion() {
+        let criteria = tracker::criteria(CRITERIA_BODY);
+        let work = Implementation {
+            summary: "Add CSV export.".into(),
+            criteria: vec![status(1, Mark::Met, "the writer keeps the header order")],
+            ..Implementation::default()
+        };
+        let body = pr_body(7, &work, None, &criteria, &style());
+        assert!(
+            body.contains("## Acceptance criteria\n\nThe author's account."),
+            "{body}"
+        );
+        assert!(
+            body.contains("- Done: Preserve column order. The writer keeps the header order."),
+            "{body}"
+        );
+        assert!(
+            body.contains("- No status given: Connects on a device."),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn only_a_criterion_ruled_met_by_every_answer_is_met() {
+        let criteria = tracker::criteria(CRITERIA_BODY);
+        let rulings = vec![
+            status(1, Mark::Met, "checked"),
+            status(2, Mark::Met, "looks right"),
+            status(2, Mark::NeedsPerson, "needs a device"),
+            status(9, Mark::Met, "no such criterion"),
+        ];
+        let ruled = ruled(&criteria, &rulings);
+        assert_eq!(2, ruled.len());
+        assert_eq!(Some(Mark::Met), ruled[0].status);
+        assert_eq!("- [ ] Preserve column order.", ruled[0].raw);
+        assert_eq!(Some(Mark::NeedsPerson), ruled[1].status);
+        assert_eq!(None, super::ruled(&criteria, &[])[0].status);
+    }
+
+    #[test]
+    fn the_authors_claim_never_reaches_a_ruling() {
+        let criteria = tracker::criteria(CRITERIA_BODY);
+        // The implementor said done; the reviewer did not rule. Nothing is met.
+        let ruled = ruled(&criteria, &[]);
+        assert!(ruled.iter().all(|c| c.status != Some(Mark::Met)));
+    }
+
+    fn approved_with(criteria: Vec<Ruled>, ticks: bool) -> Option<String> {
+        let mut state = IssueRun::new(1, "t");
+        state.criteria = criteria;
+        state.ticks_criteria = ticks;
+        outcome_comment(&state, &Ledger::new(), &Ending::Approved, &style())
+    }
+
+    fn ruled_one(text: &str, status: Option<Mark>, reason: &str) -> Ruled {
+        Ruled {
+            raw: format!("- [ ] {text}"),
+            text: text.into(),
+            status,
+            reason: reason.into(),
+        }
+    }
+
+    #[test]
+    fn a_clean_approval_names_a_criterion_not_ruled_met() {
+        let text = approved_with(
+            vec![
+                ruled_one("Preserve column order.", Some(Mark::Met), "checked"),
+                ruled_one(
+                    "Connects on a device",
+                    Some(Mark::NeedsPerson),
+                    "needs a phone",
+                ),
+            ],
+            true,
+        )
+        .expect("a comment");
+        assert!(
+            text.contains("Needs a person: Connects on a device. Needs a phone."),
+            "{text}"
+        );
+        assert!(!text.contains("Preserve column order"), "{text}");
+        assert!(text.contains("left unchecked"), "{text}");
+    }
+
+    #[test]
+    fn a_clean_approval_with_every_criterion_met_stays_silent() {
+        let text = approved_with(
+            vec![ruled_one(
+                "Preserve column order.",
+                Some(Mark::Met),
+                "checked",
+            )],
+            true,
+        );
+        assert_eq!(None, text);
+    }
+
+    #[test]
+    fn without_ticking_the_comment_lists_every_ruling() {
+        let text = approved_with(
+            vec![
+                ruled_one("Preserve column order.", Some(Mark::Met), "checked"),
+                ruled_one("Connects on a device", None, ""),
+            ],
+            false,
+        )
+        .expect("a comment");
+        assert!(
+            text.contains("- Met: Preserve column order. Checked."),
+            "{text}"
+        );
+        assert!(
+            text.contains("- Not ruled on: Connects on a device."),
+            "{text}"
+        );
+        assert!(text.contains("Nothing was ticked"), "{text}");
     }
 }
 

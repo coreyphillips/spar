@@ -65,6 +65,7 @@ fn main() {
                           I have no objections to this change landing as it stands."
                     .into(),
                 findings: vec![],
+                criteria: Vec::new(),
             },
             &style
         )
@@ -121,6 +122,7 @@ fn main() {
                         false,
                     ),
                 ],
+                criteria: Vec::new(),
             },
             &style
         )
@@ -191,6 +193,7 @@ fn main() {
                 ..Implementation::default()
             },
             Some("cargo test"),
+            &[],
             &style
         )
     );

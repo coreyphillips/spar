@@ -7202,6 +7202,7 @@ case "$*" in
   "pr view {number} "*) printf '%s\n' '{{"number":{number},"url":"https://github.com/example/project/pull/{number}","title":"PR {number}","body":"","headRefName":"feature-{number}","baseRefName":"main","state":"{state}","closingIssuesReferences":[],"isCrossRepository":false}}' ;;
   "api repos/{{owner}}/{{repo}}/issues/{number} --jq"*) printf 'pr\n' ;;
   "api repos/{{owner}}/{{repo}}/issues/42 --jq"*) printf 'issue\n' ;;
+  "issue comment 42 "*) : ;;
   "issue view 42 "*) printf '{{"number":42,"title":"Retry smarter","body":"please","labels":[],"state":"%s","url":"https://github.com/example/project/issues/42","author":{{"login":"bob"}},"comments":[]}}\n' "${{SPAR_FAKE_ISSUE_STATE:-OPEN}}" ;;
   "api repos/{{owner}}/{{repo}}/compare/"*) printf '3\n' ;;
   "api --paginate repos/{{owner}}/{{repo}}/issues/{number}/comments"|"api --paginate repos/{{owner}}/{{repo}}/issues/42/comments")
@@ -7377,7 +7378,12 @@ impl Listening {
 
     /// The same, with more of the environment set.
     fn run_with(&self, args: &[&str], extra: &[(&str, &str)]) -> (bool, String, String) {
-        let mut argv = vec!["listen"];
+        self.command("listen", args, extra)
+    }
+
+    /// Any command that takes `--config` and `--repo`, against the same fakes.
+    fn command(&self, name: &str, args: &[&str], extra: &[(&str, &str)]) -> (bool, String, String) {
+        let mut argv = vec![name];
         argv.extend_from_slice(args);
         argv.extend_from_slice(&["--config", self.config.to_str().unwrap(), "--repo"]);
         argv.push(self.fx.work.to_str().unwrap());
@@ -8434,6 +8440,42 @@ fn an_issue_mention_does_not_recheck_a_pull_request_past_its_cap() {
     );
     assert!(!out.contains("about to take a second look"), "{out}");
     assert_eq!(0, l.agent_calls(), "{out}");
+}
+
+/// An issue with no pull request is answered on the issue. The answer went
+/// through `gh pr comment`, which refuses an issue's number, so `spar checkin`
+/// on an issue never posted anything it composed.
+#[test]
+#[cfg(unix)]
+fn checkin_on_an_issue_posts_its_answer_on_the_issue() {
+    let l = Listening::new(
+        "checkinissue",
+        r#"{"verdicts":[{"ref_id":"c1","ask":"answer","request":"asks whether it retries","reasoning":"It retries three times, then gives up.","unambiguous":true,"new_issue_title":null,"new_issue_body":null}]}"#,
+        r#"{"checks":[{"ref_id":"c1","agrees":true,"ask":"answer","unambiguous":true,"reasoning":"checked the loop"}]}"#,
+        &listen_gh(7, "aaa", "alice", "OPEN"),
+    );
+    let comments = l.with_comments(serde_json::json!([{
+        "id": 501,
+        "user": {"login": "bob", "type": "User"},
+        "author_association": "NONE",
+        "body": "does it retry?",
+        "created_at": "2026-10-20T10:00:00Z"
+    }]));
+
+    let (ok, out, log) = l.command(
+        "checkin",
+        &["42"],
+        &[("SPAR_FAKE_COMMENTS", comments.to_str().unwrap())],
+    );
+
+    assert!(ok, "{out}");
+    assert!(out.contains("#42: answered"), "{out}");
+    assert!(log.contains("issue comment 42 --body"), "{log}");
+    assert!(
+        log.contains("It retries three times, then gives up."),
+        "{log}"
+    );
+    assert!(!log.contains("pr comment"), "{log}");
 }
 
 /// A poll is all or nothing. A second page that failed used to be skipped

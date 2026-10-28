@@ -973,7 +973,7 @@ fn apply(repo: &Repo, tracker: i64, steps: &[Step]) -> Vec<i64> {
                 let Some(change) = step.action.change() else {
                     continue;
                 };
-                if write(repo, tracker, &step.item.raw, &change) {
+                if write(repo, tracker, &step.item.raw, &change, None) {
                     log!("  ticked '{what}' off, #{number} is finished");
                 }
             }
@@ -988,7 +988,7 @@ fn apply(repo: &Repo, tracker: i64, steps: &[Step]) -> Vec<i64> {
                 let Some(change) = step.action.change() else {
                     continue;
                 };
-                if write(repo, tracker, &step.item.raw, &change) && *open {
+                if write(repo, tracker, &step.item.raw, &change, None) && *open {
                     children.push(*number);
                 }
             }
@@ -1024,6 +1024,7 @@ fn apply(repo: &Repo, tracker: i64, steps: &[Step]) -> Vec<i64> {
                             tracker,
                             &step.item.raw,
                             &Change::Reference(format!("#{number}")),
+                            None,
                         );
                         match linked {
                             true if filed.number().is_some() => children.push(number),
@@ -1105,8 +1106,14 @@ fn still_asked_for(repo: &Repo, tracker: i64, raw: &str) -> bool {
 /// parsed. A run is long, and somebody editing the tracker while it goes must
 /// not lose that edit: if the line has moved or changed, or the markdown around
 /// it has stopped making it an item, this is a skip with a log line, never a
-/// write.
-pub(crate) fn write(repo: &Repo, tracker: i64, raw: &str, change: &Change) -> bool {
+/// write. `at`, when given, is the 1-based line it has to still be on.
+pub(crate) fn write(
+    repo: &Repo,
+    tracker: i64,
+    raw: &str,
+    change: &Change,
+    at: Option<usize>,
+) -> bool {
     let body = match repo.record_failed_write(repo.read_issue(tracker)) {
         Ok(issue) => issue.body_text().to_string(),
         Err(e) => {
@@ -1117,6 +1124,16 @@ pub(crate) fn write(repo: &Repo, tracker: i64, raw: &str, change: &Change) -> bo
     if !still_an_item(&body, raw) {
         logdim!("  not editing #{tracker}: {}", why_not_an_item(&body, raw));
         return false;
+    }
+    if let Some(at) = at {
+        let now = split_keep(&body)
+            .iter()
+            .position(|line| without_eol(line) == raw)
+            .map_or(0, |index| index + 1);
+        if now != at {
+            logdim!("  not editing #{tracker}: that line moved from line {at} to line {now}");
+            return false;
+        }
     }
     let updated = match rewrite(&body, raw, change) {
         Ok(updated) => updated,

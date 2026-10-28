@@ -9187,13 +9187,17 @@ case "$1 $2" in
   "issue view")
     if [ "${SPAR_CODE_MODE:-}" = issue-fetch-failure ]; then exit 1; fi
     if [ -n "${SPAR_CODE_BODY:-}" ]; then
-      printf '{"number":42,"title":"Add CSV export","body":%s,"state":"OPEN","labels":[],"url":"https://github.com/example/project/issues/42"}\n' "$SPAR_CODE_BODY"
+      body=$SPAR_CODE_BODY
+      if [ -f "$SPAR_CODE_DIR/pr-merged" ]; then body=${SPAR_CODE_BODY_MERGED:-$body}; fi
+      printf '{"number":42,"title":"Add CSV export","body":%s,"state":"OPEN","labels":[],"url":"https://github.com/example/project/issues/42"}\n' "$body"
     else
       printf '%s\n' '{"number":42,"title":"Add CSV export","body":"Export the current rows as CSV.","state":"OPEN","labels":[],"url":"https://github.com/example/project/issues/42"}'
     fi
     ;;
   "issue edit") cat > "$SPAR_CODE_DIR/issue-edit-body" ;;
-  "pr merge") : ;;
+  "pr merge")
+    if [ "${SPAR_CODE_MODE:-}" != queued ]; then touch "$SPAR_CODE_DIR/pr-merged"; fi
+    ;;
   "pr list")
     if [ -f "$SPAR_CODE_DIR/pr-created" ]; then
       printf '%s\n' '[{"number":43,"url":"https://github.com/example/project/pull/43","title":"Add CSV export","baseRefName":"main"}]'
@@ -9208,7 +9212,13 @@ case "$1 $2" in
   "pr view")
     case "$*" in
       *headRefOid*) printf '{"headRefOid":"%s"}\n' "$(git rev-parse origin/issue-42)" ;;
-      *state*) printf '%s\n' '{"state":"OPEN"}' ;;
+      *state*)
+        if [ -f "$SPAR_CODE_DIR/pr-merged" ]; then
+          printf '%s\n' '{"state":"MERGED"}'
+        else
+          printf '%s\n' '{"state":"OPEN"}'
+        fi
+        ;;
       *) exit 64 ;;
     esac
     ;;
@@ -9505,17 +9515,32 @@ fn code_body() -> String {
 
 #[cfg(unix)]
 fn code_criteria_run(auto_merge: bool, ruling: &str) -> (CodeFixture, String) {
+    code_criteria_run_with(auto_merge, ruling, "", &[])
+}
+
+#[cfg(unix)]
+fn code_criteria_run_with(
+    auto_merge: bool,
+    ruling: &str,
+    mode: &str,
+    env: &[(&str, &str)],
+) -> (CodeFixture, String) {
     let test = CodeFixture::new();
     test.set_loop(&format!("auto_merge = {auto_merge}\n"));
     let body = code_body();
+    let mut vars = vec![
+        ("SPAR_CODE_BODY", body.as_str()),
+        ("SPAR_CODE_RULING", ruling),
+    ];
+    vars.extend_from_slice(env);
     let (ok, out, err) = test.run_with(
         &["--max-rounds", "1", "--first", "b"],
         CODE_DRAFT,
-        "",
-        &[("SPAR_CODE_BODY", &body), ("SPAR_CODE_RULING", ruling)],
+        mode,
+        &vars,
     );
     assert!(ok, "{out}\n{err}");
-    (test, out)
+    (test, format!("{out}{err}"))
 }
 
 #[cfg(unix)]
@@ -9561,6 +9586,33 @@ fn code_leaves_a_criterion_ruled_not_met_unchecked_and_names_it() {
         calls.contains("- Not met: Preserve column order. Checked the header row."),
         "{calls}\n{out}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn code_ticks_nothing_while_the_merge_is_only_queued() {
+    let (test, out) = code_criteria_run_with(true, "met", "queued", &[]);
+    let calls = test.log("gh.log");
+    assert_eq!(1, calls.matches("pr merge ").count(), "{calls}");
+    assert!(!calls.contains("issue edit"), "{calls}");
+    assert!(out.contains("not merged yet"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn code_skips_a_criterion_that_moved_before_the_tick() {
+    let draft: serde_json::Value = serde_json::from_str(CODE_DRAFT).unwrap();
+    let moved = draft["body"]
+        .as_str()
+        .unwrap()
+        .replace("- [ ] Preserve column order.\n", "")
+        + "\n\n## Separate follow-up\n- [ ] Preserve column order.";
+    let moved = serde_json::Value::from(moved).to_string();
+    let (test, out) = code_criteria_run_with(true, "met", "", &[("SPAR_CODE_BODY_MERGED", &moved)]);
+    let calls = test.log("gh.log");
+    assert_eq!(1, calls.matches("pr merge ").count(), "{calls}");
+    assert!(!calls.contains("issue edit"), "{calls}");
+    assert!(out.contains("that line moved from line"), "{out}");
 }
 
 #[cfg(unix)]

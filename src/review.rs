@@ -1012,6 +1012,7 @@ fn resume_inner(
         .first()
         .map(|r| r.number)
         .unwrap_or(pr_number);
+    let closing_url = pr.closing_issues_references.first().map(|r| &r.url);
 
     if let Some(holder) = holder_override {
         if !cfg.has_agent(holder) {
@@ -1131,8 +1132,11 @@ fn resume_inner(
         start_round,
         holder,
         release: Release::Pr(pr_number),
+        // A closing link can name another repository's issue, and the lookup
+        // above found this one's namesake, whose boxes are not this PR's.
         criteria: issue
             .as_ref()
+            .filter(|issue| Some(&issue.url) == closing_url)
             .map(|issue| tracker::criteria(issue.body_text()))
             .unwrap_or_default(),
     };
@@ -1968,7 +1972,17 @@ fn approve(
         state.status = Status::Merged;
         repo.clear_state(ctx.pr_number); // nothing left to resume
         log!("{}: merged", ctx.label);
-        if state.ticks_criteria && ctx.subject != ctx.pr_number {
+        let some_met = state.criteria.iter().any(|c| c.status == Some(Mark::Met));
+        if state.ticks_criteria && ctx.subject != ctx.pr_number && some_met {
+            // A merge queue takes the command and merges later, or not at all.
+            if repo.pr_state(ctx.pr_number) != "MERGED" {
+                log!(
+                    "{}: not merged yet, so no acceptance criteria were ticked on #{}",
+                    ctx.label,
+                    ctx.subject
+                );
+                return Ok(());
+            }
             let ticked = tick_met(repo, ctx.subject, &state.criteria);
             if ticked > 0 {
                 let noun = if ticked == 1 { "criterion" } else { "criteria" };
@@ -3862,10 +3876,10 @@ fn implement_prompt(number: i64, title: &str, url: &str, body: &str, criteria: &
     };
     IMPLEMENT_PROMPT
         .replace("{thread_rule}", THREAD_RULE)
-        .replace("{criteria}", &criteria)
         .replace("{number}", &number.to_string())
         .replace("{title}", title)
         .replace("{url}", url)
+        .replace("{criteria}", &criteria)
         .replace("{body}", body)
 }
 
@@ -4024,6 +4038,7 @@ fn ruled(criteria: &[Item], rulings: &[CriterionStatus]) -> Vec<Ruled> {
             let status = status_for(rulings, at + 1);
             Ruled {
                 raw: item.raw.clone(),
+                line: item.line,
                 text: item.text.trim().to_string(),
                 status: status.map(|s| s.status),
                 reason: status.map(|s| s.reason.clone()).unwrap_or_default(),
@@ -4040,7 +4055,8 @@ fn ruled(criteria: &[Item], rulings: &[CriterionStatus]) -> Vec<Ruled> {
 fn tick_met(repo: &Repo, issue: i64, criteria: &[Ruled]) -> usize {
     let mut ticked = 0;
     for criterion in criteria.iter().filter(|c| c.status == Some(Mark::Met)) {
-        if tracker::write(repo, issue, &criterion.raw, &tracker::Change::Tick) {
+        let at = Some(criterion.line);
+        if tracker::write(repo, issue, &criterion.raw, &tracker::Change::Tick, at) {
             ticked += 1;
         }
     }
@@ -6488,6 +6504,16 @@ mod tests {
     }
 
     #[test]
+    fn a_criterion_is_not_read_as_template_syntax() {
+        let criteria = tracker::criteria("- [ ] Keep the literal {number} and {url}.\n");
+        let implement = implement_prompt(42, "t", "u", "b", &criteria);
+        assert!(
+            implement.contains("1. Keep the literal {number} and {url}."),
+            "{implement}"
+        );
+    }
+
+    #[test]
     fn prompts_number_each_criterion_verbatim() {
         let criteria = tracker::criteria(CRITERIA_BODY);
         let implement = implement_prompt(1, "t", "u", "b", &criteria);
@@ -6574,6 +6600,7 @@ mod tests {
     fn ruled_one(text: &str, status: Option<Mark>, reason: &str) -> Ruled {
         Ruled {
             raw: format!("- [ ] {text}"),
+            line: 1,
             text: text.into(),
             status,
             reason: reason.into(),

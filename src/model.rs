@@ -832,6 +832,10 @@ pub struct CriterionStatus {
 pub struct Ruled {
     /// The line exactly as it stood, which is what a tick finds it by.
     pub raw: String,
+    /// Where it stood when it was read, so a criterion moved since is skipped
+    /// rather than ticked in its new place.
+    #[serde(default)]
+    pub line: usize,
     pub text: String,
     /// None when the review said nothing about this one.
     pub status: Option<Mark>,
@@ -1685,6 +1689,10 @@ pub struct PrRef {
 #[derive(Debug, Clone, Deserialize)]
 pub struct IssueRef {
     pub number: i64,
+    /// What tells this repository's issue from one of the same number in
+    /// another, since a closing link can cross repositories.
+    #[serde(default)]
+    pub url: String,
 }
 
 /// An open pull request's size, as one listing call reports it.

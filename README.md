@@ -435,14 +435,16 @@ the author's claim. A ruling does not gate the merge.
 
 When spar merges the pull request itself, it ticks each criterion ruled met on
 the issue, the same way the tracker checklist is ticked: the body is read again
-before each write, a line that changed or now appears twice is skipped with the
-reason in the log, every other byte is left alone, and a box is never
-unchecked. The outcome comment names every criterion not ruled met, with the
-ruling and its reason, even on an otherwise clean approval. With `auto_merge`
-off, or `tick_criteria = false`, nothing is ticked, because a tick means the
-work landed, and the outcome comment lists every ruling instead. Ticks count in
-the `writes:` line like any other GitHub write. Resuming a pull request that
-closes an issue does the same. A person merging does not tick anything.
+before each write, a line that changed, moved or now appears twice is skipped
+with the reason in the log, every other byte is left alone, and a box is never
+unchecked. A merge that only joined a merge queue ticks nothing. The outcome
+comment names every criterion not ruled met, with the ruling and its reason,
+even on an otherwise clean approval. With `auto_merge` off, or
+`tick_criteria = false`, nothing is ticked, because a tick means the work
+landed, and the outcome comment lists every ruling instead. Ticks count in the
+`writes:` line like any other GitHub write. Resuming a pull request that closes
+an issue in this repository does the same. A person merging does not tick
+anything.
 
 **Follow-ups.** A review that finds something real but out of scope files it as
 its own issue. Before filing, spar looks for an issue that already describes the

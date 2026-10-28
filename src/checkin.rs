@@ -691,6 +691,7 @@ fn inner_pr(
         mode,
         &mut state,
         seen,
+        false,
     );
 
     if let Err(e) = &outcome {
@@ -803,6 +804,7 @@ fn inner_issue(
         mode,
         &mut state,
         seen,
+        true,
     )?;
     Ok(state)
 }
@@ -847,6 +849,7 @@ fn act(
     mode: &Mode,
     state: &mut IssueRun,
     mut seen: Answered,
+    on_issue: bool,
 ) -> Result<FixPublication> {
     let cap = cfg.loop_cfg.max_checkin_comments;
     let mut pending: Vec<Pending> = found.pending.clone();
@@ -1002,7 +1005,7 @@ fn act(
     }
 
     // -- say it, then resolve --------------------------------------------
-    post(repo, number, &items, mode, state, &mut seen);
+    post(repo, number, &items, mode, state, &mut seen, on_issue);
     write_answered(repo, number, &seen);
 
     for item in &items {
@@ -1256,6 +1259,8 @@ fn require_no_unreported_work(
 ///
 /// Reply first, resolve second, always: a resolved thread with no reply in it
 /// is one somebody has to un-resolve to find out what happened.
+///
+/// `on_issue` because `gh pr comment` refuses an issue's number.
 fn post(
     repo: &Repo,
     number: i64,
@@ -1263,6 +1268,7 @@ fn post(
     mode: &Mode,
     state: &mut IssueRun,
     seen: &mut Answered,
+    on_issue: bool,
 ) {
     let summary = checkin_comment(items, &repo.style);
 
@@ -1353,7 +1359,12 @@ fn post(
         .filter(|i| i.pending.reply_root().is_none())
         .collect();
     if let Some(text) = summary {
-        match repo.comment_pr(number, &text) {
+        let posted = if on_issue {
+            repo.comment_issue(number, &text)
+        } else {
+            repo.comment_pr(number, &text)
+        };
+        match posted {
             Ok(()) => {
                 for item in &loose {
                     seen.seen

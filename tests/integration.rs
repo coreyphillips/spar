@@ -6938,7 +6938,8 @@ fn sent_review(path: &Path) -> serde_json::Value {
 }
 
 /// A finding on a line the diff shows goes on that line, in the same review as
-/// the summary, and the summary still says everything it did before.
+/// the summary. The summary names it and leaves the detail to the line, so it
+/// is not read twice.
 #[test]
 #[cfg(unix)]
 fn a_finding_on_a_line_the_diff_shows_goes_on_that_line() {
@@ -6964,7 +6965,13 @@ fn a_finding_on_a_line_the_diff_shows_goes_on_that_line() {
     let body = review["body"].as_str().unwrap();
     assert!(body.starts_with("Two independent reviews."), "{body}");
     assert!(
-        body.contains("- Retry loop never terminates (src/net.rs:88) [both]."),
+        body.contains(
+            "needs changing before merge\n- Retry loop never terminates (src/net.rs:88) [both]\n"
+        ),
+        "{body}"
+    );
+    assert!(
+        !body.contains("the guard compares against Some(0)"),
         "{body}"
     );
     let comments = review["comments"].as_array().unwrap();
@@ -7040,12 +7047,17 @@ fn a_finding_the_diff_does_not_show_leaves_the_review_as_it_was() {
         )),
         "{log}"
     );
+    assert!(
+        log.contains("- Retry loop never terminates (src/net.rs:88) [both]. the guard compares against Some(0)"),
+        "{log}"
+    );
     assert!(!log.contains("--input"), "{log}");
 }
 
 /// GitHub refuses a whole review over one line it will not take. The review
-/// then goes up with its body alone, which already says everything, and that
-/// is one write that succeeded, not a failure and a success.
+/// then goes up with its full body alone, the detail its line comment would
+/// have carried included, and that is one write that succeeded, not a failure
+/// and a success.
 #[test]
 #[cfg(unix)]
 fn a_review_whose_line_comments_are_refused_goes_up_with_its_body_alone() {
@@ -7074,6 +7086,18 @@ fn a_review_whose_line_comments_are_refused_goes_up_with_its_body_alone() {
         ))
         .expect("the body went up alone");
     assert!(inline_at < plain_at, "{log}");
+    assert!(
+        log[plain_at..].contains("- Retry loop never terminates (src/net.rs:88) [both]. the guard compares against Some(0)"),
+        "{log}"
+    );
+    let tried = sent_review(&sent);
+    assert!(
+        !tried["body"]
+            .as_str()
+            .unwrap()
+            .contains("the guard compares against Some(0)"),
+        "{tried}"
+    );
     assert!(out.contains("did not go up"), "{out}");
     assert!(out.contains("Validation Failed"), "{out}");
     assert!(
@@ -7170,12 +7194,17 @@ fn with_inline_comments_off_every_finding_stays_in_the_summary() {
         log.contains("pr comment 5 --body Two independent reviews."),
         "{log}"
     );
+    assert!(
+        log.contains("- Retry loop never terminates (src/net.rs:88) [both]. the guard compares against Some(0)"),
+        "{log}"
+    );
     assert!(!log.contains("--input"), "{log}");
     assert!(!submitted_a_review(&log), "{log}");
 }
 
 /// A dry run posts nothing, line comments included, and says how many
 /// findings would have gone on their lines, since the saved summary cannot.
+/// What it saves is the full summary, since `spar post` sends no lines.
 #[test]
 #[cfg(unix)]
 fn a_dry_run_says_how_many_findings_would_go_on_their_lines() {
@@ -7196,6 +7225,14 @@ fn a_dry_run_says_how_many_findings_would_go_on_their_lines() {
     );
     assert!(!log.contains("--input"), "{log}");
     assert!(!log.contains("pr comment"), "{log}");
+    let saved = Repo::open(&fx.work, &cfg())
+        .unwrap()
+        .read_pending_comment(5)
+        .expect("the summary was saved");
+    assert!(
+        saved.contains("- Retry loop never terminates (src/net.rs:88) [both]. the guard compares against Some(0)"),
+        "{saved}"
+    );
 }
 
 const RECHECK_FIXED: &str = r#"{"summary":"holds","rulings":[{"index":1,"outcome":"fixed","reasoning":"line 2 of file.txt now checks the bound"}],"findings":[]}"#;
@@ -7310,6 +7347,53 @@ fn a_recheck_keeps_a_point_open_when_one_reviewer_still_sees_it() {
         Some(spar::model::ReviewVerdict::RequestChanges),
         record.verdict
     );
+}
+
+/// A second look puts a new point on its line and names it in the summary,
+/// and an earlier point still open reads as it always has, since it is not
+/// put on a line again.
+#[test]
+#[cfg(unix)]
+fn a_recheck_names_a_new_point_on_its_line_and_keeps_an_open_one_whole() {
+    let (fx, before) = inline_fixture("recheckinline", None);
+    write_record(&fx, 5, &blocking_record(&before));
+    commit(&fx.work, "file.txt", "half done\n", "try the bound");
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/5/head"]);
+    let after = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    let sent = fx.dir.join("review.json");
+    let answer = r#"{"summary":"no","rulings":[{"index":1,"outcome":"open","reasoning":"the guard still compares against Some(0)"}],"findings":[{"severity":"blocking","title":"Timeout is never read","detail":"the field is set and never used","file":"src/net.rs:40","in_scope":true,"problem":null,"reproduction":null,"impact":null,"expected":null}]}"#;
+
+    let (ok, out, log) = review_run_with(
+        &fx,
+        &["5", "--recheck"],
+        answer,
+        answer,
+        &review_gh(5, &after, "someone-else"),
+        &[("SPAR_FAKE_GH_STDIN", sent.to_str().unwrap())],
+        "",
+    );
+
+    assert!(ok, "{out}");
+    assert!(log.contains(INLINE_POST), "{log}");
+    let review = sent_review(&sent);
+    assert_eq!(after, review["commit_id"]);
+    let body = review["body"].as_str().unwrap();
+    assert!(body.starts_with("Rechecked after 1 new commit ("), "{body}");
+    assert!(
+        body.contains("still open\n- Retry loop never terminates (src/net.rs:88) [both]. the guard compares against Some(0)"),
+        "{body}"
+    );
+    assert!(
+        body.contains("new since the last review\n\nneeds changing before merge\n- Timeout is never read (src/net.rs:40) [both]"),
+        "{body}"
+    );
+    assert!(!body.contains("the field is set and never used"), "{body}");
+    let comments = review["comments"].as_array().unwrap();
+    assert_eq!(1, comments.len(), "{review}");
+    assert_eq!(40, comments[0]["line"]);
+    let said = comments[0]["body"].as_str().unwrap();
+    assert!(said.contains("the field is set and never used"), "{said}");
+    assert_eq!(1, read_record(&fx, 5).rechecks);
 }
 
 /// Nothing moved and nobody spoke: no agent runs, nothing is posted, and the

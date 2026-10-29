@@ -765,7 +765,7 @@ fn finish(
     pr: &PrView,
     state: &mut IssueRun,
     judged: &[Judged],
-    inline: &[InlineComment],
+    inline: &OnLines,
     reviewers: usize,
     reviewed: Reviewed<'_>,
 ) -> Result<()> {
@@ -801,7 +801,10 @@ fn finish(
         });
     }
 
+    // The full text is what goes anywhere the line comments do not: printed,
+    // saved for `spar post`, or posted alone.
     let comment = verdict_comment_from(judged, &repo.style, reviewers);
+    let brief = verdict_comment_placed(judged, &repo.style, reviewers, &inline.placed);
     let verdict = reviewed
         .opts
         .verdict
@@ -816,7 +819,7 @@ fn finish(
     let silent = dry_run || repo.style.pr_comments == PrComments::None;
     if silent {
         println!("\n{comment}\n");
-        say_unposted_lines(pr.number, inline);
+        say_unposted_lines(pr.number, &inline.comments);
         save_unposted(repo, pr.number, &comment, held_because(dry_run));
         record(state, false);
         return Ok(());
@@ -829,9 +832,14 @@ fn finish(
             hold_back(repo, state, pr.number, &comment, reviewed.head, &now);
             return Ok(());
         }
-        Ok(None) if reviewed.opts.verdict || !inline.is_empty() => {
-            repo.submit_review(pr.number, verdict, &comment, reviewed.head, inline)
-        }
+        Ok(None) if reviewed.opts.verdict || !inline.comments.is_empty() => repo.submit_review(
+            pr.number,
+            verdict,
+            &brief,
+            &comment,
+            reviewed.head,
+            &inline.comments,
+        ),
         Ok(None) => repo.comment_pr(pr.number, &comment),
         Err(e) => Err(e),
     };
@@ -975,8 +983,8 @@ fn save_unposted(repo: &Repo, number: i64, text: &str, why: &str) {
 }
 
 /// Say how many findings a review that was not posted would have put on their
-/// lines. The saved text is the summary alone, which `spar post` posts as a
-/// comment, so this is the only place they show.
+/// lines. The saved text is the full summary, which `spar post` posts as a
+/// comment, so this is the only place the lines themselves show.
 fn say_unposted_lines(number: i64, inline: &[InlineComment]) {
     let n = inline.len();
     if n > 0 {
@@ -989,10 +997,18 @@ fn say_unposted_lines(number: i64, inline: &[InlineComment]) {
     }
 }
 
+/// The line comments a review carries, and which findings they are, as
+/// indices into the findings they were made from.
+#[derive(Debug, Default)]
+struct OnLines {
+    comments: Vec<InlineComment>,
+    placed: Vec<usize>,
+}
+
 /// The line comments a review carries, or none when `inline_comments` is off.
-fn inline_for(repo: &Repo, work_dir: &Path, base: &str, judged: &[Judged]) -> Vec<InlineComment> {
+fn inline_for(repo: &Repo, work_dir: &Path, base: &str, judged: &[Judged]) -> OnLines {
     if !repo.style.inline_comments {
-        return Vec::new();
+        return OnLines::default();
     }
     inline_comments(
         judged,
@@ -1007,28 +1023,30 @@ fn inline_for(repo: &Repo, work_dir: &Path, base: &str, judged: &[Judged]) -> Ve
 ///
 /// Only those lines: GitHub refuses the whole review over a comment on one its
 /// diff does not show. A finding with no line, or a line outside the diff, is
-/// in the summary alone, as every finding was before.
-fn inline_comments(
-    judged: &[Judged],
-    hunks: &Hunks,
-    work_dir: &Path,
-    style: &Style,
-) -> Vec<InlineComment> {
-    judged
+/// in the summary alone, in full, as every finding was before.
+fn inline_comments(judged: &[Judged], hunks: &Hunks, work_dir: &Path, style: &Style) -> OnLines {
+    let (placed, comments) = judged
         .iter()
-        .filter(|j| (j.standing.counts() && j.finding.in_scope) || j.standing == Standing::Disputed)
-        .filter_map(|j| {
+        .enumerate()
+        .filter(|(_, j)| {
+            (j.standing.counts() && j.finding.in_scope) || j.standing == Standing::Disputed
+        })
+        .filter_map(|(i, j)| {
             let (path, start, end) = crate::jsonx::finding_location(&j.finding.file)?;
             let path = repo_relative(&path, work_dir);
             let (start_line, line) = anchor(hunks.get(&path)?, start, end)?;
-            Some(InlineComment {
-                path,
-                line,
-                start_line,
-                body: inline_body(j, style),
-            })
+            Some((
+                i,
+                InlineComment {
+                    path,
+                    line,
+                    start_line,
+                    body: inline_body(j, style),
+                },
+            ))
         })
-        .collect()
+        .unzip();
+    OnLines { comments, placed }
 }
 
 /// A path as the diff names it. Agents work in the review worktree, so one
@@ -1061,7 +1079,8 @@ fn anchor(hunks: &[(u32, u32)], start: u32, end: u32) -> Option<(Option<u32>, u3
 
 /// A finding as its line comment says it: what kind of point it is, its title
 /// and how well attested, then the detail, and for a point the two dispute,
-/// both sides of the argument.
+/// both sides of the argument. The summary names a finding placed on a line
+/// and leaves the rest to this.
 fn inline_body(j: &Judged, style: &Style) -> String {
     let disputed = j.standing == Standing::Disputed;
     let kind = match j.finding.severity {
@@ -1190,6 +1209,19 @@ pub fn verdict_comment(judged: &[Judged], style: &Style) -> String {
 /// "Two independent reviews." is what makes [both] and [one reviewer only] mean
 /// anything, and it was printed whether two answered or one did.
 pub fn verdict_comment_from(judged: &[Judged], style: &Style, reviewers: usize) -> String {
+    verdict_comment_placed(judged, style, reviewers, &[])
+}
+
+/// The same, for a review whose line comments carry the findings at `placed`.
+/// Those are named here and their line comments say the rest, so a finding is
+/// not read twice. Anything that goes up without the line comments needs the
+/// full text instead.
+fn verdict_comment_placed(
+    judged: &[Judged],
+    style: &Style,
+    reviewers: usize,
+    placed: &[usize],
+) -> String {
     let blocking = judged
         .iter()
         .filter(|j| j.standing.counts() && j.finding.blocks())
@@ -1212,18 +1244,23 @@ pub fn verdict_comment_from(judged: &[Judged], style: &Style, reviewers: usize) 
     } else {
         format!("{heading}.")
     }];
-    out.extend(severity_sections(judged, style));
-    out.extend(disputed_section(judged, style));
+    out.extend(severity_sections(judged, style, placed));
+    out.extend(disputed_section(judged, style, placed));
     out.join("\n\n")
 }
 
-/// One finding as a bullet: title, where, how well attested, and the detail.
-fn finding_line(j: &Judged, style: &Style) -> String {
+/// One finding as a bullet: title, where, how well attested, and the detail
+/// unless its line comment carries it.
+fn finding_line(j: &Judged, style: &Style, on_its_line: bool) -> String {
     let where_at = match j.finding.where_at() {
         "general" => String::new(),
         file => format!(" ({file})"),
     };
-    let detail = style::detail(&j.finding.detail, style);
+    let detail = if on_its_line {
+        String::new()
+    } else {
+        style::detail(&j.finding.detail, style)
+    };
     let attested = attestation(j.standing);
     if detail.is_empty() {
         format!(
@@ -1248,14 +1285,17 @@ fn attestation(standing: Standing) -> &'static str {
 }
 
 /// The counting findings, grouped by severity, each group a paragraph with its
-/// heading. Empty groups are left out.
-fn severity_sections(judged: &[Judged], style: &Style) -> Vec<String> {
-    let live: Vec<&Judged> = judged.iter().filter(|j| j.standing.counts()).collect();
+/// heading. Empty groups are left out. Those at `placed` are on their lines.
+fn severity_sections(judged: &[Judged], style: &Style, placed: &[usize]) -> Vec<String> {
+    let live: Vec<(usize, &Judged)> = judged
+        .iter()
+        .enumerate()
+        .filter(|(_, j)| j.standing.counts())
+        .collect();
     let pick = |severity: Severity| -> Vec<String> {
         live.iter()
-            .copied()
-            .filter(|j| j.finding.severity == severity && j.finding.in_scope)
-            .map(|j| finding_line(j, style))
+            .filter(|(_, j)| j.finding.severity == severity && j.finding.in_scope)
+            .map(|&(i, j)| finding_line(j, style, placed.contains(&i)))
             .collect()
     };
     let mut out = Vec::new();
@@ -1272,17 +1312,21 @@ fn severity_sections(judged: &[Judged], style: &Style) -> Vec<String> {
 }
 
 /// What the two still disagree about, with both sides of the argument, or
-/// nothing when they agree.
-fn disputed_section(judged: &[Judged], style: &Style) -> Option<String> {
+/// nothing when they agree. A point at `placed` has both sides on its line.
+fn disputed_section(judged: &[Judged], style: &Style, placed: &[usize]) -> Option<String> {
     let lines: Vec<String> = judged
         .iter()
-        .filter(|j| j.standing == Standing::Disputed)
-        .map(|j| {
+        .enumerate()
+        .filter(|(_, j)| j.standing == Standing::Disputed)
+        .map(|(i, j)| {
             let mut line = format!(
                 "- {} ({})",
                 style::title(&j.finding.title, style),
                 j.finding.where_at()
             );
+            if placed.contains(&i) {
+                return line;
+            }
             if let Some(objection) = &j.counterpoint {
                 line.push_str(&format!(
                     ". Objection: {}",
@@ -1761,10 +1805,18 @@ fn recheck_phases(
     // The new points only. An earlier one already has its place, the first
     // look's line comment or the summary, and this review says where it stands.
     let inline = inline_for(repo, look.work_dir, look.base, &judged);
+    let brief = recheck_comment_placed(
+        look.delta,
+        &rechecked,
+        &judged,
+        &repo.style,
+        by_agent.len(),
+        &inline.placed,
+    );
     let silent = look.mode.dry_run || repo.style.pr_comments == PrComments::None;
     if silent {
         println!("\n{body}\n");
-        say_unposted_lines(pr.number, &inline);
+        say_unposted_lines(pr.number, &inline.comments);
         save_unposted(repo, pr.number, &body, held_because(look.mode.dry_run));
         return Ok(());
     }
@@ -1773,7 +1825,14 @@ fn recheck_phases(
             hold_back(repo, state, pr.number, &body, look.head, &now);
             return Ok(());
         }
-        Ok(None) => repo.submit_review(pr.number, verdict, &body, look.head, &inline),
+        Ok(None) => repo.submit_review(
+            pr.number,
+            verdict,
+            &brief,
+            &body,
+            look.head,
+            &inline.comments,
+        ),
         Err(e) => Err(e),
     };
     match posted {
@@ -2067,6 +2126,20 @@ pub fn recheck_comment(
     style: &Style,
     reviewers: usize,
 ) -> String {
+    recheck_comment_placed(delta, earlier, judged, style, reviewers, &[])
+}
+
+/// The same, for a second look whose line comments carry the new findings at
+/// `placed`, as `verdict_comment_placed` is for a first. Earlier points are
+/// never put on a line again, so they read as they always do.
+fn recheck_comment_placed(
+    delta: &Delta,
+    earlier: &[Rechecked],
+    judged: &[Judged],
+    style: &Style,
+    reviewers: usize,
+    placed: &[usize],
+) -> String {
     let mut first = if delta.rewritten {
         "Rechecked after the branch was rewritten, so every earlier point was verified again \
          from scratch."
@@ -2181,14 +2254,14 @@ pub fn recheck_comment(
         out.push(format!("still open\n{}", still_open.join("\n")));
     }
 
-    let fresh = severity_sections(judged, style);
+    let fresh = severity_sections(judged, style, placed);
     if !fresh.is_empty() {
         out.push(format!(
             "new since the last review\n\n{}",
             fresh.join("\n\n")
         ));
     }
-    out.extend(disputed_section(judged, style));
+    out.extend(disputed_section(judged, style, placed));
     out.join("\n\n")
 }
 
@@ -2875,6 +2948,7 @@ mod tests {
 
     fn placed(judged: &[Judged]) -> Vec<(String, Option<u32>, u32)> {
         inline_comments(judged, &hunks(), Path::new("/work/pr-7"), &Style::default())
+            .comments
             .into_iter()
             .map(|c| (c.path, c.start_line, c.line))
             .collect()
@@ -3038,6 +3112,124 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("Answer: The validation runs after"), "{body}");
+    }
+
+    #[test]
+    fn a_finding_on_its_line_is_only_named_in_the_summary_and_one_elsewhere_keeps_its_detail() {
+        let mut on_line = at(
+            Standing::Corroborated,
+            "blocking",
+            "Loop never ends",
+            "src/net.rs:88",
+        );
+        on_line.finding.detail = "the guard compares against Some(0)".into();
+        let mut elsewhere = at(
+            Standing::Corroborated,
+            "blocking",
+            "Old file",
+            "src/old.rs:3",
+        );
+        elsewhere.finding.detail = "the cache is never cleared".into();
+        let mut disputed = at(
+            Standing::Disputed,
+            "blocking",
+            "Swallows an error",
+            "src/net.rs:90",
+        );
+        disputed.counterpoint = Some("the caller validates first".into());
+        disputed.defence = Some("the validation runs after".into());
+        let judged = [on_line, elsewhere, disputed];
+        let lines = inline_comments(
+            &judged,
+            &hunks(),
+            Path::new("/work/pr-7"),
+            &Style::default(),
+        );
+        assert_eq!(vec![0, 2], lines.placed);
+
+        let text = verdict_comment_placed(&judged, &Style::default(), 2, &lines.placed);
+        assert!(text.starts_with("Two independent reviews.\n\n"), "{text}");
+        assert!(
+            text.contains(
+                "needs changing before merge\n- Loop never ends (src/net.rs:88) [both]\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("Some(0)"), "{text}");
+        assert!(
+            text.contains("- Old file (src/old.rs:3) [both]. "),
+            "{text}"
+        );
+        assert!(text.contains("the cache is never cleared"), "{text}");
+        assert!(
+            text.ends_with(
+                "the reviewers disagree, your call\n- Swallows an error (src/net.rs:90)"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("Objection"), "{text}");
+        assert!(!text.contains("Answer"), "{text}");
+
+        // What the summary leaves out is on the lines.
+        assert!(
+            lines.comments[0]
+                .body
+                .contains("the guard compares against Some(0)"),
+            "{:?}",
+            lines.comments
+        );
+        let argued = &lines.comments[1].body;
+        assert!(
+            argued.contains("Objection: The caller validates first"),
+            "{argued}"
+        );
+        assert!(
+            argued.contains("Answer: The validation runs after"),
+            "{argued}"
+        );
+
+        // And the full summary, for anywhere the lines do not go, has it all.
+        let full = verdict_comment_from(&judged, &Style::default(), 2);
+        assert!(full.contains("Some(0)"), "{full}");
+        assert!(
+            full.contains("Objection: The caller validates first"),
+            "{full}"
+        );
+    }
+
+    #[test]
+    fn with_nothing_on_a_line_the_summary_is_the_full_one() {
+        let mut disputed = at(
+            Standing::Disputed,
+            "blocking",
+            "Swallows an error",
+            "src/old.rs:9",
+        );
+        disputed.counterpoint = Some("the caller validates first".into());
+        let judged = [
+            at(
+                Standing::Corroborated,
+                "blocking",
+                "Old file",
+                "src/old.rs:3",
+            ),
+            at(Standing::Unverified, "nit", "General", ""),
+            disputed,
+        ];
+        let lines = inline_comments(
+            &judged,
+            &hunks(),
+            Path::new("/work/pr-7"),
+            &Style::default(),
+        );
+        assert!(lines.placed.is_empty(), "{lines:?}");
+        let full = verdict_comment_from(&judged, &Style::default(), 2);
+        assert_eq!(
+            full,
+            verdict_comment_placed(&judged, &Style::default(), 2, &lines.placed)
+        );
+        assert!(full.contains("why it matters"), "{full}");
+        assert!(full.contains("Objection: "), "{full}");
     }
 }
 
@@ -3414,6 +3606,53 @@ mod recheck_tests {
         assert!(
             text.contains("still open\n- Retry loop never terminates (src/net.rs:88) [both]. why it matters. Still"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn a_second_look_names_a_new_point_on_its_line_and_leaves_earlier_ones_whole() {
+        let earlier = vec![
+            open(one_blocker().remove(0)),
+            closed(recorded(
+                Severity::NonBlocking,
+                "Name it",
+                "src/a.rs:1",
+                Standing::Confirmed,
+            )),
+        ];
+        let fresh = vec![
+            judged(Severity::Blocking, "Leak", Standing::Corroborated),
+            judged(Severity::Nit, "Spacing", Standing::Corroborated),
+        ];
+        let d = delta(&["abc1234 x"]);
+        let full = recheck_comment(&d, &earlier, &fresh, &Style::default(), 2);
+        let brief = recheck_comment_placed(&d, &earlier, &fresh, &Style::default(), 2, &[0]);
+
+        let before_new = |t: &str| {
+            t.split("new since the last review")
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(before_new(&full), before_new(&brief));
+        assert!(
+            brief.contains("still open\n- Retry loop never terminates (src/net.rs:88) [both]. why it matters. Still"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("addressed\n- Name it (src/a.rs:1). Fixed"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains(
+                "new since the last review\n\nneeds changing before merge\n- Leak (src/x.rs:4) \
+                 [both]\n\nnits\n- Spacing (src/x.rs:4) [both]. detail"
+            ),
+            "{brief}"
+        );
+        assert!(
+            full.contains("- Leak (src/x.rs:4) [both]. detail"),
+            "{full}"
         );
     }
 

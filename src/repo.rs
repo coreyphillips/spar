@@ -1276,11 +1276,14 @@ pub(crate) fn state_file_number(name: &str) -> Option<i64> {
         .and_then(|digits| digits.parse().ok())
 }
 
-/// Whether the viewer has already submitted this review: exactly this body, on
-/// this commit, and still standing. A clean review reads the same on every
-/// commit, so a body alone would take an approval of an older commit for this
-/// one; and a dismissed review was withdrawn, so it is not this one either.
-fn has_viewer_review(reviews: &[Value], viewer: &str, body: &str, commit: &str) -> bool {
+/// Whether the viewer has already submitted this review: exactly one of these
+/// bodies, on this commit, and still standing. A clean review reads the same on
+/// every commit, so a body alone would take an approval of an older commit for
+/// this one; and a dismissed review was withdrawn, so it is not this one either.
+///
+/// More than one body because a review with line comments goes up with a
+/// shorter one than the same review without them.
+fn has_viewer_review(reviews: &[Value], viewer: &str, bodies: &[&str], commit: &str) -> bool {
     reviews.iter().any(|review| {
         let field = |name: &str| review.get(name).and_then(Value::as_str).unwrap_or("");
         let standing = !matches!(
@@ -1292,7 +1295,7 @@ fn has_viewer_review(reviews: &[Value], viewer: &str, body: &str, commit: &str) 
             .and_then(|u| u.get("login"))
             .and_then(Value::as_str)
             .is_some_and(|login| crate::comments::same_login(login, viewer))
-            && field("body") == body
+            && bodies.contains(&field("body"))
             && field("commit_id").eq_ignore_ascii_case(commit)
             && standing
     })
@@ -1300,14 +1303,14 @@ fn has_viewer_review(reviews: &[Value], viewer: &str, body: &str, commit: &str) 
 
 fn reconcile_review_post(
     number: i64,
-    body: &str,
+    bodies: &[&str],
     viewer: &str,
     commit: &str,
     post_error: crate::error::SparError,
     reviews: Result<Vec<Value>>,
 ) -> Result<()> {
     match reviews {
-        Ok(reviews) if has_viewer_review(&reviews, viewer, body, commit) => Ok(()),
+        Ok(reviews) if has_viewer_review(&reviews, viewer, bodies, commit) => Ok(()),
         Ok(_) => Err(post_error),
         Err(read_error) => Err(crate::error::SparError::uncertain_write(format!(
             "could not submit a review on #{number}. {} The result could not be verified: {}",
@@ -5110,17 +5113,22 @@ impl Repo {
     /// gave it. `gh pr review` cannot name one, hence the REST call.
     ///
     /// `comments` go on their lines in the same review, so they arrive with
-    /// it or not at all. GitHub refuses the whole review over one line its diff
-    /// does not show, so when it refused this one and the read back finds
-    /// nothing landed, the review goes up again without them: the body already
-    /// says everything they do. Any other failure is reconciled as a review
-    /// without them would be, never retried: a gateway error can arrive while
-    /// GitHub is still saving a review that will land.
+    /// it or not at all. `body` goes with them, and may leave to them what
+    /// they say. `full` says everything, and is what goes up when they do not.
+    /// GitHub refuses the whole review over one line its diff does not show,
+    /// so when it refused this one and the read back finds nothing landed, the
+    /// review goes up again without them, with `full`. Any other failure is
+    /// reconciled as a review without them would be, never retried: a gateway
+    /// error can arrive while GitHub is still saving a review that will land.
+    ///
+    /// Either body standing on `commit` already is this review, so a rerun
+    /// after the fallback landed does not post it again.
     pub fn submit_review(
         &self,
         number: i64,
         verdict: Option<crate::model::ReviewVerdict>,
         body: &str,
+        full: &str,
         commit: &str,
         comments: &[InlineComment],
     ) -> Result<()> {
@@ -5128,11 +5136,16 @@ impl Repo {
             Some(_) => self.record_failed_write(self.pr_is_own(number))?,
             None => false,
         };
-        let text = match (verdict, own) {
-            (Some(v), true) => format!("Verdict: {}.\n\n{body}", v.words()),
-            _ => body.to_string(),
+        let prepare = |body: &str| {
+            let text = match (verdict, own) {
+                (Some(v), true) => format!("Verdict: {}.\n\n{body}", v.words()),
+                _ => body.to_string(),
+            };
+            self.record_failed_write(self.clean(&text))
+                .map(|b| signed(&b))
         };
-        let body = signed(&self.record_failed_write(self.clean(&text))?);
+        let body = prepare(body)?;
+        let full = prepare(full)?;
         let mut inline = Vec::with_capacity(comments.len());
         for c in comments {
             inline.push(InlineComment {
@@ -5140,9 +5153,10 @@ impl Repo {
                 ..c.clone()
             });
         }
+        let either = [body.as_str(), full.as_str()];
         let viewer = self.record_failed_write(self.viewer_login())?.to_string();
         let reviews = self.record_failed_write(self.try_pr_reviews(number))?;
-        if has_viewer_review(&reviews, &viewer, &body, commit) {
+        if has_viewer_review(&reviews, &viewer, &either, commit) {
             return Ok(());
         }
         let event = match (verdict, own) {
@@ -5150,7 +5164,7 @@ impl Repo {
             _ => "COMMENT",
         };
         let result = if inline.is_empty() {
-            self.post_review(number, &body, &viewer, commit, event)
+            self.post_review(number, &full, &viewer, commit, event)
         } else {
             let path = format!("repos/{{owner}}/{{repo}}/pulls/{number}/reviews");
             let payload = review_payload(commit, event, &body, &inline).to_string();
@@ -5161,23 +5175,23 @@ impl Repo {
                 Ok(_) => Ok(()),
                 Err(post_error) if !refused(&post_error) => reconcile_review_post(
                     number,
-                    &body,
+                    &[&body],
                     &viewer,
                     commit,
                     post_error,
                     self.try_pr_reviews(number),
                 ),
                 Err(post_error) => match self.try_pr_reviews(number) {
-                    Ok(reviews) if !has_viewer_review(&reviews, &viewer, &body, commit) => {
+                    Ok(reviews) if !has_viewer_review(&reviews, &viewer, &either, commit) => {
                         logwarn!(
                             "the review of #{number} with its line comments did not go up ({}), \
                              so it is going up with every finding in its body only",
                             post_error.last_line()
                         );
-                        self.post_review(number, &body, &viewer, commit, event)
+                        self.post_review(number, &full, &viewer, commit, event)
                     }
                     reviews => {
-                        reconcile_review_post(number, &body, &viewer, commit, post_error, reviews)
+                        reconcile_review_post(number, &either, &viewer, commit, post_error, reviews)
                     }
                 },
             }
@@ -5212,7 +5226,7 @@ impl Repo {
             Ok(_) => Ok(()),
             Err(post_error) => reconcile_review_post(
                 number,
-                body,
+                &[body],
                 viewer,
                 commit,
                 post_error,
@@ -11860,9 +11874,29 @@ mod review_record_tests {
             json!({"user": {"login": "Me"}, "body": "the body", "commit_id": "AAA", "state": "APPROVED"}),
             json!({"user": {"login": "alice"}, "body": "other", "commit_id": "aaa", "state": "COMMENTED"}),
         ];
-        assert!(has_viewer_review(&reviews, "me", "the body", "aaa"));
-        assert!(!has_viewer_review(&reviews, "me", "other", "aaa"));
-        assert!(!has_viewer_review(&reviews, "alice", "the body", "aaa"));
+        assert!(has_viewer_review(&reviews, "me", &["the body"], "aaa"));
+        assert!(!has_viewer_review(&reviews, "me", &["other"], "aaa"));
+        assert!(!has_viewer_review(&reviews, "alice", &["the body"], "aaa"));
+    }
+
+    /// A review with line comments goes up with a brief body, and the same
+    /// review refused its lines goes up with the full one. A rerun after either
+    /// landed would otherwise post a second review.
+    #[test]
+    fn a_review_that_landed_with_either_body_is_not_sent_again() {
+        let brief = vec![
+            json!({"user": {"login": "me"}, "body": "brief", "commit_id": "aaa", "state": "COMMENTED"}),
+        ];
+        let full = vec![
+            json!({"user": {"login": "me"}, "body": "full", "commit_id": "aaa", "state": "CHANGES_REQUESTED"}),
+        ];
+        for landed in [&brief, &full] {
+            assert!(has_viewer_review(landed, "me", &["brief", "full"], "aaa"));
+            assert!(has_viewer_review(landed, "me", &["full", "brief"], "aaa"));
+            assert!(!has_viewer_review(landed, "me", &["brief", "full"], "bbb"));
+        }
+        assert!(!has_viewer_review(&brief, "me", &["full"], "aaa"));
+        assert!(!has_viewer_review(&full, "me", &[], "aaa"));
     }
 
     /// A clean review says the same thing on every commit. Taking the approval
@@ -11873,11 +11907,11 @@ mod review_record_tests {
         let older = vec![
             json!({"user": {"login": "me"}, "body": "the body", "commit_id": "aaa", "state": "APPROVED"}),
         ];
-        assert!(!has_viewer_review(&older, "me", "the body", "bbb"));
+        assert!(!has_viewer_review(&older, "me", &["the body"], "bbb"));
         let dismissed = vec![
             json!({"user": {"login": "me"}, "body": "the body", "commit_id": "bbb", "state": "DISMISSED"}),
         ];
-        assert!(!has_viewer_review(&dismissed, "me", "the body", "bbb"));
+        assert!(!has_viewer_review(&dismissed, "me", &["the body"], "bbb"));
     }
 
     #[test]
@@ -11934,16 +11968,17 @@ mod review_record_tests {
         let landed = vec![json!({"user": {"login": "me"}, "body": "the body", "commit_id": "aaa"})];
         let error = crate::error::SparError::call_failed("gh: boom");
         assert!(
-            reconcile_review_post(5, "the body", "me", "aaa", error.clone(), Ok(landed)).is_ok()
+            reconcile_review_post(5, &["the body"], "me", "aaa", error.clone(), Ok(landed)).is_ok()
         );
 
         let missing = vec![json!({"user": {"login": "me"}, "body": "older", "commit_id": "aaa"})];
-        let err = reconcile_review_post(5, "the body", "me", "aaa", error.clone(), Ok(missing))
+        let err = reconcile_review_post(5, &["the body"], "me", "aaa", error.clone(), Ok(missing))
             .unwrap_err();
         assert_eq!(crate::error::ErrorKind::CallFailed, err.kind());
 
         let unreadable = Err(crate::error::SparError::new("no network"));
-        let err = reconcile_review_post(5, "the body", "me", "aaa", error, unreadable).unwrap_err();
+        let err =
+            reconcile_review_post(5, &["the body"], "me", "aaa", error, unreadable).unwrap_err();
         assert_eq!(crate::error::ErrorKind::UncertainWrite, err.kind());
         assert!(err.to_string().contains("could not be verified"), "{err}");
     }

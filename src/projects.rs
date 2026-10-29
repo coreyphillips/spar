@@ -40,6 +40,12 @@ fn toplevel(path: &Path) -> Option<PathBuf> {
     std::fs::canonicalize(&top).ok()
 }
 
+/// The mirror's config. Every checkout shares it, so a call can name a filter
+/// or helper there that a later Git command would run with spar's permissions.
+fn read_config(mirror: &Path) -> Option<Vec<u8>> {
+    std::fs::read(mirror.join("config")).ok()
+}
+
 /// The origin URL of a clone, made absolute when it is a relative path.
 fn origin_url(clone: &Path) -> Option<String> {
     let url = git_try(clone, &["remote", "get-url", "origin"])?;
@@ -60,9 +66,10 @@ pub struct Project {
     pub path: Option<PathBuf>,
     /// The bare repository spar fetches into and checks out from.
     mirror: PathBuf,
-    /// The base branch, fetched once per run. The error is kept as text so
-    /// every call after a failed fetch reports the same reason.
-    base: OnceLock<std::result::Result<String, String>>,
+    /// The base branch and the mirror's config as spar left it, fetched once
+    /// per run. The error is kept as text so every call after a failed fetch
+    /// reports the same reason.
+    base: OnceLock<std::result::Result<(String, Vec<u8>), String>>,
     /// `git worktree add` on one repository is not safe to run twice at once.
     adding: Mutex<()>,
 }
@@ -93,15 +100,16 @@ impl Project {
         }
     }
 
-    /// Make the mirror if it is not there, fetch it, and return the base.
-    fn fetch(&self) -> Result<String> {
+    /// Make the mirror if it is not there, fetch it, and return the base and
+    /// the mirror's config.
+    fn fetch(&self) -> Result<(String, Vec<u8>)> {
         let fetched = self
             .base
             .get_or_init(|| self.fetch_now().map_err(|e| e.message().to_string()));
         fetched.clone().map_err(SparError::new)
     }
 
-    fn fetch_now(&self) -> Result<String> {
+    fn fetch_now(&self) -> Result<(String, Vec<u8>)> {
         if !self.mirror.join("HEAD").exists() {
             self.create_mirror()?;
         }
@@ -124,13 +132,16 @@ impl Project {
         let _ = git(&self.mirror, &["remote", "set-head", "origin", "--auto"]);
         let head = git_try(&self.mirror, &["symbolic-ref", "refs/remotes/origin/HEAD"])
             .unwrap_or_default();
-        match head.strip_prefix("refs/remotes/origin/") {
-            Some(base) if !base.is_empty() => Ok(base.to_string()),
+        let base = match head.strip_prefix("refs/remotes/origin/") {
+            Some(base) if !base.is_empty() => base.to_string(),
             _ => bail!(
                 "project '{}': could not tell its base branch from origin/HEAD",
                 self.name
             ),
-        }
+        };
+        let config = read_config(&self.mirror)
+            .ok_or_else(|| spar_err!("could not read {}/config", self.mirror.display()))?;
+        Ok((base, config))
     }
 
     fn create_mirror(&self) -> Result<()> {
@@ -141,8 +152,10 @@ impl Project {
         let mirror = self.mirror.display().to_string();
         match (&self.path, &self.slug) {
             (Some(_), _) => {
+                // Before `init`: a mirror with a HEAD is taken as set up.
+                let remote = self.remote()?;
                 git(Path::new("/"), &["init", "--quiet", "--bare", &mirror])?;
-                git(&self.mirror, &["remote", "add", "origin", &self.remote()?])?;
+                git(&self.mirror, &["remote", "add", "origin", &remote])?;
             }
             (None, Some(slug)) => {
                 // gh rather than git so a private repository uses the same
@@ -177,7 +190,7 @@ impl Project {
     }
 
     fn checkout(&self) -> Result<Checkout> {
-        let base = self.fetch()?;
+        let (base, config) = self.fetch()?;
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let path = loop {
             let serial = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -194,6 +207,14 @@ impl Project {
         let start = format!("refs/remotes/origin/{base}");
         {
             let _guard = self.adding.lock().unwrap_or_else(|e| e.into_inner());
+            if read_config(&self.mirror).as_ref() != Some(&config) {
+                return Err(SparError::uncertain_write(format!(
+                    "project '{}': {}/config changed during a call. No Git command was run in \
+                     the mirror. Inspect it before retrying.",
+                    self.name,
+                    self.mirror.display()
+                )));
+            }
             git(
                 &self.mirror,
                 &["worktree", "add", "--quiet", "--detach", &path_str, &start],
@@ -218,6 +239,7 @@ impl Project {
             base,
             path,
             mirror: self.mirror.clone(),
+            config,
             marker,
             baseline,
             changed: OnceLock::new(),
@@ -327,6 +349,7 @@ impl Projects {
         let mut made = Checkouts {
             list: Vec::new(),
             keep: self.keep,
+            left: false,
         };
         for project in &self.list {
             // Dropping `made` on an error removes the ones already made.
@@ -344,6 +367,8 @@ pub struct Checkout {
     pub base: String,
     pub path: PathBuf,
     mirror: PathBuf,
+    /// The mirror's config as spar left it.
+    config: Vec<u8>,
     /// The `.git` file. Compared before any Git probe, since it says which
     /// Git directory, and so which config, that probe would read.
     marker: Vec<u8>,
@@ -359,6 +384,15 @@ impl Checkout {
     fn changed(&self) -> Option<String> {
         self.changed
             .get_or_init(|| {
+                if read_config(&self.mirror).as_ref() != Some(&self.config) {
+                    // Put back before any Git runs in the mirror again, in this
+                    // run or the next.
+                    let path = self.mirror.join("config");
+                    if let Err(e) = std::fs::write(&path, &self.config) {
+                        logwarn!("could not put back {}: {e}", path.display());
+                    }
+                    return Some(format!("{} changed", path.display()));
+                }
                 let git_file = self.path.join(".git");
                 if std::fs::read(&git_file).ok().as_ref() != Some(&self.marker) {
                     return Some(format!("{} changed", git_file.display()));
@@ -377,9 +411,16 @@ impl Checkout {
 pub struct Checkouts {
     list: Vec<Checkout>,
     keep: bool,
+    /// The call may still be running, so nothing is probed or removed.
+    left: bool,
 }
 
 impl Checkouts {
+    /// Keep every checkout as it is, unprobed: the call was not seen to stop.
+    pub fn leave(&mut self) {
+        self.left = true;
+    }
+
     pub fn dirs(&self) -> Vec<String> {
         self.list
             .iter()
@@ -423,6 +464,14 @@ impl Checkouts {
 impl Drop for Checkouts {
     fn drop(&mut self) {
         for c in &self.list {
+            if self.left {
+                logwarn!(
+                    "left the checkout of project '{}' at {} because its call may still be running",
+                    c.name,
+                    c.path.display()
+                );
+                continue;
+            }
             if self.keep {
                 logdim!(
                     "kept the checkout of project '{}' at {}",

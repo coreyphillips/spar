@@ -675,7 +675,7 @@ impl Agent {
         );
         // Made before the prompt so it can name where each one is. Dropping
         // them removes them, whichever way this call ends.
-        let checkouts = match &self.projects {
+        let mut checkouts = match &self.projects {
             Some(projects) => Some(projects.checkouts()?),
             None => None,
         };
@@ -732,6 +732,11 @@ impl Agent {
                 .and_then(|out| tokens_used(&out.stdout)),
             ok: called.as_ref().is_ok_and(|out| out.ok()),
         });
+        if let (Err(e), Some(made)) = (&called, checkouts.as_mut()) {
+            if e.kind() == ErrorKind::UncertainWrite {
+                made.leave();
+            }
+        }
         after_call_is_quiet(&called, || {
             if let Some(git_file) = git_file {
                 git_file.restore_if_changed(cwd)?;

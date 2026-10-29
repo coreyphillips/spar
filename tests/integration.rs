@@ -9856,9 +9856,52 @@ fn a_helper_a_call_sets_in_a_project_is_not_run_by_spar() {
         "git -C \"$0\" config core.fsmonitor '{}' && echo done",
         helper.display()
     );
-    let answer = ask_with_project(&primary.work, &linked.work, &script).unwrap();
-    assert_eq!("done", answer.trim());
+    let err = ask_with_project(&primary.work, &linked.work, &script).unwrap_err();
+    assert!(err.to_string().contains("config changed"), "{err}");
     assert!(!ran.exists(), "spar ran the helper the call configured");
+}
+
+/// A filter set by one call is neither run by the next checkout nor left in
+/// the mirror.
+#[test]
+fn a_filter_a_call_sets_in_a_project_is_not_run_by_a_later_checkout() {
+    let primary = repo("proj-filter-primary");
+    let linked = repo("proj-filter-linked");
+    commit(
+        &linked.work,
+        ".gitattributes",
+        "*.txt filter=probe\n",
+        "attrs",
+    );
+    commit(&linked.work, "a.txt", "a\n", "a");
+    git(&linked.work, &["push", "-q", "origin", "main"]);
+    let ran = linked.dir.join("ran");
+    let cfg = with_project(&linked.work);
+    let projects = std::sync::Arc::new(
+        spar::projects::Projects::resolve(&cfg.projects, &primary.work, false).unwrap(),
+    );
+    let mut spec = cfg.agents[0].clone();
+    spec.command = vec![
+        CommandPart::One("/bin/sh".into()),
+        CommandPart::One("-c".into()),
+        CommandPart::One(format!(
+            "git -C \"$0\" config filter.probe.smudge \"touch '{}'; cat\" && echo done",
+            ran.display()
+        )),
+        CommandPart::Group(vec!["{add_dir}".into()]),
+    ];
+    let effort = spar::agent::Effort::just(None);
+    let err = Agent::new(spec)
+        .with_projects(projects.clone())
+        .ask("read it", &primary.work, &effort)
+        .unwrap_err();
+    assert!(err.to_string().contains("config changed"), "{err}");
+    let made = projects.checkouts().unwrap();
+    assert_eq!(1, made.dirs().len());
+    assert!(
+        !ran.exists(),
+        "a later checkout ran the filter the call set"
+    );
 }
 
 /// Two names that are the same once made safe for a directory still get a

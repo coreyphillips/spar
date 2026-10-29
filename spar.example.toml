@@ -403,3 +403,24 @@ max_issue_body_chars = 20000 # a filed issue's body. Far larger on purpose: a
                              # code blocks are never truncated and never count
                              # against this at all, so steps to reproduce and
                              # the offending snippet always survive.
+
+# Other repositories every agent call may read. Each call gets a fresh checkout
+# of each one at its origin base branch, made from a copy spar keeps inside
+# this repository's git directory, so a path here is never checked out,
+# fetched into, or edited. The checkouts are removed after the call unless
+# keep_worktrees is on, and a call that changes one has its answer thrown away.
+# They reach the CLI through {add_dir}, which both default presets use.
+#
+# Each entry names exactly one of path (a local clone) or repo (owner/name or a
+# GitHub URL, which spar clones with gh). access is "read", the default, or
+# "write". Changes to another project go through that project's own issues and
+# pull requests, never through this repository's.
+#
+# [[projects]]
+# name   = "engine"
+# path   = "~/code/engine"
+# access = "read"
+#
+# [[projects]]
+# name   = "wallet-core"
+# repo   = "owner/wallet-core"

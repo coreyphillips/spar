@@ -9,6 +9,8 @@ command = [
   ["-m", "{model}"],
   ["-c", "model_reasoning_effort={effort}"],
   ["-C", "{cwd}"],
+  # Other projects from [[projects]], one flag per checkout.
+  ["--add-dir", "{add_dir}"],
   ["--output-schema", "{schema_file}"],
   "--", "{prompt}",
 ]

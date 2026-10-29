@@ -8,6 +8,9 @@ command = [
   # form swallows the following positional prompt unless another flag
   # happens to sit between them.
   ["--allowedTools=Bash,Read,Write,Edit,Glob,Grep,WebFetch"],
+  # Other projects from [[projects]], one group per checkout. Equals form for
+  # the same reason: --add-dir is variadic too.
+  ["--add-dir={add_dir}"],
   # Native structured output. Claude Code takes the schema as an argument rather
   # than a path, hence {schema} and not {schema_file}. The group drops when
   # there is no schema, which is every call that wants prose back.

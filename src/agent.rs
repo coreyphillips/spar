@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use serde_json::Value;
 
@@ -16,6 +16,7 @@ use crate::config::{AgentSpec, CommandPart, OutputMode, SystemVia};
 use crate::error::{ErrorKind, Result, SparError};
 use crate::jsonx;
 use crate::proc::{self, ExecOpts};
+use crate::projects::Projects;
 use crate::repo::{
     attribute_state, git_state, ignored_untracked_state, join_reasons, list_paths,
     note_ignored_leavings, probe_again_on_failure, safe_git_state, uncertain_worktree_change,
@@ -101,6 +102,8 @@ pub struct Agent {
     fallback: Option<Box<Agent>>,
     /// Extra instructions for this run, carried onto every request.
     instructions: Option<String>,
+    /// Other repositories every call gets a checkout of.
+    projects: Option<Arc<Projects>>,
     resolved: OnceLock<PathBuf>,
 }
 
@@ -230,6 +233,7 @@ impl Agent {
             spec,
             fallback,
             instructions: None,
+            projects: None,
             resolved: OnceLock::new(),
         }
     }
@@ -248,6 +252,18 @@ impl Agent {
             self.fallback = Some(Box::new(backup.with_instructions(text)));
         }
         self.instructions = Some(text.to_string());
+        self
+    }
+
+    /// Give every call, here and on the stand in, a checkout of each project.
+    pub fn with_projects(mut self, projects: Arc<Projects>) -> Self {
+        if projects.is_empty() {
+            return self;
+        }
+        if let Some(backup) = self.fallback.take() {
+            self.fallback = Some(Box::new(backup.with_projects(projects.clone())));
+        }
+        self.projects = Some(projects);
         self
     }
 
@@ -374,9 +390,28 @@ impl Agent {
     /// Substitute placeholders. A group whose placeholder is unset is dropped
     /// whole, so omitting `model` drops `--model` with it rather than passing
     /// an empty string that the CLI would reject or, worse, accept.
+    ///
+    /// A group naming `{add_dir}` is emitted once per extra directory, and
+    /// dropped with none, so a CLI whose flag takes one directory and one whose
+    /// flag is variadic are both written the same way.
     pub fn render(&self, values: &Placeholders) -> Result<Vec<String>> {
         let mut out = vec![self.resolve_bin()?.display().to_string()];
         for part in self.spec.command.iter().skip(1) {
+            if part.args().iter().any(|a| a.contains(ADD_DIR)) {
+                for dir in &values.add_dir {
+                    let one = Placeholders {
+                        add_dir: Vec::new(),
+                        ..values.clone()
+                    };
+                    let rendered: Option<Vec<String>> = part
+                        .args()
+                        .iter()
+                        .map(|arg| one.substitute(&arg.replace(ADD_DIR, dir)))
+                        .collect();
+                    out.extend(rendered.unwrap_or_default());
+                }
+                continue;
+            }
             let mut rendered = Vec::new();
             let mut skip = false;
             for arg in part.args() {
@@ -638,6 +673,16 @@ impl Agent {
             "{STYLE_RULES}\n\n{}",
             deadline_rule(self.spec.timeout, crate::clock::now_secs())
         );
+        // Made before the prompt so it can name where each one is. Dropping
+        // them removes them, whichever way this call ends.
+        let checkouts = match &self.projects {
+            Some(projects) => Some(projects.checkouts()?),
+            None => None,
+        };
+        let prompt = match &checkouts {
+            Some(made) => format!("{prompt}\n\n{}", made.prompt()),
+            None => prompt.to_string(),
+        };
         let body = match self.spec.system_via {
             SystemVia::Placeholder => prompt.to_string(),
             SystemVia::Prompt => format!("{system}\n\n{prompt}"),
@@ -653,6 +698,7 @@ impl Agent {
             cwd: Some(cwd.display().to_string()),
             schema_file: schema_file.map(|p| p.display().to_string()),
             schema: schema.map(str::to_string),
+            add_dir: checkouts.as_ref().map(|c| c.dirs()).unwrap_or_default(),
         };
         let argv = self.render(&values)?;
         // `check(false)` so the whole output is still in hand when the call
@@ -692,6 +738,15 @@ impl Agent {
             }
             Ok(())
         })?;
+        // Nothing in a project checkout is ever committed, so an answer that
+        // rests on a change made there rests on something nobody will see.
+        // Not retried, and not handed to a stand in: the same request would
+        // invite the same edit.
+        if let Some(reason) = checkouts.as_ref().and_then(|c| c.changed()) {
+            return Err(SparError::uncertain_write(format!(
+                "{reason}. Its answer was discarded."
+            )));
+        }
         let out = called?;
         if !out.ok() {
             return Err(self.call_failure(&argv, &out));
@@ -1344,6 +1399,8 @@ fn ensure_recovery_path_clear(cwd: &Path) -> Result<()> {
 // Placeholders
 // ---------------------------------------------------------------------------
 
+const ADD_DIR: &str = "{add_dir}";
+
 #[derive(Debug, Default, Clone)]
 pub struct Placeholders {
     pub prompt: Option<String>,
@@ -1355,6 +1412,8 @@ pub struct Placeholders {
     pub schema_file: Option<String>,
     /// The schema itself, for a CLI that takes it as an argument.
     pub schema: Option<String>,
+    /// Directories beyond `cwd` the call may read, one `{add_dir}` group each.
+    pub add_dir: Vec<String>,
 }
 
 impl Placeholders {
@@ -1652,6 +1711,77 @@ mod tests {
             ..values()
         };
         assert_eq!(vec!["/fake/bin", "-m", "m1", "hi"], a.render(&v).unwrap());
+    }
+
+    #[test]
+    fn an_add_dir_group_is_written_once_per_directory() {
+        let a = agent(vec![
+            one("x"),
+            group(&["--add-dir", "{add_dir}"]),
+            group(&["--add-dir={add_dir}"]),
+            one("{prompt}"),
+        ]);
+        assert_eq!(vec!["/fake/bin", "hi"], a.render(&values()).unwrap());
+        let one_dir = Placeholders {
+            add_dir: vec!["/p1".into()],
+            ..values()
+        };
+        assert_eq!(
+            vec!["/fake/bin", "--add-dir", "/p1", "--add-dir=/p1", "hi"],
+            a.render(&one_dir).unwrap()
+        );
+        let two = Placeholders {
+            add_dir: vec!["/p1".into(), "/p2".into()],
+            ..values()
+        };
+        assert_eq!(
+            vec![
+                "/fake/bin",
+                "--add-dir",
+                "/p1",
+                "--add-dir",
+                "/p2",
+                "--add-dir=/p1",
+                "--add-dir=/p2",
+                "hi"
+            ],
+            a.render(&two).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_template_without_add_dir_ignores_the_directories() {
+        let a = agent(vec![one("x"), one("{prompt}")]);
+        let v = Placeholders {
+            add_dir: vec!["/p1".into()],
+            ..values()
+        };
+        assert_eq!(vec!["/fake/bin", "hi"], a.render(&v).unwrap());
+    }
+
+    #[test]
+    fn both_default_presets_hand_over_the_project_checkouts() {
+        for (name, want) in [("claude", "--add-dir=/p1"), ("codex", "/p1")] {
+            let raw = crate::config::load_preset(name).unwrap();
+            let mut spec: AgentSpec = raw.try_into().unwrap();
+            spec.name = name.into();
+            let a = Agent::with_bin(spec, "/b");
+            let with = Placeholders {
+                add_dir: vec!["/p1".into()],
+                ..values()
+            };
+            let argv = a.render(&with).unwrap();
+            let at = argv.iter().position(|arg| arg == want).unwrap();
+            assert!(
+                argv[at..].iter().any(|arg| arg == "hi"),
+                "{name}: the prompt must come after the directory: {argv:?}"
+            );
+            let without = a.render(&values()).unwrap();
+            assert!(
+                !without.iter().any(|arg| arg.contains("add-dir")),
+                "{name}: {without:?}"
+            );
+        }
     }
 
     #[test]

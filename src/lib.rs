@@ -22,6 +22,7 @@ pub mod logging;
 pub mod model;
 pub mod proc;
 pub mod progress;
+pub mod projects;
 pub mod repo;
 pub mod review;
 pub mod review_only;

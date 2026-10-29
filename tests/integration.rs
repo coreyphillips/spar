@@ -9737,3 +9737,103 @@ fn code_rejects_whitespace_before_loading_a_config() {
     assert!(!ok);
     assert!(err.contains("nonempty project prompt"), "{err}");
 }
+
+// -- [[projects]] -------------------------------------------------------------
+
+fn with_project(path: &Path) -> Config {
+    config::parse(&format!(
+        "{TWO_AGENTS}[[projects]]\nname = \"engine\"\npath = \"{}\"\n",
+        path.display()
+    ))
+    .unwrap()
+}
+
+fn clone_state(clone: &Path) -> (String, String, String, String) {
+    (
+        git(clone, &["rev-parse", "HEAD"]),
+        git(clone, &["branch", "--list"]),
+        git(clone, &["status", "--porcelain", "--ignored"]),
+        git(clone, &["worktree", "list", "--porcelain"]),
+    )
+}
+
+/// The checkout comes from the linked origin, not the user's clone, and
+/// neither the clone nor its origin is touched.
+#[test]
+fn a_call_reads_a_fresh_checkout_of_each_project_and_leaves_the_clone_alone() {
+    let primary = repo("proj-primary");
+    let linked = repo("proj-linked");
+    // Origin moves on without the user's clone, which also has local work.
+    let other = linked.dir.join("other");
+    git(&linked.dir, &["clone", "-q", "origin.git", "other"]);
+    git(&other, &["config", "user.email", "spar@example.invalid"]);
+    git(&other, &["config", "user.name", "spar test"]);
+    git(&other, &["config", "commit.gpgsign", "false"]);
+    commit(&other, "upstream.txt", "new\n", "upstream");
+    git(&other, &["push", "-q", "origin", "main"]);
+    std::fs::write(linked.work.join("dirty.txt"), "mine\n").unwrap();
+    let before = clone_state(&linked.work);
+
+    let cfg = with_project(&linked.work);
+    let projects = std::sync::Arc::new(
+        spar::projects::Projects::resolve(&cfg.projects, &primary.work, false).unwrap(),
+    );
+    let mut spec = cfg.agents[0].clone();
+    spec.command = vec![
+        CommandPart::One("/bin/sh".into()),
+        CommandPart::One("-c".into()),
+        CommandPart::One(
+            "cat \"$0/upstream.txt\"; test ! -e \"$0/dirty.txt\" && printf '%s' \"$0\"".into(),
+        ),
+        CommandPart::Group(vec!["{add_dir}".into()]),
+    ];
+    let agent = Agent::new(spec).with_projects(projects);
+    let effort = spar::agent::Effort::just(None);
+    let answer = agent.ask("read it", &primary.work, &effort).unwrap();
+    let (content, dir) = answer.split_at(answer.find('/').unwrap());
+    assert_eq!("new", content.trim());
+    assert!(
+        !Path::new(dir).exists(),
+        "the checkout was not removed: {dir}"
+    );
+    assert_eq!(before, clone_state(&linked.work));
+}
+
+#[test]
+fn a_call_that_changes_a_project_checkout_has_its_answer_discarded() {
+    let primary = repo("proj-write-primary");
+    let linked = repo("proj-write-linked");
+    let before = clone_state(&linked.work);
+    let cfg = with_project(&linked.work);
+    let projects = std::sync::Arc::new(
+        spar::projects::Projects::resolve(&cfg.projects, &primary.work, false).unwrap(),
+    );
+    let mut spec = cfg.agents[0].clone();
+    spec.command = vec![
+        CommandPart::One("/bin/sh".into()),
+        CommandPart::One("-c".into()),
+        CommandPart::One("echo edit >> \"$0/README.md\"; echo done".into()),
+        CommandPart::Group(vec!["{add_dir}".into()]),
+    ];
+    let agent = Agent::new(spec).with_projects(projects);
+    let effort = spar::agent::Effort::just(None);
+    let err = agent.ask("read it", &primary.work, &effort).unwrap_err();
+    assert!(err.to_string().contains("project 'engine'"), "{err}");
+    assert!(git(&primary.work, &["status", "--porcelain"]).is_empty());
+    assert_eq!(before, clone_state(&linked.work));
+}
+
+#[test]
+fn a_project_must_be_a_repository_other_than_this_one() {
+    let primary = repo("proj-self");
+    let cfg = with_project(&primary.work);
+    let err = spar::projects::Projects::resolve(&cfg.projects, &primary.work, false)
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("'engine'"), "{err}");
+    let missing = with_project(&primary.dir.join("nowhere"));
+    let err = spar::projects::Projects::resolve(&missing.projects, &primary.work, false)
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("not a git repository"), "{err}");
+}

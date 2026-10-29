@@ -1550,6 +1550,51 @@ terse              = true
 See [`spar.example.toml`](spar.example.toml) for every option with its
 reasoning.
 
+### Reading other projects
+
+Some work needs to see more than one repository: an app that reaches an engine
+only through a client library, say. List the others under `[[projects]]` and
+every agent call gets a fresh checkout of each one at its `origin/<base>`, with
+the prompt naming each checkout, its GitHub repository, and its access.
+
+```toml
+[[projects]]
+name   = "engine"
+path   = "~/code/engine"            # your own clone
+access = "read"                     # the default; or "write"
+
+[[projects]]
+name   = "wallet-core"
+repo   = "owner/wallet-core"        # or a GitHub URL; spar clones it with gh
+```
+
+Each entry names exactly one of `path` or `repo`. A duplicate name, an unknown
+`access`, a `path` that is not a git repository, and the repository spar is
+running in are all refused, naming the project.
+
+Your clone is only asked for its origin URL. Spar keeps its own copy of each
+project inside this repository's git directory, fetches it once per run, and
+makes the per-call checkouts from that, in the system temporary directory. They
+are removed after the call unless `keep_worktrees` is on. A call that changes
+one has its answer thrown away, the way a read-only call that changes its own
+checkout does, and nothing in a project checkout is ever committed or pushed.
+
+The checkouts reach the CLI through `{add_dir}`. A command group holding it is
+written once per checkout and dropped when there are none, so with no
+`[[projects]]` every command and prompt is exactly what it was. Both default
+presets use it, the Claude one as `--add-dir={add_dir}` because the flag is
+variadic and would otherwise swallow the prompt. `spar doctor` lists each
+project and warns about an agent whose template has no `{add_dir}`.
+
+Contributing to another project goes through that project's own issues and pull
+requests, one per repository, never through an edit made from here. A change in
+a project checkout would skip everything that makes an edit safe in this one:
+nothing would commit it, run `check` on it, review it, or open a pull request
+for it. And a project pinned to another one's commits can only use an upstream
+change after that change has merged and the pin has moved, which is what one
+pull request per repository, merged in order, gives. `access = "write"` is
+accepted for that, and today grants nothing beyond `read`.
+
 ## Pairing other agents
 
 An agent is a command template plus an output adapter, not a class. Supporting a

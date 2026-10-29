@@ -9799,28 +9799,96 @@ fn a_call_reads_a_fresh_checkout_of_each_project_and_leaves_the_clone_alone() {
     assert_eq!(before, clone_state(&linked.work));
 }
 
-#[test]
-fn a_call_that_changes_a_project_checkout_has_its_answer_discarded() {
-    let primary = repo("proj-write-primary");
-    let linked = repo("proj-write-linked");
-    let before = clone_state(&linked.work);
-    let cfg = with_project(&linked.work);
+/// One call with `linked` as the project, running `script` with the checkout
+/// as `$0`.
+fn ask_with_project(primary: &Path, linked: &Path, script: &str) -> spar::error::Result<String> {
+    let cfg = with_project(linked);
     let projects = std::sync::Arc::new(
-        spar::projects::Projects::resolve(&cfg.projects, &primary.work, false).unwrap(),
+        spar::projects::Projects::resolve(&cfg.projects, primary, false).unwrap(),
     );
     let mut spec = cfg.agents[0].clone();
     spec.command = vec![
         CommandPart::One("/bin/sh".into()),
         CommandPart::One("-c".into()),
-        CommandPart::One("echo edit >> \"$0/README.md\"; echo done".into()),
+        CommandPart::One(script.into()),
         CommandPart::Group(vec!["{add_dir}".into()]),
     ];
-    let agent = Agent::new(spec).with_projects(projects);
     let effort = spar::agent::Effort::just(None);
-    let err = agent.ask("read it", &primary.work, &effort).unwrap_err();
+    Agent::new(spec)
+        .with_projects(projects)
+        .ask("read it", primary, &effort)
+}
+
+#[test]
+fn a_call_that_changes_a_project_checkout_has_its_answer_discarded() {
+    let primary = repo("proj-write-primary");
+    let linked = repo("proj-write-linked");
+    let before = clone_state(&linked.work);
+    let script = "echo edit >> \"$0/README.md\"; echo done";
+    let err = ask_with_project(&primary.work, &linked.work, script).unwrap_err();
     assert!(err.to_string().contains("project 'engine'"), "{err}");
     assert!(git(&primary.work, &["status", "--porcelain"]).is_empty());
     assert_eq!(before, clone_state(&linked.work));
+}
+
+#[test]
+fn a_project_edit_git_status_does_not_show_is_still_caught() {
+    let primary = repo("proj-hidden-primary");
+    let linked = repo("proj-hidden-linked");
+    let script =
+        "cd \"$0\" && git update-index --skip-worktree README.md && echo edit > README.md \
+                  && test -z \"$(git status --porcelain)\" && echo done";
+    let err = ask_with_project(&primary.work, &linked.work, script).unwrap_err();
+    assert!(err.to_string().contains("project 'engine'"), "{err}");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_helper_a_call_sets_in_a_project_is_not_run_by_spar() {
+    use std::os::unix::fs::PermissionsExt;
+    let primary = repo("proj-helper-primary");
+    let linked = repo("proj-helper-linked");
+    let ran = linked.dir.join("ran");
+    let helper = linked.dir.join("helper.sh");
+    std::fs::write(&helper, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let script = format!(
+        "git -C \"$0\" config core.fsmonitor '{}' && echo done",
+        helper.display()
+    );
+    let answer = ask_with_project(&primary.work, &linked.work, &script).unwrap();
+    assert_eq!("done", answer.trim());
+    assert!(!ran.exists(), "spar ran the helper the call configured");
+}
+
+/// Two names that are the same once made safe for a directory still get a
+/// mirror each, on every call and not only the first.
+#[test]
+fn each_project_checks_out_the_repository_it_names() {
+    let primary = repo("proj-mirror-primary");
+    let a = repo("proj-mirror-a");
+    let b = repo("proj-mirror-b");
+    for (fx, who) in [(&a, "a\n"), (&b, "b\n")] {
+        commit(&fx.work, "who.txt", who, "who");
+        git(&fx.work, &["push", "-q", "origin", "main"]);
+    }
+    let cfg = config::parse(&format!(
+        "{TWO_AGENTS}[[projects]]\nname = \"engine.core\"\npath = \"{}\"\n\
+         [[projects]]\nname = \"engine_core\"\npath = \"{}\"\n",
+        a.work.display(),
+        b.work.display()
+    ))
+    .unwrap();
+    let projects = spar::projects::Projects::resolve(&cfg.projects, &primary.work, false).unwrap();
+    for _ in 0..2 {
+        let made = projects.checkouts().unwrap();
+        let read: Vec<String> = made
+            .dirs()
+            .iter()
+            .map(|dir| std::fs::read_to_string(Path::new(dir).join("who.txt")).unwrap())
+            .collect();
+        assert_eq!(vec!["a\n", "b\n"], read);
+    }
 }
 
 #[test]

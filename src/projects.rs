@@ -10,17 +10,24 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use sha2::{Digest, Sha256};
+
+use crate::agent::{Access, EditBaseline};
 use crate::config::{github_slug, ProjectAccess, ProjectCfg, ProjectSource};
 use crate::error::{Result, SparError};
 use crate::proc::{self, ExecOpts};
+use crate::repo::git_without_automation_argv;
 use crate::{bail, logdim, logwarn, spar_err};
 
 const GIT_TIMEOUT: u64 = 600;
 
+/// Git with no hooks or fsmonitor: a call can set either in a checkout's
+/// shared config, and this runs with spar's own permissions.
 fn git(cwd: &Path, args: &[&str]) -> Result<String> {
-    let mut argv = vec!["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0"];
-    argv.extend_from_slice(args);
-    proc::run_str(&argv, &ExecOpts::new().cwd(cwd).timeout_secs(GIT_TIMEOUT))
+    proc::run(
+        &git_without_automation_argv(args),
+        &ExecOpts::new().cwd(cwd).timeout_secs(GIT_TIMEOUT),
+    )
 }
 
 fn git_try(cwd: &Path, args: &[&str]) -> Option<String> {
@@ -201,7 +208,9 @@ impl Project {
         }
         // Canonical, so the path in the prompt is the one tools report back.
         let path = std::fs::canonicalize(&path).unwrap_or(path);
-        let head = git(&path, &["rev-parse", "HEAD"])?.trim().to_string();
+        let marker = std::fs::read(path.join(".git"))
+            .map_err(|e| spar_err!("could not read {}: {e}", path.join(".git").display()))?;
+        let baseline = EditBaseline::capture(&path)?;
         Ok(Checkout {
             name: self.name.clone(),
             access: self.access,
@@ -209,7 +218,9 @@ impl Project {
             base,
             path,
             mirror: self.mirror.clone(),
-            head,
+            marker,
+            baseline,
+            changed: OnceLock::new(),
         })
     }
 }
@@ -243,7 +254,10 @@ impl Projects {
                     };
                     let slug = origin_url(&top).as_deref().and_then(github_slug);
                     let same_dir = primary_top.as_ref() == Some(&top);
-                    let same_origin = slug.is_some() && slug == primary_slug;
+                    let same_origin = slug
+                        .as_deref()
+                        .zip(primary_slug.as_deref())
+                        .is_some_and(|(slug, own)| slug.eq_ignore_ascii_case(own));
                     if same_dir || same_origin {
                         bail!(
                             "project '{name}' is the repository spar is running in: list only \
@@ -275,12 +289,21 @@ impl Projects {
                     }
                 })
                 .collect();
+            // Keyed by the name and the source together: the directory name
+            // alone is lossy, and a project pointed at another repository
+            // must not be served from the mirror of the one it left.
+            let source = match (&path, &slug) {
+                (Some(top), _) => top.display().to_string(),
+                (None, slug) => slug.as_deref().unwrap_or_default().to_ascii_lowercase(),
+            };
+            let digest = Sha256::digest(format!("{name}\0{source}"));
+            let key: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
             list.push(Project {
                 name: name.clone(),
                 access: cfg.access,
                 slug,
                 path,
-                mirror: store.join(format!("{dir}.git")),
+                mirror: store.join(format!("{dir}-{key}.git")),
                 base: OnceLock::new(),
                 adding: Mutex::new(()),
             });
@@ -321,30 +344,32 @@ pub struct Checkout {
     pub base: String,
     pub path: PathBuf,
     mirror: PathBuf,
-    head: String,
+    /// The `.git` file. Compared before any Git probe, since it says which
+    /// Git directory, and so which config, that probe would read.
+    marker: Vec<u8>,
+    baseline: EditBaseline,
+    changed: OnceLock<Option<String>>,
 }
 
 impl Checkout {
     /// What changed since the checkout was made, or None.
     ///
-    /// Ignored files are left out, as they are for a read-only call in the
-    /// primary checkout: building or testing a project is reading it.
+    /// Held to the same test as a read-only call in the primary checkout, so
+    /// build output under ignored paths is reading, not changing.
     fn changed(&self) -> Option<String> {
-        let head = git_try(&self.path, &["rev-parse", "HEAD"]);
-        if head.as_deref() != Some(self.head.as_str()) {
-            return Some(format!("HEAD moved in {}", self.path.display()));
-        }
-        match git_try(
-            &self.path,
-            &["status", "--porcelain", "--untracked-files=all"],
-        ) {
-            Some(status) if status.is_empty() => None,
-            Some(_) => Some(format!("files changed in {}", self.path.display())),
-            None => Some(format!(
-                "could not read the state of {}",
-                self.path.display()
-            )),
-        }
+        self.changed
+            .get_or_init(|| {
+                let git_file = self.path.join(".git");
+                if std::fs::read(&git_file).ok().as_ref() != Some(&self.marker) {
+                    return Some(format!("{} changed", git_file.display()));
+                }
+                match self.baseline.recovery_needed(&self.path, Access::Read) {
+                    Ok(None) => None,
+                    Ok(Some(why)) => Some(format!("{why} in {}", self.path.display())),
+                    Err(e) => Some(e.last_line().to_string()),
+                }
+            })
+            .clone()
     }
 }
 

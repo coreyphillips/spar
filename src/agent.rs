@@ -79,7 +79,7 @@ const JSON_INSTRUCTION: &str = "Respond with ONLY a JSON object matching this \
 schema. No prose, no markdown fences, no commentary before or after:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Access {
+pub(crate) enum Access {
     Read,
     Edit,
 }
@@ -969,7 +969,7 @@ impl Agent {
 /// This is recovery tracking, not an operating-system security boundary. It
 /// prevents a failed call, retry, or fallback from silently building on work
 /// the same operation already left behind.
-struct EditBaseline {
+pub(crate) struct EditBaseline {
     attributes: AttributeState,
     git_state: GitState,
     git_entry: GitEntry,
@@ -977,7 +977,7 @@ struct EditBaseline {
 }
 
 impl EditBaseline {
-    fn capture(cwd: &Path) -> Result<Self> {
+    pub(crate) fn capture(cwd: &Path) -> Result<Self> {
         let git_entry = GitEntry::capture(cwd)?;
         if matches!(&git_entry, GitEntry::File) {
             ensure_recovery_path_clear(cwd)?;
@@ -1013,7 +1013,7 @@ impl EditBaseline {
 
     /// What the call left behind, named, or `None` when the tree is where it
     /// was. `Err` means the question could not be answered at all.
-    fn recovery_needed(&self, cwd: &Path, access: Access) -> Result<Option<String>> {
+    pub(crate) fn recovery_needed(&self, cwd: &Path, access: Access) -> Result<Option<String>> {
         if !self.git_entry.still_matches(cwd)? {
             return Err(uncertain_worktree_change(
                 cwd,

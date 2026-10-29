@@ -2658,6 +2658,7 @@ fn cmd_doctor(config_path: Option<&Path>) -> Result<i32> {
     }
 
     for line in project_lines(&cfg) {
+        ok &= !line.starts_with("  FAIL");
         println!("{line}");
     }
 

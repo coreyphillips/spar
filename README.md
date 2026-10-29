@@ -586,17 +586,20 @@ comment.
 
 Each finding the comment lists also goes on the line it is about, when the pull
 request's diff shows that line, so it can be answered and resolved where it is.
-The comment itself is unchanged and still lists every finding: the line
-comments repeat it rather than replace it. A finding with no line, or a line
-the diff does not show, is in the comment alone, since GitHub refuses a whole
-review over one line comment it cannot place. If GitHub refuses one anyway, the
-review goes up again without them and spar says so. A line comment can only
-travel on a review, so without `--verdict` a review that has one goes up as a
-plain review comment, which approves nothing and asks for nothing. A reply in
-one of those threads is something said since, so a second look reads it, and
-the new points a second look raises go on their lines the same way.
-`inline_comments = false` under `[style]` keeps every finding in the comment
-alone.
+The comment still lists every finding, but names one on a line by its title,
+location and tag alone, so nothing is read twice. Its line comment carries the
+detail, and for a disputed point the objection and the answer. A finding with
+no line, or a line the diff does not show, is in the comment alone and in full,
+since GitHub refuses a whole review over one line comment it cannot place. If
+GitHub refuses one anyway, the review goes up again without them, with every
+finding in full, and spar says so. A review that is saved rather than posted is
+saved in full too, since `spar post` sends no line comments. A line comment can
+only travel on a review, so without `--verdict` a review that has one goes up
+as a plain review comment, which approves nothing and asks for nothing. A reply
+in one of those threads is something said since, so a second look reads it,
+and the new points a second look raises go on their lines the same way. What
+it says about earlier points is unchanged. `inline_comments = false` under
+`[style]` keeps every finding in the comment alone, in full.
 
 Every review now leaves a record under `.spar/state/review-N.json`: the commit it
 read, when it began, and the points it raised with how well each was attested.

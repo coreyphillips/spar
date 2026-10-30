@@ -1405,6 +1405,16 @@ afterwards rather than removed. A Git entry Git does not report, such as
 `git init` run inside a tracked directory, still stops the call, since every
 file written under one is invisible to the outer worktree.
 
+`spar review` is the exception for a new ordinary file. Its two reviewers read
+one checkout at the same time, so a file that appears while one of them works
+may be the other's, and judging each call alone blamed the reviewer that
+finished first for a repro test its partner still had open. A whole review was
+thrown away over a file deleted half a minute later. There, new files are
+judged once both reviewers have finished: anything still left is moved to
+`.spar/scratch/pr-<number>-<seconds>/` under the same path, a warning names it,
+and the review goes on. Rewriting a tracked file, or one that was already
+there, still stops it.
+
 Probes are held to the same standard. A path Git listed and a build then deleted,
 or one that appears between two listings of the same tree, is a fact about a
 worktree being built in rather than evidence of damage, and no longer ends the

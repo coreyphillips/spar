@@ -80,6 +80,11 @@ schema. No prose, no markdown fences, no commentary before or after:";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Access {
     Read,
+    /// Read only, beside other calls running in the same checkout at the same
+    /// time. A new untracked file there cannot be told apart from one a
+    /// neighbour still has open, so it is left to the caller, which judges the
+    /// checkout once every call beside this one is done.
+    ReadAlongside,
     Edit,
 }
 
@@ -666,7 +671,7 @@ impl Agent {
         // Supported review commands can still write despite being asked not
         // to, so linked-worktree marker recovery applies to every agent call.
         let git_file = match access {
-            Access::Read | Access::Edit => GitFile::capture(cwd)?,
+            Access::Read | Access::ReadAlongside | Access::Edit => GitFile::capture(cwd)?,
         };
         let started = std::time::Instant::now();
         let called = proc::exec(&argv, &opts);
@@ -711,6 +716,33 @@ impl Agent {
     ) -> Result<T> {
         let baseline = EditBaseline::capture(cwd)?;
         self.ask_json_with_access(prompt, schema, cwd, effort, Access::Read, Some(&baseline))
+    }
+
+    /// `ask_json` for a call that shares its checkout with others running at
+    /// the same time.
+    ///
+    /// Two reviewers read one checkout at once, and judging each call on its
+    /// own snapshot blamed the one that finished first for a repro test the
+    /// other still had open: a whole review was thrown away over a file its
+    /// author deleted half a minute later. A new untracked file is the
+    /// caller's to judge here, once both are done. Everything else is still
+    /// judged per call.
+    pub fn ask_json_alongside<T: serde::de::DeserializeOwned>(
+        &self,
+        prompt: &str,
+        schema: &Value,
+        cwd: &Path,
+        effort: &Effort,
+    ) -> Result<T> {
+        let baseline = EditBaseline::capture(cwd)?;
+        self.ask_json_with_access(
+            prompt,
+            schema,
+            cwd,
+            effort,
+            Access::ReadAlongside,
+            Some(&baseline),
+        )
     }
 
     /// Ask for a structured call that may modify the working tree.
@@ -897,16 +929,34 @@ impl Agent {
         cwd: &Path,
         effort: &Effort,
     ) -> Result<T> {
-        let scoped = format!(
-            "{prompt}\n\nThe changes under review are the diff between `{base}` and HEAD in your \
-             working directory. Inspect them with git, then read the surrounding code before \
-             judging. Do not review only the diff.\n\nThis call is a review and nothing else. Do \
-             not edit the code under review, do not commit, and do not push: somebody else acts \
-             on what you find, and a reviewer that writes ends up reviewing its own work. Put any \
-             scratch file under the system temporary directory, not in the working tree."
-        );
-        self.ask_json(&scoped, schema, cwd, effort)
+        self.ask_json(&scoped_review(base, prompt), schema, cwd, effort)
     }
+
+    /// `review` for a reviewer that shares its checkout with another reading
+    /// it at the same time. `ask_json_alongside` says what that changes.
+    pub fn review_alongside<T: serde::de::DeserializeOwned>(
+        &self,
+        base: &str,
+        prompt: &str,
+        schema: &Value,
+        cwd: &Path,
+        effort: &Effort,
+    ) -> Result<T> {
+        self.ask_json_alongside(&scoped_review(base, prompt), schema, cwd, effort)
+    }
+}
+
+/// A review prompt with what every review is told about its diff and about
+/// keeping its hands off the checkout.
+fn scoped_review(base: &str, prompt: &str) -> String {
+    format!(
+        "{prompt}\n\nThe changes under review are the diff between `{base}` and HEAD in your \
+         working directory. Inspect them with git, then read the surrounding code before \
+         judging. Do not review only the diff.\n\nThis call is a review and nothing else. Do \
+         not edit the code under review, do not commit, and do not push: somebody else acts \
+         on what you find, and a reviewer that writes ends up reviewing its own work. Put any \
+         scratch file under the system temporary directory, not in the working tree."
+    )
 }
 
 /// The repository state before a logical editing operation begins.
@@ -999,11 +1049,18 @@ impl EditBaseline {
         // editing call is held to the stricter rule, because what it writes is
         // about to be staged.
         let untracked = match access {
-            Access::Read => {
-                let leavings = self.ignored_untracked.read_only_leavings(&ignored);
+            Access::Read | Access::ReadAlongside => {
+                let mut leavings = self.ignored_untracked.read_only_leavings(&ignored);
                 // Said even when the call is kept, though not as a warning and
                 // not once per call. `note_ignored_leavings` carries why.
                 note_ignored_leavings(cwd, "call", &leavings.tolerated);
+                // Whose a new file is cannot be said from here when another
+                // call shares the checkout. The caller checks it once they
+                // have all finished.
+                if access == Access::ReadAlongside {
+                    let created = self.ignored_untracked.new_ordinary_paths(&ignored);
+                    leavings.condemning.retain(|path| !created.contains(path));
+                }
                 (!leavings.condemning.is_empty()).then(|| {
                     format!(
                         "untracked file(s) changed: {}",
@@ -1022,7 +1079,7 @@ impl EditBaseline {
         // own, so nothing there moves HEAD but the call itself, and a reviewer
         // that quietly committed is exactly what this check is for.
         let tracked = match (access, &self.git_entry) {
-            (Access::Read, GitEntry::Directory(_)) => {
+            (Access::Read | Access::ReadAlongside, GitEntry::Directory(_)) => {
                 self.git_state.read_only_difference(&current, cwd)
             }
             _ => self.git_state.describe_difference(&current),
@@ -2533,6 +2590,92 @@ mod tests {
             .to_string_lossy()
             .starts_with(".spar-recovery-needed-")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn marked(dir: &Path) -> bool {
+        std::fs::read_dir(dir).unwrap().flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".spar-recovery-needed-")
+        })
+    }
+
+    /// Two reviewers read one checkout at once, and a repro test only one of
+    /// them made ended the call of the other. Beside another call, a new file
+    /// is left to whoever checks the checkout once both are done.
+    #[test]
+    fn a_read_alongside_another_is_not_judged_on_a_new_file() {
+        let (root, main, linked, _marker) = linked_worktree("alongside-new-file");
+        let agent = Agent::with_bin(
+            shell("reader", "printf 'repro\\n' > zz-repro.test.txt; echo '{}'"),
+            "/bin/sh",
+        );
+        let schema = serde_json::json!({"type": "object"});
+
+        let answer: Value = agent
+            .ask_json_alongside("read it", &schema, &linked, &Effort::default())
+            .expect("the answer stands");
+
+        assert!(answer.is_object());
+        assert!(!marked(&linked));
+        assert_eq!(
+            "repro\n",
+            std::fs::read_to_string(linked.join("zz-repro.test.txt")).unwrap()
+        );
+
+        // Alone in the checkout, the same call still answers for it.
+        std::fs::remove_file(linked.join("zz-repro.test.txt")).unwrap();
+        let err = agent
+            .ask_json::<Value>("read it", &schema, &linked, &Effort::default())
+            .unwrap_err();
+        assert_eq!(ErrorKind::UncertainWrite, err.kind());
+        assert!(err.message().contains("zz-repro.test.txt"), "{err}");
+
+        git_at(
+            &main,
+            &["worktree", "remove", "--force", linked.to_str().unwrap()],
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Only a new file is left to the caller. Rewriting what was already there,
+    /// tracked or not, is still the call's to answer for.
+    #[test]
+    fn a_read_alongside_another_still_answers_for_what_was_there() {
+        let (root, main, linked, _marker) = linked_worktree("alongside-existing");
+        std::fs::write(linked.join("notes.txt"), "before\n").unwrap();
+        let schema = serde_json::json!({"type": "object"});
+
+        for (line, path) in [
+            ("printf 'rewritten\\n' > README.md; echo '{}'", "README.md"),
+            ("printf 'after\\n' > notes.txt; echo '{}'", "notes.txt"),
+        ] {
+            let agent = Agent::with_bin(shell("reader", line), "/bin/sh");
+
+            let err = agent
+                .ask_json_alongside::<Value>("read it", &schema, &linked, &Effort::default())
+                .unwrap_err();
+
+            assert_eq!(ErrorKind::UncertainWrite, err.kind());
+            assert!(err.message().contains(path), "{err}");
+            git_at(&linked, &["checkout", "--", "README.md"]);
+            for entry in std::fs::read_dir(&linked).unwrap().flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".spar-recovery-needed-")
+                {
+                    std::fs::remove_file(entry.path()).unwrap();
+                }
+            }
+        }
+
+        git_at(
+            &main,
+            &["worktree", "remove", "--force", linked.to_str().unwrap()],
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A repository whose `main` is one fast forward behind `advanced`, so a

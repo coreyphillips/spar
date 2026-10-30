@@ -96,6 +96,11 @@ most useful thing you can do here.
 Give your own severity even where you agree the defect is real: the other
 reviewer calling something blocking does not make it so.
 
+This call reads and nothing else. Do not edit the code, do not commit, and do
+not push. The other reviewer is working in this same checkout right now. Put
+any scratch file, a reproduction test included, under the system temporary
+directory, not in the working tree.
+
 Findings:
 {findings}";
 
@@ -110,6 +115,11 @@ agrees=false to withdraw it, which is the right answer when they are correct.
 Withdrawing costs nothing. Defending a point you cannot substantiate puts it in
 front of a maintainer with two reviewers' names on it, which is worse than never
 having raised it.
+
+This call reads and nothing else. Do not edit the code, do not commit, and do
+not push. The other reviewer is working in this same checkout right now. Put
+any scratch file, a reproduction test included, under the system temporary
+directory, not in the working tree.
 
 Findings, with the objection to each:
 {findings}";
@@ -270,7 +280,7 @@ fn run_phases(
 
     let reviews = concurrently(agents, |a| {
         let effort = a.effort(cfg, Call::Review(1)).about(pr.number);
-        a.review::<Review>(&base_ref, &prompt, &schema::review(), work_dir, &effort)
+        a.review_alongside::<Review>(&base_ref, &prompt, &schema::review(), work_dir, &effort)
     });
 
     let mut by_agent: Vec<(String, Vec<Finding>)> = Vec::new();
@@ -281,11 +291,7 @@ fn run_phases(
         }
         by_agent.push((name, review.findings));
     }
-    repo.require_unchanged_worktree(
-        work_dir,
-        checkpoint,
-        &format!("review worktree for PR #{}", pr.number),
-    )?;
+    settle(repo, work_dir, checkpoint, pr.number)?;
 
     let mut judged = corroborate(&by_agent);
     cross_check(
@@ -404,7 +410,7 @@ fn cross_check(
 
     // -- phase 2: each rules on what only the other raised ----------------
     if budget >= 2 && reviewers == 2 {
-        adjudicate(agents, cfg, repo, work_dir, checkpoint, judged, 2)?;
+        adjudicate(agents, cfg, repo, number, work_dir, checkpoint, judged, 2)?;
     } else if budget < 2 {
         for j in judged.iter_mut() {
             if j.standing == Standing::Unverified {
@@ -415,10 +421,27 @@ fn cross_check(
 
     // -- phase 3: whoever raised a rejected point defends it or drops it --
     if budget >= 3 && judged.iter().any(rejected) {
-        rebut(agents, cfg, repo, work_dir, checkpoint, judged, 3)?;
+        rebut(agents, cfg, repo, number, work_dir, checkpoint, judged, 3)?;
     }
 
     state.rounds = budget.min(3);
+    settle(repo, work_dir, checkpoint, number)
+}
+
+/// Hold the review checkout to its checkpoint once every call reading it side
+/// by side has finished.
+///
+/// Each of those calls was judged alone only on what its neighbour could not
+/// have done in its place. A file one of them created is judged here instead,
+/// where nobody is still using it: moved out of the checkout and kept, after
+/// which everything else is compared as strictly as before.
+fn settle(
+    repo: &Repo,
+    work_dir: &Path,
+    checkpoint: &WorktreeCheckpoint,
+    number: i64,
+) -> Result<()> {
+    repo.set_aside_review_scratch(work_dir, checkpoint, number);
     repo.require_unchanged_worktree(
         work_dir,
         checkpoint,
@@ -550,10 +573,12 @@ fn matching_finding(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn adjudicate(
     agents: &[Agent],
     cfg: &Config,
     repo: &Repo,
+    number: i64,
     work_dir: &Path,
     checkpoint: &WorktreeCheckpoint,
     judged: &mut [Judged],
@@ -587,7 +612,7 @@ fn adjudicate(
         let listed: Vec<Finding> = theirs.iter().map(|j| j.finding.clone()).collect();
         let prompt =
             ADJUDICATE_PROMPT.replace("{findings}", &crate::review::findings_for_prompt(&listed));
-        adjudicator.ask_json::<AdjudicationDoc>(
+        adjudicator.ask_json_alongside::<AdjudicationDoc>(
             &prompt,
             &schema::adjudication(),
             work_dir,
@@ -622,8 +647,7 @@ fn adjudicate(
             rule_on(target, &verdict, &repo.style);
         }
     }
-    repo.require_unchanged_worktree(work_dir, checkpoint, "read-only review worktree")?;
-    Ok(())
+    settle(repo, work_dir, checkpoint, number)
 }
 
 /// What one reviewer's ruling makes of a finding only the other raised.
@@ -670,10 +694,12 @@ fn rejected(j: &Judged) -> bool {
     j.standing == Standing::Disputed && j.rated.is_none()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rebut(
     agents: &[Agent],
     cfg: &Config,
     repo: &Repo,
+    number: i64,
     work_dir: &Path,
     checkpoint: &WorktreeCheckpoint,
     judged: &mut [Judged],
@@ -715,7 +741,7 @@ fn rebut(
             .collect::<Vec<_>>()
             .join("\n");
         let prompt = REBUT_PROMPT.replace("{findings}", &listed);
-        author.ask_json::<AdjudicationDoc>(
+        author.ask_json_alongside::<AdjudicationDoc>(
             &prompt,
             &schema::adjudication(),
             work_dir,
@@ -756,8 +782,7 @@ fn rebut(
             }
         }
     }
-    repo.require_unchanged_worktree(work_dir, checkpoint, "read-only review worktree")?;
-    Ok(())
+    settle(repo, work_dir, checkpoint, number)
 }
 
 fn finish(
@@ -1733,7 +1758,7 @@ fn recheck_phases(
     );
     let answers = concurrently(agents, |a| {
         let effort = a.effort(cfg, Call::Recheck).about(pr.number);
-        a.review::<RecheckDoc>(
+        a.review_alongside::<RecheckDoc>(
             &base_ref,
             &prompt,
             &schema::recheck(),
@@ -1742,11 +1767,7 @@ fn recheck_phases(
         )
     });
     let answered = collect_answers(answers, state, pr.number, "recheck")?;
-    repo.require_unchanged_worktree(
-        look.work_dir,
-        look.checkpoint,
-        &format!("review worktree for PR #{}", pr.number),
-    )?;
+    settle(repo, look.work_dir, look.checkpoint, pr.number)?;
 
     // Every agent that was asked, not every one that answered: a point is
     // closed only when both close it, and a reviewer that said nothing closed
@@ -3911,6 +3932,18 @@ mod recheck_tests {
     fn the_recheck_prompt_contains_no_dash_of_any_kind() {
         let style = Style::default();
         for text in [RECHECK_PROMPT, RESPONSES_RULE] {
+            assert!(style::violations(text, &style).is_empty(), "{text}");
+        }
+    }
+
+    /// The cross-check is where a reviewer goes and confirms a finding, often
+    /// by writing a test, and it was the one pass never told where that goes.
+    #[test]
+    fn the_cross_check_prompts_keep_scratch_out_of_the_checkout() {
+        let style = Style::default();
+        for text in [ADJUDICATE_PROMPT, REBUT_PROMPT] {
+            assert!(text.contains("system temporary"), "{text}");
+            assert!(text.contains("not in the working tree"), "{text}");
             assert!(style::violations(text, &style).is_empty(), "{text}");
         }
     }

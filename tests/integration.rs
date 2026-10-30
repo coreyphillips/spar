@@ -9783,6 +9783,10 @@ fn code_titles_the_pr_for_what_it_ships() {
         calls.contains("--title Add CSV export (#42) --body"),
         "{calls}"
     );
+    let long = "Export rows ".repeat(12);
+    let (test, _) = code_criteria_run_with(true, "met", "", &[("SPAR_CODE_TITLE", &long)]);
+    let calls = test.log("gh.log");
+    assert!(calls.contains(" (#42) --body"), "{calls}");
 }
 
 #[cfg(unix)]
@@ -9806,7 +9810,9 @@ fn resuming_a_part_of_pr_rules_on_its_issue_and_ticks_after_merging() {
         "headRefName": "issue-42",
         "baseRefName": "main",
         "state": "OPEN",
-        "closingIssuesReferences": [],
+        "closingIssuesReferences": [
+            {"number": 99, "url": "https://github.com/example/project/issues/99"}
+        ],
         "isCrossRepository": false
     })
     .to_string();
@@ -9840,6 +9846,7 @@ fn resuming_a_part_of_pr_rules_on_its_issue_and_ticks_after_merging() {
     assert!(test.log("pr-body").starts_with("Closes #42\n\n"), "{calls}");
     assert_eq!(1, calls.matches("pr merge ").count(), "{calls}");
     assert_eq!(1, calls.matches("issue edit 42").count(), "{calls}");
+    assert!(!calls.contains("issue edit 99"), "{calls}");
     assert!(test
         .log("issue-edit-body")
         .contains("- [x] Preserve column order."));

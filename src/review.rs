@@ -915,7 +915,7 @@ fn implement_and_review(
                 branch,
                 &target,
                 &base,
-                &format!("{} (#{number})", pr_title(repo, &work, &item.title)),
+                &pr_title(repo, &work, &item.title, number),
                 &body,
             )?
         }
@@ -942,13 +942,20 @@ fn implement_and_review(
 }
 
 /// What the change ships, as its author named it, or the issue's title when it
-/// named nothing. Cleaned here as well as at creation, so a title the gate
-/// empties falls back too.
-fn pr_title(repo: &Repo, work: &Implementation, issue_title: &str) -> String {
-    match repo.clean_title(&work.title) {
+/// named nothing, then ` (#N)`. Cleaned here as well as at creation, so a title
+/// the gate empties falls back too. Shortened here, since the clip at creation
+/// would cut the suffix.
+fn pr_title(repo: &Repo, work: &Implementation, issue_title: &str, number: i64) -> String {
+    let name = match repo.clean_title(&work.title) {
         Ok(title) if !title.trim().is_empty() => title.trim().to_string(),
         _ => issue_title.to_string(),
+    };
+    let suffix = format!(" (#{number})");
+    if !repo.style.terse {
+        return format!("{name}{suffix}");
     }
+    let room = repo.style.max_title_chars.saturating_sub(suffix.len());
+    format!("{}{suffix}", style::clip_bare(&name, room))
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,20 +1024,10 @@ fn resume_inner(
         return Err(spar_err!("PR #{pr_number} is {}", pr.state.to_lowercase()));
     }
 
-    // A `Part of` pull request closes nothing, so GitHub names no issue for
-    // it. Spar's own lead line on spar's own branch for that issue is what
-    // still ties it to the criteria it is being ruled on.
-    let part_of = pr
-        .closing_issues_references
-        .is_empty()
-        .then(|| part_of_issue(&pr.body))
-        .flatten()
-        .filter(|&n| pr.head_ref_name.trim() == repo.branch_for_issue(n));
-    let subject = pr
-        .closing_issues_references
-        .first()
-        .map(|r| r.number)
-        .or(part_of)
+    // The issue spar opened it as part of wins over any other the body closes.
+    let part_of = part_of_pr(repo, &pr);
+    let subject = part_of
+        .or_else(|| pr.closing_issues_references.first().map(|r| r.number))
         .unwrap_or(pr_number);
     let closing_url = pr.closing_issues_references.first().map(|r| &r.url);
 
@@ -4014,12 +4011,17 @@ fn lead_for(statuses: impl IntoIterator<Item = Option<Mark>>) -> Lead {
 
 /// `text` with each GitHub closing keyword aimed at `#issue` turned into
 /// `<keyword> part of #issue`, which GitHub does not read as closing it.
+///
+/// An `owner/repo#issue` reference is disarmed whatever repository it names,
+/// since the body does not know its own.
 fn disarm_closing(text: &str, issue: i64) -> String {
-    let pattern = format!(r"(?i)\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)(?::\s*|\s+)#{issue}\b");
+    let pattern = format!(
+        r"(?i)\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)(?::\s*|\s+)((?:[\w.-]+/[\w.-]+)?#{issue})\b"
+    );
     match regex::Regex::new(&pattern) {
         Ok(re) => re
             .replace_all(text, |caps: &regex::Captures| {
-                format!("{} part of #{issue}", &caps[1])
+                format!("{} part of {}", &caps[1], &caps[2])
             })
             .into_owned(),
         Err(_) => text.to_string(),
@@ -4042,6 +4044,14 @@ fn part_of_issue(body: &str) -> Option<i64> {
     let first = body.lines().next()?.trim();
     let number: i64 = first.strip_prefix("Part of #")?.parse().ok()?;
     (number > 0 && Lead::PartOf.line(number) == first).then_some(number)
+}
+
+/// The issue a pull request spar opened as `Part of #N` works on.
+///
+/// It does not close the issue, so GitHub does not name it. Spar's own lead
+/// line on spar's own branch for that issue is what still ties the two.
+pub(crate) fn part_of_pr(repo: &Repo, pr: &PrView) -> Option<i64> {
+    part_of_issue(&pr.body).filter(|&n| pr.head_ref_name.trim() == repo.branch_for_issue(n))
 }
 
 fn swap_lead(body: &str, issue: i64, want: Lead) -> LeadSwap {
@@ -6821,6 +6831,10 @@ mod tests {
                 "Closes #7, fixed: #7, Resolves  #7, fixes #70, closes #8",
                 7
             )
+        );
+        assert_eq!(
+            "Fixes part of example/project#7, fixes example/project#70",
+            disarm_closing("Fixes example/project#7, fixes example/project#70", 7)
         );
     }
 

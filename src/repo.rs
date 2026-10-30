@@ -446,7 +446,7 @@ impl IgnoredState {
             .collect()
     }
 
-    fn new_ordinary_paths(&self, after: &Self) -> Vec<PathBuf> {
+    pub(crate) fn new_ordinary_paths(&self, after: &Self) -> Vec<PathBuf> {
         after
             .files
             .keys()
@@ -3379,6 +3379,100 @@ impl Repo {
             git_state: safe_git_state(cwd)?,
             ignored_untracked: ignored_untracked_state(cwd)?,
         })
+    }
+
+    /// Move the files read-only calls created in a review checkout out of it,
+    /// into `.spar/scratch/pr-<number>-<seconds>/` under the same paths, so the
+    /// checkout matches its checkpoint again.
+    ///
+    /// A reviewer told to keep its scratch in the temporary directory still
+    /// writes a repro test where the project's test runner will find it, and
+    /// holding that against the review threw away everything both reviewers
+    /// had done. What a review judges is the tracked tree, which
+    /// `require_unchanged_worktree` still compares as strictly as ever, along
+    /// with every untracked file that was there before. Only a file that was
+    /// not is moved, and it is moved rather than deleted: it may be the
+    /// reproduction a finding rests on.
+    ///
+    /// Best effort. Whatever this cannot move stays where it is, and the check
+    /// that follows refuses it exactly as before.
+    pub(crate) fn set_aside_review_scratch(
+        &self,
+        cwd: &Path,
+        checkpoint: &WorktreeCheckpoint,
+        number: i64,
+    ) {
+        let Ok(after) = probe_again_on_failure(|| ignored_untracked_state(cwd)) else {
+            return;
+        };
+        let created: Vec<PathBuf> = checkpoint
+            .ignored_untracked
+            .new_ordinary_paths(&after)
+            .into_iter()
+            .filter(|path| {
+                std::fs::symlink_metadata(cwd.join(path))
+                    .is_ok_and(|meta| meta.is_file() || meta.file_type().is_symlink())
+            })
+            .collect();
+        if created.is_empty() {
+            return;
+        }
+        let shelf = match self.scratch_shelf(number) {
+            Ok(shelf) => shelf,
+            Err(e) => {
+                logdim!("could not make room to move a reviewer's files aside: {e}");
+                return;
+            }
+        };
+        let mut moved = Vec::new();
+        for path in created {
+            let to = shelf.join(&path);
+            let result = to
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::rename(cwd.join(&path), &to));
+            match result {
+                Ok(()) => moved.push(path),
+                Err(e) => logdim!(
+                    "could not move {} out of the review checkout: {e}",
+                    cwd.join(&path).display()
+                ),
+            }
+        }
+        if !moved.is_empty() {
+            logwarn!(
+                "PR #{number}: a reviewer left {} file(s) in the review checkout: {}. They were \
+                 moved to {} and the review went on.",
+                moved.len(),
+                list_paths(&moved),
+                shelf.display()
+            );
+        }
+    }
+
+    /// A directory of its own under `.spar/scratch` for what one review phase
+    /// left behind, so two phases never write over each other's files.
+    fn scratch_shelf(&self, number: i64) -> Result<PathBuf> {
+        let scratch = self.root.join(STATE_DIR).join("scratch");
+        std::fs::create_dir_all(&scratch)
+            .map_err(|e| spar_err!("could not create {}: {e}", scratch.display()))?;
+        let stem = format!("pr-{number}-{}", crate::clock::now_secs());
+        for serial in 0..1000 {
+            let name = match serial {
+                0 => stem.clone(),
+                n => format!("{stem}-{n}"),
+            };
+            let shelf = scratch.join(name);
+            match std::fs::create_dir(&shelf) {
+                Ok(()) => return Ok(shelf),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(spar_err!("could not create {}: {e}", shelf.display())),
+            }
+        }
+        bail!(
+            "could not choose a free directory under {}",
+            scratch.display()
+        )
     }
 
     /// Require a read-only checkout to match a previously captured checkpoint.
@@ -10323,6 +10417,61 @@ mod tests {
 
         repo.refuse_read_only_leavings(&path, &baseline).unwrap();
         repo.refuse_new_ignored_files(&path, &baseline).unwrap();
+    }
+
+    /// A repro test a reviewer left behind is moved out with its path kept,
+    /// and the checkout matches its checkpoint again.
+    #[test]
+    fn a_file_a_reviewer_created_is_moved_aside_and_the_checkout_is_whole_again() {
+        let (_fixture, repo, path, checkpoint) = review_fixture("scratch-aside", 945);
+        std::fs::create_dir_all(path.join("tests")).unwrap();
+        std::fs::write(path.join("tests/zz-repro.test.ts"), "repro\n").unwrap();
+
+        repo.set_aside_review_scratch(&path, &checkpoint, 945);
+
+        assert!(!path.join("tests/zz-repro.test.ts").exists());
+        let shelves: Vec<PathBuf> = std::fs::read_dir(repo.root().join(".spar/scratch"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(1, shelves.len(), "{shelves:?}");
+        assert_eq!(
+            "repro\n",
+            std::fs::read_to_string(shelves[0].join("tests/zz-repro.test.ts")).unwrap()
+        );
+        repo.require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .unwrap();
+    }
+
+    /// Only what was not there before is moved. A rewritten tracked file, or
+    /// an untracked one that was already there, stays put for the check to
+    /// refuse.
+    #[test]
+    fn only_a_file_that_was_not_there_is_moved_aside() {
+        let (_fixture, repo, path, _checkpoint) = review_fixture("scratch-only-new", 946);
+        std::fs::write(path.join("notes.txt"), "before\n").unwrap();
+        let checkpoint = repo.worktree_checkpoint(&path).unwrap();
+        std::fs::write(path.join("README.md"), "rewritten\n").unwrap();
+        std::fs::write(path.join("notes.txt"), "after\n").unwrap();
+
+        repo.set_aside_review_scratch(&path, &checkpoint, 946);
+
+        assert_eq!(
+            "rewritten\n",
+            std::fs::read_to_string(path.join("README.md")).unwrap()
+        );
+        assert_eq!(
+            "after\n",
+            std::fs::read_to_string(path.join("notes.txt")).unwrap()
+        );
+        assert!(!repo.root().join(".spar/scratch").exists());
+        let error = repo
+            .require_unchanged_worktree(&path, &checkpoint, "review worktree")
+            .unwrap_err();
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, error.kind());
+        assert!(error.to_string().contains("README.md"), "{error}");
+        assert!(error.to_string().contains("notes.txt"), "{error}");
     }
 
     #[test]

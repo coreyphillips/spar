@@ -6749,15 +6749,39 @@ fn review_run_with(
         let text = std::fs::read_to_string(&config).unwrap();
         std::fs::write(&config, format!("{text}\n{more_config}")).unwrap();
     }
+    review_run_configured(fx, args, &config, &path, env)
+}
+
+/// `review_run`, with each fake reviewer given a whole shell script instead of
+/// an answer, for a reviewer that does something besides answering.
+#[cfg(unix)]
+fn review_run_scripted(
+    fx: &Fixture,
+    args: &[&str],
+    a: &str,
+    b: &str,
+    gh: &str,
+) -> (bool, String, String) {
+    let (config, path) = brainstorm_commands(fx, "", "", gh);
+    let bin = fx.dir.join("fake-bin");
+    executable(&bin.join("agent-a"), &format!("#!/bin/sh\n{a}\n"));
+    executable(&bin.join("agent-b"), &format!("#!/bin/sh\n{b}\n"));
+    review_run_configured(fx, args, &config, &path, &[])
+}
+
+fn review_run_configured(
+    fx: &Fixture,
+    args: &[&str],
+    config: &Path,
+    path: &str,
+    env: &[(&str, &str)],
+) -> (bool, String, String) {
     let log = fx.dir.join("gh.log");
     let mut argv = vec!["review"];
     argv.extend_from_slice(args);
     argv.extend_from_slice(&["--config", config.to_str().unwrap(), "--repo"]);
     argv.push(fx.work.to_str().unwrap());
-    let mut vars = vec![
-        ("PATH", path.as_str()),
-        ("SPAR_FAKE_GH_LOG", log.to_str().unwrap()),
-    ];
+    let mut vars = vec![("PATH", path), ("SPAR_FAKE_GH_LOG", log.to_str().unwrap())];
     vars.extend_from_slice(env);
     let (ok, stdout, stderr) = spar_with_env(&argv, &fx.dir, &vars);
     let log = std::fs::read_to_string(&log).unwrap_or_default();
@@ -6799,6 +6823,90 @@ fn review_with_verdict_submits_a_formal_approval_and_leaves_a_record() {
     assert!(record.findings.is_empty());
     assert_eq!(0, record.rechecks);
     assert_eq!(20, record.reviewed_at.len(), "{}", record.reviewed_at);
+}
+
+/// Both reviewers share one checkout and run at the same time. One wrote a
+/// repro test, ran it and deleted it, and the other finished while it was
+/// still there: the one that finished first was blamed for a file it never
+/// made, and a whole review was thrown away over a checkout that ended clean.
+#[test]
+#[cfg(unix)]
+fn a_review_survives_a_file_the_other_reviewer_still_had_open() {
+    let fx = repo("reviewneighbour");
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/5/head"]);
+    let head = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let (ok, out, log) = review_run_scripted(
+        &fx,
+        &["5", "--verdict"],
+        &format!(
+            "sleep 1\nprintf 'repro\\n' > zz-repro.test.txt\nsleep 3\nrm zz-repro.test.txt\nprintf \
+             '%s\\n' '{CLEAN_REVIEW}'"
+        ),
+        &format!("sleep 2\nprintf '%s\\n' '{CLEAN_REVIEW}'"),
+        &review_gh(5, &head, "someone-else"),
+    );
+
+    assert!(ok, "{out}");
+    assert!(out.contains("#5     clean"), "{out}");
+    assert!(
+        log.contains(&review_post(5, &head, "APPROVE")),
+        "{log}\n{out}"
+    );
+    assert!(
+        !out.contains("read-only call changed the worktree"),
+        "{out}"
+    );
+    assert!(!fx.work.join(".spar").join("scratch").exists(), "{out}");
+}
+
+/// A reviewer told to keep its scratch in the temporary directory still left
+/// a repro test in the checkout. The review it did stands, and the file is
+/// moved out where a person can find it rather than ending the run.
+#[test]
+#[cfg(unix)]
+fn a_scratch_file_a_reviewer_leaves_is_moved_aside_and_the_review_stands() {
+    let fx = repo("reviewscratch");
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/5/head"]);
+    let head = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let (ok, out, log) = review_run_scripted(
+        &fx,
+        &["5", "--verdict"],
+        &format!(
+            "mkdir -p tests\nprintf 'repro\\n' > tests/zz-repro.test.txt\nprintf '%s\\n' \
+             '{CLEAN_REVIEW}'"
+        ),
+        &format!("printf '%s\\n' '{CLEAN_REVIEW}'"),
+        &review_gh(5, &head, "someone-else"),
+    );
+
+    assert!(ok, "{out}");
+    assert!(
+        log.contains(&review_post(5, &head, "APPROVE")),
+        "{log}\n{out}"
+    );
+    assert!(out.contains("tests/zz-repro.test.txt"), "{out}");
+    let scratch = fx.work.join(".spar").join("scratch");
+    let runs: Vec<PathBuf> = std::fs::read_dir(&scratch)
+        .unwrap_or_else(|e| panic!("nothing set aside at {}: {e}\n{out}", scratch.display()))
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(1, runs.len(), "{runs:?}");
+    assert!(
+        runs[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("pr-5-"),
+        "{runs:?}"
+    );
+    assert_eq!(
+        "repro\n",
+        std::fs::read_to_string(runs[0].join("tests/zz-repro.test.txt")).unwrap()
+    );
+    assert!(!fx.work.join(".spar-worktrees").join("review-5").exists());
 }
 
 #[test]

@@ -1106,6 +1106,10 @@ pub struct Implementation {
     /// opened it rather than for the harness.
     #[serde(default, deserialize_with = "de_string")]
     pub reason: String,
+    /// The pull request title: what the change ships, which is not always
+    /// the whole of what the issue asks for. Empty falls back to the issue's.
+    #[serde(default, deserialize_with = "de_string")]
+    pub title: String,
     /// One sentence saying what changed. Leads the body.
     #[serde(default, deserialize_with = "de_string")]
     pub summary: String,
@@ -1336,6 +1340,10 @@ pub struct IssueRun {
     /// verified. A later invocation rechecks GitHub before any new write.
     #[serde(skip)]
     pub followup_writes_uncertain: bool,
+    /// How many criteria the signing review did not rule met, when the pull
+    /// request says `Part of` its issue and so leaves it open on merge.
+    #[serde(skip)]
+    pub left_open: Option<usize>,
 }
 
 impl IssueRun {
@@ -1353,6 +1361,7 @@ impl IssueRun {
             criteria: Vec::new(),
             ticks_criteria: false,
             followup_writes_uncertain: false,
+            left_open: None,
         }
     }
 

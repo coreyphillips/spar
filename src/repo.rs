@@ -5318,6 +5318,43 @@ impl Repo {
         self.record_write(result)
     }
 
+    /// One pull request's body, exactly as GitHub holds it.
+    pub fn pr_body(&self, number: i64) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Row {
+            #[serde(default)]
+            body: Option<String>,
+        }
+        let text = self.gh(&["pr", "view", &number.to_string(), "--json", "body"])?;
+        let row: Row = serde_json::from_str(text.trim())
+            .map_err(|e| spar_err!("unexpected shape for PR #{number}: {e}"))?;
+        Ok(row.body.unwrap_or_default())
+    }
+
+    /// Replace a pull request's body with `body`, if it still reads `expected`.
+    ///
+    /// Not through the style gate, for the reason `edit_issue_body` gives: the
+    /// caller changes one line spar wrote and every other byte is passed back
+    /// as GitHub holds it.
+    pub fn edit_pr_body(&self, number: i64, expected: &str, body: &str) -> Result<()> {
+        let current = self.record_failed_write(self.pr_body(number))?;
+        if current != expected {
+            return self.record_failed_write(Err(spar_err!(
+                "the body of PR #{number} changed since it was read, so it was left alone rather \
+                 than written over."
+            )));
+        }
+        let edited = self.gh_stdin(
+            &["pr", "edit", &number.to_string(), "--body-file", "-"],
+            body,
+        );
+        let result = match edited {
+            Ok(_) => Ok(()),
+            Err(edit_error) => reconcile_issue_edit(number, body, edit_error, self.pr_body(number)),
+        };
+        self.record_write(result)
+    }
+
     /// One issue's body, exactly as GitHub holds it.
     pub fn issue_body(&self, number: i64) -> Result<String> {
         #[derive(Deserialize)]

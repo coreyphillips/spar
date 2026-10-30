@@ -915,7 +915,7 @@ fn implement_and_review(
                 branch,
                 &target,
                 &base,
-                &format!("{} (#{number})", item.title),
+                &pr_title(repo, &work, &item.title, number),
                 &body,
             )?
         }
@@ -939,6 +939,23 @@ fn implement_and_review(
         criteria,
     };
     review_loop(agents, cfg, repo, &ctx, state, ledger, Vec::new())
+}
+
+/// What the change ships, as its author named it, or the issue's title when it
+/// named nothing, then ` (#N)`. Cleaned here as well as at creation, so a title
+/// the gate empties falls back too. Shortened here, since the clip at creation
+/// would cut the suffix.
+fn pr_title(repo: &Repo, work: &Implementation, issue_title: &str, number: i64) -> String {
+    let name = match repo.clean_title(&work.title) {
+        Ok(title) if !title.trim().is_empty() => title.trim().to_string(),
+        _ => issue_title.to_string(),
+    };
+    let suffix = format!(" (#{number})");
+    if !repo.style.terse {
+        return format!("{name}{suffix}");
+    }
+    let room = repo.style.max_title_chars.saturating_sub(suffix.len());
+    format!("{}{suffix}", style::clip_bare(&name, room))
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,10 +1024,10 @@ fn resume_inner(
         return Err(spar_err!("PR #{pr_number} is {}", pr.state.to_lowercase()));
     }
 
-    let subject = pr
-        .closing_issues_references
-        .first()
-        .map(|r| r.number)
+    // The issue spar opened it as part of wins over any other the body closes.
+    let part_of = part_of_pr(repo, &pr);
+    let subject = part_of
+        .or_else(|| pr.closing_issues_references.first().map(|r| r.number))
         .unwrap_or(pr_number);
     let closing_url = pr.closing_issues_references.first().map(|r| &r.url);
 
@@ -1136,7 +1153,7 @@ fn resume_inner(
         // above found this one's namesake, whose boxes are not this PR's.
         criteria: issue
             .as_ref()
-            .filter(|issue| Some(&issue.url) == closing_url)
+            .filter(|issue| part_of.is_some() || Some(&issue.url) == closing_url)
             .map(|issue| tracker::criteria(issue.body_text()))
             .unwrap_or_default(),
     };
@@ -1947,9 +1964,19 @@ fn approve(
     )?;
     let live_head = repo.pr_head_oid(ctx.pr_number)?;
     ensure_reviewed_head(ctx.pr_number, published_head, &live_head)?;
+    let lead_settled = reconcile_lead(repo, ctx, state);
     // A tick says the work landed, so only a merge spar performs earns one.
-    state.ticks_criteria = cfg.loop_cfg.auto_merge && cfg.loop_cfg.tick_criteria;
+    state.ticks_criteria = lead_settled && cfg.loop_cfg.auto_merge && cfg.loop_cfg.tick_criteria;
     post_outcome(repo, ctx.pr_number, state, ledger, Ending::Approved);
+    if let Some(left) = state.left_open {
+        state.notes.push(stays_open(ctx.subject, left));
+    }
+    if !lead_settled {
+        // Left in draft as well: ready is what invites a person to merge it,
+        // and the body still closes the issue.
+        log!("{}: approved, not merged", ctx.label);
+        return Ok(());
+    }
     // Before the merge, not after: a draft cannot be merged, and the state the
     // draft was signalling, that two agents were still arguing about it, has
     // just stopped being true.
@@ -1972,6 +1999,9 @@ fn approve(
         state.status = Status::Merged;
         repo.clear_state(ctx.pr_number); // nothing left to resume
         log!("{}: merged", ctx.label);
+        if let Some(left) = state.left_open {
+            log!("{}: {}", ctx.label, stays_open(ctx.subject, left));
+        }
         let some_met = state.criteria.iter().any(|c| c.status == Some(Mark::Met));
         if state.ticks_criteria && ctx.subject != ctx.pr_number && some_met {
             // A merge queue takes the command and merges later, or not at all.
@@ -3558,6 +3588,7 @@ fn outcome_comment_with_unread(
                 && state.filed.is_empty()
                 && state.noted.is_empty()
                 && criteria.is_none()
+                && state.left_open.is_none()
             {
                 // A clean approval with nothing outstanding needs no comment.
                 // The absence of objections is the message. `noted` is in that
@@ -3569,6 +3600,9 @@ fn outcome_comment_with_unread(
             }
             out.push("Reviewed, nothing blocking a merge.".into());
             out.extend(criteria);
+            if let Some(left) = state.left_open {
+                out.push(stays_open(state.issue, left));
+            }
         }
         Ending::OutOfRounds => {
             out.push(
@@ -3903,7 +3937,8 @@ pub fn pr_body(
     criteria: &[Item],
     style: &Style,
 ) -> String {
-    let mut parts = vec![format!("Closes #{issue}")];
+    let claimed = (1..=criteria.len()).map(|n| status_for(&work.criteria, n).map(|s| s.status));
+    let mut parts = vec![lead_for(claimed).line(issue)];
 
     for lead in [&work.summary, &work.problem] {
         let text = style::sentence(lead, style);
@@ -3926,7 +3961,200 @@ pub fn pr_body(
         parts.push(format!("## Notes\n\n{notes}"));
     }
 
-    style::body(&parts.join("\n\n"), style)
+    // The lead is the one line that decides whether a merge closes the issue,
+    // and sign-off rewrites only that line, so nothing below it may close it.
+    let lead = parts.remove(0);
+    let rest = disarm_closing(&parts.join("\n\n"), issue);
+    let text = if rest.is_empty() {
+        lead
+    } else {
+        format!("{lead}\n\n{rest}")
+    };
+    style::body(&text, style)
+}
+
+/// The line a pull request body leads with, naming its issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lead {
+    /// Nothing is left, so merging closes the issue.
+    Closes,
+    /// Something is left, so merging must leave the issue open.
+    PartOf,
+}
+
+impl Lead {
+    fn line(self, issue: i64) -> String {
+        match self {
+            Lead::Closes => format!("Closes #{issue}"),
+            Lead::PartOf => format!("Part of #{issue}"),
+        }
+    }
+
+    fn other(self) -> Lead {
+        match self {
+            Lead::Closes => Lead::PartOf,
+            Lead::PartOf => Lead::Closes,
+        }
+    }
+}
+
+/// `Closes` only when every criterion is marked met, which an issue with none
+/// trivially is. A missing status counts against it: an issue closed too early
+/// is the outcome somebody has to notice before they can undo it.
+fn lead_for(statuses: impl IntoIterator<Item = Option<Mark>>) -> Lead {
+    if statuses.into_iter().all(|s| s == Some(Mark::Met)) {
+        Lead::Closes
+    } else {
+        Lead::PartOf
+    }
+}
+
+/// `text` with each GitHub closing keyword aimed at `#issue` turned into
+/// `<keyword> part of #issue`, which GitHub does not read as closing it.
+///
+/// An `owner/repo#issue` reference is disarmed whatever repository it names,
+/// since the body does not know its own.
+fn disarm_closing(text: &str, issue: i64) -> String {
+    let pattern = format!(
+        r"(?i)\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)(?::\s*|\s+)((?:[\w.-]+/[\w.-]+)?#{issue})\b"
+    );
+    match regex::Regex::new(&pattern) {
+        Ok(re) => re
+            .replace_all(text, |caps: &regex::Captures| {
+                format!("{} part of {}", &caps[1], &caps[2])
+            })
+            .into_owned(),
+        Err(_) => text.to_string(),
+    }
+}
+
+/// What a body's first line says about changing it to `want`.
+#[derive(Debug, PartialEq, Eq)]
+enum LeadSwap {
+    /// It already says that.
+    Already,
+    /// The whole body with only the first line changed.
+    Swapped(String),
+    /// The first line is not one spar writes, so somebody else wrote it.
+    NotOurs(String),
+}
+
+/// The issue a body's `Part of #N` lead line names, if it has one.
+fn part_of_issue(body: &str) -> Option<i64> {
+    let first = body.lines().next()?.trim();
+    let number: i64 = first.strip_prefix("Part of #")?.parse().ok()?;
+    (number > 0 && Lead::PartOf.line(number) == first).then_some(number)
+}
+
+/// The issue a pull request spar opened as `Part of #N` works on.
+///
+/// It does not close the issue, so GitHub does not name it. Spar's own lead
+/// line on spar's own branch for that issue is what still ties the two.
+pub(crate) fn part_of_pr(repo: &Repo, pr: &PrView) -> Option<i64> {
+    part_of_issue(&pr.body).filter(|&n| pr.head_ref_name.trim() == repo.branch_for_issue(n))
+}
+
+fn swap_lead(body: &str, issue: i64, want: Lead) -> LeadSwap {
+    let (first, rest) = body.split_at(body.find('\n').unwrap_or(body.len()));
+    let (line, cr) = match first.strip_suffix('\r') {
+        Some(line) => (line, "\r"),
+        None => (first, ""),
+    };
+    if line == want.line(issue) {
+        LeadSwap::Already
+    } else if line == want.other().line(issue) {
+        LeadSwap::Swapped(format!("{}{cr}{rest}", want.line(issue)))
+    } else {
+        LeadSwap::NotOurs(line.to_string())
+    }
+}
+
+/// Make the body's lead line agree with the signing review before the pull
+/// request is marked ready or merged, so a merge closes the issue only when
+/// every criterion was ruled met.
+///
+/// False when the body still says `Closes` over a criterion not ruled met,
+/// which is the one case a merge must not follow.
+fn reconcile_lead(repo: &Repo, ctx: &LoopCtx, state: &mut IssueRun) -> bool {
+    if ctx.criteria.is_empty() || ctx.subject == ctx.pr_number {
+        return true;
+    }
+    let (pr, issue) = (ctx.pr_number, ctx.subject);
+    // By the issue's list, so a criterion the signing review left out entirely
+    // counts as not met rather than vanishing from an empty ruling.
+    let rulings: Vec<Option<Mark>> = (0..ctx.criteria.len())
+        .map(|at| state.criteria.get(at).and_then(|c| c.status))
+        .collect();
+    let want = lead_for(rulings.iter().copied());
+    let left = rulings.iter().filter(|s| **s != Some(Mark::Met)).count();
+    let swapped = repo.record_failed_write(repo.pr_body(pr)).and_then(|body| {
+        match swap_lead(&body, issue, want) {
+            LeadSwap::Already => Ok(true),
+            LeadSwap::Swapped(edited) => repo.edit_pr_body(pr, &body, &edited).map(|()| {
+                log!(
+                    "{}: the body now leads with `{}`",
+                    ctx.label,
+                    want.line(issue)
+                );
+                true
+            }),
+            LeadSwap::NotOurs(line) => {
+                log!(
+                    "{}: left the body alone, since its first line {line:?} is not the `{}` or \
+                     `{}` spar writes, so somebody changed it",
+                    ctx.label,
+                    Lead::Closes.line(issue),
+                    Lead::PartOf.line(issue)
+                );
+                Ok(false)
+            }
+        }
+    });
+    match swapped {
+        Ok(true) => {
+            state.left_open = (want == Lead::PartOf).then_some(left);
+            true
+        }
+        Ok(false) => true,
+        Err(e) if want == Lead::PartOf => {
+            let why = format!(
+                "not merged: the body could not be changed to `{}`, so merging it would close \
+                 #{issue} with {} not ruled met. {}",
+                want.line(issue),
+                criteria_count(left),
+                e.last_line()
+            );
+            logwarn!("{}: {why}", ctx.label);
+            state.notes.push(why);
+            false
+        }
+        Err(e) => {
+            let why = format!(
+                "the body could not be changed to `{}`, so merging it leaves #{issue} open. {}",
+                want.line(issue),
+                e.last_line()
+            );
+            logwarn!("{}: {why}", ctx.label);
+            state.notes.push(why);
+            true
+        }
+    }
+}
+
+fn criteria_count(n: usize) -> String {
+    match n {
+        1 => "one acceptance criterion".to_string(),
+        n => format!("{n} acceptance criteria"),
+    }
+}
+
+/// What a merge that leaves the issue open says about it.
+fn stays_open(issue: i64, left: usize) -> String {
+    format!(
+        "#{issue} stays open after this merges, with {} not ruled met. `spar run {issue}` \
+         continues it.",
+        criteria_count(left)
+    )
 }
 
 /// The author's status on each acceptance criterion, said to be the author's.
@@ -6566,6 +6794,110 @@ mod tests {
         assert!(
             body.contains("- No status given: Connects on a device."),
             "{body}"
+        );
+    }
+
+    #[test]
+    fn a_pr_body_closes_its_issue_only_when_the_author_says_every_criterion_is_done() {
+        let criteria = tracker::criteria(CRITERIA_BODY);
+        let with = |claims: Vec<CriterionStatus>| {
+            let work = Implementation {
+                summary: "Add CSV export, which fixes #7 in part.".into(),
+                criteria: claims,
+                ..Implementation::default()
+            };
+            pr_body(7, &work, None, &criteria, &style())
+        };
+        let done = with(vec![status(1, Mark::Met, "a"), status(2, Mark::Met, "b")]);
+        assert!(done.starts_with("Closes #7\n\n"), "{done}");
+        assert!(done.contains("fixes part of #7 in part"), "{done}");
+        for second in [Some(Mark::NotMet), Some(Mark::NeedsPerson), None] {
+            let mut claims = vec![status(1, Mark::Met, "a")];
+            if let Some(mark) = second {
+                claims.push(status(2, mark, "b"));
+            }
+            let body = with(claims);
+            assert!(body.starts_with("Part of #7\n\n"), "{body}");
+            assert!(!body.to_lowercase().contains("closes"), "{body}");
+            assert!(body.contains("fixes part of #7 in part"), "{body}");
+        }
+    }
+
+    #[test]
+    fn nothing_below_the_lead_line_closes_the_issue() {
+        assert_eq!(
+            "Closes part of #7, fixed part of #7, Resolves part of #7, fixes #70, closes #8",
+            disarm_closing(
+                "Closes #7, fixed: #7, Resolves  #7, fixes #70, closes #8",
+                7
+            )
+        );
+        assert_eq!(
+            "Fixes part of example/project#7, fixes example/project#70",
+            disarm_closing("Fixes example/project#7, fixes example/project#70", 7)
+        );
+    }
+
+    #[test]
+    fn swapping_the_lead_line_leaves_every_other_byte_alone() {
+        let body = "Closes #7\r\n\r\nAdd CSV export.\n\n## Notes\n\nCloses #7 is above.  \n";
+        let LeadSwap::Swapped(edited) = swap_lead(body, 7, Lead::PartOf) else {
+            panic!("not swapped");
+        };
+        assert_eq!(body.replacen("Closes #7", "Part of #7", 1), edited);
+        assert_eq!(
+            LeadSwap::Swapped(body.to_string()),
+            swap_lead(&edited, 7, Lead::Closes)
+        );
+        assert_eq!(LeadSwap::Already, swap_lead(body, 7, Lead::Closes));
+        assert_eq!(
+            LeadSwap::Swapped("Part of #7".into()),
+            swap_lead("Closes #7", 7, Lead::PartOf)
+        );
+    }
+
+    #[test]
+    fn a_lead_line_somebody_changed_is_not_swapped() {
+        for body in [
+            "Closes #7 and #8\n\nBody.",
+            "Fixes #7",
+            "",
+            "Add CSV export.\n\nCloses #7",
+        ] {
+            assert!(
+                matches!(swap_lead(body, 7, Lead::PartOf), LeadSwap::NotOurs(_)),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_part_of_lead_line_names_its_issue() {
+        assert_eq!(Some(42), part_of_issue("Part of #42\n\nAdd CSV export."));
+        assert_eq!(Some(42), part_of_issue("Part of #42\r\n"));
+        assert_eq!(None, part_of_issue("Closes #42"));
+        assert_eq!(None, part_of_issue("Part of #42 and #43"));
+        assert_eq!(None, part_of_issue("Add CSV export.\n\nPart of #42"));
+    }
+
+    #[test]
+    fn an_issue_left_open_is_named_with_what_is_left() {
+        let mut state = IssueRun::new(42, "t");
+        state.criteria = vec![Ruled {
+            raw: "- [ ] a".into(),
+            line: 1,
+            text: "a".into(),
+            status: Some(Mark::NotMet),
+            reason: "no".into(),
+        }];
+        state.left_open = Some(1);
+        let text = outcome_comment(&state, &Ledger::new(), &Ending::Approved, &style()).unwrap();
+        assert!(
+            text.contains(
+                "#42 stays open after this merges, with one acceptance criterion not ruled met. \
+                 `spar run 42` continues it."
+            ),
+            "{text}"
         );
     }
 

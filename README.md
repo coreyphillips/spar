@@ -357,8 +357,17 @@ newlines, or shell punctuation, or put `--` before the prompt after any options.
 
 The drafted acceptance criteria are `- [ ]` checkboxes, and the run treats them
 as a list: each agent is asked about every one by number, and a box is ticked
-when spar merges a pull request the review ruled met it. See "Acceptance
-criteria" under "How a run goes".
+when spar merges a pull request the review ruled met it. The pull request
+closes the issue only when every box is ruled met. Otherwise it says
+`Part of #N`, and the issue stays open after the merge with its remaining boxes
+unchecked. See "Acceptance criteria" and "Closing the issue" under "How a run
+goes".
+
+The draft is one issue, and the run gives it one pull request. A request too
+large for that has two paths. File it with `spar code "..." --file-only`, break
+it up with `spar split N`, and run it with `spar run N` and
+`decompose_trackers = true`. Or run `spar run N` again after each merge until
+every box is ticked: each run is handed only the boxes still unchecked.
 
 The issue URL and a `spar run <number>` recovery command print before triage,
 even with `--quiet`. If a later step fails, use that issue number to continue.
@@ -431,7 +440,25 @@ criteria`, labelled as the author's account. Each review, and the closing pass,
 rules on the same list: met, not met, or needs a person, and what it checked.
 The ruling that counts is the one from the pass that signs the pull request off,
 so a tick always comes from the agent that did not write the head, never from
-the author's claim. A ruling does not gate the merge.
+the author's claim.
+
+**Closing the issue.** A pull request closes its issue only when every criterion
+is met. It opens with `Closes #N` when the issue has no criteria or the author
+marks every one done, and with `Part of #N` otherwise. At sign-off, before the
+outcome comment, the move out of draft and the merge, spar changes that first
+line to match the signing ruling: `Closes #N` when every criterion is ruled met,
+`Part of #N` when any is not met or needs a person. This happens with
+`auto_merge` off too, so a person who merges gets the right line. Only the line
+spar wrote is changed. If somebody edited it, spar leaves the body alone and
+says why in the log. The edit counts in the `writes:` line. If it fails while a
+criterion is unmet, spar does not merge, and the pull request stays approved
+with its first line as it was. A ruling of not met does not stop a merge on its
+own: a correct part of the work still lands, and the issue stays open. The
+outcome comment and the run report then say how many criteria are left and that
+`spar run N` continues it. Closing keywords for the issue anywhere else in the
+body spar writes are turned into `part of #N`. The pull request title names what
+the change ships, from the implementor's report, with ` (#N)` after it, and falls
+back to the issue title when the report gives none.
 
 When spar merges the pull request itself, it ticks each criterion ruled met on
 the issue, the same way the tracker checklist is ticked: the body is read again
@@ -443,7 +470,8 @@ even on an otherwise clean approval. With `auto_merge` off, or
 `tick_criteria = false`, nothing is ticked, because a tick means the work
 landed, and the outcome comment lists every ruling instead. Ticks count in the
 `writes:` line like any other GitHub write. Resuming a pull request that closes
-an issue in this repository does the same. A person merging does not tick
+an issue in this repository does the same, and so does resuming one spar opened
+as `Part of #N` on its `issue-N` branch. A person merging does not tick
 anything.
 
 **Follow-ups.** A review that finds something real but out of scope files it as

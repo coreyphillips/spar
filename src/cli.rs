@@ -1710,6 +1710,9 @@ fn issues_covered_by(repo: &Repo, prs: &[i64]) -> BTreeMap<i64, i64> {
                 for issue in &view.closing_issues_references {
                     covered.insert(issue.number, *number);
                 }
+                if let Some(issue) = review::part_of_pr(repo, &view) {
+                    covered.insert(issue, *number);
+                }
             }
             Err(e) => logwarn!(
                 "#{number}: could not read which issue(s) it closes, so none are skipped: {}",

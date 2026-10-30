@@ -170,6 +170,10 @@ pub fn implementation() -> Value {
                 "type": "string",
                 "description": "Only when not_worth_doing is true, empty string otherwise. One or two sentences, posted verbatim on the issue, so write it for the person who opened it."
             },
+            "title": {
+                "type": "string",
+                "description": "A short pull request title naming what this change ships, not the issue's title. When the change delivers only part of the issue, name that part."
+            },
             "summary": {
                 "type": "string",
                 "description": "One plain sentence saying what changed, at most 200 characters. It leads the pull request body, and it carries one fact: what this does now that it did not before. Not the signatures, not the null handling, not the edge cases, all of which belong in changes. If it needs a comma to join two ideas, or reads like a changelog line, it is carrying too much."
@@ -193,7 +197,7 @@ pub fn implementation() -> Value {
                 "description": "Null unless there is something the reviewer would otherwise have to ask about: a deliberate omission, a decision worth defending, a risk you are taking knowingly. Not a summary of the above, and not an apology."
             }
         },
-        "required": ["not_worth_doing", "reason", "summary", "problem", "changes", "testing", "notes"]
+        "required": ["not_worth_doing", "reason", "title", "summary", "problem", "changes", "testing", "notes"]
     })
 }
 

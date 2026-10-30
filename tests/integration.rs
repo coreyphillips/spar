@@ -9296,10 +9296,22 @@ case "$1 $2" in
     ;;
   "pr create")
     touch "$SPAR_CODE_DIR/pr-created"
+    while [ $# -gt 0 ]; do
+      if [ "$1" = --body ]; then printf '%s' "$2" > "$SPAR_CODE_DIR/pr-body"; fi
+      shift
+    done
     printf '%s\n' 'https://github.com/example/project/pull/43'
+    ;;
+  "pr edit")
+    if [ "${SPAR_CODE_MODE:-}" = pr-edit-failure ]; then exit 1; fi
+    cat > "$SPAR_CODE_DIR/pr-body"
     ;;
   "pr view")
     case "$*" in
+      *closingIssuesReferences*) printf '%s\n' "$SPAR_CODE_PR_VIEW" ;;
+      *"--json body"*)
+        printf '{"body":%s}\n' "$(awk 'BEGIN { ORS = ""; print "\"" } { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, "\\r"); if (NR > 1) print "\\n"; print } END { print "\"" }' "$SPAR_CODE_DIR/pr-body")"
+        ;;
       *headRefOid*) printf '{"headRefOid":"%s"}\n' "$(git rev-parse origin/issue-42)" ;;
       *state*)
         if [ -f "$SPAR_CODE_DIR/pr-merged" ]; then
@@ -9314,6 +9326,7 @@ case "$1 $2" in
   "pr comment"|"issue comment") : ;;
   "repo view") printf '%s\n' '{"name":"project"}' ;;
   "api repos/{owner}/{repo}/issues/42") printf '%s\n' 'issue' ;;
+  "api repos/{owner}/{repo}/issues/43") printf '%s\n' 'pr' ;;
   "api --paginate") printf '%s\n' '[]' ;;
   *) printf 'unexpected gh call: %s\n' "$*" >&2; exit 64 ;;
 esac
@@ -9341,7 +9354,9 @@ case "$*" in
   *"Implement GitHub issue #42"*)
     printf '%s\n' "implement:$1" >> "$SPAR_CODE_DIR/stages.log"
     printf 'CSV export\n' > export.txt
-    printf '%s\n' '{"summary":"Add CSV export","problem":"Rows cannot be exported","changes":["Export rows"],"testing":["Checked the fixture"],"notes":null,"criteria":[{"number":1,"status":"done","reason":"Columns keep their order"}]}'
+    title=''
+    if [ -n "${SPAR_CODE_TITLE:-}" ]; then title="\"title\":\"$SPAR_CODE_TITLE\","; fi
+    printf '{%s"summary":"Add CSV export","problem":"Rows cannot be exported","changes":["Export rows"],"testing":["Checked the fixture"],"notes":null,"criteria":[{"number":1,"status":"%s","reason":"Columns keep their order"}]}\n' "$title" "${SPAR_CODE_AUTHOR:-done}"
     ;;
   *"Review the changes on this branch"*)
     printf '%s\n' "review:$1" >> "$SPAR_CODE_DIR/stages.log"
@@ -9675,6 +9690,159 @@ fn code_leaves_a_criterion_ruled_not_met_unchecked_and_names_it() {
         calls.contains("- Not met: Preserve column order. Checked the header row."),
         "{calls}\n{out}"
     );
+    // The author said done, so the PR opened closing #42. The ruling took
+    // that back before the merge.
+    assert!(calls.contains("--body Closes #42\n"), "{calls}");
+    let edited = calls.find("pr edit 43").expect("no pr edit");
+    assert!(edited < calls.find("pr merge ").unwrap(), "{calls}");
+    assert!(test.log("pr-body").starts_with("Part of #42\n\n"));
+    let open = "#42 stays open after this merges, with one acceptance criterion not ruled met. \
+                `spar run 42` continues it.";
+    assert!(calls.contains(open), "{calls}");
+    assert!(out.contains(open), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn code_closes_the_issue_once_the_review_rules_every_criterion_met() {
+    let (test, out) = code_criteria_run_with(true, "met", "", &[("SPAR_CODE_AUTHOR", "not_done")]);
+    let calls = test.log("gh.log");
+    assert!(calls.contains("--body Part of #42\n"), "{calls}");
+    assert!(!calls.contains("Closes #42"), "{calls}");
+    let edited = calls.find("pr edit 43").expect("no pr edit");
+    assert!(edited < calls.find("pr merge ").unwrap(), "{calls}");
+    assert!(test.log("pr-body").starts_with("Closes #42\n\n"));
+    assert_eq!(1, calls.matches("issue edit 42").count(), "{calls}");
+    assert!(test
+        .log("issue-edit-body")
+        .contains("- [x] Preserve column order."));
+    assert!(!out.contains("stays open"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn code_says_part_of_without_auto_merge_and_merges_nothing() {
+    let (test, out) = code_criteria_run(false, "not_met");
+    let calls = test.log("gh.log");
+    assert!(calls.contains("pr edit 43"), "{calls}");
+    assert!(test.log("pr-body").starts_with("Part of #42\n\n"));
+    assert!(!calls.contains("pr merge"), "{calls}");
+    assert!(!calls.contains("issue edit"), "{calls}");
+    // One write more than the same run whose body needed no edit.
+    let (_, unedited) = code_criteria_run(false, "met");
+    assert!(
+        unedited.contains("writes: 4 attempted, 4 succeeded"),
+        "{unedited}"
+    );
+    assert!(out.contains("writes: 5 attempted, 5 succeeded"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn code_does_not_merge_when_the_body_cannot_say_part_of() {
+    let test = CodeFixture::new();
+    test.set_loop("auto_merge = true\n");
+    let body = code_body();
+    let (ok, out, err) = test.run_with(
+        &["--max-rounds", "1", "--first", "b"],
+        CODE_DRAFT,
+        "pr-edit-failure",
+        &[("SPAR_CODE_BODY", &body), ("SPAR_CODE_RULING", "not_met")],
+    );
+    // A failed write fails the run.
+    assert!(!ok, "{out}\n{err}");
+    let calls = test.log("gh.log");
+    assert!(calls.contains("pr edit 43"), "{calls}");
+    assert!(!calls.contains("pr merge"), "{calls}");
+    assert!(!calls.contains("issue edit"), "{calls}");
+    assert!(test.log("pr-body").starts_with("Closes #42\n\n"));
+    assert!(
+        out.contains("not merged: the body could not be changed to `Part of #42`"),
+        "{out}"
+    );
+    assert!(out.contains("1 failed"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn code_titles_the_pr_for_what_it_ships() {
+    let (test, _) = code_criteria_run_with(
+        true,
+        "met",
+        "",
+        &[("SPAR_CODE_TITLE", "Export rows as CSV")],
+    );
+    let calls = test.log("gh.log");
+    assert!(
+        calls.contains("--title Export rows as CSV (#42) --body"),
+        "{calls}"
+    );
+    let (test, _) = code_criteria_run(true, "met");
+    let calls = test.log("gh.log");
+    assert!(
+        calls.contains("--title Add CSV export (#42) --body"),
+        "{calls}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn resuming_a_part_of_pr_rules_on_its_issue_and_ticks_after_merging() {
+    let (test, _) = code_criteria_run(false, "not_met");
+    assert!(test.log("pr-body").starts_with("Part of #42\n\n"));
+    let config = std::fs::read_to_string(&test.config).unwrap();
+    std::fs::write(
+        &test.config,
+        config.replace("auto_merge = false", "auto_merge = true"),
+    )
+    .unwrap();
+    std::fs::remove_file(test.fx.dir.join("prompts.log")).unwrap();
+    std::fs::remove_file(test.fx.dir.join("gh.log")).unwrap();
+    let view = serde_json::json!({
+        "number": 43,
+        "url": "https://github.com/example/project/pull/43",
+        "title": "Add CSV export (#42)",
+        "body": test.log("pr-body"),
+        "headRefName": "issue-42",
+        "baseRefName": "main",
+        "state": "OPEN",
+        "closingIssuesReferences": [],
+        "isCrossRepository": false
+    })
+    .to_string();
+    let body = code_body();
+    let (ok, out, err) = spar_with_env(
+        &[
+            "resume",
+            "43",
+            "--config",
+            test.config.to_str().unwrap(),
+            "--repo",
+            test.fx.work.to_str().unwrap(),
+            "--max-rounds",
+            "1",
+        ],
+        &test.fx.dir,
+        &[
+            ("PATH", test.path.as_str()),
+            ("SPAR_CODE_DIR", test.fx.dir.to_str().unwrap()),
+            ("SPAR_CODE_DRAFT", CODE_DRAFT),
+            ("SPAR_CODE_MODE", ""),
+            ("SPAR_CODE_BODY", body.as_str()),
+            ("SPAR_CODE_RULING", "met"),
+            ("SPAR_CODE_PR_VIEW", view.as_str()),
+        ],
+    );
+    assert!(ok, "{out}\n{err}");
+    let prompts = test.log("prompts.log");
+    assert!(prompts.contains("1. Preserve column order."), "{prompts}");
+    let calls = test.log("gh.log");
+    assert!(test.log("pr-body").starts_with("Closes #42\n\n"), "{calls}");
+    assert_eq!(1, calls.matches("pr merge ").count(), "{calls}");
+    assert_eq!(1, calls.matches("issue edit 42").count(), "{calls}");
+    assert!(test
+        .log("issue-edit-body")
+        .contains("- [x] Preserve column order."));
 }
 
 #[cfg(unix)]

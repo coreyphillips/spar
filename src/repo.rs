@@ -6994,7 +6994,7 @@ fn git_without_maintenance_argv(args: &[&str]) -> Vec<String> {
     argv
 }
 
-fn git_without_automation_argv(args: &[&str]) -> Vec<String> {
+pub(crate) fn git_without_automation_argv(args: &[&str]) -> Vec<String> {
     let mut argv = git_without_maintenance_argv(&[]);
     argv.extend([
         "-c".to_string(),

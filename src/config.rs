@@ -926,6 +926,8 @@ pub struct Config {
     pub alternate_first: bool,
     /// Where this config was read from, for error messages.
     pub source: Option<PathBuf>,
+    /// Other repositories every agent call gets a checkout of.
+    pub projects: Vec<ProjectCfg>,
 }
 
 impl Config {
@@ -1015,6 +1017,132 @@ struct RawConfig {
     style: Option<StyleCfg>,
     #[serde(default)]
     listen: Option<ListenCfg>,
+    #[serde(default)]
+    projects: Vec<RawProject>,
+}
+
+// ---------------------------------------------------------------------------
+// Other projects a run may read
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProject {
+    name: Option<String>,
+    path: Option<String>,
+    repo: Option<String>,
+    access: Option<String>,
+}
+
+/// What a run may do in another project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectAccess {
+    Read,
+    Write,
+}
+
+impl std::fmt::Display for ProjectAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ProjectAccess::Read => "read",
+            ProjectAccess::Write => "write",
+        })
+    }
+}
+
+/// Where another project's history comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectSource {
+    /// The user's own clone. Spar reads its origin URL and nothing else.
+    Path(PathBuf),
+    /// `owner/name` on GitHub, cloned by spar into a directory it owns.
+    Repo(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCfg {
+    pub name: String,
+    pub source: ProjectSource,
+    pub access: ProjectAccess,
+}
+
+impl ProjectCfg {
+    pub fn describe_source(&self) -> String {
+        match &self.source {
+            ProjectSource::Path(path) => path.display().to_string(),
+            ProjectSource::Repo(slug) => slug.clone(),
+        }
+    }
+}
+
+/// `owner/name` from a slug or a GitHub URL, or None when it is neither.
+pub fn github_slug(text: &str) -> Option<String> {
+    let text = text.trim().trim_end_matches('/');
+    let text = text.strip_suffix(".git").unwrap_or(text);
+    let rest = [
+        "https://github.com/",
+        "http://github.com/",
+        "git@github.com:",
+        "ssh://git@github.com/",
+    ]
+    .iter()
+    .find_map(|prefix| text.strip_prefix(prefix))
+    .unwrap_or(text);
+    let mut parts = rest.split('/');
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return None;
+    };
+    let valid = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    (valid(owner) && valid(name)).then(|| format!("{owner}/{name}"))
+}
+
+fn build_projects(raw: Vec<RawProject>) -> Result<Vec<ProjectCfg>> {
+    let mut out: Vec<ProjectCfg> = Vec::new();
+    for (index, project) in raw.into_iter().enumerate() {
+        let name = project.name.as_deref().map(str::trim).unwrap_or_default();
+        if name.is_empty() {
+            bail!("[[projects]] entry {} has no name", index + 1);
+        }
+        if out.iter().any(|p| p.name == name) {
+            bail!("project '{name}' is configured twice: each [[projects]] name must be unique");
+        }
+        let blank = |v: &Option<String>| v.as_deref().is_none_or(|s| s.trim().is_empty());
+        let source = match (blank(&project.path), blank(&project.repo)) {
+            (false, false) => bail!("project '{name}' sets both path and repo: give exactly one"),
+            (true, true) => bail!("project '{name}' needs a path or a repo"),
+            (false, true) => {
+                let path = expand_tilde(project.path.as_deref().unwrap_or_default().trim());
+                ProjectSource::Path(path)
+            }
+            (true, false) => {
+                let raw = project.repo.as_deref().unwrap_or_default();
+                let Some(slug) = github_slug(raw) else {
+                    bail!(
+                        "project '{name}' has repo = \"{raw}\", which is neither owner/name nor \
+                         a GitHub URL"
+                    );
+                };
+                ProjectSource::Repo(slug)
+            }
+        };
+        let access = match project.access.as_deref().map(str::trim) {
+            None | Some("read") => ProjectAccess::Read,
+            Some("write") => ProjectAccess::Write,
+            Some(other) => {
+                bail!("project '{name}' has access = \"{other}\": it must be \"read\" or \"write\"")
+            }
+        };
+        out.push(ProjectCfg {
+            name: name.to_string(),
+            source,
+            access,
+        });
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1240,6 +1368,14 @@ pub fn mentions(config_text: &str, key: &str) -> bool {
     })
 }
 
+/// Whether a config file has a `[[projects]]` table, set or commented out.
+pub fn mentions_projects(config_text: &str) -> bool {
+    config_text.lines().any(|line| {
+        let bare = line.trim_start().trim_start_matches('#').trim_start();
+        bare.starts_with("[[projects]]")
+    })
+}
+
 /// Options this config file has never heard of, which is what somebody who
 /// upgraded wants to know.
 pub fn unmentioned_options(config_text: &str) -> Vec<OptionInfo> {
@@ -1306,6 +1442,7 @@ pub fn parse(text: &str) -> Result<Config> {
     let loop_cfg = raw.loop_cfg.unwrap_or_default();
     let style = raw.style.unwrap_or_default().to_style();
     let listen = raw.listen.unwrap_or_default();
+    let projects = build_projects(raw.projects)?;
 
     if loop_cfg.max_rounds == 0 {
         bail!("max_rounds must be at least 1");
@@ -1369,6 +1506,7 @@ pub fn parse(text: &str) -> Result<Config> {
         first_implementor: first,
         alternate_first: alternate,
         source: None,
+        projects,
     })
 }
 
@@ -1380,6 +1518,79 @@ pub fn resolve_search_path(raw: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PAIR: &str = "[agents.a]\ncommand = [\"x\"]\n[agents.b]\ncommand = [\"y\"]\n";
+
+    fn projects_error(extra: &str) -> String {
+        parse(&format!("{PAIR}{extra}")).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn projects_parse_with_read_as_the_default() {
+        let cfg = parse(&format!(
+            "{PAIR}[[projects]]\nname = \"engine\"\npath = \"/tmp/engine\"\n\
+             [[projects]]\nname = \"core\"\nrepo = \"https://github.com/o/core.git\"\naccess = \"write\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            vec![
+                ProjectCfg {
+                    name: "engine".into(),
+                    source: ProjectSource::Path("/tmp/engine".into()),
+                    access: ProjectAccess::Read,
+                },
+                ProjectCfg {
+                    name: "core".into(),
+                    source: ProjectSource::Repo("o/core".into()),
+                    access: ProjectAccess::Write,
+                },
+            ],
+            cfg.projects
+        );
+    }
+
+    #[test]
+    fn no_projects_is_an_empty_list() {
+        assert!(parse(PAIR).unwrap().projects.is_empty());
+    }
+
+    #[test]
+    fn a_bad_project_is_refused_by_name() {
+        let twice = projects_error(
+            "[[projects]]\nname = \"e\"\nrepo = \"o/a\"\n[[projects]]\nname = \"e\"\nrepo = \"o/b\"\n",
+        );
+        assert!(twice.contains("'e'") && twice.contains("twice"), "{twice}");
+        let both = projects_error("[[projects]]\nname = \"e\"\nrepo = \"o/a\"\npath = \"/x\"\n");
+        assert!(both.contains("'e'") && both.contains("both"), "{both}");
+        let neither = projects_error("[[projects]]\nname = \"e\"\n");
+        assert!(
+            neither.contains("'e'") && neither.contains("path or a repo"),
+            "{neither}"
+        );
+        let access =
+            projects_error("[[projects]]\nname = \"e\"\nrepo = \"o/a\"\naccess = \"admin\"\n");
+        assert!(
+            access.contains("'e'") && access.contains("admin"),
+            "{access}"
+        );
+        let slug = projects_error("[[projects]]\nname = \"e\"\nrepo = \"not a repo\"\n");
+        assert!(slug.contains("'e'"), "{slug}");
+    }
+
+    #[test]
+    fn a_github_slug_comes_from_any_usual_spelling() {
+        for text in [
+            "o/r",
+            "https://github.com/o/r",
+            "https://github.com/o/r.git",
+            "git@github.com:o/r.git",
+            "ssh://git@github.com/o/r",
+        ] {
+            assert_eq!(Some("o/r".to_string()), github_slug(text), "{text}");
+        }
+        assert_eq!(None, github_slug("https://gitlab.com/o/r"));
+        assert_eq!(None, github_slug("/home/me/r"));
+    }
 
     const TWO_AGENTS: &str = r#"
 [agents.claude]

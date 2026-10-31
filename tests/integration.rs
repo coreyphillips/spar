@@ -9845,3 +9845,214 @@ fn code_rejects_whitespace_before_loading_a_config() {
     assert!(!ok);
     assert!(err.contains("nonempty project prompt"), "{err}");
 }
+
+// -- [[projects]] -------------------------------------------------------------
+
+fn with_project(path: &Path) -> Config {
+    config::parse(&format!(
+        "{TWO_AGENTS}[[projects]]\nname = \"engine\"\npath = \"{}\"\n",
+        path.display()
+    ))
+    .unwrap()
+}
+
+fn clone_state(clone: &Path) -> (String, String, String, String) {
+    (
+        git(clone, &["rev-parse", "HEAD"]),
+        git(clone, &["branch", "--list"]),
+        git(clone, &["status", "--porcelain", "--ignored"]),
+        git(clone, &["worktree", "list", "--porcelain"]),
+    )
+}
+
+/// The checkout comes from the linked origin, not the user's clone, and
+/// neither the clone nor its origin is touched.
+#[test]
+fn a_call_reads_a_fresh_checkout_of_each_project_and_leaves_the_clone_alone() {
+    let primary = repo("proj-primary");
+    let linked = repo("proj-linked");
+    // Origin moves on without the user's clone, which also has local work.
+    let other = linked.dir.join("other");
+    git(&linked.dir, &["clone", "-q", "origin.git", "other"]);
+    git(&other, &["config", "user.email", "spar@example.invalid"]);
+    git(&other, &["config", "user.name", "spar test"]);
+    git(&other, &["config", "commit.gpgsign", "false"]);
+    commit(&other, "upstream.txt", "new\n", "upstream");
+    git(&other, &["push", "-q", "origin", "main"]);
+    std::fs::write(linked.work.join("dirty.txt"), "mine\n").unwrap();
+    let before = clone_state(&linked.work);
+
+    let cfg = with_project(&linked.work);
+    let projects = std::sync::Arc::new(
+        spar::projects::Projects::resolve(&cfg.projects, &primary.work, false).unwrap(),
+    );
+    let mut spec = cfg.agents[0].clone();
+    spec.command = vec![
+        CommandPart::One("/bin/sh".into()),
+        CommandPart::One("-c".into()),
+        CommandPart::One(
+            "cat \"$0/upstream.txt\"; test ! -e \"$0/dirty.txt\" && printf '%s' \"$0\"".into(),
+        ),
+        CommandPart::Group(vec!["{add_dir}".into()]),
+    ];
+    let agent = Agent::new(spec).with_projects(projects);
+    let effort = spar::agent::Effort::just(None);
+    let answer = agent.ask("read it", &primary.work, &effort).unwrap();
+    let (content, dir) = answer.split_at(answer.find('/').unwrap());
+    assert_eq!("new", content.trim());
+    assert!(
+        !Path::new(dir).exists(),
+        "the checkout was not removed: {dir}"
+    );
+    assert_eq!(before, clone_state(&linked.work));
+}
+
+/// One call with `linked` as the project, running `script` with the checkout
+/// as `$0`.
+fn ask_with_project(primary: &Path, linked: &Path, script: &str) -> spar::error::Result<String> {
+    let cfg = with_project(linked);
+    let projects = std::sync::Arc::new(
+        spar::projects::Projects::resolve(&cfg.projects, primary, false).unwrap(),
+    );
+    let mut spec = cfg.agents[0].clone();
+    spec.command = vec![
+        CommandPart::One("/bin/sh".into()),
+        CommandPart::One("-c".into()),
+        CommandPart::One(script.into()),
+        CommandPart::Group(vec!["{add_dir}".into()]),
+    ];
+    let effort = spar::agent::Effort::just(None);
+    Agent::new(spec)
+        .with_projects(projects)
+        .ask("read it", primary, &effort)
+}
+
+#[test]
+fn a_call_that_changes_a_project_checkout_has_its_answer_discarded() {
+    let primary = repo("proj-write-primary");
+    let linked = repo("proj-write-linked");
+    let before = clone_state(&linked.work);
+    let script = "echo edit >> \"$0/README.md\"; echo done";
+    let err = ask_with_project(&primary.work, &linked.work, script).unwrap_err();
+    assert!(err.to_string().contains("project 'engine'"), "{err}");
+    assert!(git(&primary.work, &["status", "--porcelain"]).is_empty());
+    assert_eq!(before, clone_state(&linked.work));
+}
+
+#[test]
+fn a_project_edit_git_status_does_not_show_is_still_caught() {
+    let primary = repo("proj-hidden-primary");
+    let linked = repo("proj-hidden-linked");
+    let script =
+        "cd \"$0\" && git update-index --skip-worktree README.md && echo edit > README.md \
+                  && test -z \"$(git status --porcelain)\" && echo done";
+    let err = ask_with_project(&primary.work, &linked.work, script).unwrap_err();
+    assert!(err.to_string().contains("project 'engine'"), "{err}");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_helper_a_call_sets_in_a_project_is_not_run_by_spar() {
+    use std::os::unix::fs::PermissionsExt;
+    let primary = repo("proj-helper-primary");
+    let linked = repo("proj-helper-linked");
+    let ran = linked.dir.join("ran");
+    let helper = linked.dir.join("helper.sh");
+    std::fs::write(&helper, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let script = format!(
+        "git -C \"$0\" config core.fsmonitor '{}' && echo done",
+        helper.display()
+    );
+    let err = ask_with_project(&primary.work, &linked.work, &script).unwrap_err();
+    assert!(err.to_string().contains("config changed"), "{err}");
+    assert!(!ran.exists(), "spar ran the helper the call configured");
+}
+
+/// A filter set by one call is neither run by the next checkout nor left in
+/// the mirror.
+#[test]
+fn a_filter_a_call_sets_in_a_project_is_not_run_by_a_later_checkout() {
+    let primary = repo("proj-filter-primary");
+    let linked = repo("proj-filter-linked");
+    commit(
+        &linked.work,
+        ".gitattributes",
+        "*.txt filter=probe\n",
+        "attrs",
+    );
+    commit(&linked.work, "a.txt", "a\n", "a");
+    git(&linked.work, &["push", "-q", "origin", "main"]);
+    let ran = linked.dir.join("ran");
+    let cfg = with_project(&linked.work);
+    let projects = std::sync::Arc::new(
+        spar::projects::Projects::resolve(&cfg.projects, &primary.work, false).unwrap(),
+    );
+    let mut spec = cfg.agents[0].clone();
+    spec.command = vec![
+        CommandPart::One("/bin/sh".into()),
+        CommandPart::One("-c".into()),
+        CommandPart::One(format!(
+            "git -C \"$0\" config filter.probe.smudge \"touch '{}'; cat\" && echo done",
+            ran.display()
+        )),
+        CommandPart::Group(vec!["{add_dir}".into()]),
+    ];
+    let effort = spar::agent::Effort::just(None);
+    let err = Agent::new(spec)
+        .with_projects(projects.clone())
+        .ask("read it", &primary.work, &effort)
+        .unwrap_err();
+    assert!(err.to_string().contains("config changed"), "{err}");
+    let made = projects.checkouts().unwrap();
+    assert_eq!(1, made.dirs().len());
+    assert!(
+        !ran.exists(),
+        "a later checkout ran the filter the call set"
+    );
+}
+
+/// Two names that are the same once made safe for a directory still get a
+/// mirror each, on every call and not only the first.
+#[test]
+fn each_project_checks_out_the_repository_it_names() {
+    let primary = repo("proj-mirror-primary");
+    let a = repo("proj-mirror-a");
+    let b = repo("proj-mirror-b");
+    for (fx, who) in [(&a, "a\n"), (&b, "b\n")] {
+        commit(&fx.work, "who.txt", who, "who");
+        git(&fx.work, &["push", "-q", "origin", "main"]);
+    }
+    let cfg = config::parse(&format!(
+        "{TWO_AGENTS}[[projects]]\nname = \"engine.core\"\npath = \"{}\"\n\
+         [[projects]]\nname = \"engine_core\"\npath = \"{}\"\n",
+        a.work.display(),
+        b.work.display()
+    ))
+    .unwrap();
+    let projects = spar::projects::Projects::resolve(&cfg.projects, &primary.work, false).unwrap();
+    for _ in 0..2 {
+        let made = projects.checkouts().unwrap();
+        let read: Vec<String> = made
+            .dirs()
+            .iter()
+            .map(|dir| std::fs::read_to_string(Path::new(dir).join("who.txt")).unwrap())
+            .collect();
+        assert_eq!(vec!["a\n", "b\n"], read);
+    }
+}
+
+#[test]
+fn a_project_must_be_a_repository_other_than_this_one() {
+    let primary = repo("proj-self");
+    let cfg = with_project(&primary.work);
+    let err = spar::projects::Projects::resolve(&cfg.projects, &primary.work, false)
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("'engine'"), "{err}");
+    let missing = with_project(&primary.dir.join("nowhere"));
+    let err = spar::projects::Projects::resolve(&missing.projects, &primary.work, false)
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("not a git repository"), "{err}");
+}

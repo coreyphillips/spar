@@ -1510,7 +1510,23 @@ fn prepare(common: &Common, overrides: Option<Overrides>) -> Result<(Config, Rep
         cfg.loop_cfg.base_branch = repo.default_branch(cfg.base_branch());
     }
 
-    let agents = agent::build(&cfg)?;
+    let projects = std::sync::Arc::new(crate::projects::Projects::resolve(
+        &cfg.projects,
+        repo.root(),
+        cfg.loop_cfg.keep_worktrees,
+    )?);
+    let agents: Vec<_> = agent::build(&cfg)?
+        .into_iter()
+        .map(|agent| agent.with_projects(projects.clone()))
+        .collect();
+    for project in projects.iter() {
+        log!(
+            "project {} ({} access) at {}",
+            project.name,
+            project.access,
+            project.location()
+        );
+    }
     if let Some(warning) = agent::correlation_warning(&agents) {
         logging::warn(warning);
     }
@@ -2070,7 +2086,8 @@ fn cmd_init_update(out: &Path) -> Result<i32> {
     config::parse(&text).map_err(|e| spar_err!("{} does not parse: {e}", out.display()))?;
 
     let unset = config::unmentioned_options(&text);
-    if unset.is_empty() {
+    let add_projects = !config::mentions_projects(&text);
+    if unset.is_empty() && !add_projects {
         println!("{} already mentions every setting.", out.display());
         return Ok(0);
     }
@@ -2095,6 +2112,10 @@ fn cmd_init_update(out: &Path) -> Result<i32> {
         block.push_str(&wrap_comment(note_for(&option.key)));
         block.push_str(&format!("# {} = {}\n", option.key, option.default));
     }
+    if add_projects {
+        block.push('\n');
+        block.push_str(PROJECTS_BLOCK);
+    }
 
     use std::io::Write;
     std::fs::OpenOptions::new()
@@ -2105,7 +2126,7 @@ fn cmd_init_update(out: &Path) -> Result<i32> {
 
     println!(
         "added {} setting(s) to {} as comments",
-        unset.len(),
+        unset.len() + usize::from(add_projects),
         out.display()
     );
     Ok(0)
@@ -2190,6 +2211,10 @@ fn cmd_init(out: &Path, force: bool) -> Result<i32> {
         text.push_str(&agent_block(name, spec));
     }
     text.push_str(&settings_block(&chosen[0].0));
+    // Apart from the settings, which are each one line to uncomment: a
+    // project is a table, and its keys belong under its header.
+    text.push('\n');
+    text.push_str(PROJECTS_BLOCK);
 
     std::fs::write(out, text).map_err(|e| spar_err!("could not write {}: {e}", out.display()))?;
     println!("\nwrote {}", out.display());
@@ -2264,6 +2289,22 @@ const LOOP_OPTIONS: &[Setting] = &[
     (true, "checkin_resolve", "Mark a review thread resolved when spar made the change it asked for. A thread spar disagreed with is left open whatever this says."),
     (true, "max_checkin_comments", "Most unanswered comments spar will answer on one pull request in a run. A backstop against a long argument being read back to somebody, not a target."),
 ];
+
+/// Written commented out, since a project is a path or a repository only the
+/// person writing the config can name.
+const PROJECTS_BLOCK: &str = "\
+# Other repositories every agent call may read. Each call gets a fresh checkout
+# of each one at its origin base branch, made from a copy spar keeps, so a path
+# here is never checked out, fetched into, or edited. A call that changes a
+# checkout has its answer thrown away. Each entry names exactly one of path (a
+# local clone) or repo (owner/name or a GitHub URL, which spar clones with gh).
+# access is read, the default, or write. Changes to another project go through
+# that project's own issues and pull requests, never through this repository's.
+# [[projects]]
+# name   = \"engine\"
+# path   = \"~/code/engine\"
+# access = \"read\"
+";
 
 const STYLE_OPTIONS: &[Setting] = &[
     (false, "ban_em_dash", "Strip em-dashes and en-dashes from everything spar posts, then refuse to post text that still has one."),
@@ -2450,6 +2491,54 @@ fn note_for(key: &str) -> &'static str {
         .unwrap_or("")
 }
 
+/// What `doctor` says about `[[projects]]`: each one, and each agent that
+/// would not be handed their checkouts.
+///
+/// Checked against the working directory as the primary repository, which is
+/// where a run started from here would be. Outside one, the projects are
+/// listed as configured and the primary check is left to the run.
+fn project_lines(cfg: &config::Config) -> Vec<String> {
+    if cfg.projects.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec!["\n  projects:".to_string()];
+    let here = std::env::current_dir().unwrap_or_default();
+    match crate::projects::Projects::resolve(&cfg.projects, &here, cfg.loop_cfg.keep_worktrees) {
+        Ok(resolved) => {
+            for project in resolved.iter() {
+                out.push(format!(
+                    "  ok    {:12} {} access, {}",
+                    project.name,
+                    project.access,
+                    project.location()
+                ));
+            }
+        }
+        Err(e) => {
+            for project in &cfg.projects {
+                out.push(format!(
+                    "  ??    {:12} {} access, {}",
+                    project.name,
+                    project.access,
+                    project.describe_source()
+                ));
+            }
+            out.push(format!("  FAIL  projects     {}", e.first_line()));
+        }
+    }
+    for spec in &cfg.agents {
+        let template = spec.command.iter().flat_map(|p| p.args());
+        if !template.into_iter().any(|a| a.contains("{add_dir}")) {
+            out.push(format!(
+                "  WARNING  {}'s command has no {{add_dir}}, so it is not handed the project \
+                 checkouts and can only learn their paths from the prompt",
+                spec.name
+            ));
+        }
+    }
+    out
+}
+
 /// Wrap a note across comment lines so a long one does not run off the edge.
 fn wrap_comment(text: &str) -> String {
     const WIDTH: usize = 76;
@@ -2566,6 +2655,11 @@ fn cmd_doctor(config_path: Option<&Path>) -> Result<i32> {
 
     for line in unknown_effort_values(&cfg) {
         println!("\n  WARNING  {line}");
+    }
+
+    for line in project_lines(&cfg) {
+        ok &= !line.starts_with("  FAIL");
+        println!("{line}");
     }
 
     println!(

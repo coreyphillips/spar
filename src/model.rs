@@ -1816,6 +1816,37 @@ pub struct ReviewRequested {
     pub who: Login,
 }
 
+/// An issue, with who it is assigned to now and every assignment its timeline
+/// shows, as `spar listen` reads them to tell an assignment it has not judged
+/// from one it has.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AssignedIssue {
+    pub number: i64,
+    pub title: String,
+    /// The logins assigned to it now.
+    pub assignees: Vec<String>,
+    /// Each assignment as `(when, who)`, oldest first.
+    pub assigned: Vec<(String, String)>,
+}
+
+impl AssignedIssue {
+    /// When `viewer` was last assigned to it, while still assigned. None when
+    /// the viewer is not assigned now, however often they were, or when no
+    /// assignment of theirs is on the timeline with a time that reads.
+    pub fn newest_for(&self, viewer: &str) -> Option<String> {
+        let same = |login: &str| crate::comments::same_login(login, viewer);
+        if !self.assignees.iter().any(|a| same(a)) {
+            return None;
+        }
+        self.assigned
+            .iter()
+            .filter(|(_, who)| same(who))
+            .filter_map(|(at, _)| crate::clock::parse_rfc3339(at).map(|t| (t, at)))
+            .max_by_key(|(t, _)| *t)
+            .map(|(_, at)| at.clone())
+    }
+}
+
 /// Issues and pull requests share one number sequence per repository, so a
 /// number names exactly one of them and spar can work out which.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2189,5 +2220,49 @@ mod review_record_tests {
         assert!(doc.rulings.is_empty());
         assert_eq!("APPROVE", ReviewVerdict::Approve.api_event());
         assert_eq!("changes requested", ReviewVerdict::RequestChanges.words());
+    }
+}
+
+#[cfg(test)]
+mod assigned_issue_tests {
+    use super::*;
+
+    fn issue(assignees: &[&str], assigned: &[(&str, &str)]) -> AssignedIssue {
+        AssignedIssue {
+            number: 42,
+            title: "t".into(),
+            assignees: assignees.iter().map(|s| s.to_string()).collect(),
+            assigned: assigned
+                .iter()
+                .map(|(at, who)| (at.to_string(), who.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_newest_assignment_counts_only_for_the_viewer_and_only_while_assigned() {
+        let both = issue(
+            &["somebody", "Viewer"],
+            &[
+                ("2026-11-01T10:00:00Z", "viewer"),
+                ("2026-11-03T09:00:00Z", "somebody"),
+                ("2026-11-02T10:00:00Z", "VIEWER"),
+                ("not a time", "viewer"),
+            ],
+        );
+        assert_eq!(
+            Some("2026-11-02T10:00:00Z".to_string()),
+            both.newest_for("viewer")
+        );
+        assert_eq!(
+            Some("2026-11-03T09:00:00Z".to_string()),
+            both.newest_for("somebody")
+        );
+        // Assigned once and unassigned since: nothing asks the viewer now.
+        let dropped = issue(&["somebody"], &[("2026-11-01T10:00:00Z", "viewer")]);
+        assert_eq!(None, dropped.newest_for("viewer"));
+        // Assigned with no assignment on the timeline to say when.
+        let silent = issue(&["viewer"], &[]);
+        assert_eq!(None, silent.newest_for("viewer"));
     }
 }

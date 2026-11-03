@@ -830,6 +830,26 @@ impl std::fmt::Display for OwnPr {
     }
 }
 
+/// What `spar listen` does with an issue assigned to you.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunOrIgnore {
+    /// `spar run` on it: triage, then the implement and review loop, or the
+    /// pull request already open for it continued.
+    Run,
+    /// Say so in the log and do nothing.
+    Ignore,
+}
+
+impl std::fmt::Display for RunOrIgnore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RunOrIgnore::Run => "run",
+            RunOrIgnore::Ignore => "ignore",
+        })
+    }
+}
+
 /// What `spar listen` does when somebody mentions you on an issue with no pull
 /// request spar reviewed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -863,8 +883,9 @@ pub struct ListenCfg {
     /// Seconds between polls of GitHub's notifications for the repository.
     /// GitHub says how often it will answer, and the larger of the two is used.
     pub interval: u64,
-    /// Seconds between sweeps of the open pull requests. The sweep sees what a
-    /// notification can miss: a review asked for again, an assignment, a
+    /// Seconds between sweeps of the open pull requests and of the issues
+    /// assigned to you. The sweep sees what a notification can miss: a review
+    /// asked for again, an assignment, including one you made yourself, a
     /// close, or a push, which raises no notification for a reviewer.
     pub sweep: u64,
     /// Seconds an item has to stay quiet before spar acts on it, so a review
@@ -879,6 +900,9 @@ pub struct ListenCfg {
     pub max_rechecks: u32,
     pub on_review_requested: ReviewOrIgnore,
     pub on_assigned: ReviewOrIgnore,
+    /// What an issue assigned to you gets, whoever assigned it: `spar run`,
+    /// or nothing.
+    pub on_assigned_issue: RunOrIgnore,
     pub on_own_pr: OwnPr,
     /// Whether a review `spar listen` starts submits a formal verdict, approve
     /// or request changes, rather than a comment. A recheck always does.
@@ -900,6 +924,7 @@ impl Default for ListenCfg {
             max_rechecks: 5,
             on_review_requested: ReviewOrIgnore::Review,
             on_assigned: ReviewOrIgnore::Review,
+            on_assigned_issue: RunOrIgnore::Run,
             on_own_pr: OwnPr::Checkin,
             verdicts: true,
             on_mention: OnMention::Answer,
@@ -1632,6 +1657,7 @@ model = "gpt-5.6-sol"
         assert_eq!(5, bare.listen.max_rechecks);
         assert_eq!(ReviewOrIgnore::Review, bare.listen.on_review_requested);
         assert_eq!(ReviewOrIgnore::Review, bare.listen.on_assigned);
+        assert_eq!(RunOrIgnore::Run, bare.listen.on_assigned_issue);
     }
 
     #[test]
@@ -1683,6 +1709,23 @@ model = "gpt-5.6-sol"
         }
         assert_eq!(OnMention::Answer, ListenCfg::default().on_mention);
         assert_eq!(3, ListenCfg::default().max_answers);
+        for (text, want) in [("run", RunOrIgnore::Run), ("ignore", RunOrIgnore::Ignore)] {
+            let cfg = parse(&format!(
+                "{TWO_AGENTS}\n[listen]\non_assigned_issue = \"{text}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(want, cfg.listen.on_assigned_issue);
+            assert_eq!(text, want.to_string());
+        }
+        let err = parse(&format!(
+            "{TWO_AGENTS}\n[listen]\non_assigned_issue = \"review\"\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("on_assigned_issue") || err.contains("review"),
+            "{err}"
+        );
         let err = parse(&format!("{TWO_AGENTS}\n[listen]\non_own_pr = \"push\"\n"))
             .unwrap_err()
             .to_string();

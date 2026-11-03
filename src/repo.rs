@@ -1264,6 +1264,101 @@ pub fn parse_review_requests(text: &str) -> Option<Vec<crate::model::ReviewReque
     )
 }
 
+/// What one issue says about who it is assigned to, as both assignment
+/// queries ask for it. The last twenty assignments are plenty: only the newest
+/// one of the viewer matters.
+const ASSIGNMENT_FIELDS: &str = "
+        number
+        title
+        assignees(first: 100) { nodes { login } }
+        timelineItems(itemTypes: [ASSIGNED_EVENT], last: 20) {
+          nodes {
+            ... on AssignedEvent {
+              createdAt
+              assignee {
+                ... on User { login }
+                ... on Bot { login }
+                ... on Mannequin { login }
+              }
+            }
+          }
+        }";
+
+/// The open issues assigned to one login, most recently updated first. A
+/// hundred is far more than anybody is assigned at once, and the newest
+/// updates, which are where a new assignment shows, come first.
+fn assigned_issues_query() -> String {
+    format!(
+        "query($owner: String!, $repo: String!, $login: String!) {{
+  repository(owner: $owner, name: $repo) {{
+    issues(states: OPEN, filterBy: {{assignee: $login}}, first: 100, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
+      nodes {{{ASSIGNMENT_FIELDS}
+      }}
+    }}
+  }}
+}}"
+    )
+}
+
+/// The same for one issue, open or not.
+fn issue_assignments_query() -> String {
+    format!(
+        "query($owner: String!, $repo: String!, $number: Int!) {{
+  repository(owner: $owner, name: $repo) {{
+    issue(number: $number) {{{ASSIGNMENT_FIELDS}
+    }}
+  }}
+}}"
+    )
+}
+
+/// One issue node either query returned. None without a number.
+fn assigned_issue(node: &Value) -> Option<crate::model::AssignedIssue> {
+    let text_at = |node: &Value, path: &str| {
+        node.pointer(path)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let nodes = |path: &str| {
+        node.pointer(path)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    Some(crate::model::AssignedIssue {
+        number: node.pointer("/number")?.as_i64()?,
+        title: text_at(node, "/title"),
+        assignees: nodes("/assignees/nodes")
+            .iter()
+            .map(|a| text_at(a, "/login"))
+            .filter(|login| !login.is_empty())
+            .collect(),
+        // An assignment of somebody GitHub no longer knows names nobody, and
+        // one without a time cannot be compared with anything.
+        assigned: nodes("/timelineItems/nodes")
+            .iter()
+            .map(|e| (text_at(e, "/createdAt"), text_at(e, "/assignee/login")))
+            .filter(|(at, who)| !at.is_empty() && !who.is_empty())
+            .collect(),
+    })
+}
+
+/// The issues `assigned_issues_query` returned. None when the answer is not
+/// that shape, which is a failed sweep rather than nobody assigned anything.
+pub fn parse_assigned_issues(text: &str) -> Option<Vec<crate::model::AssignedIssue>> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    let nodes = v.pointer("/data/repository/issues/nodes")?.as_array()?;
+    Some(nodes.iter().filter_map(assigned_issue).collect())
+}
+
+/// The issue `issue_assignments_query` returned. None when the answer is not
+/// that shape.
+pub fn parse_issue_assignments(text: &str) -> Option<crate::model::AssignedIssue> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    assigned_issue(v.pointer("/data/repository/issue")?)
+}
+
 /// The pull request a per item state file is about: `pr-12.json`,
 /// `review-12.json`, `checkin-12.json`. None for anything else, so the shared
 /// files beside them, `spend.json` and the rest, are never touched.
@@ -4743,6 +4838,46 @@ impl Repo {
             ])
             .ok()?;
         parse_review_requests(&text)
+    }
+
+    /// The open issues assigned to `login`, with when each assignment was
+    /// made. GitHub raises no notification for the viewer's own actions, so
+    /// this is the only way `spar listen` learns that somebody assigned an
+    /// issue to themselves.
+    pub fn sweep_assigned_issues(&self, login: &str) -> Result<Vec<crate::model::AssignedIssue>> {
+        let text = self.gh(&[
+            "api",
+            "graphql",
+            "-F",
+            "owner={owner}",
+            "-F",
+            "repo={repo}",
+            "-f",
+            &format!("login={login}"),
+            "-f",
+            &format!("query={}", assigned_issues_query()),
+        ])?;
+        parse_assigned_issues(&text)
+            .ok_or_else(|| spar_err!("unexpected shape for the issues assigned to {login}"))
+    }
+
+    /// Who issue `number` is assigned to now, and when each assignment was
+    /// made.
+    pub fn issue_assignments(&self, number: i64) -> Result<crate::model::AssignedIssue> {
+        let text = self.gh(&[
+            "api",
+            "graphql",
+            "-F",
+            "owner={owner}",
+            "-F",
+            "repo={repo}",
+            "-F",
+            &format!("number={number}"),
+            "-f",
+            &format!("query={}", issue_assignments_query()),
+        ])?;
+        parse_issue_assignments(&text)
+            .ok_or_else(|| spar_err!("unexpected shape for the assignments on #{number}"))
     }
 
     /// How many commits lie between two SHAs, when GitHub will say.
@@ -12110,6 +12245,70 @@ mod review_record_tests {
         );
         assert!(parse_review_requests(r#"{"errors": [{"message": "no"}]}"#).is_none());
         assert!(parse_review_requests("gh: not json").is_none());
+    }
+
+    #[test]
+    fn assigned_issues_are_read_with_who_holds_them_and_when_each_was_assigned() {
+        let text = json!({"data": {"repository": {"issues": {"nodes": [
+            {
+                "number": 1144,
+                "title": "Send max",
+                "assignees": {"nodes": [{"login": "viewer"}]},
+                "timelineItems": {"nodes": [
+                    {"createdAt": "2026-08-10T10:00:00Z", "assignee": {"login": "viewer"}},
+                    {"createdAt": "2026-11-03T12:36:22Z", "assignee": {"login": "a-bot"}},
+                    {"createdAt": "2026-11-03T12:40:00Z", "assignee": null},
+                    {"assignee": {"login": "viewer"}},
+                    {}
+                ]}
+            },
+            {"title": "no number"},
+            {"number": 7}
+        ]}}}})
+        .to_string();
+        let issues = parse_assigned_issues(&text).expect("issues");
+        assert_eq!(2, issues.len());
+        assert_eq!(1144, issues[0].number);
+        assert_eq!("Send max", issues[0].title);
+        assert_eq!(vec!["viewer".to_string()], issues[0].assignees);
+        assert_eq!(
+            vec![
+                ("2026-08-10T10:00:00Z".to_string(), "viewer".to_string()),
+                ("2026-11-03T12:36:22Z".to_string(), "a-bot".to_string()),
+            ],
+            issues[0].assigned
+        );
+        assert_eq!(7, issues[1].number);
+        assert!(issues[1].assignees.is_empty() && issues[1].assigned.is_empty());
+
+        let none = json!({"data": {"repository": {"issues": {"nodes": []}}}});
+        assert_eq!(
+            Some(0),
+            parse_assigned_issues(&none.to_string()).map(|i| i.len())
+        );
+        assert!(parse_assigned_issues(r#"{"errors": [{"message": "no"}]}"#).is_none());
+        assert!(parse_assigned_issues("gh: not json").is_none());
+    }
+
+    #[test]
+    fn one_issues_assignments_are_read_the_same_way() {
+        let text = json!({"data": {"repository": {"issue": {
+            "number": 42,
+            "title": "t",
+            "assignees": {"nodes": [{"login": "Viewer"}]},
+            "timelineItems": {"nodes": [
+                {"createdAt": "2026-11-03T12:36:22Z", "assignee": {"login": "Viewer"}}
+            ]}
+        }}}})
+        .to_string();
+        let issue = parse_issue_assignments(&text).expect("an issue");
+        assert_eq!(42, issue.number);
+        assert_eq!(
+            Some("2026-11-03T12:36:22Z".to_string()),
+            issue.newest_for("viewer")
+        );
+        assert!(parse_issue_assignments(r#"{"data": {"repository": {"issue": null}}}"#).is_none());
+        assert!(parse_issue_assignments("gh: not json").is_none());
     }
 
     #[test]

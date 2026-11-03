@@ -3,8 +3,9 @@
 //! Every other command does one pass and exits, so a review asked for again
 //! after spar posted one waited for a person to notice and run spar again.
 //! `spar listen` waits instead, and it waits for free: the only thing that
-//! calls an agent is a review, a second look, or a check-in, and none of those
-//! starts until GitHub says something happened.
+//! calls an agent is a review, a second look, a check-in, an answer, or a run
+//! on an issue assigned to the viewer, and none of those starts until GitHub
+//! says something happened.
 //!
 //! A second look is asked for, never assumed: a review requested again or a
 //! mention starts one, and a push or a comment alone does not. The author may
@@ -18,7 +19,9 @@
 //! when nothing changed. But a push raises no notification for a reviewer, so a
 //! slower sweep of the open pull requests compares each head with the commit
 //! spar last read. Notifications are never raised for the viewer's own actions,
-//! which is also why spar's own comments never wake it.
+//! which is also why spar's own comments never wake it, and why the same sweep
+//! reads the issues assigned to the viewer: an issue somebody assigned to
+//! themselves raises nothing either.
 //!
 //! Events settle before anything runs: a review request followed by three
 //! comments in the same minute is one second look, not four. What runs is
@@ -37,9 +40,9 @@ use crate::agent::Agent;
 use crate::answer;
 use crate::checkin;
 use crate::clock;
-use crate::config::{Config, ListenCfg, OnMention, OwnPr, ReviewOrIgnore};
+use crate::config::{Config, ListenCfg, OnMention, OwnPr, ReviewOrIgnore, RunOrIgnore};
 use crate::error::Result;
-use crate::model::{IssueRun, ItemKind, Login, PrSweepRow, ReviewRequested, Status};
+use crate::model::{AssignedIssue, IssueRun, ItemKind, Login, PrSweepRow, ReviewRequested, Status};
 use crate::proc;
 use crate::repo::{ApiResponse, Repo};
 use crate::review_only::{self, RecheckMode, ReviewOpts};
@@ -220,6 +223,16 @@ pub struct Watched {
     /// the reasons come back with it.
     #[serde(default)]
     pub held: BTreeSet<Trigger>,
+    /// For an issue: the newest assignment of the viewer that spar ran on or
+    /// ignored. A notification thread keeps the reason it was raised for, so
+    /// an issue thread that began with an assignment says so on every later
+    /// comment, and only an assignment newer than this is news.
+    #[serde(default)]
+    pub assignment_judged: Option<String>,
+    /// For an issue: the newest assignment of the viewer the sweep already
+    /// raised, so it is raised once rather than on every sweep.
+    #[serde(default)]
+    pub assignment_raised: Option<String>,
 }
 
 impl Watched {
@@ -237,6 +250,8 @@ impl Watched {
             said_resume: false,
             last_dispatched: None,
             held: BTreeSet::new(),
+            assignment_judged: None,
+            assignment_raised: None,
         }
     }
 }
@@ -249,6 +264,12 @@ pub struct ListenState {
     /// Threads updated after this are new. RFC 3339, the shape GitHub takes.
     #[serde(default)]
     pub watermark: String,
+    /// Where this listener began watching, RFC 3339: the first watermark, or
+    /// the one `--since` set. An assignment older than this was made before
+    /// anybody was listening and is not news, however a later comment brings
+    /// it up.
+    #[serde(default)]
+    pub origin: String,
     /// `Last-Modified` of the last poll that answered, sent back as
     /// `If-Modified-Since` so a poll that finds nothing costs nothing.
     #[serde(default)]
@@ -570,6 +591,79 @@ pub fn events_from_sweep(
     out
 }
 
+/// What an assignment of the viewer on issue `number` has to be later than to
+/// be news: where listening began, or the newest assignment spar already
+/// judged there, whichever is later. Seconds, and 0 when neither reads.
+pub fn assignment_after(state: &ListenState, number: i64) -> u64 {
+    let judged = state
+        .items
+        .get(&number)
+        .and_then(|w| w.assignment_judged.as_deref());
+    [Some(state.origin.as_str()), judged]
+        .into_iter()
+        .flatten()
+        .filter_map(clock::parse_rfc3339)
+        .max()
+        .unwrap_or(0)
+}
+
+/// What a sweep of the issues assigned to the viewer says happened.
+///
+/// GitHub raises no notification for the viewer's own actions, so an issue
+/// somebody assigned to themselves is only seen here. An assignment is raised
+/// when it is the viewer's, still standing, and newer than `assignment_after`
+/// and than any this sweep raised before, so one made before anybody was
+/// listening is not news and each one is raised once, rather than on every
+/// sweep while it settles. In numbers mode only the named issues count, and
+/// nothing is recorded about the rest, which a listener over the whole
+/// repository has yet to see.
+pub fn events_from_assigned(
+    issues: &[AssignedIssue],
+    viewer: &str,
+    state: &mut ListenState,
+    named: &BTreeSet<i64>,
+    min_number: i64,
+    repo_mode: bool,
+) -> Vec<Event> {
+    let mut out = Vec::new();
+    for issue in issues {
+        let is_named = named.contains(&issue.number);
+        if (!repo_mode && !is_named) || (issue.number < min_number && !is_named) {
+            continue;
+        }
+        let Some(at) = issue.newest_for(viewer) else {
+            continue;
+        };
+        let Some(when) = clock::parse_rfc3339(&at) else {
+            continue;
+        };
+        let raised = state
+            .items
+            .get(&issue.number)
+            .and_then(|w| w.assignment_raised.as_deref())
+            .and_then(clock::parse_rfc3339)
+            .unwrap_or(0);
+        if when <= assignment_after(state, issue.number).max(raised) {
+            continue;
+        }
+        let watched = state.watched(issue.number, ItemKind::Issue);
+        if !issue.title.is_empty() {
+            watched.title = issue.title.clone();
+        }
+        watched.assignment_raised = Some(at);
+        out.push(Event {
+            number: issue.number,
+            kind: ItemKind::Issue,
+            trigger: Trigger::Assigned,
+            who: None,
+            head: None,
+            commits: None,
+            from_thread: false,
+        });
+    }
+    out
+}
+
 /// Fold one event into what is pending for its item.
 pub fn merge(pending: &mut BTreeMap<i64, Pending>, event: &Event, now: u64) {
     let p = pending.entry(event.number).or_insert_with(|| Pending {
@@ -643,6 +737,8 @@ pub enum Action {
     /// This pull request was rechecked as often as the config allows; a person
     /// runs `spar review`. An issue names its pull request.
     Capped(i64),
+    /// `spar run` on an issue assigned to the viewer.
+    Run,
     /// Custody state and no review record: `spar resume` owns it.
     BelongsToResume,
     /// Closed or merged: forget it.
@@ -662,6 +758,7 @@ impl Action {
             Action::Checkin { reply_only: true } => "answer the comments on it".to_string(),
             Action::Answer { draft: false } => "answer what it asks of you".to_string(),
             Action::Answer { draft: true } => "draft an answer to what it asks of you".to_string(),
+            Action::Run => "work it with `spar run`".to_string(),
             Action::Capped(_) | Action::AnswersCapped | Action::BelongsToResume => {
                 "leave it".to_string()
             }
@@ -673,7 +770,11 @@ impl Action {
     fn runs(&self) -> bool {
         matches!(
             self,
-            Action::Recheck(_) | Action::Review | Action::Checkin { .. } | Action::Answer { .. }
+            Action::Recheck(_)
+                | Action::Review
+                | Action::Checkin { .. }
+                | Action::Answer { .. }
+                | Action::Run
         )
     }
 }
@@ -713,6 +814,12 @@ pub struct Facts {
     /// For the same issue: `spar answer` ran on it `max_answers` times
     /// without a person running it since.
     pub answers_capped: bool,
+    /// For an issue: when the viewer was last assigned to it, while the viewer
+    /// still is. Read only when an assignment is pending.
+    pub assigned_at: Option<String>,
+    /// For the same issue: a pull request somebody other than the viewer
+    /// wrote is open for it. Read only when an assignment is pending.
+    pub others_pr: bool,
 }
 
 /// Whether a pull request's `reviewRequests` ask the viewer now: by name, or
@@ -792,6 +899,28 @@ pub fn settle_mention(p: &mut Pending, f: &Facts) -> bool {
     stale
 }
 
+/// An assignment is a reason a thread keeps too, so an issue thread that
+/// began with one says so on every later comment. On an issue only an
+/// assignment of the viewer made after `after`, where listening began or the
+/// newest assignment spar already judged there, asks for a run, and only while
+/// the viewer is still assigned; any other is only something happening on a
+/// thread the viewer is part of. True when it was.
+pub fn settle_assignment(p: &mut Pending, f: &Facts, after: u64) -> bool {
+    if p.kind != ItemKind::Issue {
+        return false;
+    }
+    let fresh = f
+        .assigned_at
+        .as_deref()
+        .and_then(clock::parse_rfc3339)
+        .is_some_and(|when| when > after);
+    let stale = !fresh && p.triggers.remove(&Trigger::Assigned);
+    if stale {
+        p.triggers.insert(Trigger::Replied);
+    }
+    stale
+}
+
 /// The dispatch table.
 pub fn plan(p: &Pending, f: &Facts, cfg: &ListenCfg) -> Action {
     use Trigger::*;
@@ -803,9 +932,24 @@ pub fn plan(p: &Pending, f: &Facts, cfg: &ListenCfg) -> Action {
     }
     match p.kind {
         ItemKind::Issue => {
-            // Only a mention asks. A reply is not a request, and an issue
-            // thread that began with an assignment says so on every later
-            // comment.
+            // An assignment settling kept is one spar has not judged, and it
+            // asks for what `spar run` does.
+            if p.triggers.contains(&Assigned) {
+                let declined = match cfg.on_assigned_issue {
+                    RunOrIgnore::Ignore => "on_assigned_issue is ignore",
+                    // `spar run` continues the pull request open for an
+                    // issue, and unattended that would push to somebody
+                    // else's branch.
+                    RunOrIgnore::Run if f.others_pr => {
+                        "an issue whose open pull request somebody else wrote"
+                    }
+                    RunOrIgnore::Run => return Action::Run,
+                };
+                if !p.triggers.contains(&Mentioned) {
+                    return Action::Ignore(declined);
+                }
+            }
+            // Otherwise only a mention asks. A reply is not a request.
             if !p.triggers.contains(&Mentioned) {
                 return Action::Ignore("nothing on the issue asked for spar");
             }
@@ -1181,26 +1325,41 @@ struct Swept {
     rows: Vec<PrSweepRow>,
     /// Named issues that are no longer open.
     closed_issues: Vec<i64>,
+    /// The open issues assigned to the viewer, with when each was assigned.
+    assigned: Vec<AssignedIssue>,
 }
 
 /// The rows a sweep looks at: every open pull request, or the named ones
-/// still watched.
+/// still watched, and the issues assigned to the viewer when an assignment
+/// can lead anywhere.
 fn sweep_rows(
     repo: &Repo,
     cfg: &Config,
+    viewer: &str,
     repo_mode: bool,
     named_prs: &[i64],
     named_issues: &[i64],
     state: &ListenState,
 ) -> Result<Swept> {
+    let watched = |n: &&i64| state.items.contains_key(*n);
+    let wants_assigned = cfg.listen.on_assigned_issue == RunOrIgnore::Run
+        && (repo_mode || named_issues.iter().any(|n| watched(&n)));
+    let assigned = if wants_assigned {
+        repo.sweep_assigned_issues(viewer)?
+    } else {
+        Vec::new()
+    };
     if repo_mode {
         return Ok(Swept {
             rows: repo.sweep_open_prs()?,
             closed_issues: Vec::new(),
+            assigned,
         });
     }
-    let watched = |n: &&i64| state.items.contains_key(*n);
-    let mut swept = Swept::default();
+    let mut swept = Swept {
+        assigned,
+        ..Swept::default()
+    };
     for number in named_prs.iter().filter(watched) {
         swept.rows.push(repo.sweep_pr(*number)?);
     }
@@ -1224,7 +1383,7 @@ fn sweep_rows(
 }
 
 /// `mention` says a mention is pending, which is the only time the comments are
-/// read for one.
+/// read for one, and `assigned` the same for an assignment on an issue.
 fn facts(
     repo: &Repo,
     cfg: &Config,
@@ -1232,6 +1391,7 @@ fn facts(
     kind: ItemKind,
     named: bool,
     mention: bool,
+    assigned: bool,
 ) -> Result<Facts> {
     let viewer = repo.viewer_login()?.to_string();
     let below_floor = number < cfg.loop_cfg.min_number;
@@ -1282,31 +1442,45 @@ fn facts(
                 mentioned,
                 asks_open: false,
                 answers_capped: false,
+                assigned_at: None,
+                others_pr: false,
             })
         }
         ItemKind::Issue => {
             let issue = repo.read_issue(number)?;
-            let linked = repo
+            let open_pr = repo
                 .try_open_pr_for_issue(number, cfg.base_branch())
                 .ok()
-                .flatten()
-                .and_then(|pr| {
-                    repo.read_review_record(pr.number)
-                        .filter(|r| r.posted)
-                        .map(|r| (pr.number, r))
-                });
+                .flatten();
+            let linked = open_pr.as_ref().and_then(|pr| {
+                repo.read_review_record(pr.number)
+                    .filter(|r| r.posted)
+                    .map(|r| (pr.number, r))
+            });
+            // Who wrote the open pull request, read only when the table asks:
+            // for the pull request's own row, or for an assignment, which
+            // leaves somebody else's alone.
+            let pr_by_viewer = match &open_pr {
+                Some(pr) if assigned || linked.is_some() => Some(
+                    repo.sweep_pr(pr.number)?
+                        .author
+                        .as_ref()
+                        .is_some_and(|a| crate::comments::same_login(&a.login, &viewer)),
+                ),
+                _ => None,
+            };
             // What the pull request's own row of the table would check.
             let (author_is_viewer, recheck_capped) = match &linked {
-                Some((pr, record)) => {
-                    let row = repo.sweep_pr(*pr)?;
-                    (
-                        row.author
-                            .as_ref()
-                            .is_some_and(|a| crate::comments::same_login(&a.login, &viewer)),
-                        record.rechecks >= cfg.listen.max_rechecks,
-                    )
-                }
+                Some((_, record)) => (
+                    pr_by_viewer.unwrap_or(false),
+                    record.rechecks >= cfg.listen.max_rechecks,
+                ),
                 None => (false, false),
+            };
+            let assigned_at = if assigned {
+                repo.issue_assignments(number)?.newest_for(&viewer)
+            } else {
+                None
             };
             let mentioned = match &linked {
                 Some((_, record)) if mention => crate::comments::mentioned_in(
@@ -1339,6 +1513,8 @@ fn facts(
                 mentioned,
                 asks_open,
                 answers_capped,
+                assigned_at,
+                others_pr: assigned && pr_by_viewer == Some(false),
             })
         }
     }
@@ -1401,6 +1577,7 @@ fn dispatch(
                 posts: checkin::posts(cfg),
             },
         ),
+        Action::Run => crate::cli::run_issue(agents, cfg, repo, number),
         other => {
             let mut run = IssueRun::new(number, format!("#{number}"));
             run.status = Status::Error;
@@ -1442,6 +1619,11 @@ fn describe(repo: &Repo, event: &Event) -> String {
             format!("#{n}: news on a thread that asked for your review")
         }
         Trigger::ReviewRequested => format!("#{n}: your review was requested"),
+        // A thread says only that it began as one, which a later comment on
+        // it says too. The sweep read an assignment it had not raised before.
+        Trigger::Assigned if event.kind == ItemKind::Issue && event.from_thread => {
+            format!("#{n}: news on an issue assigned to you")
+        }
         Trigger::Assigned => format!("#{n}: assigned to you"),
         Trigger::Closed => format!("#{n}: closed, no longer watched"),
     }
@@ -1506,10 +1688,7 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
     };
 
     let mut state = read_state(repo);
-    if state.watermark.is_empty() || opts.since.is_some() {
-        let back = opts.since.map(|d| d.as_secs()).unwrap_or(0);
-        state.watermark = clock::rfc3339(now.saturating_sub(back));
-        state.last_modified = None;
+    if start_watching(&mut state, now, opts.since) {
         log!("watching from {}", state.watermark);
     }
     for number in &named_prs {
@@ -1584,10 +1763,19 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
         }
 
         if now >= next_sweep {
-            match sweep_rows(repo, cfg, repo_mode, &named_prs, &named_issues, &state) {
+            match sweep_rows(
+                repo,
+                cfg,
+                &viewer,
+                repo_mode,
+                &named_prs,
+                &named_issues,
+                &state,
+            ) {
                 Ok(Swept {
                     rows,
                     closed_issues,
+                    assigned,
                 }) => {
                     backoff.recovered();
                     if !repo_mode {
@@ -1617,10 +1805,20 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                         repo_mode,
                     );
                     events.extend(swept);
+                    events.extend(events_from_assigned(
+                        &assigned,
+                        &viewer,
+                        &mut state,
+                        &named,
+                        cfg.loop_cfg.min_number,
+                        repo_mode,
+                    ));
                     next_sweep = now + cfg.listen.sweep;
                 }
                 Err(e) => {
-                    next_sweep = now + backoff.failed("sweep the pull requests", e.last_line());
+                    next_sweep = now
+                        + backoff
+                            .failed("sweep the pull requests and assigned issues", e.last_line());
                     tick_failed = true;
                 }
             }
@@ -1665,7 +1863,8 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
             };
             let named_item = named.contains(&number);
             let mention = p.triggers.contains(&Trigger::Mentioned);
-            let f = match facts(repo, cfg, number, p.kind, named_item, mention) {
+            let assigned = p.kind == ItemKind::Issue && p.triggers.contains(&Trigger::Assigned);
+            let f = match facts(repo, cfg, number, p.kind, named_item, mention, assigned) {
                 Ok(f) => f,
                 Err(e) => {
                     let w = state.watched(number, p.kind);
@@ -1700,6 +1899,23 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                     );
                 }
             }
+            if settle_assignment(&mut p, &f, assignment_after(&state, number)) {
+                if f.assigned_at.is_none() {
+                    log!("#{number}: it is not assigned to you now, so that was only an update");
+                } else {
+                    log!(
+                        "#{number}: its assignment to you is one spar already judged, or was made \
+                         before spar was listening, so that was only an update"
+                    );
+                }
+            }
+            // The assignment this pass judges, if one is still pending. It is
+            // judged once the item is done with, run or not, and not when the
+            // run fails, so a retry still finds it new.
+            let judged = f
+                .assigned_at
+                .clone()
+                .filter(|_| p.triggers.contains(&Trigger::Assigned));
             if p.triggers.contains(&Trigger::ReviewRequested) || f.request_answered {
                 // Answered now, or by the review on record, whichever way it
                 // arrived. A standing note or a review posted as a comment
@@ -1708,6 +1924,9 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                 state.watched(number, p.kind).requested_noticed = true;
             }
             let action = plan(&p, &f, &cfg.listen);
+            if !action.runs() || opts.dry_run {
+                judge_assignment(&mut state, number, judged.as_deref());
+            }
             match &action {
                 Action::Ignore(why) => {
                     logdim!("#{number}: ignoring {why}");
@@ -1854,6 +2073,7 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                             w.retry_after = 0;
                             w.last_dispatched = Some(now);
                             state.pending.remove(&number);
+                            judge_assignment(&mut state, number, judged.as_deref());
                         }
                     }
                 }
@@ -1908,6 +2128,32 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
         Ending::Once { failed: true } => 1.max(writes),
         Ending::Once { failed: false } | Ending::Done => writes,
     })
+}
+
+/// Where a run starts watching from: on the first run, or with `--since`, now
+/// or that far back, which is also where an assignment starts being news.
+/// True when the watermark was set here.
+pub fn start_watching(state: &mut ListenState, now: u64, since: Option<Duration>) -> bool {
+    let reset = state.watermark.is_empty() || since.is_some();
+    if reset {
+        let back = since.map(|d| d.as_secs()).unwrap_or(0);
+        state.watermark = clock::rfc3339(now.saturating_sub(back));
+        state.origin = state.watermark.clone();
+        state.last_modified = None;
+    }
+    if state.origin.is_empty() {
+        // Kept before there was an origin. Listening reached its watermark,
+        // and an assignment older than that is one nobody was listening for.
+        state.origin = state.watermark.clone();
+    }
+    reset
+}
+
+/// Record that the assignment made at `at` on issue `number` was judged.
+fn judge_assignment(state: &mut ListenState, number: i64, at: Option<&str>) {
+    if let Some(at) = at {
+        state.watched(number, ItemKind::Issue).assignment_judged = Some(at.to_string());
+    }
 }
 
 fn read_state(repo: &Repo) -> ListenState {
@@ -2964,17 +3210,13 @@ mod tests {
                 &cfg()
             )
         );
-        // Only a mention asks. An issue thread that began with an assignment
-        // says so on every later comment, and a comment asks for nothing, on a
-        // named issue too.
-        assert!(matches!(
-            plan(
-                &pending(ItemKind::Issue, &[Trigger::Assigned], 0),
-                &linked,
-                &cfg()
-            ),
-            Action::Ignore(_)
-        ));
+        // An issue thread that began with an assignment says so on every
+        // later comment. Settling takes one with no assignment spar has not
+        // judged for an update, and an update asks for nothing, on a named
+        // issue too.
+        let mut thread = pending(ItemKind::Issue, &[Trigger::Assigned], 0);
+        assert!(settle_assignment(&mut thread, &linked, 0));
+        assert!(matches!(plan(&thread, &linked, &cfg()), Action::Ignore(_)));
         let named = Facts {
             named: true,
             ..linked
@@ -3293,5 +3535,253 @@ mod tests {
         let taken = Lock::at(path.clone(), 1000).expect("a left file is taken over");
         drop(taken);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn assigned(number: i64, assignees: &[&str], assigned: &[(&str, &str)]) -> AssignedIssue {
+        AssignedIssue {
+            number,
+            title: format!("issue {number}"),
+            assignees: assignees.iter().map(|s| s.to_string()).collect(),
+            assigned: assigned
+                .iter()
+                .map(|(at, who)| (at.to_string(), who.to_string()))
+                .collect(),
+        }
+    }
+
+    fn listening_since(origin: &str) -> ListenState {
+        ListenState {
+            version: STATE_VERSION,
+            watermark: origin.into(),
+            origin: origin.into(),
+            ..Default::default()
+        }
+    }
+
+    fn secs(at: &str) -> u64 {
+        clock::parse_rfc3339(at).unwrap()
+    }
+
+    #[test]
+    fn an_assignment_made_since_listening_began_is_raised_once_and_again_when_reassigned() {
+        let mut state = listening_since("2026-11-03T12:00:00Z");
+        let none = BTreeSet::new();
+        let issues = vec![
+            // Before anybody was listening: not news.
+            assigned(10, &["me"], &[("2026-08-10T10:00:00Z", "me")]),
+            // Since, by somebody else or by the viewer: news.
+            assigned(1144, &["Me"], &[("2026-11-03T12:36:22Z", "me")]),
+            // Assigned to somebody else.
+            assigned(12, &["you"], &[("2026-11-03T12:40:00Z", "you")]),
+            // Assigned and unassigned since.
+            assigned(13, &[], &[("2026-11-03T12:40:00Z", "me")]),
+        ];
+        let events = events_from_assigned(&issues, "me", &mut state, &none, 0, true);
+        assert_eq!(1, events.len());
+        assert_eq!(1144, events[0].number);
+        assert_eq!(ItemKind::Issue, events[0].kind);
+        assert_eq!(Trigger::Assigned, events[0].trigger);
+        assert!(!events[0].from_thread);
+        assert_eq!("issue 1144", state.items[&1144].title);
+        // Nothing recorded about what was not raised.
+        assert!(!state.items.contains_key(&10));
+
+        // The next sweep, five minutes on, sees the same assignment.
+        assert!(events_from_assigned(&issues, "me", &mut state, &none, 0, true).is_empty());
+
+        // Unassigned and assigned again later: a new assignment.
+        let again = vec![assigned(
+            1144,
+            &["me"],
+            &[
+                ("2026-11-03T12:36:22Z", "me"),
+                ("2026-11-03T15:00:00Z", "me"),
+            ],
+        )];
+        let events = events_from_assigned(&again, "me", &mut state, &none, 0, true);
+        assert_eq!(
+            vec![1144],
+            events.iter().map(|e| e.number).collect::<Vec<_>>()
+        );
+
+        // One already judged, by a notification that arrived first, is not
+        // raised by the sweep either.
+        let mut judged = listening_since("2026-11-03T12:00:00Z");
+        judged.watched(1144, ItemKind::Issue).assignment_judged =
+            Some("2026-11-03T12:36:22Z".into());
+        assert!(events_from_assigned(&issues, "me", &mut judged, &none, 0, true).is_empty());
+    }
+
+    #[test]
+    fn an_assignment_below_the_floor_or_outside_the_named_items_is_not_raised() {
+        let issues = vec![
+            assigned(5, &["me"], &[("2026-11-03T12:36:22Z", "me")]),
+            assigned(1144, &["me"], &[("2026-11-03T12:36:22Z", "me")]),
+        ];
+        let mut state = listening_since("2026-11-03T12:00:00Z");
+        let events = events_from_assigned(&issues, "me", &mut state, &BTreeSet::new(), 100, true);
+        assert_eq!(
+            vec![1144],
+            events.iter().map(|e| e.number).collect::<Vec<_>>()
+        );
+
+        // A named issue below the floor counts, and in numbers mode nothing
+        // else is raised or recorded, so a listener over the repository still
+        // sees it.
+        let mut state = listening_since("2026-11-03T12:00:00Z");
+        let named: BTreeSet<i64> = [5].into_iter().collect();
+        let events = events_from_assigned(&issues, "me", &mut state, &named, 100, false);
+        assert_eq!(vec![5], events.iter().map(|e| e.number).collect::<Vec<_>>());
+        assert!(!state.items.contains_key(&1144));
+    }
+
+    #[test]
+    fn an_issue_assignment_counts_only_when_newer_than_listening_and_the_last_one_judged() {
+        let mut state = listening_since("2026-11-03T12:00:00Z");
+        assert_eq!(secs("2026-11-03T12:00:00Z"), assignment_after(&state, 1144));
+        state.watched(1144, ItemKind::Issue).assignment_judged =
+            Some("2026-11-03T12:36:22Z".into());
+        assert_eq!(secs("2026-11-03T12:36:22Z"), assignment_after(&state, 1144));
+        // A judged time older than the origin does not move it back.
+        state.watched(7, ItemKind::Issue).assignment_judged = Some("2026-08-01T00:00:00Z".into());
+        assert_eq!(secs("2026-11-03T12:00:00Z"), assignment_after(&state, 7));
+        assert_eq!(0, assignment_after(&ListenState::default(), 7));
+
+        let after = secs("2026-11-03T12:00:00Z");
+        let fresh = Facts {
+            number: 1144,
+            open: true,
+            assigned_at: Some("2026-11-03T12:36:22Z".into()),
+            ..Default::default()
+        };
+        let mut p = pending(ItemKind::Issue, &[Trigger::Assigned], 0);
+        assert!(!settle_assignment(&mut p, &fresh, after));
+        assert!(p.triggers.contains(&Trigger::Assigned));
+
+        // Judged already, or made before listening began.
+        let mut p = pending(ItemKind::Issue, &[Trigger::Assigned], 0);
+        assert!(settle_assignment(
+            &mut p,
+            &fresh,
+            secs("2026-11-03T12:36:22Z")
+        ));
+        assert_eq!(
+            vec![Trigger::Replied],
+            p.triggers.iter().copied().collect::<Vec<_>>()
+        );
+
+        // Not assigned to the viewer now.
+        let gone = Facts {
+            assigned_at: None,
+            ..fresh.clone()
+        };
+        let mut p = pending(ItemKind::Issue, &[Trigger::Assigned, Trigger::Mentioned], 0);
+        assert!(settle_assignment(&mut p, &gone, after));
+        assert!(p.triggers.contains(&Trigger::Mentioned));
+        assert!(!p.triggers.contains(&Trigger::Assigned));
+
+        // A pull request's assignment is the sweep's to judge, not this.
+        let mut p = pending(ItemKind::Pr, &[Trigger::Assigned], 0);
+        assert!(!settle_assignment(&mut p, &gone, after));
+        assert!(p.triggers.contains(&Trigger::Assigned));
+    }
+
+    #[test]
+    fn an_issue_assigned_to_you_gets_spar_run_unless_the_config_or_somebody_elses_pr_says_no() {
+        let issue = Facts {
+            number: 1144,
+            open: true,
+            assigned_at: Some("2026-11-03T12:36:22Z".into()),
+            ..Default::default()
+        };
+        let assignment = pending(ItemKind::Issue, &[Trigger::Assigned], 0);
+        assert_eq!(Action::Run, plan(&assignment, &issue, &cfg()));
+        assert_eq!("work it with `spar run`", Action::Run.phrase(1144));
+        assert!(Action::Run.runs());
+        // With a pull request of the viewer's open for it, `spar run`
+        // continues that, which is what running it means.
+        let own = Facts {
+            linked_pr_with_record: Some(1147),
+            ..issue.clone()
+        };
+        assert_eq!(Action::Run, plan(&assignment, &own, &cfg()));
+
+        let mut off = cfg();
+        off.on_assigned_issue = RunOrIgnore::Ignore;
+        assert_eq!(
+            Action::Ignore("on_assigned_issue is ignore"),
+            plan(&assignment, &issue, &off)
+        );
+        let others = Facts {
+            others_pr: true,
+            ..issue.clone()
+        };
+        assert_eq!(
+            Action::Ignore("an issue whose open pull request somebody else wrote"),
+            plan(&assignment, &others, &cfg())
+        );
+
+        // An assignment and a mention together: the assignment asks for more.
+        let both = pending(ItemKind::Issue, &[Trigger::Assigned, Trigger::Mentioned], 0);
+        let asks = Facts {
+            asks_open: true,
+            ..issue.clone()
+        };
+        assert_eq!(Action::Run, plan(&both, &asks, &cfg()));
+        // Declined, the mention is still answered.
+        assert_eq!(Action::Answer { draft: false }, plan(&both, &asks, &off));
+
+        // Closed, or below the floor and not named, as for anything else.
+        let closed = Facts {
+            open: false,
+            ..issue.clone()
+        };
+        assert_eq!(Action::Drop, plan(&assignment, &closed, &cfg()));
+        let low = Facts {
+            below_floor: true,
+            ..issue
+        };
+        assert!(matches!(plan(&assignment, &low, &cfg()), Action::Ignore(_)));
+    }
+
+    #[test]
+    fn watching_starts_where_it_left_off_and_an_old_state_takes_its_watermark_as_its_origin() {
+        let now = secs("2026-11-03T15:00:00Z");
+        let mut fresh = ListenState::default();
+        assert!(start_watching(&mut fresh, now, None));
+        assert_eq!("2026-11-03T15:00:00Z", fresh.watermark);
+        assert_eq!(fresh.watermark, fresh.origin);
+
+        // A listen.json from before origin was kept.
+        let text = r#"{"version": 1, "watermark": "2026-11-03T14:22:36Z"}"#;
+        let mut old: ListenState = serde_json::from_str(text).unwrap();
+        assert!(old.origin.is_empty());
+        assert!(!start_watching(&mut old, now, None));
+        assert_eq!("2026-11-03T14:22:36Z", old.watermark);
+        assert_eq!("2026-11-03T14:22:36Z", old.origin);
+
+        // An origin already kept stays where it was.
+        let mut kept = listening_since("2026-11-01T00:00:00Z");
+        kept.watermark = "2026-11-03T14:22:36Z".into();
+        assert!(!start_watching(&mut kept, now, None));
+        assert_eq!("2026-11-01T00:00:00Z", kept.origin);
+
+        // --since moves both back, so an assignment in that window is news.
+        assert!(start_watching(
+            &mut kept,
+            now,
+            Some(Duration::from_secs(8 * 3600))
+        ));
+        assert_eq!("2026-11-03T07:00:00Z", kept.watermark);
+        assert_eq!("2026-11-03T07:00:00Z", kept.origin);
+
+        let mut state = listening_since("2026-11-03T12:00:00Z");
+        state.watched(1144, ItemKind::Issue).assignment_judged =
+            Some("2026-11-03T12:36:22Z".into());
+        state.watched(1144, ItemKind::Issue).assignment_raised =
+            Some("2026-11-03T12:36:22Z".into());
+        let back: ListenState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(state, back);
     }
 }

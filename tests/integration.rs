@@ -7585,8 +7585,10 @@ fn a_recheck_without_a_posted_review_on_record_reviews_afresh() {
 /// who the pull request asks for a review, nobody when it is missing; and
 /// `$SPAR_FAKE_REQUESTED` is its timeline of review requests, empty when it is
 /// missing. `$SPAR_FAKE_ISSUE_ROW` is issue 42 as the REST API gives it, bob
-/// asking for nothing when it is missing. The viewer is in team `ours` and in
-/// no other.
+/// asking for nothing when it is missing. `$SPAR_FAKE_ASSIGNED` is the open
+/// issues assigned to the viewer, none when it is missing, and
+/// `$SPAR_FAKE_ISSUE_ASSIGNED` is who issue 42 is assigned to, nobody when it
+/// is missing. The viewer is in team `ours` and in no other.
 fn listen_gh(number: i64, head: &str, author: &str, state: &str) -> String {
     format!(
         r#"set -eu
@@ -7644,6 +7646,12 @@ case "$*" in
     if [ "${{SPAR_FAKE_COMMENTS_FAIL:-}}" = 1 ]; then printf 'gh: HTTP 502: Bad Gateway\n' >&2; exit 1; fi
     if [ -f "${{SPAR_FAKE_COMMENTS:-/nonexistent}}" ]; then cat "$SPAR_FAKE_COMMENTS"; else printf '[]\n'; fi ;;
   "api --paginate "*) printf '[]\n' ;;
+  "api graphql "*filterBy*)
+    if [ -f "${{SPAR_FAKE_ASSIGNED:-/nonexistent}}" ]; then cat "$SPAR_FAKE_ASSIGNED"
+    else printf '%s\n' '{{"data":{{"repository":{{"issues":{{"nodes":[]}}}}}}}}'; fi ;;
+  "api graphql "*ASSIGNED_EVENT*)
+    if [ -f "${{SPAR_FAKE_ISSUE_ASSIGNED:-/nonexistent}}" ]; then cat "$SPAR_FAKE_ISSUE_ASSIGNED"
+    else printf '%s\n' '{{"data":{{"repository":{{"issue":{{"number":42,"title":"Retry smarter","assignees":{{"nodes":[]}},"timelineItems":{{"nodes":[]}}}}}}}}}}'; fi ;;
   "api graphql "*REVIEW_REQUESTED_EVENT*)
     if [ -f "${{SPAR_FAKE_REQUESTED:-/nonexistent}}" ]; then cat "$SPAR_FAKE_REQUESTED"
     else printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"timelineItems":{{"nodes":[]}}}}}}}}}}'; fi ;;
@@ -7943,6 +7951,198 @@ fn listen_once_dry_run_names_what_each_event_would_trigger_and_triggers_nothing(
     );
     assert!(submitted_a_review(&log), "{log}");
     assert_eq!(2, l.agent_calls(), "{out}");
+}
+
+/// Both agents decline issue 42 at triage, which is a whole `spar run` that
+/// implements nothing.
+const SKIP_42: &str = r#"{"issues":[{"issue":42,"worth_doing":false,"tracker":false,"reason":"not now","complexity":"s","depends_on":[],"risk":"low"}]}"#;
+
+/// Issue 42 as both assignment queries give it: assigned now to `assignees`,
+/// and assigned to each `(when, who)` on its timeline. The environment that
+/// points the fake gh at them.
+fn assignments(
+    l: &Listening,
+    assignees: &[&str],
+    assigned: &[(&str, &str)],
+) -> Vec<(String, String)> {
+    let node = serde_json::json!({
+        "number": 42,
+        "title": "Retry smarter",
+        "assignees": {"nodes": assignees.iter().map(|a| serde_json::json!({"login": a})).collect::<Vec<_>>()},
+        "timelineItems": {"nodes": assigned
+            .iter()
+            .map(|(at, who)| serde_json::json!({"createdAt": at, "assignee": {"login": who}}))
+            .collect::<Vec<_>>()},
+    });
+    let one = l.fx.dir.join("issue-assigned.json");
+    std::fs::write(
+        &one,
+        serde_json::json!({"data": {"repository": {"issue": node}}}).to_string(),
+    )
+    .unwrap();
+    let listed = if assignees.contains(&"viewer") {
+        vec![node]
+    } else {
+        Vec::new()
+    };
+    let list = l.fx.dir.join("assigned.json");
+    std::fs::write(
+        &list,
+        serde_json::json!({"data": {"repository": {"issues": {"nodes": listed}}}}).to_string(),
+    )
+    .unwrap();
+    vec![
+        ("SPAR_FAKE_ISSUE_ASSIGNED".into(), one.display().to_string()),
+        ("SPAR_FAKE_ASSIGNED".into(), list.display().to_string()),
+    ]
+}
+
+fn pairs(env: &[(String, String)]) -> Vec<(&str, &str)> {
+    env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+}
+
+/// An issue somebody assigns to you gets what `spar run` does, once. The
+/// thread keeps saying it began with an assignment on every later comment,
+/// and only an assignment newer than the one judged asks again. Assignments
+/// here are dated far ahead, so they are newer than wherever listening began.
+#[test]
+#[cfg(unix)]
+fn listen_works_an_issue_assigned_to_you_with_spar_run_once_per_assignment() {
+    let l = Listening::new(
+        "listenassigned",
+        SKIP_42,
+        SKIP_42,
+        &listen_gh(7, "aaa", "alice", "OPEN"),
+    );
+    l.configure("[loop]\nclose_skipped = false\n");
+    l.with_notifications(&[notification("1", "assign", "Issue", 42)]);
+    let env = assignments(&l, &["viewer"], &[("2099-01-01T00:00:00Z", "viewer")]);
+
+    let (ok, out, _) = l.run_with(&["--once", "--dry-run"], &pairs(&env));
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("#42: news on an issue assigned to you"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "#42: would work it with `spar run` after an assignment, dry run so nothing runs"
+        ),
+        "{out}"
+    );
+    assert_eq!(0, l.agent_calls(), "{out}");
+    assert!(!l.listen_json_exists(), "a dry run wrote listen.json");
+
+    // The real run triages it, both agents decline, and that is the run done.
+    let (ok, out, log) = l.run_with(&["--once"], &pairs(&env));
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("#42: about to work it with `spar run` after an assignment"),
+        "{out}"
+    );
+    assert_eq!(2, l.agent_calls(), "{out}");
+    assert!(out.contains("skipped by both reviewers"), "{out}");
+    assert!(log.contains("issue comment 42"), "{log}");
+    let state = l.state();
+    assert_eq!(
+        "2099-01-01T00:00:00Z", state["items"]["42"]["assignment_judged"],
+        "{state}"
+    );
+    assert!(state["pending"].get("42").is_none(), "{state}");
+
+    // A comment on the thread brings the assignment up again: only an update.
+    l.with_notifications(&[notification("2", "assign", "Issue", 42)]);
+    let (ok, out, _) = l.run_with(&["--once"], &pairs(&env));
+    assert!(ok, "{out}");
+    assert!(
+        out.contains(
+            "#42: its assignment to you is one spar already judged, or was made before spar \
+             was listening, so that was only an update"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("#42: ignoring nothing on the issue asked for spar"),
+        "{out}"
+    );
+    assert_eq!(2, l.agent_calls(), "{out}");
+
+    // Unassigned and assigned again: a new assignment, which the sweep sees
+    // with no notification at all, the way one you make yourself arrives.
+    std::fs::write(&l.notify, "[]\n").unwrap();
+    let env = assignments(
+        &l,
+        &["viewer"],
+        &[
+            ("2099-01-01T00:00:00Z", "viewer"),
+            ("2099-02-01T00:00:00Z", "viewer"),
+        ],
+    );
+    let (ok, out, _) = l.run_with(&["--once"], &pairs(&env));
+    assert!(ok, "{out}");
+    assert!(out.contains("#42: assigned to you"), "{out}");
+    assert!(
+        out.contains("#42: about to work it with `spar run` after an assignment"),
+        "{out}"
+    );
+    assert_eq!(4, l.agent_calls(), "{out}");
+}
+
+/// What an assignment does not ask for: one made before anybody was listening,
+/// one the viewer no longer holds, one with somebody else's pull request open
+/// for the issue, and any when the config says to ignore them.
+#[test]
+#[cfg(unix)]
+fn listen_leaves_an_old_dropped_or_taken_assignment_and_one_the_config_ignores() {
+    let l = Listening::refusing("listenassignedno", &listen_gh(7, "aaa", "alice", "OPEN"));
+    l.with_notifications(&[notification("1", "assign", "Issue", 42)]);
+
+    let old = assignments(&l, &["viewer"], &[("2020-01-01T00:00:00Z", "viewer")]);
+    let (ok, out, _) = l.run_with(&["--once", "--dry-run"], &pairs(&old));
+    assert!(ok, "{out}");
+    assert!(
+        out.contains(
+            "#42: its assignment to you is one spar already judged, or was made before spar \
+             was listening, so that was only an update"
+        ),
+        "{out}"
+    );
+
+    let dropped = assignments(&l, &["somebody"], &[("2099-01-01T00:00:00Z", "viewer")]);
+    let (ok, out, _) = l.run_with(&["--once", "--dry-run"], &pairs(&dropped));
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("#42: it is not assigned to you now, so that was only an update"),
+        "{out}"
+    );
+
+    let fresh = assignments(&l, &["viewer"], &[("2099-01-01T00:00:00Z", "viewer")]);
+    let linked = l.fx.dir.join("linked.json");
+    std::fs::write(
+        &linked,
+        r#"[{"number":7,"url":"https://github.com/example/project/pull/7","title":"PR 7","baseRefName":"main","closingIssuesReferences":[{"number":42}]}]"#,
+    )
+    .unwrap();
+    let mut taken = pairs(&fresh);
+    taken.push(("SPAR_FAKE_LINKED", linked.to_str().unwrap()));
+    let (ok, out, _) = l.run_with(&["--once", "--dry-run"], &taken);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("#42: ignoring an issue whose open pull request somebody else wrote"),
+        "{out}"
+    );
+
+    l.configure("[listen]\non_assigned_issue = \"ignore\"\n");
+    std::fs::write(&l.gh_log, "").unwrap();
+    let (ok, out, log) = l.run_with(&["--once", "--dry-run"], &pairs(&fresh));
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("#42: ignoring on_assigned_issue is ignore"),
+        "{out}"
+    );
+    // Turned off, the sweep does not ask who is assigned what.
+    assert!(!log.contains("filterBy"), "{log}");
+    assert_eq!(0, l.agent_calls(), "{out}");
 }
 
 /// A push raises no notification for a reviewer, so the sweep is what notices

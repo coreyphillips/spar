@@ -317,8 +317,8 @@ answer      = "high"         # drafting and checking answers to what an issue
 # rest      = "high"         # the same, for later rounds and the close
 
 # What `spar listen` watches for and what it does about it. Waiting is gh
-# polling alone and spends no agent calls; only a review, a recheck or an
-# answer does. The README's "Listening for what happens next" says what
+# polling alone and spends no agent calls; only a review, a recheck, an
+# answer or a run on an issue assigned to you does. The README's "Listening for what happens next" says what
 # triggers what.
 [listen]
 interval            = 60       # seconds between polls of GitHub's notifications
@@ -327,9 +327,11 @@ interval            = 60       # seconds between polls of GitHub's notifications
                                # A poll that finds nothing costs nothing against
                                # the rate limit.
 sweep               = 300      # seconds between sweeps of the open pull
-                               # requests. The sweep sees what a notification
-                               # can miss: a review asked for again, an
-                               # assignment, a close, or a push.
+                               # requests and of the issues assigned to you.
+                               # The sweep sees what a notification can miss:
+                               # a review asked for again, an assignment,
+                               # including one you made yourself, a close, or
+                               # a push.
 settle              = 120      # quiet seconds before an item is acted on, so a
                                # review request and three comments cost one
                                # recheck
@@ -341,6 +343,13 @@ max_rechecks        = 5        # second looks one pull request gets before a
 on_review_requested = "review" # a pull request somebody asked you to review:
                                # review | ignore
 on_assigned         = "review" # a pull request assigned to you: review | ignore
+on_assigned_issue   = "run"    # an issue assigned to you, whoever assigned it:
+                               # run does what `spar run` does, triage and then
+                               # the implement and review loop, or continues
+                               # the pull request already open for it. ignore
+                               # does nothing. One with somebody else's pull
+                               # request open is left alone, and each
+                               # assignment is acted on once.
 on_own_pr           = "checkin"
                                # activity on a pull request you authored, which
                                # the same account cannot approve. checkin may

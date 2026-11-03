@@ -330,12 +330,13 @@ pub enum Command {
     ///
     /// Polls GitHub through gh for activity on pull requests spar has
     /// reviewed, for pull requests assigned to you or awaiting your review,
-    /// and for mentions of you. A reviewed pull request gets a second look
-    /// and a verdict when your review is requested again or you are mentioned
-    /// on it, never for a push or a comment alone; a new one gets a review; a
-    /// comment on a pull request you wrote gets `spar checkin`; a mention of
+    /// for issues assigned to you, and for mentions of you. A reviewed pull
+    /// request gets a second look and a verdict when your review is requested
+    /// again or you are mentioned on it, never for a push or a comment alone;
+    /// a new one gets a review; a comment on a pull request you wrote gets
+    /// `spar checkin`; an issue assigned to you gets `spar run`; a mention of
     /// you on an issue gets `spar answer`. Waiting costs no agent calls: only
-    /// a review, a second look, a check-in, or an answer does.
+    /// a review, a second look, a check-in, a run, or an answer does.
     ///
     /// With numbers, watches only those issues and pull requests and exits
     /// once every one is closed. Ctrl-C stops it after the call in flight is
@@ -1098,6 +1099,67 @@ fn run_targets(
         return Ok(report_writes(repo).max(i32::from(!stopped.is_empty())));
     }
     Ok(report_with(&results, cfg, repo, &stopped, &parked))
+}
+
+/// `spar run N` on one issue, as `spar listen` starts it on an issue assigned
+/// to the viewer: the same triage, the same loop, and a pull request already
+/// open for it continued rather than implemented again, under the same config,
+/// since `spar run` with no flags overrides nothing. Only the report differs.
+/// The listener prints one outcome per dispatch, so whatever else the run did
+/// goes in that outcome's notes.
+pub(crate) fn run_issue(agents: &[Agent], cfg: &Config, repo: &Repo, number: i64) -> IssueRun {
+    let mut results = Vec::new();
+    let mut stopped = Vec::new();
+    let mut parked = Vec::new();
+    let mut progress = Progress::new(0);
+    let worked = work_issues(
+        agents,
+        cfg,
+        repo,
+        vec![number],
+        Path::new("plan.json"),
+        &mut results,
+        &mut stopped,
+        &mut parked,
+        &mut progress,
+        false,
+    );
+    // An issue whose pull request was continued comes back under the pull
+    // request's number, so the first result stands in when none has the
+    // issue's own.
+    let mut run = match results.iter().position(|r| r.issue == number) {
+        Some(i) => results.remove(i),
+        None if !results.is_empty() => results.remove(0),
+        None => {
+            let mut nothing = IssueRun::new(number, format!("#{number}"));
+            // Nothing ran. A failure is tried again later, and a triage that
+            // parked or skipped it is waiting on a person.
+            nothing.status = if worked.is_err() || !stopped.is_empty() {
+                Status::Error
+            } else {
+                Status::Pending
+            };
+            nothing
+        }
+    };
+    let mut notes: Vec<String> = parked.into_iter().chain(stopped).collect();
+    if let Err(e) = worked {
+        notes.push(format!("the issue queue stopped: {e}"));
+    }
+    for other in &results {
+        notes.push(format!(
+            "also worked #{}: {}{}",
+            other.issue,
+            other.status,
+            other
+                .pr
+                .as_deref()
+                .map(|url| format!(" {url}"))
+                .unwrap_or_default()
+        ));
+    }
+    run.notes.extend(notes);
+    run
 }
 
 impl Overrides {
@@ -2280,12 +2342,13 @@ const STYLE_OPTIONS: &[Setting] = &[
 
 const LISTEN_OPTIONS: &[Setting] = &[
     (true, "interval", "Seconds between polls of GitHub's notifications for this repository. GitHub says how often it will answer and the larger of the two is used. A poll that finds nothing costs nothing against the rate limit, and waiting never costs an agent call."),
-    (true, "sweep", "Seconds between sweeps of the open pull requests. The sweep sees what a notification can miss: a review asked for again, an assignment, a close, or a push, which raises no notification for a reviewer."),
+    (true, "sweep", "Seconds between sweeps of the open pull requests and of the issues assigned to you. The sweep sees what a notification can miss: a review asked for again, an assignment, including one you made yourself, a close, or a push, which raises no notification for a reviewer."),
     (true, "settle", "Seconds an item has to stay quiet before spar acts on it, so a review request and three comments in the same minute cost one recheck rather than four."),
     (true, "max_wait", "Most seconds an item may keep settling before it is acted on anyway."),
     (true, "max_rechecks", "Rechecks one pull request gets from `spar listen` before a person has to run `spar review` on it again. A cap against two bots arguing, not a target. 0 turns automatic rechecks off."),
     (true, "on_review_requested", "What a pull request somebody asked you to review gets: review or ignore."),
     (true, "on_assigned", "What a pull request assigned to you gets: review or ignore."),
+    (true, "on_assigned_issue", "What an issue assigned to you gets, whoever assigned it: run does what `spar run` does, triage and then the implement and review loop, or continues the pull request already open for it; ignore does nothing. An issue with somebody else's pull request open is left alone, and each assignment is acted on once."),
     (false, "on_own_pr", "What activity on a pull request you authored gets, since the same account cannot approve it: checkin may push a change both agents agree on, reply answers in words only, ignore does nothing."),
     (false, "verdicts", "Whether a review `spar listen` starts submits a formal verdict, approve or request changes, rather than a comment. A recheck always does."),
     (false, "on_mention", "What a mention of you on an issue gets, when the issue has no pull request spar reviewed: answer runs `spar answer`, which posts what both agents agree on and can check and leaves anything that asks you to decide for you; draft saves that for `spar post` instead; ignore does nothing."),

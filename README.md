@@ -208,7 +208,8 @@ spar review 108 --verdict   # approve or request changes instead of commenting
 spar review 108 --recheck   # rule on the last review's points, review what landed since
 
 spar listen                 # watch the repo: second looks at reviewed PRs that move,
-                            # reviews of what is assigned to you or awaiting your review
+                            # reviews of what is assigned to you or awaiting your review,
+                            # `spar run` on issues assigned to you
 spar listen 108 42          # watch only these, and stop once they are closed
 spar listen --once          # one poll, act on what is due, exit; for cron
 spar listen --dry-run       # say what each event would trigger, trigger nothing
@@ -1020,18 +1021,20 @@ the repository say why a thread moved, a review request, a mention, a comment,
 and spar polls them with a conditional request: when nothing changed GitHub
 answers `304 Not Modified`, which costs nothing against the rate limit, and spar
 obeys the interval GitHub asks for. But a push raises no notification for a
-reviewer, so every `sweep` seconds spar lists the open pull requests and compares
-each head with the commit its review record holds. Your own actions raise no new
-notification, but they can still move a thread you are part of, and a thread
-keeps the reason it was first raised for. A thread that began as a review request
-is therefore called one again when spar's own review moves it, so spar checks the
-pull request: a review request counts only while it is still open, to you by name
-or to a team you are in. A team request asks GitHub whether you are in the team,
-which takes the `read:org` scope `gh auth login` asks for, and a team GitHub will
-not answer for counts as asking you. A review spar posted as a comment, which is
-what `spar review` does without `--verdict`, leaves the request open, so on a
-pull request spar reviewed it also checks when the request was made: one made
-before that review began was answered by it, and counts as an update.
+reviewer, so every `sweep` seconds spar lists the open pull requests and
+compares each head with the commit its review record holds, and lists the open
+issues assigned to you, since an issue you assign to yourself raises no
+notification either. Your own actions raise no new notification, but they can
+still move a thread you are part of, and a thread keeps the reason it was first
+raised for. A thread that began as a review request is therefore called one
+again when spar's own review moves it, so spar checks the pull request: a review
+request counts only while it is still open, to you by name or to a team you are
+in. A team request asks GitHub whether you are in the team, which takes the
+`read:org` scope `gh auth login` asks for, and a team GitHub will not answer for
+counts as asking you. A review spar posted as a comment, which is what
+`spar review` does without `--verdict`, leaves the request open, so on a pull
+request spar reviewed it also checks when the request was made: one made before
+that review began was answered by it, and counts as an update.
 
 What an event leads to is a table, not a judgement:
 
@@ -1064,8 +1067,18 @@ What an event leads to is a table, not a judgement:
   posts what both agents agree on and leaves the rest for you, `draft` saves it
   for `spar post`, `ignore` does nothing. Only a mention spar has not judged
   counts, so its own answer moving the thread is an update, and after
-  `max_answers` runs on one issue it is left for you. Nothing else on an issue
-  asks for anything.
+  `max_answers` runs on one issue it is left for you.
+- An issue assigned to you, by somebody else or by yourself, gets what
+  `spar run` does under `on_assigned_issue`: `run` triages it and works it
+  through the implement and review loop, or continues the pull request already
+  open for it; `ignore` does nothing. Each assignment is acted on once. A thread
+  that began with one says so on every later comment, so only an assignment
+  newer than the last one spar judged there counts, and only while you are still
+  assigned. One made before spar began listening counts for nothing, and
+  `--since` moves where that begins. An issue with somebody else's pull request
+  open is left alone, rather than pushed to. An assignment and a mention
+  together get the run, and a mention alone gets the answer above.
+- Nothing else on an issue asks for anything.
 - Anything closed or merged is dropped. Anything below `min_number` is ignored
   unless you named it.
 
@@ -1082,7 +1095,8 @@ With numbers, `spar listen 108 42` watches only those: a named pull request gets
 a second look on the same terms as any other, is reviewed on the first thing
 that happens to it if spar never reviewed it, and the command exits once every
 named item is closed. A named issue is watched through its open pull request,
-when spar has reviewed one. Nothing else is acted on, including work a listener
+when spar has reviewed one, and gets `spar run` when it is assigned to you, on
+the same terms as any other issue. Nothing else is acted on, including work a listener
 over the whole repository left pending, which stays for the next one.
 
 `--once` does one poll and one sweep, acts on whatever is due without waiting
@@ -1885,8 +1899,10 @@ and two with `--max-rounds 1`. Filing from a saved session costs nothing.
 `spar listen` costs nothing while it waits: polling is `gh` alone, and a poll
 that finds nothing does not even count against GitHub's rate limit. What an
 event costs is what the command it dispatches costs: a review's four to six
-calls, a check-in's two or three, and a second look's two calls plus the
-cross-check when something new turned up, which reads the `recheck` effort key.
+calls, a check-in's two or three, a second look's two calls plus the
+cross-check when something new turned up, which reads the `recheck` effort key,
+and an issue assigned to you whatever `spar run` on it costs, which is the most
+of any of them: triage, then a whole implement and review loop.
 `settle` is what keeps a review request and the comments around it to one of
 them.
 

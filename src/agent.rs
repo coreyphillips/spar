@@ -1431,6 +1431,10 @@ impl Placeholders {
 
     /// Substitute every placeholder in one argument. `None` means a placeholder
     /// in this argument had no value, so the whole group is dropped.
+    ///
+    /// Tokens are found in the template argument only. An inserted value is
+    /// copied verbatim, so a prompt that quotes `{model}` reaches the agent as
+    /// written instead of being rewritten or dropping the argument.
     fn substitute(&self, arg: &str) -> Option<String> {
         const KEYS: [&str; 7] = [
             "prompt",
@@ -1441,14 +1445,27 @@ impl Placeholders {
             "schema_file",
             "schema",
         ];
-        let mut out = arg.to_string();
-        for key in KEYS {
-            let token = format!("{{{key}}}");
-            if out.contains(&token) {
-                let value = self.get(key)?;
-                out = out.replace(&token, value);
+        let mut out = String::with_capacity(arg.len());
+        let mut rest = arg;
+        while let Some(open) = rest.find('{') {
+            out.push_str(&rest[..open]);
+            rest = &rest[open..];
+            let token = KEYS.iter().find_map(|key| {
+                let after = rest.strip_prefix('{')?.strip_prefix(key)?;
+                after.starts_with('}').then_some((*key, key.len() + 2))
+            });
+            match token {
+                Some((key, len)) => {
+                    out.push_str(self.get(key)?);
+                    rest = &rest[len..];
+                }
+                None => {
+                    out.push('{');
+                    rest = &rest[1..];
+                }
             }
         }
+        out.push_str(rest);
         Some(out)
     }
 }
@@ -1775,6 +1792,59 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(vec!["/fake/bin"], a.render(&v).unwrap());
+    }
+
+    /// Issue text that quotes a placeholder is data, not template.
+    #[test]
+    fn a_placeholder_quoted_in_the_prompt_is_kept_when_set() {
+        let a = agent(vec![one("x"), group(&["-m", "{model}"]), one("{prompt}")]);
+        let v = Placeholders {
+            prompt: Some("Issue: Render {model} verbatim".into()),
+            model: Some("m1".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            vec!["/fake/bin", "-m", "m1", "Issue: Render {model} verbatim"],
+            a.render(&v).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_placeholder_quoted_in_the_prompt_is_kept_when_unset() {
+        let a = agent(vec![one("x"), group(&["-p", "{prompt}"])]);
+        let v = Placeholders {
+            prompt: Some("Render {model} and {effort} verbatim".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            vec!["/fake/bin", "-p", "Render {model} and {effort} verbatim"],
+            a.render(&v).unwrap()
+        );
+    }
+
+    /// One value is not rescanned for the placeholders that follow it either.
+    #[test]
+    fn an_inserted_value_is_not_rescanned_within_its_argument() {
+        let a = agent(vec![one("x"), one("{system}:{model}")]);
+        let v = Placeholders {
+            system: Some("{effort}".into()),
+            model: Some("m1".into()),
+            ..Default::default()
+        };
+        assert_eq!(vec!["/fake/bin", "{effort}:m1"], a.render(&v).unwrap());
+    }
+
+    #[test]
+    fn braces_that_are_not_placeholders_survive() {
+        let a = agent(vec![one("x"), one("{{model}} {other} {"), one("{model")]);
+        let v = Placeholders {
+            model: Some("m1".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            vec!["/fake/bin", "{m1} {other} {", "{model"],
+            a.render(&v).unwrap()
+        );
     }
 
     #[test]

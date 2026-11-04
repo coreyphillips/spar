@@ -33,6 +33,7 @@ use crate::model::{
 };
 use crate::repo::{PushTarget, Repo};
 use crate::style::{self, Style};
+use crate::template::fill;
 use crate::tracker::{self, Item};
 use crate::{bail, log, logdim, logwarn, schema, spar_err};
 
@@ -318,9 +319,10 @@ fn check_before_push(
         agent.name()
     );
 
-    let prompt = CHECK_PROMPT
-        .replace("{command}", &failed.command)
-        .replace("{output}", &failed.output);
+    let prompt = fill(
+        CHECK_PROMPT,
+        &[("{command}", &failed.command), ("{output}", &failed.output)],
+    );
     let baseline = repo.worktree_baseline(work_dir)?;
     let before = repo.head_oid_checked(work_dir)?;
     let answer = agent.edit(&prompt, work_dir, &agent.effort(cfg, call));
@@ -1487,11 +1489,7 @@ fn review_loop(
                 ctx.label,
                 blocking.len()
             );
-            let prompt = RESPOND_PROMPT
-                .replace("{number}", &ctx.subject.to_string())
-                .replace("{context}", &ctx.context)
-                .replace("{findings}", &findings_for_prompt(&blocking))
-                .replace("{optional}", &optional_block(&review.findings));
+            let prompt = respond_prompt(ctx.subject, &ctx.context, &blocking, &review.findings);
             let before_response = repo.head_oid_checked(&ctx.work_dir)?;
             let worktree_baseline = repo.worktree_baseline(&ctx.work_dir)?;
             let response: Result<ResponseDoc> = author.edit_json(
@@ -3790,16 +3788,20 @@ fn close_prompt(
              {base}...HEAD`.\n"
         ),
     };
-    CLOSE_PROMPT
-        .replace("{number}", &number.to_string())
-        .replace("{title}", title)
-        .replace("{context}", context)
-        .replace("{criteria}", &criteria_to_rule(criteria))
-        .replace("{base}", base)
-        .replace("{landed}", &landed)
-        .replace("{open}", &open_findings_block(open_findings))
-        .replace("{answers}", &closing_answers(ledger, round))
-        .replace("{settled}", &settled_block(ledger))
+    fill(
+        CLOSE_PROMPT,
+        &[
+            ("{number}", &number.to_string()),
+            ("{title}", title),
+            ("{context}", context),
+            ("{criteria}", &criteria_to_rule(criteria)),
+            ("{base}", base),
+            ("{landed}", &landed),
+            ("{open}", &open_findings_block(open_findings)),
+            ("{answers}", &closing_answers(ledger, round)),
+            ("{settled}", &settled_block(ledger)),
+        ],
+    )
 }
 
 fn open_findings_block(findings: &[Finding]) -> String {
@@ -3846,16 +3848,39 @@ fn review_prompt(
     last: u32,
     criteria: &[Item],
 ) -> String {
-    REVIEW_PROMPT
-        .replace("{base}", base)
-        .replace("{number}", &number.to_string())
-        .replace("{title}", title)
-        .replace("{context}", context)
-        .replace("{criteria}", &criteria_to_rule(criteria))
-        .replace("{open}", &open_findings_block(open_findings))
-        .replace("{answers}", &answers_block(ledger, round))
-        .replace("{settled}", &settled_block(ledger))
-        .replace("{round}", &round_note(round, last))
+    fill(
+        REVIEW_PROMPT,
+        &[
+            ("{base}", base),
+            ("{number}", &number.to_string()),
+            ("{title}", title),
+            ("{context}", context),
+            ("{criteria}", &criteria_to_rule(criteria)),
+            ("{open}", &open_findings_block(open_findings)),
+            ("{answers}", &answers_block(ledger, round)),
+            ("{settled}", &settled_block(ledger)),
+            ("{round}", &round_note(round, last)),
+        ],
+    )
+}
+
+/// What the author is asked about the blocking findings, with the non-blocking
+/// ones offered beside them.
+fn respond_prompt(
+    number: i64,
+    context: &str,
+    blocking: &[Finding],
+    findings: &[Finding],
+) -> String {
+    fill(
+        RESPOND_PROMPT,
+        &[
+            ("{number}", &number.to_string()),
+            ("{context}", context),
+            ("{findings}", &findings_for_prompt(blocking)),
+            ("{optional}", &optional_block(findings)),
+        ],
+    )
 }
 
 /// What the implementor is asked, with the issue in front of it.
@@ -3878,13 +3903,17 @@ fn implement_prompt(number: i64, title: &str, url: &str, body: &str, criteria: &
             numbered(criteria)
         )
     };
-    IMPLEMENT_PROMPT
-        .replace("{thread_rule}", THREAD_RULE)
-        .replace("{number}", &number.to_string())
-        .replace("{title}", title)
-        .replace("{url}", url)
-        .replace("{criteria}", &criteria)
-        .replace("{body}", body)
+    fill(
+        IMPLEMENT_PROMPT,
+        &[
+            ("{thread_rule}", THREAD_RULE),
+            ("{number}", &number.to_string()),
+            ("{title}", title),
+            ("{url}", url),
+            ("{criteria}", &criteria),
+            ("{body}", body),
+        ],
+    )
 }
 
 /// The pull request body.
@@ -6038,11 +6067,7 @@ mod tests {
             1,
             &[],
         );
-        let respond = RESPOND_PROMPT
-            .replace("{number}", "42")
-            .replace("{context}", &context)
-            .replace("{findings}", "(none)")
-            .replace("{optional}", "");
+        let respond = respond_prompt(42, &context, &[], &[]);
         for prompt in [review, close, respond] {
             assert!(prompt.contains("Honour Retry-After"), "{prompt}");
             assert!(prompt.contains("Ran the 429 test"), "{prompt}");
@@ -6093,11 +6118,7 @@ mod tests {
         assert_eq!(1, optional.len(), "{optional:?}");
         assert_eq!("Timeout is hard coded", optional[0].title);
 
-        let prompt = RESPOND_PROMPT
-            .replace("{number}", "42")
-            .replace("{context}", "")
-            .replace("{findings}", &findings_for_prompt(&[findings[0].clone()]))
-            .replace("{optional}", &optional_block(&findings));
+        let prompt = respond_prompt(42, "", &[findings[0].clone()], &findings);
         assert!(prompt.contains("Timeout is hard coded"), "{prompt}");
         assert!(prompt.contains("will not hold the merge"), "{prompt}");
         assert!(
@@ -6515,6 +6536,82 @@ mod tests {
             implement.contains("1. Keep the literal {number} and {url}."),
             "{implement}"
         );
+    }
+
+    /// Every placeholder the implement, review and closing templates use.
+    const EVERY_PLACEHOLDER: &str = "{thread_rule} {number} {title} {url} {criteria} {body} \
+                                     {base} {context} {landed} {open} {answers} {settled} {round}";
+
+    #[test]
+    fn issue_text_naming_a_placeholder_reaches_every_prompt_as_written() {
+        let title = format!("Title {EVERY_PLACEHOLDER}");
+        let body = format!("Body {EVERY_PLACEHOLDER}");
+        let criterion = format!("1. Criterion {EVERY_PLACEHOLDER}\n");
+        let context = context_block(42, "u", &body, "");
+        let ledger = Ledger::new();
+        let with = tracker::criteria(&format!("- [ ] Criterion {EVERY_PLACEHOLDER}\n"));
+        assert_eq!(1, with.len(), "{with:?}");
+
+        for criteria in [with, Vec::new()] {
+            let implement = implement_prompt(42, &title, "u", &body, &criteria);
+            // The last round and something landed, so the round note and the
+            // landed block are both filled with text rather than nothing.
+            let review = review_prompt("main", 42, &title, &context, &ledger, &[], 3, 3, &criteria);
+            let close = close_prompt(
+                "main",
+                42,
+                &title,
+                &context,
+                "abc1234",
+                Some(&[]),
+                &ledger,
+                &[],
+                3,
+                &criteria,
+            );
+            for prompt in [&implement, &review, &close] {
+                assert!(prompt.contains(&title), "{prompt}");
+                assert!(prompt.contains(&body), "{prompt}");
+                assert_eq!(
+                    !criteria.is_empty(),
+                    prompt.contains(&criterion),
+                    "{prompt}"
+                );
+                let expected = if criteria.is_empty() { 2 } else { 3 };
+                assert_eq!(
+                    expected,
+                    prompt.matches(EVERY_PLACEHOLDER).count(),
+                    "{prompt}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn findings_and_context_naming_a_placeholder_reach_the_author_as_written() {
+        let every = "{number} {context} {findings} {optional}";
+        let context = format!("\nContext {every}\n");
+        let findings = vec![
+            finding(
+                "blocking",
+                &format!("Blocker {every}"),
+                every,
+                "src/a.rs",
+                true,
+            ),
+            finding(
+                "non-blocking",
+                &format!("Optional {every}"),
+                every,
+                "src/b.rs",
+                true,
+            ),
+        ];
+        let prompt = respond_prompt(42, &context, &[findings[0].clone()], &findings);
+        assert!(prompt.contains(&context), "{prompt}");
+        assert!(prompt.contains(&format!("Blocker {every}")), "{prompt}");
+        assert!(prompt.contains(&format!("Optional {every}")), "{prompt}");
+        assert_eq!(5, prompt.matches(every).count(), "{prompt}");
     }
 
     #[test]

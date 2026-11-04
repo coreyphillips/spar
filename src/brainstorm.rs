@@ -31,6 +31,7 @@ use crate::model::{ConvergeDoc, CrossDoc, CrossKind, Idea, IdeasDoc};
 use crate::repo::{Repo, FOLLOWUP_MARKER};
 use crate::review_only::concurrently;
 use crate::style::{self, Style};
+use crate::template::fill;
 use crate::{bail, log, logdim, logwarn, schema};
 
 // ---------------------------------------------------------------------------
@@ -347,10 +348,14 @@ fn diverge_prompt(session: &Session, repo: &Repo) -> String {
         Some(topic) => TOPIC_OPENING.replace("{subject}", topic.trim()),
         None => REPO_OPENING.replace("{open_issues}", &open_issues_block(repo)),
     };
-    DIVERGE_PROMPT
-        .replace("{opening}", &opening)
-        .replace("{count}", &session.wanted.to_string())
-        .replace("{read_only}", READ_ONLY)
+    fill(
+        DIVERGE_PROMPT,
+        &[
+            ("{opening}", &opening),
+            ("{count}", &session.wanted.to_string()),
+            ("{read_only}", READ_ONLY),
+        ],
+    )
 }
 
 /// What is already filed, so repo mode does not propose it again. Best
@@ -441,10 +446,14 @@ fn cross(
         if theirs == 0 {
             return Ok(CrossDoc::default());
         }
-        let prompt = CROSS_PROMPT
-            .replace("{subject}", subject)
-            .replace("{read_only}", READ_ONLY)
-            .replace("{ideas}", &ideas_for_prompt(set, Some(agent.name())));
+        let prompt = fill(
+            CROSS_PROMPT,
+            &[
+                ("{subject}", subject),
+                ("{read_only}", READ_ONLY),
+                ("{ideas}", &ideas_for_prompt(set, Some(agent.name()))),
+            ],
+        );
         agent.ask_json::<CrossDoc>(
             &prompt,
             &schema::brainstorm_cross(),
@@ -573,11 +582,15 @@ fn converge(
                 mine.join(", ")
             )
         };
-        let prompt = CONVERGE_PROMPT
-            .replace("{subject}", subject)
-            .replace("{defend}", &defend)
-            .replace("{read_only}", READ_ONLY)
-            .replace("{ideas}", &ideas_for_prompt(set, None));
+        let prompt = fill(
+            CONVERGE_PROMPT,
+            &[
+                ("{subject}", subject),
+                ("{defend}", &defend),
+                ("{read_only}", READ_ONLY),
+                ("{ideas}", &ideas_for_prompt(set, None)),
+            ],
+        );
         agent.ask_json::<ConvergeDoc>(
             &prompt,
             &schema::brainstorm_converge(),

@@ -46,6 +46,7 @@ use crate::model::{
 };
 use crate::repo::{Hunks, Repo, WorktreeCheckpoint};
 use crate::style::{self, Style};
+use crate::template::fill;
 use crate::{bail, log, logdim, logwarn, schema, spar_err};
 
 /// The independent review prompt, for the test that holds it and
@@ -272,11 +273,15 @@ fn run_phases(
     // worktree the local branch is whatever the primary checkout last had.
     let base_ref = repo.base_ref(work_dir, base);
     let context = context_for(cfg, repo, pr);
-    let prompt = REVIEW_ONLY_PROMPT
-        .replace("{number}", &pr.number.to_string())
-        .replace("{base}", &base_ref)
-        .replace("{title}", &pr.title)
-        .replace("{context}", &context);
+    let prompt = fill(
+        REVIEW_ONLY_PROMPT,
+        &[
+            ("{number}", &pr.number.to_string()),
+            ("{base}", &base_ref),
+            ("{title}", &pr.title),
+            ("{context}", &context),
+        ],
+    );
 
     let reviews = concurrently(agents, |a| {
         let effort = a.effort(cfg, Call::Review(1)).about(pr.number);
@@ -1896,18 +1901,20 @@ fn recheck_prompt(
     said: &[Said],
     fence: &Fence,
 ) -> String {
-    // The machine's own text first, the author's text last, so nothing a
-    // person wrote can be mistaken for a placeholder still to be filled.
-    RECHECK_PROMPT
-        .replace("{number}", &pr.number.to_string())
-        .replace("{base}", base_ref)
-        .replace("{from}", delta.short_from())
-        .replace("{delta}", &delta_block(delta, base_ref, fence))
-        .replace("{rule}", &format!("\n{RESPONSES_RULE}\n"))
-        .replace("{title}", &pr.title)
-        .replace("{context}", context)
-        .replace("{earlier}", &earlier_block(earlier))
-        .replace("{responses}", &responses_block(said, fence))
+    fill(
+        RECHECK_PROMPT,
+        &[
+            ("{number}", &pr.number.to_string()),
+            ("{base}", base_ref),
+            ("{from}", delta.short_from()),
+            ("{delta}", &delta_block(delta, base_ref, fence)),
+            ("{rule}", &format!("\n{RESPONSES_RULE}\n")),
+            ("{title}", &pr.title),
+            ("{context}", context),
+            ("{earlier}", &earlier_block(earlier)),
+            ("{responses}", &responses_block(said, fence)),
+        ],
+    )
 }
 
 /// What landed since the earlier review, in one of three shapes.
@@ -3885,6 +3892,43 @@ mod recheck_tests {
             !text.contains('{'),
             "a placeholder was left unfilled:\n{text}"
         );
+    }
+
+    #[test]
+    fn text_naming_a_placeholder_reaches_the_recheck_prompt_as_written() {
+        let every = "{number} {base} {from} {delta} {rule} {title} {context} {earlier} {responses}";
+        let pr = PrView {
+            title: format!("Title {every}"),
+            ..pr()
+        };
+        let context = format!("Context {every}");
+        let earlier = [recorded(
+            Severity::Blocking,
+            &format!("Point {every}"),
+            "src/net.rs:88",
+            Standing::Disputed,
+        )];
+        let text = recheck_prompt(
+            &pr,
+            "refs/remotes/origin/main",
+            &context,
+            &delta(&["abc1234 fix the guard"]),
+            &earlier,
+            &[said(&format!("Reply {every}"))],
+            &Fence::fixed("tok"),
+        );
+        for wanted in [
+            &pr.title,
+            &context,
+            &earlier[0].title,
+            &format!("Reply {every}"),
+        ] {
+            assert!(
+                text.contains(wanted.as_str()),
+                "{wanted:?} is missing:\n{text}"
+            );
+        }
+        assert_eq!(4, text.matches(every).count(), "{text}");
     }
 
     #[test]

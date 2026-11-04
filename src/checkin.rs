@@ -24,6 +24,7 @@ use crate::model::{
 };
 use crate::repo::{PushTarget, Repo};
 use crate::style::{self, Style};
+use crate::template::fill;
 use crate::{bail, log, logdim, logwarn, schema, spar_err};
 use regex::Regex;
 use sha2::{Digest, Sha256};
@@ -878,17 +879,21 @@ fn act(
     let refs: Vec<&Pending> = pending.iter().collect();
     let block = listed(&fence, &refs);
     let verdicts: CheckinDoc = judge.ask_json(
-        &JUDGE_PROMPT
-            .replace("{number}", &number.to_string())
-            // The title is the pull request author's text, and on a fork that
-            // is not somebody with write access here.
-            .replace("{title}", &fence.wrap("pull request title", title))
-            .replace(
-                "{description}",
-                &fence.wrap("pull request description", description),
-            )
-            .replace("{fence}", NOT_INSTRUCTION)
-            .replace("{comments}", &block),
+        &fill(
+            JUDGE_PROMPT,
+            &[
+                ("{number}", &number.to_string()),
+                // The title is the pull request author's text, and on a fork
+                // that is not somebody with write access here.
+                ("{title}", &fence.wrap("pull request title", title)),
+                (
+                    "{description}",
+                    &fence.wrap("pull request description", description),
+                ),
+                ("{fence}", NOT_INSTRUCTION),
+                ("{comments}", &block),
+            ],
+        ),
         &schema::checkin(),
         work_dir,
         &judge.effort(cfg, Call::Checkin(1)).about(number),
@@ -896,19 +901,24 @@ fn act(
 
     log!("#{number}: {checker_name} checking those calls");
     let checks: Vec<CommentCheck> = match checker.ask_json::<CheckDoc>(
-        &CHECK_PROMPT
-            .replace("{number}", &number.to_string())
-            .replace("{fence}", NOT_INSTRUCTION)
-            .replace("{comments}", &block)
-            // The judge's own words, but repeated from the comments, so they
-            // are quoted rather than handed over as a colleague's summary.
-            .replace(
-                "{verdicts}",
-                &fence.wrap(
-                    "the other agent's reading of those comments",
-                    &render_verdicts(&verdicts.verdicts),
+        &fill(
+            CHECK_PROMPT,
+            &[
+                ("{number}", &number.to_string()),
+                ("{fence}", NOT_INSTRUCTION),
+                ("{comments}", &block),
+                // The judge's own words, but repeated from the comments, so
+                // they are quoted rather than handed over as a colleague's
+                // summary.
+                (
+                    "{verdicts}",
+                    &fence.wrap(
+                        "the other agent's reading of those comments",
+                        &render_verdicts(&verdicts.verdicts),
+                    ),
                 ),
-            ),
+            ],
+        ),
         &schema::checkin_check(),
         work_dir,
         &checker.effort(cfg, Call::Checkin(2)).about(number),
@@ -1109,9 +1119,13 @@ fn implement(
     let before = repo.head_oid_checked(work_dir)?;
     let worktree_baseline = repo.worktree_baseline(work_dir)?;
     let report: FixReport = match implementor.edit_json(
-        &FIX_PROMPT
-            .replace("{fence}", NOT_INSTRUCTION)
-            .replace("{comments}", &listed(&Fence::new(), &wanted)),
+        &fill(
+            FIX_PROMPT,
+            &[
+                ("{fence}", NOT_INSTRUCTION),
+                ("{comments}", &listed(&Fence::new(), &wanted)),
+            ],
+        ),
         &schema::checkin_fix(),
         work_dir,
         &implementor.effort(cfg, Call::Checkin(1)).about(number),

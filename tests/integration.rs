@@ -7249,6 +7249,65 @@ fn a_review_with_line_comments_lost_to_a_gateway_error_is_not_sent_again() {
     assert!(!read_record(&fx, 5).posted);
 }
 
+/// `spar post` with no file, from the fixture's own config, as `--dry-run`.
+fn post_dry_run(fx: &Fixture, number: i64) -> (bool, String) {
+    let number = number.to_string();
+    let config = fx.dir.join("spar.toml");
+    let (ok, out, err) = spar(
+        &[
+            "post",
+            &number,
+            "--repo",
+            fx.work.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--dry-run",
+        ],
+        &fx.dir,
+    );
+    (ok, format!("{out}\n{err}"))
+}
+
+/// A review that could not be posted is saved whole, as a dry run's is, so
+/// `spar post` can send it without the reviewers running again.
+#[test]
+#[cfg(unix)]
+fn a_review_that_could_not_be_posted_is_saved_for_spar_post() {
+    let (fx, head) = inline_fixture("reviewpostfailed", None);
+    const DETAIL: &str =
+        "- Retry loop never terminates (src/net.rs:88) [both]. the guard compares against Some(0)";
+
+    let (ok, out, _) = review_run_with(
+        &fx,
+        &["5", "--verdict"],
+        ONE_BLOCKER_REVIEW,
+        ONE_BLOCKER_REVIEW,
+        &review_gh(5, &head, "someone-else"),
+        &[("SPAR_FAKE_INLINE_FAILS", "502")],
+        "",
+    );
+
+    assert!(!ok, "{out}");
+    assert!(out.contains(DETAIL), "the full summary is printed:\n{out}");
+    assert!(out.contains("could not post the review. Saved to"), "{out}");
+    assert!(
+        out.contains("1 finding would also go on its line in the diff"),
+        "{out}"
+    );
+    assert!(!read_record(&fx, 5).posted);
+    let saved = Repo::open(&fx.work, &cfg())
+        .unwrap()
+        .read_pending_comment(5)
+        .expect("the summary was saved");
+    assert!(saved.starts_with("Two independent reviews."), "{saved}");
+    assert!(saved.contains(DETAIL), "{saved}");
+
+    let (ok, out) = post_dry_run(&fx, 5);
+    assert!(ok, "{out}");
+    assert!(out.contains(DETAIL), "{out}");
+    assert!(out.contains("would post the above to PR #5"), "{out}");
+}
+
 /// `GIT_DIFF_OPTS` widens every hunk git prints past `--unified=3`, which would
 /// make a line GitHub does not show look like one a comment can go on, and
 /// cost the review every line comment it has when GitHub refuses it.
@@ -7502,6 +7561,51 @@ fn a_recheck_names_a_new_point_on_its_line_and_keeps_an_open_one_whole() {
     let said = comments[0]["body"].as_str().unwrap();
     assert!(said.contains("the field is set and never used"), "{said}");
     assert_eq!(1, read_record(&fx, 5).rechecks);
+}
+
+/// A second look that could not be posted is saved whole for `spar post`, and
+/// the first look's record stays, so the next trigger looks again.
+#[test]
+#[cfg(unix)]
+fn a_recheck_that_could_not_be_posted_is_saved_for_spar_post() {
+    let (fx, before) = inline_fixture("recheckpostfailed", None);
+    write_record(&fx, 5, &blocking_record(&before));
+    commit(&fx.work, "file.txt", "half done\n", "try the bound");
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/5/head"]);
+    let after = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    let answer = r#"{"summary":"no","rulings":[{"index":1,"outcome":"open","reasoning":"the guard still compares against Some(0)"}],"findings":[{"severity":"blocking","title":"Timeout is never read","detail":"the field is set and never used","file":"src/net.rs:40","in_scope":true,"problem":null,"reproduction":null,"impact":null,"expected":null}]}"#;
+    const DETAIL: &str =
+        "- Timeout is never read (src/net.rs:40) [both]. the field is set and never used";
+
+    let (ok, out, _) = review_run_with(
+        &fx,
+        &["5", "--recheck"],
+        answer,
+        answer,
+        &review_gh(5, &after, "someone-else"),
+        &[("SPAR_FAKE_INLINE_FAILS", "502")],
+        "",
+    );
+
+    assert!(!ok, "{out}");
+    assert!(out.contains(DETAIL), "the full summary is printed:\n{out}");
+    assert!(out.contains("could not post the review. Saved to"), "{out}");
+    let record = read_record(&fx, 5);
+    assert_eq!(before, record.head);
+    assert_eq!(0, record.rechecks);
+    let saved = Repo::open(&fx.work, &cfg())
+        .unwrap()
+        .read_pending_comment(5)
+        .expect("the second look was saved");
+    assert!(
+        saved.starts_with("Rechecked after 1 new commit ("),
+        "{saved}"
+    );
+    assert!(saved.contains(DETAIL), "{saved}");
+
+    let (ok, out) = post_dry_run(&fx, 5);
+    assert!(ok, "{out}");
+    assert!(out.contains(DETAIL), "{out}");
 }
 
 /// Nothing moved and nobody spoke: no agent runs, nothing is posted, and the

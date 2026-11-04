@@ -892,6 +892,8 @@ fn finish(
         Err(e) => {
             state.notes.push(format!("could not post the review: {e}"));
             println!("\n{comment}\n");
+            say_unposted_lines(pr.number, &inline.comments);
+            save_unposted(repo, pr.number, &comment, POST_FAILED);
             record(state, false);
         }
     }
@@ -911,11 +913,15 @@ fn posted_as(formal: bool, verdict: Option<ReviewVerdict>) -> &'static str {
 /// Why a review was printed rather than posted.
 fn held_because(dry_run: bool) -> &'static str {
     if dry_run {
-        "dry run"
+        "dry run, nothing posted"
     } else {
-        "pr_comments is none"
+        "pr_comments is none, nothing posted"
     }
 }
+
+/// Not "nothing posted": a write whose read back also failed may still land,
+/// and the error the run reports says so.
+const POST_FAILED: &str = "could not post the review";
 
 /// Where the head is just before a look posts, when it is no longer the one
 /// the look read. A look takes minutes, and a push in that time makes its
@@ -940,7 +946,7 @@ fn hold_back(
     log!("PR #{number}: {note}");
     state.status = Status::Moved;
     state.notes.insert(0, note);
-    save_unposted(repo, number, body, "the head moved");
+    save_unposted(repo, number, body, "the head moved, nothing posted");
 }
 
 /// A look that stops before any agent runs, because the head it would read is
@@ -1000,15 +1006,15 @@ fn moved_note(reviewed: &str, now: &str) -> String {
     )
 }
 
-/// Print and save what would have been posted, and say where it went.
+/// Save what was not posted for `spar post`, and say where it went, after
+/// `why`.
 fn save_unposted(repo: &Repo, number: i64, text: &str, why: &str) {
     match repo.save_pending_comment(number, text) {
         Ok(path) => log!(
-            "{why}, nothing posted. Saved to {}. Post it with `spar post {number}`, or edit that \
-             file first.",
+            "{why}. Saved to {}. Post it with `spar post {number}`, or edit that file first.",
             path.display()
         ),
-        Err(e) => logdim!("{why}, nothing posted, and could not save it: {e}"),
+        Err(e) => logdim!("{why}, and could not save it: {e}"),
     }
 }
 
@@ -1887,6 +1893,8 @@ fn recheck_phases(
             // The old record stays, so the next trigger tries again.
             state.notes.push(format!("could not post the review: {e}"));
             println!("\n{body}\n");
+            say_unposted_lines(pr.number, &inline.comments);
+            save_unposted(repo, pr.number, &body, POST_FAILED);
         }
     }
     Ok(())

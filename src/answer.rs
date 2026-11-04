@@ -30,6 +30,7 @@ use crate::model::{
 };
 use crate::repo::Repo;
 use crate::style::{self, Style};
+use crate::template::fill;
 use crate::{bail, log, logdim, logwarn, schema, spar_err};
 
 // ---------------------------------------------------------------------------
@@ -634,11 +635,15 @@ fn inner(
         cfg.loop_cfg.max_issue_chars,
     );
     let draft: AnswerDoc = drafter.ask_json(
-        &DRAFT_PROMPT
-            .replace("{viewer}", &viewer)
-            .replace("{number}", &number.to_string())
-            .replace("{fence}", NOT_INSTRUCTION)
-            .replace("{thread}", &rendered),
+        &fill(
+            DRAFT_PROMPT,
+            &[
+                ("{viewer}", &viewer),
+                ("{number}", &number.to_string()),
+                ("{fence}", NOT_INSTRUCTION),
+                ("{thread}", &rendered),
+            ],
+        ),
         &schema::answer(),
         work_dir,
         &drafter.effort(cfg, Call::Answer(1)).about(number),
@@ -662,18 +667,22 @@ fn inner(
 
     log!("#{number}: {checker_name} checking those answers");
     let checked: Option<AnswerCheckDoc> = match checker.ask_json::<AnswerCheckDoc>(
-        &CHECK_PROMPT
-            .replace("{viewer}", &viewer)
-            .replace("{number}", &number.to_string())
-            .replace("{fence}", NOT_INSTRUCTION)
-            .replace("{thread}", &rendered)
-            .replace(
-                "{drafts}",
-                &fence.wrap(
-                    "issue answers drafted by the other agent",
-                    &render_drafts(&settled),
+        &fill(
+            CHECK_PROMPT,
+            &[
+                ("{viewer}", &viewer),
+                ("{number}", &number.to_string()),
+                ("{fence}", NOT_INSTRUCTION),
+                ("{thread}", &rendered),
+                (
+                    "{drafts}",
+                    &fence.wrap(
+                        "issue answers drafted by the other agent",
+                        &render_drafts(&settled),
+                    ),
                 ),
-            ),
+            ],
+        ),
         &schema::answer_check(),
         work_dir,
         &checker.effort(cfg, Call::Answer(2)).about(number),

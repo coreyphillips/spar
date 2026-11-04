@@ -29,6 +29,7 @@ pub mod schema;
 pub mod spend;
 pub mod split;
 pub mod style;
+pub mod template;
 pub mod textsim;
 pub mod tracker;
 pub mod triage;

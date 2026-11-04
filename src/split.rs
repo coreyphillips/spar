@@ -41,6 +41,7 @@ use crate::model::{
 };
 use crate::repo::{PushTarget, Repo, SplitPushError, WorktreeCheckpoint};
 use crate::style::{self, Style};
+use crate::template::fill;
 use crate::{bail, log, logdim, logwarn, schema, spar_err};
 
 // ---------------------------------------------------------------------------
@@ -555,11 +556,15 @@ fn issue_inner(
              the rest matters."
         );
     }
-    let prompt = PROPOSE_ISSUE_PROMPT
-        .replace("{number}", &number.to_string())
-        .replace("{title}", &issue.title)
-        .replace("{url}", &issue.url)
-        .replace("{body}", &body);
+    let prompt = fill(
+        PROPOSE_ISSUE_PROMPT,
+        &[
+            ("{number}", &number.to_string()),
+            ("{title}", &issue.title),
+            ("{url}", &issue.url),
+            ("{body}", &body),
+        ],
+    );
 
     let checkout = repo.read_checkout(&format!("split of #{number}"))?;
     let decision = propose_and_check(
@@ -870,12 +875,16 @@ fn split_pr_inner(
         return Ok(());
     }
 
-    let prompt = PROPOSE_PR_PROMPT
-        .replace("{number}", &number.to_string())
-        .replace("{title}", &pr.title)
-        .replace("{base}", &repo.base_ref(read_only, base))
-        .replace("{count}", &changed.len().to_string())
-        .replace("{files}", &listed(&changed));
+    let prompt = fill(
+        PROPOSE_PR_PROMPT,
+        &[
+            ("{number}", &number.to_string()),
+            ("{title}", &pr.title),
+            ("{base}", &repo.base_ref(read_only, base)),
+            ("{count}", &changed.len().to_string()),
+            ("{files}", &listed(&changed)),
+        ],
+    );
 
     let mut decision = propose_and_check(
         agents,
@@ -1421,14 +1430,18 @@ fn build_one(
         .map_err(|e| e.with_message(format!("could not commit the slice: {}", e.last_line())))?;
     let slice_head = repo.head_oid_checked(dir)?;
 
-    let prompt = STAND_ALONE_PROMPT
-        .replace("{parent}", &number.to_string())
-        .replace("{base}", &repo.base_ref(dir, against))
-        .replace("{index}", &index.to_string())
-        .replace("{total}", &total.to_string())
-        .replace("{title}", part.title.trim())
-        .replace("{body}", part.body.trim())
-        .replace("{files}", &listed(&part.files));
+    let prompt = fill(
+        STAND_ALONE_PROMPT,
+        &[
+            ("{parent}", &number.to_string()),
+            ("{base}", &repo.base_ref(dir, against)),
+            ("{index}", &index.to_string()),
+            ("{total}", &total.to_string()),
+            ("{title}", part.title.trim()),
+            ("{body}", part.body.trim()),
+            ("{files}", &listed(&part.files)),
+        ],
+    );
     let worktree_baseline = repo.worktree_baseline(dir)?;
     let work: Implementation = match implementor.edit_json(
         &prompt,
@@ -1901,18 +1914,22 @@ fn propose_and_check(
         proposal.parts.len()
     );
     let check: SplitCheck = checker.ask_json(
-        &CHECK_PROMPT
-            .replace("{what}", what)
-            .replace("{reason}", proposal.reason.trim())
-            .replace(
-                "{shape}",
-                if proposal.stacked {
-                    "stacked, each needing the one before it"
-                } else {
-                    "independent of each other"
-                },
-            )
-            .replace("{parts}", &render_parts(&proposal.parts)),
+        &fill(
+            CHECK_PROMPT,
+            &[
+                ("{what}", what),
+                ("{reason}", proposal.reason.trim()),
+                (
+                    "{shape}",
+                    if proposal.stacked {
+                        "stacked, each needing the one before it"
+                    } else {
+                        "independent of each other"
+                    },
+                ),
+                ("{parts}", &render_parts(&proposal.parts)),
+            ],
+        ),
         &schema::split_check(),
         work_dir,
         &checker.effort(cfg, Call::Split(2)),

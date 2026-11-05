@@ -1982,8 +1982,11 @@ fn cmd_post(
         // Through the style gate like anything else spar sends, so an edit that
         // reintroduces a banned dash is caught rather than published.
         match repo.comment_pr(*number, &text) {
-            Ok(()) => {
-                log!("posted to PR #{number}");
+            Ok(url) => {
+                log!(
+                    "posted to PR #{number}{}",
+                    crate::review_only::link(url.as_deref())
+                );
                 // The review the dry run recorded has now been seen, so a
                 // later push or reply gets a second look rather than a first.
                 if let Some(mut record) = repo.read_review_record(*number) {
@@ -2796,6 +2799,9 @@ pub(crate) fn print_outcome(r: &IssueRun, spent: &[spend::Spent]) {
     );
     for note in &r.notes {
         println!("       {}", first_line(note));
+    }
+    if let Some(url) = &r.posted {
+        println!("       posted {url}");
     }
     for url in &r.filed {
         println!("       filed {url}");

@@ -1311,6 +1311,10 @@ pub struct IssueRun {
     pub disputes: Vec<Dispute>,
     #[serde(default)]
     pub filed: Vec<String>,
+    /// The review or comment this run put on the pull request, when GitHub
+    /// said where it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posted: Option<String>,
     /// Real points a reviewer judged smaller than another round.
     ///
     /// Nothing else carries them. The round comment is off under the default
@@ -1348,6 +1352,7 @@ impl IssueRun {
             rounds: 0,
             disputes: Vec::new(),
             filed: Vec::new(),
+            posted: None,
             noted: Vec::new(),
             notes: Vec::new(),
             criteria: Vec::new(),

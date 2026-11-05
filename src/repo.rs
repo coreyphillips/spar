@@ -1379,7 +1379,17 @@ pub(crate) fn state_file_number(name: &str) -> Option<i64> {
 /// More than one body because a review with line comments goes up with a
 /// shorter one than the same review without them.
 fn has_viewer_review(reviews: &[Value], viewer: &str, bodies: &[&str], commit: &str) -> bool {
-    reviews.iter().any(|review| {
+    viewer_review(reviews, viewer, bodies, commit).is_some()
+}
+
+/// The review `has_viewer_review` finds.
+fn viewer_review<'a>(
+    reviews: &'a [Value],
+    viewer: &str,
+    bodies: &[&str],
+    commit: &str,
+) -> Option<&'a Value> {
+    reviews.iter().find(|review| {
         let field = |name: &str| review.get(name).and_then(Value::as_str).unwrap_or("");
         let standing = !matches!(
             field("state").to_uppercase().as_str(),
@@ -1403,10 +1413,12 @@ fn reconcile_review_post(
     commit: &str,
     post_error: crate::error::SparError,
     reviews: Result<Vec<Value>>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     match reviews {
-        Ok(reviews) if has_viewer_review(&reviews, viewer, bodies, commit) => Ok(()),
-        Ok(_) => Err(post_error),
+        Ok(reviews) => match viewer_review(&reviews, viewer, bodies, commit) {
+            Some(review) => Ok(html_url(review)),
+            None => Err(post_error),
+        },
         Err(read_error) => Err(crate::error::SparError::uncertain_write(format!(
             "could not submit a review on #{number}. {} The result could not be verified: {}",
             post_error.last_line(),
@@ -1519,8 +1531,8 @@ fn hunk_header(line: &str) -> Option<((u32, u32), (u32, u32))> {
     Some((range(old)?, range(new)?))
 }
 
-fn has_exact_comment(comments: &[Value], body: &str) -> bool {
-    comments.iter().any(|comment| {
+fn exact_comment<'a>(comments: &'a [Value], body: &str) -> Option<&'a Value> {
+    comments.iter().find(|comment| {
         comment
             .get("body")
             .and_then(Value::as_str)
@@ -1528,15 +1540,40 @@ fn has_exact_comment(comments: &[Value], body: &str) -> bool {
     })
 }
 
+/// Where a REST row lives on github.com, for a person to open.
+fn html_url(row: &Value) -> Option<String> {
+    row.get("html_url")
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
+}
+
+/// The comment `gh pr comment` says it made. It prints the address on a line
+/// of its own, and nothing else is promised about what is around it.
+fn printed_url(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("https://"))
+        .map(str::to_string)
+}
+
+/// The review the reviews API says it made, from the row it answers with.
+fn review_url(response: &str) -> Option<String> {
+    html_url(&serde_json::from_str(response).ok()?)
+}
+
 fn reconcile_comment_post(
     number: i64,
     body: &str,
     post_error: crate::error::SparError,
     comments: Result<Vec<Value>>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     match comments {
-        Ok(comments) if has_exact_comment(&comments, body) => Ok(()),
-        Ok(_) => Err(post_error),
+        Ok(comments) => match exact_comment(&comments, body) {
+            Some(comment) => Ok(html_url(comment)),
+            None => Err(post_error),
+        },
         Err(read_error) => Err(crate::error::SparError::uncertain_write(format!(
             "could not comment on #{number}. {} The result could not be verified: {}",
             post_error.last_line(),
@@ -5299,15 +5336,17 @@ impl Repo {
         self.record_write(reconcile_pr_creation(branch, created, found))
     }
 
-    pub fn comment_pr(&self, number: i64, body: &str) -> Result<()> {
+    /// Comment on a pull request, and say where the comment is when GitHub
+    /// did. An identical comment already there is this one.
+    pub fn comment_pr(&self, number: i64, body: &str) -> Result<Option<String>> {
         let body = signed(&self.record_failed_write(self.clean(body))?);
         let comments = self.record_failed_write(self.try_issue_comments(number))?;
-        if has_exact_comment(&comments, &body) {
-            return Ok(());
+        if let Some(comment) = exact_comment(&comments, &body) {
+            return Ok(html_url(comment));
         }
         let posted = self.gh(&["pr", "comment", &number.to_string(), "--body", &body]);
         let result = match posted {
-            Ok(_) => Ok(()),
+            Ok(stdout) => Ok(printed_url(&stdout)),
             Err(post_error) => {
                 reconcile_comment_post(number, &body, post_error, self.try_issue_comments(number))
             }
@@ -5352,6 +5391,9 @@ impl Repo {
     ///
     /// Either body standing on `commit` already is this review, so a rerun
     /// after the fallback landed does not post it again.
+    ///
+    /// The address of whichever review stands is returned when GitHub gave
+    /// one.
     pub fn submit_review(
         &self,
         number: i64,
@@ -5360,7 +5402,7 @@ impl Repo {
         full: &str,
         commit: &str,
         comments: &[InlineComment],
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let own = match verdict {
             Some(_) => self.record_failed_write(self.pr_is_own(number))?,
             None => false,
@@ -5385,8 +5427,8 @@ impl Repo {
         let either = [body.as_str(), full.as_str()];
         let viewer = self.record_failed_write(self.viewer_login())?.to_string();
         let reviews = self.record_failed_write(self.try_pr_reviews(number))?;
-        if has_viewer_review(&reviews, &viewer, &either, commit) {
-            return Ok(());
+        if let Some(review) = viewer_review(&reviews, &viewer, &either, commit) {
+            return Ok(html_url(review));
         }
         let event = match (verdict, own) {
             (Some(v), false) => v.api_event(),
@@ -5397,11 +5439,8 @@ impl Repo {
         } else {
             let path = format!("repos/{{owner}}/{{repo}}/pulls/{number}/reviews");
             let payload = review_payload(commit, event, &body, &inline).to_string();
-            match self.gh_stdin(
-                &["api", "-X", "POST", &path, "--input", "-", "--silent"],
-                &payload,
-            ) {
-                Ok(_) => Ok(()),
+            match self.gh_stdin(&["api", "-X", "POST", &path, "--input", "-"], &payload) {
+                Ok(response) => Ok(review_url(&response)),
                 Err(post_error) if !refused(&post_error) => reconcile_review_post(
                     number,
                     &[&body],
@@ -5436,7 +5475,7 @@ impl Repo {
         viewer: &str,
         commit: &str,
         event: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let path = format!("repos/{{owner}}/{{repo}}/pulls/{number}/reviews");
         let posted = self.gh(&[
             "api",
@@ -5449,10 +5488,9 @@ impl Repo {
             &format!("event={event}"),
             "-f",
             &format!("body={body}"),
-            "--silent",
         ]);
         match posted {
-            Ok(_) => Ok(()),
+            Ok(response) => Ok(review_url(&response)),
             Err(post_error) => reconcile_review_post(
                 number,
                 &[body],
@@ -5467,7 +5505,7 @@ impl Repo {
     pub fn comment_issue(&self, number: i64, body: &str) -> Result<()> {
         let body = signed(&self.record_failed_write(self.clean(body))?);
         let comments = self.record_failed_write(self.try_issue_comments(number))?;
-        if has_exact_comment(&comments, &body) {
+        if exact_comment(&comments, &body).is_some() {
             return Ok(());
         }
         let posted = self.gh(&["issue", "comment", &number.to_string(), "--body", &body]);
@@ -5475,6 +5513,7 @@ impl Repo {
             Ok(_) => Ok(()),
             Err(post_error) => {
                 reconcile_comment_post(number, &body, post_error, self.try_issue_comments(number))
+                    .map(|_| ())
             }
         };
         self.record_write(result)
@@ -12330,6 +12369,70 @@ mod review_record_tests {
         assert_eq!(crate::error::ErrorKind::UncertainWrite, err.kind());
         assert!(err.to_string().contains("could not be verified"), "{err}");
     }
+
+    #[test]
+    fn a_review_found_standing_links_to_itself() {
+        let url = "https://github.com/o/r/pull/5#pullrequestreview-7";
+        let reviews = vec![
+            json!({"user": {"login": "me"}, "body": "older", "commit_id": "aaa", "html_url": "https://github.com/o/r/pull/5#pullrequestreview-6"}),
+            json!({"user": {"login": "me"}, "body": "the body", "commit_id": "aaa", "html_url": url}),
+        ];
+        let found = viewer_review(&reviews, "me", &["the body"], "aaa").map(html_url);
+        assert_eq!(Some(Some(url.to_string())), found);
+        let error = crate::error::SparError::call_failed("gh: boom");
+        let reconciled =
+            reconcile_review_post(5, &["the body"], "me", "aaa", error.clone(), Ok(reviews));
+        assert_eq!(Some(url.to_string()), reconciled.unwrap());
+
+        let unlinked =
+            vec![json!({"user": {"login": "me"}, "body": "the body", "commit_id": "aaa"})];
+        let reconciled = reconcile_review_post(5, &["the body"], "me", "aaa", error, Ok(unlinked));
+        assert_eq!(None, reconciled.unwrap(), "no address is still a review");
+    }
+
+    #[test]
+    fn a_comment_found_standing_links_to_itself() {
+        let url = "https://github.com/o/r/pull/34#issuecomment-9";
+        let comments = vec![
+            json!({"body": "other", "html_url": "https://github.com/o/r/pull/34#issuecomment-8"}),
+            json!({"body": "the summary", "html_url": url}),
+        ];
+        assert_eq!(
+            Some(url.to_string()),
+            exact_comment(&comments, "the summary").and_then(html_url)
+        );
+        let reconciled = reconcile_comment_post(
+            34,
+            "the summary",
+            crate::error::SparError::new("connection lost"),
+            Ok(comments),
+        );
+        assert_eq!(Some(url.to_string()), reconciled.unwrap());
+        assert_eq!(None, html_url(&json!({"body": "x", "html_url": ""})));
+    }
+
+    #[test]
+    fn the_comment_gh_made_is_the_address_it_printed() {
+        let url = "https://github.com/o/r/pull/34#issuecomment-9";
+        assert_eq!(Some(url.to_string()), printed_url(&format!("{url}\n")));
+        assert_eq!(
+            Some(url.to_string()),
+            printed_url(&format!("Warning: 1 uncommitted change\n  {url}  \ndone\n"))
+        );
+        assert_eq!(None, printed_url(""));
+        assert_eq!(None, printed_url("commented\nsee http://example.test\n"));
+    }
+
+    #[test]
+    fn the_review_github_made_is_the_address_in_its_answer() {
+        let url = "https://github.com/o/r/pull/5#pullrequestreview-7";
+        let answer = json!({"id": 7, "state": "APPROVED", "html_url": url}).to_string();
+        assert_eq!(Some(url.to_string()), review_url(&answer));
+        assert_eq!(None, review_url(r#"{"id": 7, "state": "APPROVED"}"#));
+        assert_eq!(None, review_url(""));
+        assert_eq!(None, review_url("not json"));
+    }
+
     #[test]
     fn a_review_with_line_comments_names_the_new_side_and_a_range_only_when_it_has_one() {
         let comments = vec![

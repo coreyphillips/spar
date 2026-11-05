@@ -951,6 +951,109 @@ fn push_rejection(message: &str) -> Option<&str> {
         .find(|line| line.starts_with("[rejected]") || line.starts_with("[remote rejected]"))
 }
 
+/// How long to wait before each further try of a push the remote failed on
+/// its own side. Two more tries over about forty seconds rides out the blips
+/// GitHub has, and a remote that stays down longer is better reported than
+/// waited on.
+const PUSH_RETRY_WAITS: [std::time::Duration; 2] = [
+    std::time::Duration::from_secs(10),
+    std::time::Duration::from_secs(30),
+];
+
+/// Reasons a remote gives for turning a ref down that are about the remote,
+/// not the push. GitHub answers `fatal error in commit_refs_rules` for a
+/// branch no rule applies to, and takes the same push a minute later.
+const REMOTE_FAULTS: &[&str] = &["fatal error", "internal server error", "internal error"];
+
+/// What git says when the connection, not the remote's judgement, failed.
+const CONNECTION_FAULTS: &[&str] = &[
+    "the remote end hung up unexpectedly",
+    "rpc failed",
+    "returned error: 5",
+    "connection reset",
+    "connection timed out",
+    "operation timed out",
+    "connection closed by",
+    "could not resolve host",
+    "early eof",
+    "unexpected disconnect",
+    "kex_exchange_identification",
+    "ssl_error_syscall",
+    "gnutls_handshake",
+    "http/2 stream",
+];
+
+/// The line of a failed push that says the remote or the connection failed
+/// on its own side, so the same push could go through if tried again.
+///
+/// Anything that is about the push itself is left out, because the remote
+/// would refuse the same push again: a denial, a lease that lost, a hook or
+/// ruleset that declined it, or a request the server will not take, such as
+/// one too large (HTTP 413, which git follows with a hang up).
+fn transient_push_failure(message: &str) -> Option<&str> {
+    if push_denial(message).is_some() {
+        return None;
+    }
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("returned error: 4") || lower.contains("rpc failed; http 4") {
+        return None;
+    }
+    if let Some(rejection) = push_rejection(message) {
+        let reason = rejection.to_ascii_lowercase();
+        let internal = rejection.starts_with("[remote rejected]")
+            && REMOTE_FAULTS.iter().any(|fault| reason.contains(fault));
+        return internal.then_some(rejection);
+    }
+    message.lines().map(str::trim).find(|line| {
+        let line = line.to_ascii_lowercase();
+        CONNECTION_FAULTS.iter().any(|fault| line.contains(fault))
+    })
+}
+
+/// Push, and push again after a wait when the remote fails on its own side.
+///
+/// `landed` rereads the remote before each further try and after the last
+/// one. A push whose answer was lost on the way back may have gone through,
+/// and pushing it again would then lose its lease to itself. `sleep` returns
+/// true when the process was told to stop while it waited, which ends the
+/// retries with the failure in hand.
+fn retry_transient_push(
+    label: &str,
+    mut push: impl FnMut() -> Result<()>,
+    mut landed: impl FnMut() -> bool,
+    waits: &[std::time::Duration],
+    mut sleep: impl FnMut(std::time::Duration) -> bool,
+) -> Result<()> {
+    let mut waits = waits.iter();
+    loop {
+        let error = match push() {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        if !error.worth_retrying() {
+            return Err(error);
+        }
+        let message = error.to_string();
+        let Some(fault) = transient_push_failure(&message) else {
+            return Err(error);
+        };
+        if landed() {
+            log!("the push to {label} reported a failure but reached the remote, so it stands.");
+            return Ok(());
+        }
+        let Some(wait) = waits.next() else {
+            return Err(error);
+        };
+        log!(
+            "the push to {label} failed on the remote's side: {fault}\nPushing again in {}s.",
+            wait.as_secs()
+        );
+        if sleep(*wait) {
+            return Err(error);
+        }
+    }
+}
+
 fn push_error(
     target: &PushTarget,
     branch: &str,
@@ -959,6 +1062,13 @@ fn push_error(
     let message = e.to_string();
     if let Some(denied) = push_denial(&message) {
         return spar_err!("could not push to {}. {denied}", target.describe(branch));
+    }
+    if let Some(fault) = transient_push_failure(&message) {
+        return e.with_message(format!(
+            "could not push to {}. {fault}\nThe remote failed on its own side rather than \
+             refusing the branch, and pushing again did not get through. Try again later.",
+            target.describe(branch)
+        ));
     }
     spar_err!(
         "could not push to {}. {}\nCheck push access and whether the branch moved under you.",
@@ -4593,8 +4703,45 @@ impl Repo {
             (None, PushTarget::Fork(_)) => format!("--force-with-lease=refs/heads/{branch}:"),
             (None, PushTarget::Origin) => "--force-with-lease".to_string(),
         };
-        self.git_at(Some(cwd), &["push", &lease, target.remote(), &refspec])
-            .map(|_| ())
+        self.push_retrying(
+            cwd,
+            target.remote(),
+            branch,
+            &target.describe(branch),
+            &["push", &lease, target.remote(), &refspec],
+        )
+    }
+
+    /// `git push` with `args`, tried again when the remote fails on its own
+    /// side. See `retry_transient_push`.
+    fn push_retrying(
+        &self,
+        cwd: &Path,
+        remote: &str,
+        branch: &str,
+        label: &str,
+        args: &[&str],
+    ) -> Result<()> {
+        retry_transient_push(
+            label,
+            || self.git_at(Some(cwd), args).map(|_| ()),
+            || self.remote_branch_is_head(cwd, remote, branch),
+            &PUSH_RETRY_WAITS,
+            proc::sleep_unless_interrupted,
+        )
+    }
+
+    /// Whether `remote` has `branch` at the HEAD of `cwd`. False when either
+    /// side cannot be read, which leaves the push to be tried again.
+    fn remote_branch_is_head(&self, cwd: &Path, remote: &str, branch: &str) -> bool {
+        let remote_ref = format!("refs/heads/{branch}");
+        let (Ok(head), Ok(listed)) = (
+            self.git_at(Some(cwd), &["rev-parse", "HEAD"]),
+            self.git_at(Some(cwd), &["ls-remote", "--heads", remote, &remote_ref]),
+        ) else {
+            return false;
+        };
+        matches!(remote_head_oid(&listed, &remote_ref), Ok(Some(oid)) if oid == head.trim())
     }
 
     /// The authenticated user's fork of this repository, made if there is none.
@@ -4729,8 +4876,15 @@ impl Repo {
         let remote_ref = format!("refs/heads/{branch}");
         let lease = format!("--force-with-lease={remote_ref}:");
         let refspec = format!("HEAD:{remote_ref}");
-        let result = match self.git_at(Some(cwd), &["push", &lease, "origin", &refspec]) {
-            Ok(_) => Ok(()),
+        let pushed = self.push_retrying(
+            cwd,
+            "origin",
+            branch,
+            &format!("origin/{branch}"),
+            &["push", &lease, "origin", &refspec],
+        );
+        let result = match pushed {
+            Ok(()) => Ok(()),
             Err(push_error) => {
                 let local = self.git_at(Some(cwd), &["rev-parse", "HEAD"]);
                 let remote = self.git(&["ls-remote", "--heads", "origin", &remote_ref]);
@@ -11746,6 +11900,202 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    /// What GitHub answered for a branch no ruleset applies to, a minute
+    /// before it took the same push.
+    const COMMIT_REFS_RULES: &str = "To github.com:example/project.git\n \
+         ! [remote rejected] HEAD -> issue-7 (fatal error in commit_refs_rules)\n\
+         error: failed to push some refs to 'github.com:example/project.git'";
+
+    #[test]
+    fn a_remote_failing_on_its_own_side_is_worth_pushing_again() {
+        let transient = [
+            (
+                COMMIT_REFS_RULES,
+                "[remote rejected] HEAD -> issue-7 (fatal error in commit_refs_rules)",
+            ),
+            (
+                " ! [remote rejected] HEAD -> issue-7 (Internal Server Error)",
+                "[remote rejected] HEAD -> issue-7 (Internal Server Error)",
+            ),
+            (
+                "error: RPC failed; HTTP 502 curl 22 The requested URL returned error: 502\n\
+                 send-pack: unexpected disconnect while reading sideband packet\n\
+                 fatal: the remote end hung up unexpectedly",
+                "error: RPC failed; HTTP 502 curl 22 The requested URL returned error: 502",
+            ),
+            (
+                "error: RPC failed; curl 92 HTTP/2 stream 0 was not closed cleanly: CANCEL (err 8)",
+                "error: RPC failed; curl 92 HTTP/2 stream 0 was not closed cleanly: CANCEL (err 8)",
+            ),
+            (
+                "kex_exchange_identification: Connection closed by remote host\n\
+                 fatal: Could not read from remote repository.",
+                "kex_exchange_identification: Connection closed by remote host",
+            ),
+        ];
+        for (message, line) in transient {
+            assert_eq!(Some(line), transient_push_failure(message), "{message}");
+        }
+
+        let about_the_push = [
+            // A lease that lost: the branch moved.
+            "To github.com:example/project.git\n \
+             ! [rejected]        HEAD -> issue-7 (stale info)\n\
+             error: failed to push some refs to 'github.com:example/project.git'",
+            // A hook or a ruleset that declined it.
+            " ! [remote rejected] HEAD -> issue-7 (pre-receive hook declined)",
+            "remote: error: GH013: Repository rule violations found for refs/heads/issue-7.\n \
+             ! [remote rejected] HEAD -> issue-7 (push declined due to repository rule \
+             violations)",
+            // A denial, over either transport.
+            "ERROR: Permission to example/project.git denied to someone.\n\
+             fatal: Could not read from remote repository.",
+            // Too large: git hangs up after it, and the same push is as large
+            // the next time.
+            "error: RPC failed; HTTP 413 curl 22 The requested URL returned error: 413\n\
+             fatal: the remote end hung up unexpectedly",
+            "fatal: 'origin' does not appear to be a git repository\n\
+             fatal: Could not read from remote repository.",
+        ];
+        for message in about_the_push {
+            assert_eq!(None, transient_push_failure(message), "{message}");
+        }
+    }
+
+    /// A push driven by a script of answers, recording what the retry did.
+    fn scripted_push(
+        answers: Vec<std::result::Result<(), crate::error::SparError>>,
+        landed: bool,
+        interrupted: bool,
+    ) -> (Result<()>, usize, usize, Vec<u64>) {
+        let mut answers = answers.into_iter();
+        let mut pushes = 0;
+        let mut checks = 0;
+        let mut waited = Vec::new();
+        let result = retry_transient_push(
+            "origin/issue-7",
+            || {
+                pushes += 1;
+                answers.next().expect("pushed more often than scripted")
+            },
+            || {
+                checks += 1;
+                landed
+            },
+            &PUSH_RETRY_WAITS,
+            |wait| {
+                waited.push(wait.as_secs());
+                interrupted
+            },
+        );
+        (result, pushes, checks, waited)
+    }
+
+    fn github_fault() -> std::result::Result<(), crate::error::SparError> {
+        Err(crate::error::SparError::new(COMMIT_REFS_RULES))
+    }
+
+    #[test]
+    fn a_push_the_remote_failed_on_its_side_is_tried_again() {
+        let (result, pushes, checks, waited) =
+            scripted_push(vec![github_fault(), Ok(())], false, false);
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(2, pushes);
+        assert_eq!(1, checks, "the remote is reread before pushing again");
+        assert_eq!(vec![10], waited);
+    }
+
+    #[test]
+    fn a_remote_that_keeps_failing_is_reported_after_the_last_try() {
+        let (result, pushes, checks, waited) = scripted_push(
+            vec![github_fault(), github_fault(), github_fault()],
+            false,
+            false,
+        );
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("commit_refs_rules"), "{err}");
+        assert_eq!(3, pushes);
+        assert_eq!(3, checks, "the last failure is reread too");
+        assert_eq!(vec![10, 30], waited);
+    }
+
+    #[test]
+    fn a_push_that_landed_despite_the_failure_is_not_pushed_again() {
+        let (result, pushes, _, waited) = scripted_push(vec![github_fault()], true, false);
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(1, pushes);
+        assert!(waited.is_empty(), "{waited:?}");
+    }
+
+    #[test]
+    fn a_push_refused_for_itself_is_not_tried_again() {
+        let stale = Err(crate::error::SparError::new(
+            " ! [rejected]        HEAD -> issue-7 (stale info)",
+        ));
+        let timed_out = Err(crate::error::SparError::timed_out(
+            "fatal: the remote end hung up unexpectedly",
+        ));
+        for answer in [stale, timed_out] {
+            let (result, pushes, checks, waited) = scripted_push(vec![answer], false, false);
+
+            assert!(result.is_err());
+            assert_eq!((1, 0), (pushes, checks));
+            assert!(waited.is_empty(), "{waited:?}");
+        }
+    }
+
+    #[test]
+    fn a_stop_while_waiting_to_push_again_ends_the_retries() {
+        let (result, pushes, _, waited) = scripted_push(vec![github_fault()], false, true);
+
+        assert!(result.is_err());
+        assert_eq!(1, pushes);
+        assert_eq!(vec![10], waited);
+    }
+
+    /// The access advice is for a push the remote refused, and this one it
+    /// failed to take.
+    #[test]
+    fn a_push_the_remote_kept_failing_says_to_try_again_later() {
+        let err = push_error(
+            &PushTarget::Origin,
+            "issue-7",
+            &crate::error::SparError::new(COMMIT_REFS_RULES),
+        )
+        .to_string();
+
+        assert!(
+            err.starts_with(
+                "could not push to origin/issue-7. [remote rejected] HEAD -> issue-7 (fatal \
+                 error in commit_refs_rules)\nThe remote failed on its own side"
+            ),
+            "{err}"
+        );
+        assert!(err.ends_with("Try again later."), "{err}");
+        assert!(!err.contains("Check push access"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_branch_is_known_to_have_landed_only_at_this_head() {
+        let (_fixture, repo, work, _origin, fork) = denied_fixture("landed", true);
+        let fork = fork.to_str().unwrap();
+
+        assert!(!repo.remote_branch_is_head(&work, fork, "issue-7"));
+
+        test_git(&work, &["push", "-q", fork, "main:refs/heads/issue-7"]);
+        assert!(
+            !repo.remote_branch_is_head(&work, fork, "issue-7"),
+            "a branch somewhere else is not this push"
+        );
+
+        test_git(&work, &["push", "-qf", fork, "HEAD:refs/heads/issue-7"]);
+        assert!(repo.remote_branch_is_head(&work, fork, "issue-7"));
     }
 
     #[test]

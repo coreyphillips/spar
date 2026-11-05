@@ -905,7 +905,20 @@ fn implement_and_review(
     // to lease against, and `refuse_issue_branch_rebuild` already refused to
     // build over one that existed. Being new is also what lets it go to a
     // fork when origin refuses it, since no pull request is on origin yet.
-    let target = repo.publish_new_branch(work_dir, branch, &base)?;
+    //
+    // A failure here comes after the most expensive call of the run, so it
+    // says where that work is and how to carry on from it. `spar run` cannot:
+    // it refuses to rebuild a branch that holds commits nothing preserves.
+    let target = repo
+        .publish_new_branch(work_dir, branch, &base)
+        .map_err(|e| {
+            e.with_message(format!(
+                "{e}\nThe work is kept on the local branch {branch} in {}. To continue it \
+                 without implementing again, push that branch, open a pull request for it and \
+                 run `spar resume <pr>`.",
+                work_dir.display()
+            ))
+        })?;
 
     let description = pr_body(number, &work, checked.as_deref(), &criteria, &repo.style);
     let pr = match repo.pr_for_branch(branch) {

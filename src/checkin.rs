@@ -1377,7 +1377,7 @@ fn post(
         let posted = if on_issue {
             repo.comment_issue(number, &text)
         } else {
-            repo.comment_pr(number, &text)
+            repo.comment_pr(number, &text).map(|_| ())
         };
         match posted {
             Ok(()) => {

@@ -874,7 +874,7 @@ fn finish(
         Err(e) => Err(e),
     };
     match posted {
-        Ok(()) => {
+        Ok(url) => {
             let what = if blocking == 0 && contested == 0 {
                 "no blocking findings".to_string()
             } else if blocking == 0 {
@@ -883,10 +883,12 @@ fn finish(
                 format!("{blocking} blocking finding{}", plural(blocking))
             };
             log!(
-                "PR #{}: {what}, {} posted",
+                "PR #{}: {what}, {} posted{}",
                 pr.number,
-                posted_as(reviewed.opts.verdict, verdict)
+                posted_as(reviewed.opts.verdict, verdict),
+                link(url.as_deref())
             );
+            state.posted = url;
             record(state, true);
         }
         Err(e) => {
@@ -908,6 +910,12 @@ fn posted_as(formal: bool, verdict: Option<ReviewVerdict>) -> &'static str {
         (true, Some(ReviewVerdict::RequestChanges)) => "request for changes",
         (true, None) => "review comment with no verdict, since a blocking finding is disputed",
     }
+}
+
+/// The end of a "posted" line: where it went, or nothing when GitHub did not
+/// say. A post with no address still landed.
+pub(crate) fn link(url: Option<&str>) -> String {
+    url.map(|url| format!(": {url}")).unwrap_or_default()
 }
 
 /// Why a review was printed rather than posted.
@@ -1868,12 +1876,14 @@ fn recheck_phases(
         Err(e) => Err(e),
     };
     match posted {
-        Ok(()) => {
+        Ok(url) => {
             log!(
-                "PR #{}: second look posted, {}",
+                "PR #{}: second look posted, {}{}",
                 pr.number,
-                posted_as(true, verdict)
+                posted_as(true, verdict),
+                link(url.as_deref())
             );
+            state.posted = url;
             let next = record_after_recheck(
                 look.record,
                 look.head,

@@ -6655,7 +6655,9 @@ fn a_branch_with_no_commits_of_its_own_lists_nothing() {
 /// review sent as JSON on stdin, the shape that carries line comments, is
 /// saved to `$SPAR_FAKE_GH_STDIN`, and refused as GitHub refuses a line outside
 /// the diff when `SPAR_FAKE_INLINE_FAILS=1`, or lost to a gateway error when it
-/// is `502`.
+/// is `502`. With `SPAR_FAKE_LINKS=1` a write answers as GitHub does, with
+/// where it went: review 123 for one with line comments, 124 for one without,
+/// and comment 456.
 fn review_gh(number: i64, head: &str, author: &str) -> String {
     format!(
         r#"set -eu
@@ -6680,12 +6682,256 @@ case "$1 $2" in
         fi
         if [ "${{SPAR_FAKE_INLINE_FAILS:-}}" = 502 ]; then
           printf 'gh: Bad Gateway (HTTP 502)\n' >&2; exit 1
+        fi
+        if [ "${{SPAR_FAKE_LINKS:-}}" = 1 ]; then
+          printf '%s\n' '{{"id":123,"html_url":"https://github.com/example/project/pull/{number}#pullrequestreview-123"}}'
+        fi ;;
+      *"/reviews -f "*)
+        if [ "${{SPAR_FAKE_LINKS:-}}" = 1 ]; then
+          printf '%s\n' '{{"id":124,"html_url":"https://github.com/example/project/pull/{number}#pullrequestreview-124"}}'
         fi ;;
     esac ;;
-  "pr comment") : ;;
+  "pr comment")
+    if [ "${{SPAR_FAKE_LINKS:-}}" = 1 ]; then
+      printf 'https://github.com/example/project/pull/{number}#issuecomment-456\n'
+    fi ;;
   *) printf 'unexpected gh call: %s\n' "$*" >&2; exit 64 ;;
 esac"#
     )
+}
+
+const LINKS: (&str, &str) = ("SPAR_FAKE_LINKS", "1");
+
+/// Where the fake says review `id` on pull request `number` went.
+fn review_link(number: i64, id: u32) -> String {
+    format!("https://github.com/example/project/pull/{number}#pullrequestreview-{id}")
+}
+
+/// That the run said where its post went, on the "posted" line and in the
+/// report under the pull request.
+fn linked(out: &str, number: i64, url: &str) {
+    let posted = out
+        .lines()
+        .find(|line| line.contains(&format!("PR #{number}: ")) && line.contains(" posted"))
+        .unwrap_or_else(|| panic!("no posted line:\n{out}"));
+    assert!(posted.ends_with(&format!(": {url}")), "{out}");
+    assert!(out.contains(&format!("       posted {url}\n")), "{out}");
+}
+
+/// A plain comment, a formal verdict and a review with line comments each
+/// name what they put up, on the posted line and in the report.
+#[test]
+#[cfg(unix)]
+fn a_posted_review_links_to_what_went_up() {
+    let comment = "https://github.com/example/project/pull/5#issuecomment-456";
+    let fx = repo("reviewlinkcomment");
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/5/head"]);
+    let head = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    let gh = review_gh(5, &head, "someone-else");
+    let (ok, out, _) = review_run_with(&fx, &["5"], CLEAN_REVIEW, CLEAN_REVIEW, &gh, &[LINKS], "");
+    assert!(ok, "{out}");
+    assert!(
+        out.contains(&format!("no blocking findings, review posted: {comment}")),
+        "{out}"
+    );
+    linked(&out, 5, comment);
+
+    let fx = repo("reviewlinkverdict");
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/5/head"]);
+    let head = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    let gh = review_gh(5, &head, "someone-else");
+    let (ok, out, _) = review_run_with(
+        &fx,
+        &["5", "--verdict"],
+        CLEAN_REVIEW,
+        CLEAN_REVIEW,
+        &gh,
+        &[LINKS],
+        "",
+    );
+    assert!(ok, "{out}");
+    assert!(
+        out.contains(&format!("approval posted: {}", review_link(5, 124))),
+        "{out}"
+    );
+    linked(&out, 5, &review_link(5, 124));
+
+    let (fx, head) = inline_fixture("reviewlinkinline", None);
+    let gh = review_gh(5, &head, "someone-else");
+    let (ok, out, log) = review_run_with(
+        &fx,
+        &["5"],
+        ONE_BLOCKER_REVIEW,
+        ONE_BLOCKER_REVIEW,
+        &gh,
+        &[LINKS],
+        "",
+    );
+    assert!(ok, "{out}");
+    assert!(log.contains(INLINE_POST), "{log}");
+    linked(&out, 5, &review_link(5, 123));
+}
+
+/// The review that went up is the body only one, so that is the one linked.
+#[test]
+#[cfg(unix)]
+fn a_refused_review_links_to_the_body_only_one_that_went_up() {
+    let (fx, head) = inline_fixture("reviewlinkrefused", None);
+    let (ok, out, _) = review_run_with(
+        &fx,
+        &["5", "--verdict"],
+        ONE_BLOCKER_REVIEW,
+        ONE_BLOCKER_REVIEW,
+        &review_gh(5, &head, "someone-else"),
+        &[LINKS, ("SPAR_FAKE_INLINE_FAILS", "1")],
+        "",
+    );
+    assert!(ok, "{out}");
+    assert!(out.contains("did not go up"), "{out}");
+    linked(&out, 5, &review_link(5, 124));
+    assert!(!out.contains(&review_link(5, 123)), "{out}");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_second_look_links_to_what_went_up() {
+    let fx = repo("rechecklink");
+    let before = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/9/head"]);
+    write_record(&fx, 9, &blocking_record(&before));
+    commit(&fx.work, "file.txt", "bounded\n", "check the bound");
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/9/head"]);
+    let after = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let (ok, out, _) = review_run_with(
+        &fx,
+        &["9", "--recheck"],
+        RECHECK_FIXED,
+        RECHECK_FIXED,
+        &review_gh(9, &after, "someone-else"),
+        &[LINKS],
+        "",
+    );
+
+    assert!(ok, "{out}");
+    assert!(
+        out.contains(&format!(
+            "second look posted, approval: {}",
+            review_link(9, 124)
+        )),
+        "{out}"
+    );
+    linked(&out, 9, &review_link(9, 124));
+}
+
+/// GitHub not saying where a post went is no reason to doubt it landed: the
+/// run reads as it did before links, and the write counts as a success.
+#[test]
+#[cfg(unix)]
+fn a_post_with_no_address_still_succeeds_without_a_link() {
+    let fx = repo("reviewnolink");
+    git(&fx.work, &["push", "-q", "origin", "HEAD:refs/pull/5/head"]);
+    let head = git(&fx.work, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let (ok, out, _) = review_run(
+        &fx,
+        &["5", "--verdict"],
+        CLEAN_REVIEW,
+        CLEAN_REVIEW,
+        &review_gh(5, &head, "someone-else"),
+    );
+
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("no blocking findings, approval posted\n"),
+        "{out}"
+    );
+    assert!(!out.contains("       posted "), "{out}");
+    assert!(
+        !out.contains("https://github.com/example/project/pull/5#"),
+        "{out}"
+    );
+    assert!(
+        out.contains("writes: 1 attempted, 1 succeeded, 0 failed"),
+        "{out}"
+    );
+}
+
+/// `spar post` names the comment it made.
+#[test]
+#[cfg(unix)]
+fn spar_post_links_to_the_comment_it_made() {
+    let fx = repo("postlink");
+    let (config, path) = brainstorm_commands(&fx, "", "", &review_gh(5, "abc", "someone-else"));
+    let review = fx.dir.join("review.md");
+    std::fs::write(&review, "review landed").unwrap();
+    let log = fx.dir.join("gh.log");
+
+    let (ok, out, err) = spar_with_env(
+        &[
+            "post",
+            "5",
+            "--repo",
+            fx.work.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--file",
+            review.to_str().unwrap(),
+        ],
+        &fx.dir,
+        &[
+            ("PATH", path.as_str()),
+            ("SPAR_FAKE_GH_LOG", log.to_str().unwrap()),
+            LINKS,
+        ],
+    );
+
+    assert!(ok, "{out}\n{err}");
+    let out = format!("{out}\n{err}");
+    assert!(
+        out.contains("posted to PR #5: https://github.com/example/project/pull/5#issuecomment-456"),
+        "{out}"
+    );
+}
+
+/// A comment already there is the one posted, so it is the one linked.
+#[cfg(unix)]
+#[test]
+fn spar_post_links_to_the_identical_comment_already_there() {
+    let fx = repo("postlinkduplicate");
+    let gh = r#"
+case "$1 $2" in
+  "api --paginate")
+    printf '%s\n' '[{"body":"review landed\n\n<!-- spar:comment -->","html_url":"https://github.com/example/project/pull/366#issuecomment-1"}]' ;;
+  *) printf 'unexpected gh call: %s\n' "$*" >&2; exit 1 ;;
+esac
+"#;
+    let (config, path) = fake_commands(&fx, "{}", gh);
+    let review = fx.dir.join("review.md");
+    std::fs::write(&review, "review landed").unwrap();
+
+    let (ok, out, err) = spar_with_env(
+        &[
+            "post",
+            "366",
+            "--repo",
+            fx.work.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--file",
+            review.to_str().unwrap(),
+        ],
+        &fx.work,
+        &[("PATH", path.as_str())],
+    );
+
+    assert!(ok, "{out}\n{err}");
+    assert!(
+        err.contains(
+            "posted to PR #366: https://github.com/example/project/pull/366#issuecomment-1"
+        ),
+        "{out}\n{err}"
+    );
 }
 
 /// The reviews API call that submits `event` on `commit`, as the fake gh logs
@@ -7037,7 +7283,7 @@ fn inline_fixture(tag: &str, changed: Option<usize>) -> (Fixture, String) {
     (fx, head)
 }
 
-const INLINE_POST: &str = "api -X POST repos/{owner}/{repo}/pulls/5/reviews --input - --silent";
+const INLINE_POST: &str = "api -X POST repos/{owner}/{repo}/pulls/5/reviews --input -";
 
 fn sent_review(path: &Path) -> serde_json::Value {
     let text = std::fs::read_to_string(path)

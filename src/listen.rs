@@ -734,6 +734,9 @@ pub enum Action {
     /// This issue was answered as often as the config allows; a person runs
     /// `spar answer`.
     AnswersCapped,
+    /// `spar listen` checked in on this pull request of yours as often as the
+    /// config allows; a person runs `spar checkin`.
+    CheckinsCapped,
     /// This pull request was rechecked as often as the config allows; a person
     /// runs `spar review`. An issue names its pull request.
     Capped(i64),
@@ -759,9 +762,10 @@ impl Action {
             Action::Answer { draft: false } => "answer what it asks of you".to_string(),
             Action::Answer { draft: true } => "draft an answer to what it asks of you".to_string(),
             Action::Run => "work it with `spar run`".to_string(),
-            Action::Capped(_) | Action::AnswersCapped | Action::BelongsToResume => {
-                "leave it".to_string()
-            }
+            Action::Capped(_)
+            | Action::AnswersCapped
+            | Action::CheckinsCapped
+            | Action::BelongsToResume => "leave it".to_string(),
             Action::Drop => "drop it".to_string(),
             Action::Ignore(_) => "ignore it".to_string(),
         }
@@ -814,6 +818,9 @@ pub struct Facts {
     /// For the same issue: `spar answer` ran on it `max_answers` times
     /// without a person running it since.
     pub answers_capped: bool,
+    /// For the viewer's own pull request: `spar listen` checked in on it
+    /// `max_checkins` times without a person running `spar checkin` since.
+    pub checkins_capped: bool,
     /// For an issue: when the viewer was last assigned to it, while the viewer
     /// still is. Read only when an assignment is pending.
     pub assigned_at: Option<String>,
@@ -985,9 +992,12 @@ pub fn plan(p: &Pending, f: &Facts, cfg: &ListenCfg) -> Action {
                     return Action::Ignore("a push to your own pull request");
                 }
                 return match cfg.on_own_pr {
+                    OwnPr::Ignore => Action::Ignore("on_own_pr is ignore"),
+                    // Words are what another bot answers, so the cap holds
+                    // for a reply as it does for a push.
+                    _ if f.checkins_capped => Action::CheckinsCapped,
                     OwnPr::Checkin => Action::Checkin { reply_only: false },
                     OwnPr::Reply => Action::Checkin { reply_only: true },
-                    OwnPr::Ignore => Action::Ignore("on_own_pr is ignore"),
                 };
             }
             if f.has_posted_record {
@@ -1442,6 +1452,7 @@ fn facts(
                 mentioned,
                 asks_open: false,
                 answers_capped: false,
+                checkins_capped: checkin::automatic_runs(repo, number) >= cfg.listen.max_checkins,
                 assigned_at: None,
                 others_pr: false,
             })
@@ -1513,6 +1524,7 @@ fn facts(
                 mentioned,
                 asks_open,
                 answers_capped,
+                checkins_capped: false,
                 assigned_at,
                 others_pr: assigned && pr_by_viewer == Some(false),
             })
@@ -1562,6 +1574,7 @@ fn dispatch(
                 again: false,
                 resolve: cfg.loop_cfg.checkin_resolve,
                 posts: checkin::posts(cfg),
+                auto: true,
             },
         ),
         Action::Answer { draft } => answer::answer_issue(
@@ -1975,6 +1988,26 @@ pub fn run(agents: &[Agent], cfg: &Config, repo: &Repo, opts: Opts) -> Result<i3
                     }
                     state.pending.remove(&number);
                 }
+                Action::CheckinsCapped => {
+                    let w = state.watched(number, p.kind);
+                    if !w.said_capped {
+                        if cfg.listen.max_checkins == 0 {
+                            log!(
+                                "#{number}: max_checkins is 0, so spar listen answers nothing on \
+                                 your own pull requests; run `spar checkin {number}` to answer it"
+                            );
+                        } else {
+                            log!(
+                                "#{number}: checked in on {} time{} already; run `spar checkin \
+                                 {number}` to answer what is on it now",
+                                cfg.listen.max_checkins,
+                                plural(cfg.listen.max_checkins as usize)
+                            );
+                        }
+                        w.said_capped = true;
+                    }
+                    state.pending.remove(&number);
+                }
                 Action::BelongsToResume => {
                     let w = state.watched(number, p.kind);
                     if !w.said_resume {
@@ -2229,6 +2262,7 @@ mod tests {
             head_ref_oid: head.into(),
             author: Some(Author {
                 login: author.into(),
+                ..Default::default()
             }),
             state: state.into(),
             ..Default::default()
@@ -3055,6 +3089,49 @@ mod tests {
             plan(&pending(ItemKind::Pr, &[Trigger::Replied], 0), &f, &c),
             Action::Ignore(_)
         ));
+    }
+
+    /// rbitcoin#1589: a review bot that answers every reply, and a spar that
+    /// answers every message, on a pull request nothing capped.
+    #[test]
+    fn your_own_pull_request_checked_in_on_max_checkins_times_waits_for_a_person() {
+        let capped = Facts {
+            author_is_viewer: true,
+            checkins_capped: true,
+            ..open_pr()
+        };
+        let mut c = cfg();
+        for trigger in [
+            Trigger::Replied,
+            Trigger::Mentioned,
+            Trigger::ReviewRequested,
+        ] {
+            assert_eq!(
+                Action::CheckinsCapped,
+                plan(&pending(ItemKind::Pr, &[trigger], 0), &capped, &c)
+            );
+        }
+        // Words are what a bot answers, so reply is capped as checkin is.
+        c.on_own_pr = OwnPr::Reply;
+        assert_eq!(
+            Action::CheckinsCapped,
+            plan(&pending(ItemKind::Pr, &[Trigger::Replied], 0), &capped, &c)
+        );
+        assert!(!Action::CheckinsCapped.runs());
+        // Somebody else's pull request has its own cap and not this one.
+        let theirs = Facts {
+            checkins_capped: true,
+            has_posted_record: true,
+            ..open_pr()
+        };
+        assert_eq!(
+            Action::Recheck(7),
+            plan(
+                &pending(ItemKind::Pr, &[Trigger::ReviewRequested], 0),
+                &theirs,
+                &cfg()
+            )
+        );
     }
 
     #[test]

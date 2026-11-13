@@ -1269,7 +1269,7 @@ fn pr_for_base(text: &str, branch: &str, base: &str) -> Result<Option<PrRef>> {
 
 /// Sign a comment spar composed, so it can be told from one the same account
 /// wrote by hand. Idempotent: a body already signed is returned as it is.
-fn signed(body: &str) -> String {
+pub(crate) fn signed(body: &str) -> String {
     if body.contains(COMMENT_MARKER) {
         return body.to_string();
     }
@@ -12192,6 +12192,7 @@ mod tests {
             is_cross_repository: true,
             head_repository_owner: Some(crate::model::Author {
                 login: owner.into(),
+                ..Default::default()
             }),
             head_repository: Some(crate::model::HeadRepository { name: name.into() }),
         };

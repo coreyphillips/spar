@@ -79,6 +79,14 @@ build or a check, or a thread somebody settled themselves. spar says nothing in
 reply to it, so do not use answer to acknowledge one. Answer is for a question
 somebody asked.
 
+A comment from a review thread carries the whole thread, oldest first. Judge
+the message marked as the newest, in the light of the rest. A message marked as
+already said from your side is this pull request's author, or spar on an earlier
+run, and is not something to answer. When the newest message only agrees with,
+thanks, or acknowledges what was already said from your side, it is ask=nothing,
+however right the original point was: the thread has its answer, and saying it
+again is noise. Never restate an earlier reply.
+
 Set unambiguous=false whenever the comment could be read more than one way. spar
 will answer in words rather than guess. That is cheap; a commit somebody did not
 ask for is not.
@@ -98,6 +106,11 @@ commit on somebody's branch in their name.
 Hold implement to a higher bar than the rest. Getting decline wrong costs a
 person one read of a thread that stays open for them. Getting implement wrong
 costs them a commit they did not ask for on a branch they own.
+
+A comment from a review thread carries the whole thread, and the message marked
+as the newest is the one being ruled on. When it only agrees with or
+acknowledges a message marked as already said from your side, the right call is
+ask=nothing, and a decision to answer it again is one to disagree with.
 
 Set agrees=false and give the reason and what you would do instead. Set
 unambiguous=false if the comment could be read more than one way, whatever the
@@ -149,6 +162,9 @@ pub struct Mode {
     pub resolve: bool,
     /// Whether `[style] pr_comments` allows spar to say anything at all here.
     pub posts: bool,
+    /// Started by `spar listen` rather than by a person. Counts against
+    /// `max_checkins`, and a person's run sets the count back to zero.
+    pub auto: bool,
 }
 
 /// One comment, and what the pair decided about it.
@@ -245,6 +261,31 @@ pub fn settle(judge: &CommentVerdict, check: Option<&CommentCheck>) -> Ask {
         (Ask::Nothing, Some(c)) if !c.agrees && c.ask != Ask::Nothing => Ask::Answer,
         (Ask::Nothing, _) => Ask::Nothing,
     }
+}
+
+/// Why a change one agent wanted to make was answered in words instead.
+///
+/// The reply to it reads "confirmed, and here is the fix", and without this
+/// nothing in it says that no commit follows. Whoever raised the point, person
+/// or bot, is left waiting for a push that is not coming.
+pub fn unmade(
+    judge: &CommentVerdict,
+    check: Option<&CommentCheck>,
+    decided: Ask,
+) -> Option<String> {
+    if judge.ask != Ask::Implement || decided != Ask::Answer {
+        return None;
+    }
+    Some(
+        match check {
+            None => "the second reviewer did not answer, and a change takes both",
+            Some(c) if !judge.unambiguous || !c.unambiguous => {
+                "the comment could be read more than one way, so the change is left to a person"
+            }
+            Some(_) => "the two reviewers did not agree on the change, so it is left to a person",
+        }
+        .to_string(),
+    )
 }
 
 /// Implementing is impossible here whatever the agents agreed, so say so once
@@ -526,10 +567,19 @@ fn bullets(lines: &[String]) -> String {
 /// on the same principle as `outcome_comment`.
 pub fn checkin_comment(items: &[Settled], style: &Style) -> Option<String> {
     let mut out: Vec<String> = Vec::new();
+    // A person is named so GitHub tells them. A bot is named in a code span,
+    // which notifies nobody: one that answers its own name would answer this.
+    let who = |item: &Settled| {
+        if item.pending.automated {
+            format!("`@{}`", item.pending.author)
+        } else {
+            format!("@{}", item.pending.author)
+        }
+    };
     let say = |item: &Settled, what: &str| match (&item.pending.file, item.pending.line) {
-        (Some(f), Some(l)) => format!("@{} on {f}:{l}: {what}", item.pending.author),
-        (Some(f), None) => format!("@{} on {f}: {what}", item.pending.author),
-        _ => format!("@{}: {what}", item.pending.author),
+        (Some(f), Some(l)) => format!("{} on {f}:{l}: {what}", who(item)),
+        (Some(f), None) => format!("{} on {f}: {what}", who(item)),
+        _ => format!("{}: {what}", who(item)),
     };
     // A parked point is listed once, under the heading that asks somebody to
     // decide it. Listing it again under the verdict one agent reached would
@@ -645,7 +695,16 @@ fn inner_pr(
     let mut state = IssueRun::new(number, pr.title.clone());
     state.pr = Some(pr.url.clone());
 
-    let seen = read_answered(repo, number, mode);
+    let mut seen = read_answered(repo, number, mode);
+    // A person running this is a person looking, which is what the cap waits
+    // for. A dry run changes nothing, that included.
+    if !mode.auto && !mode.dry_run {
+        forget_automatic_runs(repo, number);
+        seen.automatic = 0;
+    } else {
+        // `--again` forgets what was answered, never how often.
+        seen.automatic = automatic_runs(repo, number);
+    }
     let found = comments::gather(repo, number, true, &seen)?;
     if found.pending.is_empty() {
         report_empty(number, &found);
@@ -961,7 +1020,7 @@ fn act(
         let (ask, blocked) = allowed(decided, p, mode, can_push);
         item.ask = ask;
         if item.blocked.is_none() {
-            item.blocked = blocked;
+            item.blocked = blocked.or_else(|| unmade(verdict, check, decided));
         }
         if item.ask == Ask::Answer && item.reasoning.trim().is_empty() {
             item.reasoning = verdict.request.clone();
@@ -1017,6 +1076,12 @@ fn act(
 
     // -- say it, then resolve --------------------------------------------
     post(repo, number, &items, mode, state, &mut seen, on_issue);
+    // Counted when the run had something to say or to push, which is what
+    // another bot can answer. A run that judged everything as asking for
+    // nothing is the loop ending, not one more turn of it.
+    if mode.auto && !mode.dry_run && items.iter().any(|i| i.ask != Ask::Nothing) {
+        seen.automatic += 1;
+    }
     write_answered(repo, number, &seen);
 
     for item in &items {
@@ -1407,6 +1472,32 @@ fn said_nothing(items: &[Settled], seen: &mut Answered) -> usize {
     quiet.len()
 }
 
+/// How many runs `spar listen` started on this pull request said or pushed
+/// something since a person last ran `spar checkin` on it.
+pub fn automatic_runs(repo: &Repo, number: i64) -> u32 {
+    std::fs::read_to_string(repo.checkin_state_path(number))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Answered>(&text).ok())
+        .map_or(0, |a| a.automatic)
+}
+
+fn forget_automatic_runs(repo: &Repo, number: i64) {
+    let path = repo.checkin_state_path(number);
+    let Some(mut record) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Answered>(&text).ok())
+    else {
+        return;
+    };
+    if record.automatic == 0 {
+        return;
+    }
+    record.automatic = 0;
+    if let Err(e) = crate::repo::write_json_atomic(&path, &record) {
+        logdim!("could not reset the check-in count on #{number}: {e}");
+    }
+}
+
 fn write_answered(repo: &Repo, number: i64, seen: &Answered) {
     let mut seen = seen.clone();
     seen.version = 1;
@@ -1471,6 +1562,7 @@ mod tests {
             hunk: String::new(),
             url: String::new(),
             at: "2026-01-02T03:04:05Z".into(),
+            automated: false,
         }
     }
 
@@ -1482,6 +1574,7 @@ mod tests {
             again: false,
             resolve: true,
             posts: true,
+            auto: false,
         }
     }
 
@@ -1897,6 +1990,55 @@ mod tests {
             seen.seen.get(&quiet.pending.key)
         );
         assert_eq!(1, seen.seen.len());
+    }
+
+    /// A bot that answers its own name would answer the summary too, and the
+    /// summary would be answered in turn.
+    #[test]
+    fn the_summary_names_a_bot_without_notifying_it() {
+        let person = settled(Ask::Answer);
+        let mut bot = settled(Ask::Answer);
+        bot.pending.author = "rearden-grok".into();
+        bot.pending.automated = true;
+        let out = checkin_comment(&[person, bot], &Style::default()).expect("the answers");
+        assert!(out.contains("- @alice on src/x.rs:91"), "{out}");
+        assert!(out.contains("- `@rearden-grok` on src/x.rs:91"), "{out}");
+    }
+
+    /// rbitcoin#1589: "Confirmed", the fix described, and nothing saying that
+    /// no commit was coming.
+    #[test]
+    fn a_change_one_agent_wanted_and_the_pair_did_not_make_says_so() {
+        let wanted = judge(Ask::Implement, true);
+        let refused = check(false, Ask::Answer, true);
+        let decided = settle(&wanted, Some(&refused));
+        assert_eq!(Ask::Answer, decided);
+        let why = unmade(&wanted, Some(&refused), decided).expect("a reason");
+        assert!(why.contains("did not agree"), "{why}");
+
+        let mut item = settled(Ask::Answer);
+        item.blocked = Some(why);
+        let reply = thread_reply(&item, &Style::default());
+        assert!(
+            reply.contains("Not changed here: the two reviewers"),
+            "{reply}"
+        );
+
+        let unsure = check(true, Ask::Implement, false);
+        let decided = settle(&wanted, Some(&unsure));
+        assert!(unmade(&wanted, Some(&unsure), decided)
+            .expect("a reason")
+            .contains("more than one way"));
+        assert!(unmade(&wanted, None, settle(&wanted, None))
+            .expect("a reason")
+            .contains("did not answer"));
+
+        // A question answered is not a change that was not made.
+        let asked = judge(Ask::Answer, true);
+        assert!(unmade(&asked, None, Ask::Answer).is_none());
+        // And a change that is going ahead needs no excuse.
+        let agreed = check(true, Ask::Implement, true);
+        assert!(unmade(&wanted, Some(&agreed), settle(&wanted, Some(&agreed))).is_none());
     }
 
     /// Each block is omitted when empty, so a check-in that only answered

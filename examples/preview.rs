@@ -558,6 +558,7 @@ fn settled(
             hunk: String::new(),
             url: String::new(),
             at: "2026-01-02T03:04:05Z".into(),
+            automated: false,
         },
         ask,
         request: "add a guard on the retry path".into(),

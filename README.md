@@ -872,7 +872,8 @@ agrees or does not. Five outcomes:
   not had their say yet. It also shows up under "disputed" in the terminal
   summary.
 - **The two disagree** and nothing is changed. It is answered, left open, and
-  handed to you.
+  handed to you. When one of them wanted to make the change, the reply ends by
+  saying it was not made and why, so nobody waits for a push that is not coming.
 - **Nothing asked**, such as praise, an approval, a review that found nothing to
   change, or a bot reporting a build, gets no reply and no line in the summary
   comment. It still counts as answered, so it is not judged again until
@@ -882,6 +883,32 @@ agrees or does not. Five outcomes:
 Replies to inline threads go into those threads. A review summary and a top
 level comment have no thread to reply into, so they are answered together in one
 comment on the pull request rather than five comments in a row.
+
+A thread is handed to the agents whole, with what was already said from your
+side marked and the newest message from somebody else marked as the one to
+judge. A reply that only agrees with or thanks an earlier answer is nothing
+asked, and the earlier answer is not said again.
+
+### What stops it going back and forth with a bot
+
+A review bot's finding is answered like anybody's, and fixed when both agents
+agree and `checkin_trust` allows it. What the bot says next is where two
+programs can keep each other going, each one answering every message from the
+other and neither reading it. Three things stop that:
+
+- **A bot is answered once in a thread.** When everything written in a thread
+  since your side last answered there came from a bot, the thread is passed
+  over: no agent is asked and nothing is posted. A bot here is an app's account,
+  or anything carrying spar's hidden signature, which is somebody else's spar.
+  A person writing in the thread opens it again. This is read from the thread
+  and not from `.spar/state`, so it holds on a fresh clone and a second machine.
+- **A bot is not pinged.** The summary comment names a person with a live
+  `@name` and a bot in a code span, which notifies nobody, since a bot that
+  answers its own name would answer that too.
+- **A cap.** `spar listen` checks in on one pull request of yours
+  `max_checkins` times, 5 by default, counting the runs that said or pushed
+  something, and then leaves it to you, saying so once. Running
+  `spar checkin N` yourself sets the count back to zero.
 
 ### What stops a comment from getting arbitrary code pushed
 
@@ -1057,7 +1084,9 @@ What an event leads to is a table, not a judgement:
 - A pull request you wrote, which the same account cannot approve, follows
   `on_own_pr`: `checkin` runs `spar checkin`, which may push a change both agents
   agree on behind `checkin_trust`; `reply` answers in words only; `ignore` does
-  nothing. A push to your own branch is never news.
+  nothing. A push to your own branch is never news. A bot's reply to an answer
+  spar already gave in a thread gets nothing, and after `max_checkins` runs that
+  said or pushed something the pull request is left for you.
 - A pull request in the custody loop's hands, with `.spar/state/pr-N.json` and
   no review record, is left to `spar resume`, and the log says so once.
 - A mention on an issue that has an open pull request spar reviewed, made after
@@ -1089,7 +1118,8 @@ than four. Dispatches run one at a time; what arrives during one is read on the
 next tick, and nothing is lost, because the notifications stay on GitHub's side
 until spar reads past them. Each pull request gets `max_rechecks` second looks
 before spar leaves it to a person, which is what keeps two bots from arguing
-forever; `spar review N` resets that.
+forever; `spar review N` resets that. A pull request of your own gets
+`max_checkins` check-ins on the same terms, and `spar checkin N` resets that.
 
 With numbers, `spar listen 108 42` watches only those: a named pull request gets
 a second look on the same terms as any other, is reviewed on the first thing

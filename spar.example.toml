@@ -369,6 +369,12 @@ max_answers         = 3        # times `spar listen` answers on one issue
                                # before a person has to run `spar answer` on it
                                # again. A cap against two bots talking to each
                                # other. 0 turns automatic answers off.
+max_checkins        = 5        # times `spar listen` checks in on one pull
+                               # request of yours and says or pushes something,
+                               # before a person has to run `spar checkin` on
+                               # it again. A cap against spar and a review bot
+                               # answering each other. 0 turns automatic
+                               # check-ins off.
 
 [style]
 ban_em_dash        = true

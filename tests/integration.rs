@@ -7938,7 +7938,9 @@ fn a_recheck_without_a_posted_review_on_record_reviews_afresh() {
 /// asking for nothing when it is missing. `$SPAR_FAKE_ASSIGNED` is the open
 /// issues assigned to the viewer, none when it is missing, and
 /// `$SPAR_FAKE_ISSUE_ASSIGNED` is who issue 42 is assigned to, nobody when it
-/// is missing. The viewer is in team `ours` and in no other.
+/// is missing. `$SPAR_FAKE_THREADS` is the pull request's review threads as
+/// GraphQL gives them, none when it is missing. The viewer is in team `ours`
+/// and in no other.
 fn listen_gh(number: i64, head: &str, author: &str, state: &str) -> String {
     format!(
         r#"set -eu
@@ -8005,7 +8007,9 @@ case "$*" in
   "api graphql "*REVIEW_REQUESTED_EVENT*)
     if [ -f "${{SPAR_FAKE_REQUESTED:-/nonexistent}}" ]; then cat "$SPAR_FAKE_REQUESTED"
     else printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"timelineItems":{{"nodes":[]}}}}}}}}}}'; fi ;;
-  "api graphql "*) printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[]}}}}}}}}}}' ;;
+  "api graphql "*)
+    if [ -f "${{SPAR_FAKE_THREADS:-/nonexistent}}" ]; then cat "$SPAR_FAKE_THREADS"
+    else printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[]}}}}}}}}}}'; fi ;;
   "api -X POST repos/{{owner}}/{{repo}}/pulls/{number}/reviews "*)
     if [ "${{SPAR_FAKE_REVIEW_FAILS:-}}" = 1 ]; then printf 'gh: Unprocessable Entity (HTTP 422)\n' >&2; exit 1; fi ;;
   "pr comment "*) : ;;
@@ -9628,6 +9632,95 @@ fn listen_leaves_an_issue_answered_max_answers_times_to_a_person() {
     );
     assert_eq!(0, l.agent_calls(), "{out}");
     assert!(!log.contains("issue comment"), "{log}");
+}
+
+/// rbitcoin#1589. A review bot found a bug on the viewer's own pull request,
+/// spar answered it, and the bot replied that the answer sounded right. That
+/// reply asks nothing, and answering it is how two bots keep each other going:
+/// no agent is asked and nothing is posted.
+#[test]
+#[cfg(unix)]
+fn listen_does_not_answer_a_bots_reply_to_its_own_answer() {
+    let l = Listening::refusing("listenbotreply", &listen_gh(7, "aaa", "viewer", "OPEN"));
+    let threads = l.fx.dir.join("threads.json");
+    std::fs::write(
+        &threads,
+        serde_json::json!({"data": {"repository": {"pullRequest": {"reviewThreads": {
+            "pageInfo": {"hasNextPage": false, "endCursor": null},
+            "nodes": [{
+                "id": "T1",
+                "isResolved": false,
+                "viewerCanResolve": true,
+                "path": "src/peer.rs",
+                "line": 343,
+                "comments": {"totalCount": 3, "nodes": [
+                    {"id": "c1", "databaseId": 1, "body": "The exemption is never consumed.",
+                     "createdAt": "2026-10-20T10:00:00Z", "authorAssociation": "CONTRIBUTOR",
+                     "author": {"login": "rearden-grok", "__typename": "Bot"}},
+                    {"id": "c2", "databaseId": 2, "body": "Confirmed. Track spent exemptions.",
+                     "createdAt": "2026-10-20T10:05:00Z", "authorAssociation": "CONTRIBUTOR",
+                     "author": {"login": "viewer", "__typename": "User"}},
+                    {"id": "c3", "databaseId": 3, "body": "Good catch, that sounds right.",
+                     "createdAt": "2026-10-20T11:00:00Z", "authorAssociation": "CONTRIBUTOR",
+                     "author": {"login": "rearden-grok", "__typename": "Bot"}}
+                ]}
+            }]
+        }}}}})
+        .to_string(),
+    )
+    .unwrap();
+    l.with_notifications(&[notification("1", "comment", "PullRequest", 7)]);
+
+    let (ok, out, log) = l.run_with(
+        &["--once"],
+        &[("SPAR_FAKE_THREADS", threads.to_str().unwrap())],
+    );
+
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("a bot's reply to an answer spar already gave"),
+        "{out}"
+    );
+    assert_eq!(0, l.agent_calls(), "{out}");
+    assert!(!log.contains("-X POST"), "{log}");
+    assert!(!log.contains("pr comment"), "{log}");
+}
+
+/// The backstop behind that: a pull request of the viewer's that `spar listen`
+/// has checked in on `max_checkins` times is left for a person, whatever is
+/// said on it next.
+#[test]
+#[cfg(unix)]
+fn listen_leaves_your_pull_request_checked_in_on_max_checkins_times_to_a_person() {
+    let l = Listening::refusing("listencheckincap", &listen_gh(7, "aaa", "viewer", "OPEN"));
+    std::fs::create_dir_all(l.fx.work.join(".spar/state")).unwrap();
+    std::fs::write(
+        l.fx.work.join(".spar/state/checkin-7.json"),
+        r#"{"version":1,"seen":{},"automatic":5}"#,
+    )
+    .unwrap();
+    l.with_notifications(&[notification("1", "comment", "PullRequest", 7)]);
+
+    let (ok, out, log) = l.run(&["--once"]);
+
+    assert!(ok, "{out}");
+    assert!(
+        out.contains(
+            "#7: checked in on 5 times already; run `spar checkin 7` to answer what is on it now"
+        ),
+        "{out}"
+    );
+    assert_eq!(0, l.agent_calls(), "{out}");
+    assert!(!log.contains("reviewThreads"), "{log}");
+
+    // A person running it is a person looking, and the count starts over.
+    let (ok, out, _) = l.command("checkin", &["7"], &[]);
+    assert!(ok, "{out}");
+    let record = std::fs::read_to_string(l.fx.work.join(".spar/state/checkin-7.json")).unwrap();
+    assert!(
+        record.contains("\"automatic\":0") || record.contains("\"automatic\": 0"),
+        "{record}"
+    );
 }
 
 /// A dry run prints the answer and posts nothing, and `spar post` puts up

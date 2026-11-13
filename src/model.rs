@@ -614,6 +614,10 @@ pub struct Answered {
     pub version: u32,
     #[serde(default)]
     pub seen: BTreeMap<String, String>,
+    /// Runs `spar listen` started here that said or pushed something, since a
+    /// person last ran `spar checkin` on it. `[listen] max_checkins` caps it.
+    #[serde(default)]
+    pub automatic: u32,
 }
 
 string_enum! {
@@ -1557,6 +1561,11 @@ pub struct Label {
 pub struct Author {
     #[serde(default)]
     pub login: String,
+    /// What kind of account it is, where GitHub was asked: `Bot` for an app.
+    /// GraphQL calls this `__typename` and REST calls it `type`. Empty when
+    /// the read did not ask.
+    #[serde(default, rename = "__typename", alias = "type")]
+    pub kind: String,
 }
 
 /// A login, never empty. A deleted account is null on GitHub and becomes

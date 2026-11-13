@@ -44,7 +44,7 @@ query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {
               diffHunk
               isMinimized
               authorAssociation
-              author { login }
+              author { login __typename }
             }
           }
         }
@@ -98,6 +98,13 @@ impl RawComment {
     /// GitHub stores it as one.
     fn is_live(&self) -> bool {
         !self.is_minimized && !self.body.trim().is_empty() && !self.body.contains(STATE_MARKER)
+    }
+
+    /// Whether no person wrote this: an app's account did, or spar composed
+    /// it, whoever's spar it was.
+    pub fn is_automated(&self) -> bool {
+        let kind = self.author.as_ref().map(|a| a.kind.as_str()).unwrap_or("");
+        is_bot_account(self.login(), kind) || crate::repo::is_spar_comment(&self.body)
     }
 }
 
@@ -330,7 +337,9 @@ impl Repo {
     /// on either path. So replying keeps working on a host where reading the
     /// threads did not.
     pub fn reply_in_thread(&self, pr: i64, root: i64, body: &str) -> Result<()> {
-        let body = self.record_failed_write(self.clean(body))?;
+        // Signed like everything else spar composes, so somebody else's spar
+        // reading this thread can tell the reply from a person's.
+        let body = self.record_failed_write(self.clean(&crate::repo::signed(body)))?;
         let path = format!("repos/{{owner}}/{{repo}}/pulls/{pr}/comments");
         let replied = self
             .gh(&[
@@ -430,6 +439,9 @@ pub struct Pending {
     pub hunk: String,
     pub url: String,
     pub at: String,
+    /// True when no person wrote the newest message: an app's account did, or
+    /// somebody else's spar. Its name is not written as a live mention.
+    pub automated: bool,
 }
 
 impl Pending {
@@ -529,6 +541,42 @@ fn thread_key(thread: &RawThread) -> String {
     }
 }
 
+/// Whether an account is an app's and not a person's.
+///
+/// REST gives an app the login `name[bot]` and the type `Bot`. GraphQL gives
+/// the bare name, so there the type is the only sign.
+pub fn is_bot_account(login: &str, kind: &str) -> bool {
+    login.trim().ends_with("[bot]") || kind.trim().eq_ignore_ascii_case("bot")
+}
+
+/// Whether the only thing new in a thread is automation replying to an answer
+/// the viewer already gave there.
+///
+/// A bot's finding is answered like anybody's, once. What it says back to that
+/// answer is not: a bot that acknowledges every reply and a spar that answers
+/// every message never stop, and neither is reading the other. A person who
+/// writes in the thread after the viewer's answer opens it again.
+///
+/// Read from the thread itself and not from the local record, so it holds on
+/// another machine and on a fresh clone.
+pub fn is_a_bots_reply_to_an_answer(thread: &RawThread, viewer: &str) -> bool {
+    let live: Vec<&RawComment> = thread
+        .comments
+        .nodes
+        .iter()
+        .filter(|c| c.is_live())
+        .collect();
+    let Some(answer) = live.iter().rposition(|c| same_login(c.login(), viewer)) else {
+        return false;
+    };
+    // The viewer opening a thread is not an answer to anybody.
+    let answered_somebody = live[..answer]
+        .iter()
+        .any(|c| !same_login(c.login(), viewer));
+    let after = &live[answer + 1..];
+    answered_somebody && !after.is_empty() && after.iter().all(|c| c.is_automated())
+}
+
 /// The newest message in a thread that neither the viewer nor spar wrote.
 fn newest_from_others<'a>(thread: &'a RawThread, viewer: &str) -> Option<&'a RawComment> {
     thread
@@ -601,6 +649,11 @@ pub fn gather(repo: &Repo, number: i64, pr: bool, seen: &Answered) -> Result<Gat
         let Some(newest) = newest_from_others(thread, &viewer) else {
             continue;
         };
+        if is_a_bots_reply_to_an_answer(thread, &viewer) {
+            out.skipped
+                .push("a bot's reply to an answer spar already gave".into());
+            continue;
+        }
         let live: Vec<&RawComment> = thread
             .comments
             .nodes
@@ -623,7 +676,7 @@ pub fn gather(repo: &Repo, number: i64, pr: bool, seen: &Answered) -> Result<Gat
             association: newest.author_association.clone(),
             gate_author: gate.0.to_string(),
             gate_association: gate.1.to_string(),
-            body: transcript(&live),
+            body: transcript_for_answer(&live, &viewer),
             file: thread.path.clone(),
             line: thread.line,
             hunk: live
@@ -632,6 +685,7 @@ pub fn gather(repo: &Repo, number: i64, pr: bool, seen: &Answered) -> Result<Gat
                 .unwrap_or_default(),
             url: newest.url.clone(),
             at: newest.created_at.clone(),
+            automated: newest.is_automated(),
         });
     }
 
@@ -941,11 +995,11 @@ pub fn asks_viewer(row: &Value, viewer: &str, in_team: &dyn Fn(&str) -> Option<b
         .and_then(|u| u.get("login"))
         .and_then(Value::as_str)
         .unwrap_or("ghost");
-    let bot = login.ends_with("[bot]")
-        || user
-            .and_then(|u| u.get("type"))
-            .and_then(Value::as_str)
-            .is_some_and(|t| t.eq_ignore_ascii_case("bot"));
+    let kind = user
+        .and_then(|u| u.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let bot = is_bot_account(login, kind);
     let body = row.get("body").and_then(Value::as_str).unwrap_or("");
     !same_login(login, viewer)
         && !bot
@@ -1049,6 +1103,12 @@ fn loose_comment(
     if same_login(login, viewer) {
         return None;
     }
+    let account = row
+        .get("user")
+        .and_then(|u| u.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let automated = is_bot_account(login, account) || crate::repo::is_spar_comment(body);
     let id = row.get("id").and_then(Value::as_i64).unwrap_or_default();
     let at = row
         .get("created_at")
@@ -1083,6 +1143,7 @@ fn loose_comment(
                 .unwrap_or("")
                 .to_string(),
             at,
+            automated,
         },
     ))
 }
@@ -1091,7 +1152,43 @@ fn loose_comment(
 fn transcript(comments: &[&RawComment]) -> String {
     comments
         .iter()
-        .map(|c| format!("@{}: {}", c.login(), c.body.trim()))
+        .map(|c| format!("@{}: {}", c.login(), said(c)))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// A message's words, without the signature spar leaves on its own.
+fn said(comment: &RawComment) -> &str {
+    comment.body.trim().trim_end_matches(COMMENT_MARKER).trim()
+}
+
+/// The same thread for the agents deciding whether it wants an answer, with
+/// the viewer's own messages and the one message being judged marked.
+///
+/// Unmarked, a thread reads as one request, and an agent handed "finding,
+/// answer, thanks" answers the finding a second time. spar posts as the
+/// viewer, so the viewer's messages are what this side already said, whether
+/// a person typed them or an earlier run did.
+fn transcript_for_answer(comments: &[&RawComment], viewer: &str) -> String {
+    if comments.len() < 2 {
+        return transcript(comments);
+    }
+    let newest = comments
+        .iter()
+        .rposition(|c| !same_login(c.login(), viewer));
+    comments
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let note = if same_login(c.login(), viewer) {
+                " (already said from your side)"
+            } else if Some(i) == newest {
+                " (the newest message, and the one to judge)"
+            } else {
+                ""
+            };
+            format!("@{}{note}: {}", c.login(), said(c))
+        })
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -1294,6 +1391,7 @@ mod tests {
             body: body.into(),
             author: Some(Author {
                 login: login.into(),
+                ..Default::default()
             }),
             author_association: "COLLABORATOR".into(),
             created_at: "2026-01-02T03:04:05Z".into(),
@@ -1319,7 +1417,146 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            automatic: 0,
         }
+    }
+
+    fn bot(id: &str, login: &str, body: &str) -> RawComment {
+        let mut c = comment(id, login, body);
+        c.author = Some(Author {
+            login: login.into(),
+            kind: "Bot".into(),
+        });
+        c
+    }
+
+    /// rbitcoin#1589. A review bot found a real bug, spar answered it, the bot
+    /// said "sounds right", and spar answered the finding a second time. Both
+    /// agreed and neither was reading the other.
+    #[test]
+    fn a_bots_reply_to_an_answer_spar_gave_is_not_answered_again() {
+        let t = thread(
+            "T1",
+            vec![
+                bot("c1", "rearden-grok", "the exemption is never consumed"),
+                comment("c2", "me", "Confirmed. Track spent exemptions in a set."),
+                bot("c3", "rearden-grok", "Good catch, that sounds right."),
+            ],
+        );
+        // The local record alone says it moved, which is how it was answered.
+        assert!(thread_wants_an_answer(
+            &t,
+            "me",
+            &seen(&[("thread:T1", "c1")])
+        ));
+        assert!(is_a_bots_reply_to_an_answer(&t, "me"));
+        // REST names an app `name[bot]` and may not say its type.
+        let rest = thread(
+            "T1",
+            vec![
+                comment("c1", "rearden-grok[bot]", "the exemption is never consumed"),
+                comment("c2", "ME", "Confirmed."),
+                comment("c3", "rearden-grok[bot]", "sounds right"),
+            ],
+        );
+        assert!(is_a_bots_reply_to_an_answer(&rest, "me"));
+    }
+
+    /// The finding itself is what a review bot is for, and a person who joins
+    /// the thread is somebody asking.
+    #[test]
+    fn a_bots_first_word_and_a_persons_reply_are_still_answered() {
+        let first = thread("T1", vec![bot("c1", "rearden-grok", "this leaks")]);
+        assert!(!is_a_bots_reply_to_an_answer(&first, "me"));
+
+        // The viewer opening a thread has answered nobody.
+        let opened = thread(
+            "T1",
+            vec![
+                comment("c1", "me", "note to self: check this"),
+                bot("c2", "rearden-grok", "this leaks"),
+            ],
+        );
+        assert!(!is_a_bots_reply_to_an_answer(&opened, "me"));
+
+        let person = thread(
+            "T1",
+            vec![
+                bot("c1", "rearden-grok", "this leaks"),
+                comment("c2", "me", "it is freed on drop"),
+                comment("c3", "alice", "not on the error path"),
+                bot("c4", "rearden-grok", "agreed with alice"),
+            ],
+        );
+        assert!(!is_a_bots_reply_to_an_answer(&person, "me"));
+    }
+
+    /// Two people each running spar are two bots as far as a thread goes, and
+    /// neither account is an app. The signature is the only sign.
+    #[test]
+    fn somebody_elses_spar_replying_counts_as_a_bot() {
+        let signed = crate::repo::signed("Agreed, that is the right shape.");
+        let t = thread(
+            "T1",
+            vec![
+                comment("c1", "alice", "this leaks"),
+                comment("c2", "me", "it is freed on drop"),
+                comment("c3", "alice", &signed),
+            ],
+        );
+        assert!(is_a_bots_reply_to_an_answer(&t, "me"));
+        assert!(t.comments.nodes[2].is_automated());
+        assert!(!t.comments.nodes[0].is_automated());
+    }
+
+    /// The GraphQL read asks for the account type, since it gives a bot's
+    /// login with no `[bot]` on it, and the REST fallback carries `type`.
+    #[test]
+    fn both_reads_say_which_accounts_are_bots() {
+        assert!(THREADS_QUERY.contains("author { login __typename }"));
+        let page = r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[
+            {"id":"T1","comments":{"totalCount":1,"nodes":[
+              {"id":"c1","body":"x","author":{"login":"rearden-grok","__typename":"Bot"}}]}}
+        ]}}}}}"#;
+        let threads = parse_review_threads(page);
+        assert!(threads[0].comments.nodes[0].is_automated());
+
+        let rows: Vec<Value> = serde_json::from_str(
+            r#"[{"id":1,"body":"x","user":{"login":"helper","type":"Bot"}},
+                {"id":2,"body":"y","user":{"login":"alice","type":"User"}}]"#,
+        )
+        .unwrap();
+        let rest = threads_from_rest(&rows);
+        assert!(rest[0].comments.nodes[0].is_automated());
+        assert!(!rest[1].comments.nodes[0].is_automated());
+    }
+
+    /// Unmarked, "finding, answer, thanks" reads as one request and the
+    /// finding is answered twice.
+    #[test]
+    fn the_agents_are_told_what_was_already_said_and_what_is_new() {
+        let live = [
+            comment("c1", "alice", "this leaks"),
+            comment("c2", "me", &crate::repo::signed("it is freed on drop")),
+            comment("c3", "alice", "ah, I see it now"),
+        ];
+        let refs: Vec<&RawComment> = live.iter().collect();
+        let text = transcript_for_answer(&refs, "me");
+        assert!(text.contains("@alice: this leaks"), "{text}");
+        assert!(
+            text.contains("@me (already said from your side): it is freed on drop"),
+            "{text}"
+        );
+        assert!(
+            text.contains("@alice (the newest message, and the one to judge): ah, I see it now"),
+            "{text}"
+        );
+        assert!(!text.contains(COMMENT_MARKER), "{text}");
+        // One message is the whole request and needs no marking.
+        assert_eq!(
+            "@alice: this leaks",
+            transcript_for_answer(&refs[..1], "me")
+        );
     }
 
     /// The noisiest possible failure: spar answering a thread a maintainer has
@@ -1622,6 +1859,7 @@ mod tests {
             hunk: String::new(),
             url: String::new(),
             at: "2026-01-02T03:04:05Z".into(),
+            automated: false,
         };
         let out = crate::checkin::fenced(&p);
         assert_eq!(
@@ -1656,6 +1894,7 @@ mod issue_thread_tests {
         IssueComment {
             author: Some(Author {
                 login: login.into(),
+                ..Default::default()
             }),
             author_association: association.into(),
             viewer_did_author: false,
@@ -2004,6 +2243,7 @@ mod said_since_tests {
             created_at: at.into(),
             author: Some(Author {
                 login: login.into(),
+                ..Default::default()
             }),
             ..Default::default()
         }

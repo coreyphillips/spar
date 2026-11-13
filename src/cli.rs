@@ -635,6 +635,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 again,
                 resolve: cfg.loop_cfg.checkin_resolve,
                 posts: checkin::posts(&cfg),
+                auto: false,
             };
             let numbers = if items.is_empty() {
                 let found = repo.list_open_prs(common.limit, cfg.loop_cfg.min_number)?;
@@ -2356,6 +2357,7 @@ const LISTEN_OPTIONS: &[Setting] = &[
     (false, "verdicts", "Whether a review `spar listen` starts submits a formal verdict, approve or request changes, rather than a comment. A recheck always does."),
     (false, "on_mention", "What a mention of you on an issue gets, when the issue has no pull request spar reviewed: answer runs `spar answer`, which posts what both agents agree on and can check and leaves anything that asks you to decide for you; draft saves that for `spar post` instead; ignore does nothing."),
     (true, "max_answers", "Times `spar listen` answers on one issue before a person has to run `spar answer` on it again. A cap against two bots talking to each other, not a target. 0 turns automatic answers off."),
+    (true, "max_checkins", "Times `spar listen` checks in on one pull request of yours and says or pushes something, before a person has to run `spar checkin` on it again. A cap against spar and a review bot answering each other, not a target. 0 turns automatic check-ins off."),
 ];
 
 /// The `[loop]` and `[style]` blocks of a generated config.

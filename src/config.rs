@@ -912,6 +912,11 @@ pub struct ListenCfg {
     /// to run it by hand. A cap against two bots talking to each other, not a
     /// target. 0 turns automatic answers off.
     pub max_answers: u32,
+    /// Times `spar listen` runs `spar checkin` on one pull request of yours
+    /// and says or pushes something, before a person has to run it by hand. A
+    /// cap against spar and somebody's review bot answering each other, not a
+    /// target. 0 turns automatic check-ins off.
+    pub max_checkins: u32,
 }
 
 impl Default for ListenCfg {
@@ -929,6 +934,7 @@ impl Default for ListenCfg {
             verdicts: true,
             on_mention: OnMention::Answer,
             max_answers: 3,
+            max_checkins: 5,
         }
     }
 }
@@ -1709,6 +1715,9 @@ model = "gpt-5.6-sol"
         }
         assert_eq!(OnMention::Answer, ListenCfg::default().on_mention);
         assert_eq!(3, ListenCfg::default().max_answers);
+        assert_eq!(5, ListenCfg::default().max_checkins);
+        let capped = parse(&format!("{TWO_AGENTS}\n[listen]\nmax_checkins = 0\n")).unwrap();
+        assert_eq!(0, capped.listen.max_checkins);
         for (text, want) in [("run", RunOrIgnore::Run), ("ignore", RunOrIgnore::Ignore)] {
             let cfg = parse(&format!(
                 "{TWO_AGENTS}\n[listen]\non_assigned_issue = \"{text}\"\n"

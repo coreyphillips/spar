@@ -8248,14 +8248,11 @@ fn allows_expected_crlf(
             _ => {}
         }
     }
-    if config.eol_is("crlf") {
-        return Ok(true);
-    }
     #[cfg(windows)]
     if config.eol.is_none() || config.eol_is("native") {
         return Ok(true);
     }
-    Ok(false)
+    Ok(config.eol_is("crlf"))
 }
 
 fn git_config_value(cwd: &Path, key: &str) -> Result<Option<String>> {
@@ -8749,10 +8746,7 @@ fn has_recoverable_worktree_admin_state(cwd: &Path) -> Result<bool> {
     }
 
     let head = run_git_text(cwd, &["rev-parse", "--verify", "HEAD^{commit}"])?;
-    if !commit_has_shared_ref(cwd, head.trim())? {
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(!commit_has_shared_ref(cwd, head.trim())?)
 }
 
 fn head_commit_message(cwd: &Path) -> Result<Vec<u8>> {

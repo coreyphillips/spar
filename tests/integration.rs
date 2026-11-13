@@ -3719,14 +3719,25 @@ fn doctor_warns_when_both_agents_are_the_same_binary_and_model() {
 }
 
 #[test]
+#[cfg(unix)]
 fn doctor_stays_quiet_when_the_two_agents_are_genuinely_different() {
     let dir = unique("doctorok");
     std::fs::create_dir_all(&dir).unwrap();
     let config = dir.join("spar.toml");
+    // Two files written here and not two system tools: on a system whose
+    // coreutils are one binary, `/bin/echo` and `/bin/cat` are the same file.
+    let alpha = dir.join("alpha-agent");
+    let beta = dir.join("beta-agent");
+    executable(&alpha, "#!/bin/sh\necho alpha\n");
+    executable(&beta, "#!/bin/sh\necho beta\n");
     std::fs::write(
         &config,
-        "[agents.alpha]\ncommand = [\"/bin/echo\"]\nmodel = \"fable\"\n\
-         [agents.beta]\ncommand = [\"/bin/cat\"]\nmodel = \"fable\"\n",
+        format!(
+            "[agents.alpha]\ncommand = [\"{}\"]\nmodel = \"fable\"\n\
+             [agents.beta]\ncommand = [\"{}\"]\nmodel = \"fable\"\n",
+            alpha.display(),
+            beta.display()
+        ),
     )
     .unwrap();
 

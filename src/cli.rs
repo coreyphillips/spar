@@ -3997,6 +3997,35 @@ mod agent_block_tests {
         );
     }
 
+    /// Built from the shipped preset the way `cmd_init` builds it.
+    fn preset_spec(name: &str) -> config::AgentSpec {
+        let mut spec: config::AgentSpec = config::load_preset(name)
+            .expect("a shipped preset")
+            .try_into()
+            .expect("builds");
+        spec.name = name.into();
+        spec
+    }
+
+    #[test]
+    fn init_suggests_xhigh_on_the_default_models() {
+        for (name, model) in [("claude", "opus"), ("codex", "gpt-6.1-sol")] {
+            let block = agent_block(name, &preset_spec(name));
+            assert!(
+                block.contains(&format!("# model = \"{model}\"\n")),
+                "{block}"
+            );
+            assert!(block.contains("# effort = \"xhigh\"\n"), "{block}");
+            assert!(block.contains("# timeout = 5700\n"), "{block}");
+        }
+    }
+
+    #[test]
+    fn init_offers_four_rounds() {
+        let text = settings_block("claude");
+        assert!(text.contains("\nmax_rounds = 4\n"), "{text}");
+    }
+
     /// Alternatives are named, and a single choice is not dressed up as one.
     #[test]
     fn alternatives_are_listed_only_when_there_are_any() {

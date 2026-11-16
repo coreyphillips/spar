@@ -28,5 +28,5 @@ output = "text"
 # The first entry of each list is what `spar init` writes as the suggested
 # value, so the sensible default goes first rather than the CLI's own ordering.
 models = ["opus", "fable", "sonnet"]
-efforts = ["high", "low", "medium", "xhigh", "max"]
+efforts = ["xhigh", "high", "low", "medium", "max"]
 options_note = "Model takes an alias or a full name like claude-opus-5-5. Check the current sets with: claude --help"

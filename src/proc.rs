@@ -18,11 +18,12 @@ use crate::error::{Result, SparError};
 
 /// How long one agent call may run before it is killed.
 ///
-/// An hour, because thirty minutes was not enough: a review at the highest
-/// effort setting on a large repository, running the test suite as it went,
-/// ran past it. A timeout costs the whole call, so the default errs long and
-/// `timeout` on an agent shortens it.
-pub const DEFAULT_TIMEOUT_SECS: u64 = 3600;
+/// Ninety-five minutes, sized for the xhigh effort the presets suggest. Thirty
+/// minutes was not enough even at a lower setting: a review on a large
+/// repository, running the test suite as it went, ran past it. A timeout costs
+/// the whole call, so the default errs long and `timeout` on an agent shortens
+/// it.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 5700;
 
 /// Thirty minutes was not enough for a deep review of a large repository, and a
 /// timeout costs the whole call. Checked at compile time rather than in a test,

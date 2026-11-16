@@ -410,9 +410,9 @@ finding is labelled `blocking`, `non-blocking`, or `nit`.
 
 **Rounds.** `max_rounds` is a budget for one invocation, not a lifetime cap on
 the PR, and it bounds the asking rather than the run. A run that escalates after
-three rounds and is then resumed gets three more, because a person looked at it
-and chose to continue. Round numbers keep counting up (4, 5, 6) so the ledger and
-the PR history stay coherent.
+four rounds and is then resumed gets four more, because a person looked at it
+and chose to continue. Round numbers keep counting up (5, 6, 7, 8) so the ledger
+and the PR history stay coherent.
 
 **The close.** A round is review and then fix, so the fix comes last and the
 budget used to run out on a commit nobody had read. After the last round, one
@@ -689,8 +689,8 @@ shape `spar review` uses, gated by `max_rounds`:
 2. **Cross.** Each reads only the ideas the other proposed and, for each,
    builds on it with a further piece, challenges it by naming where it already
    exists or why it cannot work, or keeps it. A build stands beside the
-   original as an idea of its own. With the default of three rounds this
-   happens once; more rounds repeat it.
+   original as an idea of its own. With the default of four rounds this
+   happens twice; each round past two adds another.
 3. **Converge.** Whoever proposed a challenged idea defends it with specifics
    or withdraws it, and both rank what is left. The order is the sum of the
    two rankings, and an idea left out of a ranking scores last rather than
@@ -1575,15 +1575,15 @@ wrote spar.toml
 [agents.claude]
 preset = "claude"
 model  = "opus"         # omit to use the CLI's own default
-effort = "high"
+effort = "xhigh"
 
 [agents.codex]
 preset = "codex"
 model  = "gpt-6.1-sol"
-effort = "high"
+effort = "xhigh"
 
 [loop]
-max_rounds        = 3       # custody rounds, or review-only phases
+max_rounds        = 4       # custody rounds, or review-only phases
 auto_merge        = false
 first_implementor = "claude"  # or "alternate"
 close_skipped     = true
@@ -1591,9 +1591,9 @@ worktrees         = true
 
 [loop.effort_schedule]
 triage      = "low"         # both agents, over the whole queue
-review_1    = "high"        # the deep pass
-review_rest = "high"        # later rounds and the closing pass
-recheck     = "high"        # the second look after commits or replies
+review_1    = "xhigh"       # the deep pass
+review_rest = "xhigh"       # later rounds and the closing pass
+recheck     = "xhigh"       # the second look after commits or replies
 
 [style]
 ban_em_dash        = true
@@ -1923,7 +1923,7 @@ and then the ordinary pipeline for each one it files. `spar checkin` is two
 calls per pull request, one to judge and one to check, and a third only when
 there is something to implement.
 
-`spar brainstorm` is two calls per round, so six at the default of three rounds
+`spar brainstorm` is two calls per round, so eight at the default of four rounds
 and two with `--max-rounds 1`. Filing from a saved session costs nothing.
 
 `spar listen` costs nothing while it waits: polling is `gh` alone, and a poll

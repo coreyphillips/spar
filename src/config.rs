@@ -685,7 +685,7 @@ pub struct LoopCfg {
 impl Default for LoopCfg {
     fn default() -> Self {
         Self {
-            max_rounds: 3,
+            max_rounds: 4,
             auto_merge: false,
             first_implementor: None,
             base_branch: "main".into(),
@@ -1883,7 +1883,7 @@ model = "gpt-5.6-sol"
             !cfg.loop_cfg.file_nits,
             "a filed nit is somebody else's triage queue"
         );
-        assert_eq!(3, cfg.loop_cfg.max_rounds);
+        assert_eq!(4, cfg.loop_cfg.max_rounds);
         assert_eq!(
             Followups::Local,
             cfg.loop_cfg.followups,
@@ -1895,6 +1895,17 @@ model = "gpt-5.6-sol"
         );
         assert_eq!(StateStore::Local, cfg.loop_cfg.state_store);
         assert!(cfg.style.terse);
+    }
+
+    #[test]
+    fn an_agent_with_no_timeout_gets_the_default() {
+        let spec: AgentSpec = toml::from_str("command = [\"x\"]").unwrap();
+        assert_eq!(5700, spec.timeout);
+
+        let cfg = parse(TWO_AGENTS).unwrap();
+        for name in ["claude", "codex"] {
+            assert_eq!(5700, cfg.spec(name).unwrap().timeout, "{name}");
+        }
     }
 
     #[test]

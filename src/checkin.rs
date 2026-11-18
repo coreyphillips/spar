@@ -1548,9 +1548,13 @@ fn post(
                     let item = &items[at];
                     seen.seen
                         .insert(item.pending.key.clone(), item.pending.newest.clone());
-                    // The summary names everything except what asked for
-                    // nothing.
-                    up[at] = item.ask != Ask::Nothing;
+                    // The summary leaves out what asked for nothing and a
+                    // change that was not pushed.
+                    up[at] = match item.ask {
+                        Ask::Nothing => false,
+                        Ask::Implement => item.changed && item.pushed,
+                        _ => true,
+                    };
                 }
                 log!("#{number}: answered");
             }
@@ -1604,9 +1608,11 @@ pub fn submitted_reviewers(rows: &[serde_json::Value]) -> Vec<String> {
 /// request and was answered here, and is not already asked.
 ///
 /// `posted` says, per item, whether its answer is up. Somebody is answered
-/// when a reply to them is up or a change they asked for is pushed. A point of
-/// theirs the two agents could not agree on, or whose answer did not go up, is
-/// still owed to them, so it is not their turn yet.
+/// when an answer to them is up. A point of theirs the two agents could not
+/// agree on, or whose answer did not go up, is still owed to them, so it is
+/// not their turn yet: a pushed change nobody explained is not one either.
+/// Whoever's feedback came from automation, a bot or a spar signed under a
+/// personal account, is never asked, since asking it starts another round.
 pub fn to_rerequest(
     items: &[Settled],
     posted: &[bool],
@@ -1623,6 +1629,9 @@ pub fn to_rerequest(
             || comments::is_bot_account(login, "")
             || named(&on.requested)
             || named(&out)
+            || items
+                .iter()
+                .any(|i| i.pending.automated && comments::same_login(&i.pending.author, login))
         {
             continue;
         }
@@ -1631,8 +1640,7 @@ pub fn to_rerequest(
             if item.ask == Ask::Nothing || !named(&item.pending.writers) {
                 continue;
             }
-            let fixed = item.ask == Ask::Implement && item.changed && item.pushed;
-            if item.parked || !(up || fixed) {
+            if item.parked || !up {
                 owed = true;
             } else {
                 answered = true;
@@ -2347,11 +2355,8 @@ mod tests {
     #[test]
     fn a_reviewer_whose_change_was_pushed_is_asked_to_review_again() {
         assert_eq!(vec!["alice"], asked(&[fixed()], &reviewed_by(&["alice"])));
-        // Pushed is answered even when the reply did not go up.
-        assert_eq!(
-            vec!["alice"],
-            to_rerequest(&[fixed()], &[false], &reviewed_by(&["alice"]), &mode())
-        );
+        // A pushed change whose explanation did not go up is still owed.
+        assert!(to_rerequest(&[fixed()], &[false], &reviewed_by(&["alice"]), &mode()).is_empty());
     }
 
     #[test]
@@ -2400,6 +2405,11 @@ mod tests {
         let mut own = settled(Ask::Answer);
         own.pending.writers = vec!["Viewer".into()];
         assert!(asked(&[own], &reviewed_by(&["viewer"])).is_empty());
+
+        // A person's account whose spar signed the review.
+        let mut signed = settled(Ask::Answer);
+        signed.pending.automated = true;
+        assert!(asked(&[signed, fixed()], &reviewed_by(&["alice"])).is_empty());
 
         let rows = vec![
             serde_json::json!({"state": "COMMENTED", "user": {"login": "review-app", "type": "Bot"}}),

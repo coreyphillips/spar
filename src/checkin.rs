@@ -1005,12 +1005,12 @@ fn act(
         let Some(verdict) = verdicts
             .verdicts
             .iter()
-            .find(|v| v.ref_id.trim() == p.ref_id)
+            .find(|v| names_comment(&v.ref_id, &p.ref_id))
         else {
             logdim!("no verdict for {} on #{number}, leaving it", p.ref_id);
             continue;
         };
-        let check = checks.iter().find(|c| c.ref_id.trim() == p.ref_id);
+        let check = checks.iter().find(|c| names_comment(&c.ref_id, &p.ref_id));
         let mut item = Settled::new(p.clone(), verdict);
         item.counterpoint = check
             .filter(|c| !c.reasoning.trim().is_empty())
@@ -1041,7 +1041,7 @@ fn act(
         let verdict = verdicts
             .verdicts
             .iter()
-            .find(|v| v.ref_id.trim() == item.pending.ref_id);
+            .find(|v| names_comment(&v.ref_id, &item.pending.ref_id));
         let title = verdict
             .and_then(|v| v.new_issue_title.clone())
             .filter(|t| !t.trim().is_empty())
@@ -1177,6 +1177,7 @@ fn implement(
         .filter(|i| i.ask == Ask::Implement)
         .map(|i| &i.pending)
         .collect();
+    let asked: Vec<String> = wanted.iter().map(|p| p.ref_id.clone()).collect();
     let name = cfg.first_implementor.clone();
     let implementor = agent::find(agents, &name)?;
     log!("#{number}: {name} making {} agreed change(s)", wanted.len());
@@ -1220,23 +1221,7 @@ fn implement(
         }
     };
     repo.refuse_changed_attributes(work_dir, &worktree_baseline)?;
-    for item in items.iter_mut().filter(|i| i.ask == Ask::Implement) {
-        if let Some(done) = report
-            .done
-            .iter()
-            .find(|d| d.ref_id.trim() == item.pending.ref_id)
-        {
-            item.summary = done.summary.clone();
-            item.files = done.files.clone();
-            item.changed = done.changed;
-            if !done.changed {
-                // The third refusal, with the code open. A better answer than
-                // making a change the agent now believes is a mistake.
-                item.ask = Ask::Decline;
-                item.reasoning = done.summary.clone();
-            }
-        }
-    }
+    let unmatched = apply_report(items, &report, number);
 
     let downgrade = |items: &mut [Settled], why: &str| {
         for item in items.iter_mut().filter(|i| i.ask == Ask::Implement) {
@@ -1268,13 +1253,16 @@ fn implement(
         )?;
         repo.refuse_unrepresented_tracked_changes(work_dir, &worktree_baseline)?;
     } else {
-        repo.refuse_unrepresented_tracked_changes(work_dir, &worktree_baseline)?;
+        let explain = |e: crate::error::SparError| unmatched_report(e, &unmatched, &asked);
+        repo.refuse_unrepresented_tracked_changes(work_dir, &worktree_baseline)
+            .map_err(explain)?;
         let dirty = repo.has_uncommitted_changes(work_dir)?;
         let after = repo.head_oid_checked(work_dir)?;
         if !dirty && before == after {
             repo.refuse_new_ignored_files(work_dir, &worktree_baseline)?;
         }
-        require_no_unreported_work(work_dir, before.as_str(), after.as_str(), dirty)?;
+        require_no_unreported_work(work_dir, before.as_str(), after.as_str(), dirty)
+            .map_err(explain)?;
         logwarn!("#{number}: nothing was committed, so nothing is being claimed as fixed");
         downgrade(items, "nothing was committed");
         return Ok(FixPublication::NoCommit);
@@ -1316,6 +1304,103 @@ fn implement(
             )))
         }
     }
+}
+
+/// Hand each agreed comment what the fix call said about it, and return the
+/// handles of reported changes that named none of them.
+///
+/// A handle that matches nothing leaves its change unclaimed, and an edit
+/// nobody claimed is one the worktree check has to refuse. When one comment
+/// was asked about and one entry came back, that entry is about that comment
+/// whatever handle it carries: there is nothing else for it to be about, and
+/// its files are still checked against the commit before anything is claimed.
+fn apply_report(items: &mut [Settled], report: &FixReport, number: i64) -> Vec<String> {
+    let asked = items.iter().filter(|i| i.ask == Ask::Implement).count();
+    let mut claimed = vec![false; report.done.len()];
+    for item in items.iter_mut().filter(|i| i.ask == Ask::Implement) {
+        let at = report
+            .done
+            .iter()
+            .position(|d| names_comment(&d.ref_id, &item.pending.ref_id))
+            .or_else(|| {
+                let sole = asked == 1 && report.done.len() == 1;
+                if sole {
+                    logdim!(
+                        "#{number}: the fix call reported its change under {:?} rather than {}, \
+                         the only comment it was asked about, so it is taken as that one's",
+                        report.done[0].ref_id.trim(),
+                        item.pending.ref_id
+                    );
+                }
+                sole.then_some(0)
+            });
+        let Some(at) = at else { continue };
+        claimed[at] = true;
+        let done = &report.done[at];
+        item.summary = done.summary.clone();
+        item.files = done.files.clone();
+        item.changed = done.changed;
+        if !done.changed {
+            // The third refusal, with the code open. A better answer than
+            // making a change the agent now believes is a mistake.
+            item.ask = Ask::Decline;
+            item.reasoning = done.summary.clone();
+        }
+    }
+    report
+        .done
+        .iter()
+        .zip(claimed)
+        .filter(|(done, claimed)| done.changed && !claimed)
+        .map(|(done, _)| done.ref_id.trim().to_string())
+        .collect()
+}
+
+/// Whether the handle a model reported names this comment.
+///
+/// Each comment opens with a line like `comment c1 from @alice on src/x.rs:9
+/// [d13b7205]`, and asked to copy the handle across, a model may write
+/// `comment c1`, `C1` or `[c1]` for the same comment. All of those are it.
+/// The bracketed code is the fence's, the same on every comment, so it never
+/// names one.
+fn names_comment(reported: &str, ref_id: &str) -> bool {
+    let tidy = |s: &str| {
+        s.trim_matches(|c: char| c.is_whitespace() || matches!(c, '[' | ']' | '`' | '"' | '\''))
+            .to_string()
+    };
+    let reported = tidy(reported);
+    let reported = match reported.get(..8) {
+        Some(head) if head.eq_ignore_ascii_case("comment ") => tidy(&reported[8..]),
+        _ => reported,
+    };
+    let ref_id = ref_id.trim();
+    !ref_id.is_empty() && reported.eq_ignore_ascii_case(ref_id)
+}
+
+/// Say which handles went unmatched, ahead of the refusal they caused.
+///
+/// Without it the refusal reads as the call having changed files it should
+/// not have, when it changed exactly the files it was asked to and only
+/// labelled them with a handle that names no comment.
+fn unmatched_report(
+    e: crate::error::SparError,
+    unmatched: &[String],
+    asked: &[String],
+) -> crate::error::SparError {
+    if unmatched.is_empty() {
+        return e;
+    }
+    e.with_message(format!(
+        "the fix call reported its change under {}, which names none of the comments it was \
+         asked about ({}), so spar could not tell which comment the change answers.\n{}",
+        unmatched
+            .iter()
+            .map(|id| format!("{id:?}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        asked.join(", "),
+        e.message()
+    ))
 }
 
 fn require_no_unreported_work(
@@ -1808,6 +1893,103 @@ mod tests {
         assert_eq!(Ask::Answer, items[1].ask);
         assert!(!items[1].changed, "a fix nobody can see was still claimed");
         assert!(items[1].blocked.is_some(), "the reply has to say why");
+    }
+
+    fn outcome(ref_id: &str, changed: bool, files: &[&str]) -> crate::model::FixOutcome {
+        crate::model::FixOutcome {
+            ref_id: ref_id.into(),
+            changed,
+            summary: "a failed renewal now sends again".into(),
+            files: files.iter().map(|f| f.to_string()).collect(),
+        }
+    }
+
+    /// A fix call on PR #1349 reported its one change under the fence's code,
+    /// `d13b7205`, rather than `c1`. Nothing was claimed, so the edit it made
+    /// was refused as unaccounted for and the check-in stopped with the work
+    /// stranded in the worktree.
+    #[test]
+    fn the_only_comment_asked_about_takes_the_only_report_whatever_its_handle() {
+        let mut items = vec![settled(Ask::Implement)];
+        let report = FixReport {
+            done: vec![outcome("d13b7205", true, &["src/x.rs"])],
+        };
+
+        let unmatched = apply_report(&mut items, &report, 1349);
+
+        assert!(unmatched.is_empty(), "{unmatched:?}");
+        assert!(items[0].changed, "the change was not claimed");
+        assert_eq!(Ask::Implement, items[0].ask);
+        assert_eq!(vec!["src/x.rs".to_string()], items[0].files);
+    }
+
+    /// With two comments asked about, a handle that names neither cannot be
+    /// given to one of them, and the refusal has to say that is why.
+    #[test]
+    fn a_handle_that_names_none_of_several_comments_is_reported_back() {
+        let mut items = vec![settled(Ask::Implement), settled(Ask::Implement)];
+        items[1].pending.ref_id = "c2".into();
+        let report = FixReport {
+            done: vec![
+                outcome("d13b7205", true, &["src/x.rs"]),
+                outcome("d13b7205", true, &["src/y.rs"]),
+            ],
+        };
+
+        let unmatched = apply_report(&mut items, &report, 1349);
+
+        assert_eq!(vec!["d13b7205", "d13b7205"], unmatched);
+        assert!(!items[0].changed && !items[1].changed);
+        let e = unmatched_report(
+            crate::error::SparError::uncertain_write("the editing call changed tracked files"),
+            &unmatched,
+            &["c1".to_string(), "c2".to_string()],
+        );
+        assert_eq!(crate::error::ErrorKind::UncertainWrite, e.kind());
+        assert!(e.message().contains("\"d13b7205\""), "{}", e.message());
+        assert!(e.message().contains("(c1, c2)"), "{}", e.message());
+        assert!(e
+            .message()
+            .ends_with("the editing call changed tracked files"));
+    }
+
+    /// Two comments, each reported under its own handle written loosely.
+    #[test]
+    fn each_comment_takes_the_report_that_names_it() {
+        let mut items = vec![settled(Ask::Implement), settled(Ask::Implement)];
+        items[1].pending.ref_id = "c2".into();
+        let report = FixReport {
+            done: vec![
+                outcome("comment C2", false, &[]),
+                outcome("[c1]", true, &["src/x.rs"]),
+            ],
+        };
+
+        let unmatched = apply_report(&mut items, &report, 7);
+
+        assert!(unmatched.is_empty(), "{unmatched:?}");
+        assert!(items[0].changed);
+        assert_eq!(Ask::Implement, items[0].ask);
+        assert!(!items[1].changed);
+        assert_eq!(
+            Ask::Decline,
+            items[1].ask,
+            "a change left alone is a decline"
+        );
+    }
+
+    #[test]
+    fn a_handle_written_loosely_still_names_its_comment() {
+        assert!(names_comment("c1", "c1"));
+        assert!(names_comment(" C1 ", "c1"));
+        assert!(names_comment("[c1]", "c1"));
+        assert!(names_comment("`c1`", "c1"));
+        assert!(names_comment("comment c1", "c1"));
+        assert!(names_comment("Comment [c1]", "c1"));
+        assert!(!names_comment("c10", "c1"));
+        assert!(!names_comment("d13b7205", "c1"));
+        assert!(!names_comment("comment", "c1"));
+        assert!(!names_comment("", ""));
     }
 
     /// `./src/x.rs` and `src/x.rs` are the same file, and only one of them is

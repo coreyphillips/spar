@@ -576,7 +576,7 @@ pub fn checkin() -> Value {
                     "properties": {
                         "ref_id": {
                             "type": "string",
-                            "description": "The handle printed beside the comment, copied across exactly, so your answer can be matched back to it."
+                            "description": "The comment's handle, such as c1: the word right after `comment` in the line that opens it, copied across exactly so your answer can be matched back to it. Not the bracketed code at the end of that line, which is the same on every comment."
                         },
                         "ask": {
                             "type": "string",
@@ -626,7 +626,7 @@ pub fn checkin_check() -> Value {
                     "properties": {
                         "ref_id": {
                             "type": "string",
-                            "description": "The handle printed beside the comment, copied across exactly."
+                            "description": "The comment's handle, such as c1: the word right after `comment` in the line that opens it, copied across exactly. Not the bracketed code at the end of that line, which is the same on every comment."
                         },
                         "agrees": {
                             "type": "boolean",
@@ -668,7 +668,7 @@ pub fn checkin_fix() -> Value {
                     "properties": {
                         "ref_id": {
                             "type": "string",
-                            "description": "The handle printed beside the comment, copied across exactly."
+                            "description": "The comment's handle, such as c1: the word right after `comment` in the line that opens it, copied across exactly. Not the bracketed code at the end of that line, which is the same on every comment."
                         },
                         "changed": {
                             "type": "boolean",
@@ -710,7 +710,7 @@ pub fn answer() -> Value {
                     "properties": {
                         "ref_id": {
                             "type": "string",
-                            "description": "The handle printed beside the mention the question is in, copied across exactly."
+                            "description": "The handle of the mention the question is in, such as m1: the word right after `mention` in the line that opens it, copied across exactly. Not the bracketed code at the end of that line, which is the same on every mention."
                         },
                         "question": {
                             "type": "string",

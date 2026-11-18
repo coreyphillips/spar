@@ -160,6 +160,9 @@ pub struct Mode {
     /// Read every comment again, ignoring what spar recorded answering.
     pub again: bool,
     pub resolve: bool,
+    /// Ask the reviewers it answered to review again, on the viewer's own
+    /// pull request.
+    pub rerequest: bool,
     /// Whether `[style] pr_comments` allows spar to say anything at all here.
     pub posts: bool,
     /// Started by `spar listen` rather than by a person. Counts against
@@ -1075,7 +1078,7 @@ fn act(
     }
 
     // -- say it, then resolve --------------------------------------------
-    post(repo, number, &items, mode, state, &mut seen, on_issue);
+    let posted = post(repo, number, &items, mode, state, &mut seen, on_issue);
     // Counted when the run had something to say or to push, which is what
     // another bot can answer. A run that judged everything as asking for
     // nothing is the loop ending, not one more turn of it.
@@ -1083,6 +1086,12 @@ fn act(
         seen.automatic += 1;
     }
     write_answered(repo, number, &seen);
+
+    // A fix that could not be pushed is a run that failed, and a reviewer
+    // asked to look now would find the change they asked for missing.
+    if !on_issue && !matches!(publication, FixPublication::Unpublished(_)) {
+        rerequest_reviews(repo, number, &items, &posted, mode, state);
+    }
 
     for item in &items {
         if item.ask == Ask::Decline {
@@ -1426,6 +1435,9 @@ fn require_no_unreported_work(
 /// is one somebody has to un-resolve to find out what happened.
 ///
 /// `on_issue` because `gh pr comment` refuses an issue's number.
+///
+/// Returns, for each item, whether its answer is up. In a dry run, whether it
+/// would have been.
 fn post(
     repo: &Repo,
     number: i64,
@@ -1434,8 +1446,9 @@ fn post(
     state: &mut IssueRun,
     seen: &mut Answered,
     on_issue: bool,
-) {
+) -> Vec<bool> {
     let summary = checkin_comment(items, &repo.style);
+    let mut up = vec![false; items.len()];
 
     if !mode.posts || mode.dry_run {
         for item in items {
@@ -1474,7 +1487,7 @@ fn post(
             ),
             Err(e) => logdim!("{why}, nothing posted, and could not save it: {e}"),
         }
-        return;
+        return items.iter().map(|i| i.ask != Ask::Nothing).collect();
     }
 
     let quiet = said_nothing(items, seen);
@@ -1485,7 +1498,7 @@ fn post(
         );
     }
 
-    for item in items {
+    for (at, item) in items.iter().enumerate() {
         let Some(root) = item.pending.reply_root() else {
             continue;
         };
@@ -1495,6 +1508,7 @@ fn post(
         }
         match repo.reply_in_thread(number, root, &text) {
             Ok(()) => {
+                up[at] = true;
                 // Recorded only once the reply is actually up. A run that could
                 // not post has not answered, and recording it would lose the
                 // comment.
@@ -1519,9 +1533,8 @@ fn post(
         }
     }
 
-    let loose: Vec<&Settled> = items
-        .iter()
-        .filter(|i| i.pending.reply_root().is_none())
+    let loose: Vec<usize> = (0..items.len())
+        .filter(|&at| items[at].pending.reply_root().is_none())
         .collect();
     if let Some(text) = summary {
         let posted = if on_issue {
@@ -1531,9 +1544,13 @@ fn post(
         };
         match posted {
             Ok(()) => {
-                for item in &loose {
+                for &at in &loose {
+                    let item = &items[at];
                     seen.seen
                         .insert(item.pending.key.clone(), item.pending.newest.clone());
+                    // The summary names everything except what asked for
+                    // nothing.
+                    up[at] = item.ask != Ask::Nothing;
                 }
                 log!("#{number}: answered");
             }
@@ -1543,6 +1560,167 @@ fn post(
             }
         }
     }
+    up
+}
+
+/// Who reviews a pull request, as far as asking them again goes.
+#[derive(Debug, Clone, Default)]
+pub struct Reviewing {
+    /// The authenticated user wrote the pull request.
+    pub own: bool,
+    pub viewer: String,
+    /// Everybody who has submitted a review on it.
+    pub reviewed: Vec<String>,
+    /// Whose request for a review is open now.
+    pub requested: Vec<String>,
+}
+
+/// Who submitted a review, from a pull request's reviews as REST gives them.
+/// A draft is not submitted, and an app's account is never asked again.
+pub fn submitted_reviewers(rows: &[serde_json::Value]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for row in rows {
+        let state = row.get("state").and_then(|v| v.as_str()).unwrap_or("");
+        let user = row.get("user");
+        let field = |name: &str| {
+            user.and_then(|u| u.get(name))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+        };
+        let login = field("login");
+        if login.is_empty()
+            || state.eq_ignore_ascii_case("PENDING")
+            || comments::is_bot_account(login, field("type"))
+            || out.iter().any(|o| comments::same_login(o, login))
+        {
+            continue;
+        }
+        out.push(login.to_string());
+    }
+    out
+}
+
+/// Whose turn this run made it: each person who reviewed the viewer's pull
+/// request and was answered here, and is not already asked.
+///
+/// `posted` says, per item, whether its answer is up. Somebody is answered
+/// when a reply to them is up or a change they asked for is pushed. A point of
+/// theirs the two agents could not agree on, or whose answer did not go up, is
+/// still owed to them, so it is not their turn yet.
+pub fn to_rerequest(
+    items: &[Settled],
+    posted: &[bool],
+    on: &Reviewing,
+    mode: &Mode,
+) -> Vec<String> {
+    if !mode.rerequest || !on.own {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for login in &on.reviewed {
+        let named = |list: &[String]| list.iter().any(|l| comments::same_login(l, login));
+        if comments::same_login(login, &on.viewer)
+            || comments::is_bot_account(login, "")
+            || named(&on.requested)
+            || named(&out)
+        {
+            continue;
+        }
+        let (mut answered, mut owed) = (false, false);
+        for (item, &up) in items.iter().zip(posted) {
+            if item.ask == Ask::Nothing || !named(&item.pending.writers) {
+                continue;
+            }
+            let fixed = item.ask == Ask::Implement && item.changed && item.pushed;
+            if item.parked || !(up || fixed) {
+                owed = true;
+            } else {
+                answered = true;
+            }
+        }
+        if answered && !owed {
+            out.push(login.clone());
+        }
+    }
+    out
+}
+
+/// Ask the reviewers this run answered to look again, once their answers are
+/// up and any fix is pushed. Best effort, like every write after the work.
+fn rerequest_reviews(
+    repo: &Repo,
+    number: i64,
+    items: &[Settled],
+    posted: &[bool],
+    mode: &Mode,
+    state: &mut IssueRun,
+) {
+    // Nobody can be answered, so there is nothing to read GitHub for.
+    if !mode.rerequest || !items.iter().any(|i| i.ask != Ask::Nothing && !i.parked) {
+        return;
+    }
+    let on = match reviewing(repo, number) {
+        Ok(on) => on,
+        Err(e) => {
+            logdim!(
+                "#{number}: could not read who reviews it, so nobody was asked to review again: {}",
+                e.last_line()
+            );
+            return;
+        }
+    };
+    let who = to_rerequest(items, posted, &on, mode);
+    if who.is_empty() {
+        return;
+    }
+    let named = who
+        .iter()
+        .map(|l| format!("@{l}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if mode.dry_run || !mode.posts {
+        println!("\n[would re-request review] {named}\n");
+        return;
+    }
+    match repo.rerequest_review(number, &who) {
+        Ok(()) => log!("#{number}: asked {named} to review again"),
+        Err(e) => {
+            logwarn!(
+                "#{number}: could not ask {named} to review again: {}",
+                e.last_line()
+            );
+            state
+                .notes
+                .push(format!("could not re-request review from {named}: {e}"));
+        }
+    }
+}
+
+fn reviewing(repo: &Repo, number: i64) -> Result<Reviewing> {
+    let row = repo.sweep_pr(number)?;
+    let viewer = repo.viewer_login()?.to_string();
+    let own = row
+        .author
+        .as_ref()
+        .is_some_and(|a| comments::same_login(&a.login, &viewer));
+    if !own {
+        return Ok(Reviewing {
+            viewer,
+            ..Reviewing::default()
+        });
+    }
+    Ok(Reviewing {
+        own,
+        viewer,
+        reviewed: submitted_reviewers(&repo.try_pr_reviews(number)?),
+        // A team has no login, and asking a team is out of scope.
+        requested: row
+            .review_requests
+            .into_iter()
+            .map(|l| l.login)
+            .filter(|l| !l.is_empty())
+            .collect(),
+    })
 }
 
 /// Record every comment that asked for nothing as answered, since saying
@@ -1648,6 +1826,7 @@ mod tests {
             url: String::new(),
             at: "2026-01-02T03:04:05Z".into(),
             automated: false,
+            writers: vec!["alice".into()],
         }
     }
 
@@ -1658,6 +1837,7 @@ mod tests {
             trust: Trust::Write,
             again: false,
             resolve: true,
+            rerequest: true,
             posts: true,
             auto: false,
         }
@@ -2139,6 +2319,138 @@ mod tests {
 
         let dirty = require_no_unreported_work(path, "before", "before", true).unwrap_err();
         assert!(dirty.message().contains("kept for recovery"));
+    }
+
+    // -- asking for another review -----------------------------------------
+
+    fn reviewed_by(logins: &[&str]) -> Reviewing {
+        Reviewing {
+            own: true,
+            viewer: "viewer".into(),
+            reviewed: logins.iter().map(|l| l.to_string()).collect(),
+            requested: Vec::new(),
+        }
+    }
+
+    fn fixed() -> Settled {
+        let mut item = settled(Ask::Implement);
+        item.changed = true;
+        item.pushed = true;
+        item
+    }
+
+    fn asked(items: &[Settled], on: &Reviewing) -> Vec<String> {
+        let up = vec![true; items.len()];
+        to_rerequest(items, &up, on, &mode())
+    }
+
+    #[test]
+    fn a_reviewer_whose_change_was_pushed_is_asked_to_review_again() {
+        assert_eq!(vec!["alice"], asked(&[fixed()], &reviewed_by(&["alice"])));
+        // Pushed is answered even when the reply did not go up.
+        assert_eq!(
+            vec!["alice"],
+            to_rerequest(&[fixed()], &[false], &reviewed_by(&["alice"]), &mode())
+        );
+    }
+
+    #[test]
+    fn a_reviewer_answered_in_words_is_asked_to_review_again() {
+        for ask in [Ask::Answer, Ask::Decline, Ask::Defer] {
+            assert_eq!(
+                vec!["alice"],
+                asked(&[settled(ask)], &reviewed_by(&["alice"])),
+                "{ask}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reviewer_who_asked_for_nothing_is_not_asked_again() {
+        assert!(asked(&[settled(Ask::Nothing)], &reviewed_by(&["alice"])).is_empty());
+    }
+
+    #[test]
+    fn a_reviewer_whose_answer_did_not_go_up_is_not_asked_again() {
+        let on = reviewed_by(&["alice"]);
+        let items = [settled(Ask::Answer)];
+        assert!(to_rerequest(&items, &[false], &on, &mode()).is_empty());
+        // One answer up and one missing is still an answer owed.
+        let items = [settled(Ask::Answer), settled(Ask::Decline)];
+        assert!(to_rerequest(&items, &[true, false], &on, &mode()).is_empty());
+    }
+
+    /// A point the two agents could not agree on is handed to the viewer, so
+    /// the move is still the viewer's.
+    #[test]
+    fn a_reviewer_with_a_point_left_for_you_is_not_asked_again() {
+        let mut parked = settled(Ask::Answer);
+        parked.parked = true;
+        let on = reviewed_by(&["alice"]);
+        assert!(asked(&[parked.clone()], &on).is_empty());
+        assert!(asked(&[fixed(), parked], &on).is_empty());
+    }
+
+    #[test]
+    fn bots_and_the_viewer_are_never_asked_again() {
+        let mut bot = settled(Ask::Answer);
+        bot.pending.writers = vec!["coderabbitai[bot]".into()];
+        assert!(asked(&[bot], &reviewed_by(&["coderabbitai[bot]"])).is_empty());
+
+        let mut own = settled(Ask::Answer);
+        own.pending.writers = vec!["Viewer".into()];
+        assert!(asked(&[own], &reviewed_by(&["viewer"])).is_empty());
+
+        let rows = vec![
+            serde_json::json!({"state": "COMMENTED", "user": {"login": "review-app", "type": "Bot"}}),
+            serde_json::json!({"state": "PENDING", "user": {"login": "carol", "type": "User"}}),
+            serde_json::json!({"state": "APPROVED", "user": {"login": "alice", "type": "User"}}),
+            serde_json::json!({"state": "COMMENTED", "user": {"login": "alice", "type": "User"}}),
+        ];
+        assert_eq!(
+            vec!["alice"],
+            submitted_reviewers(&rows),
+            "a bot, a draft, and a second review are not reviewers to ask"
+        );
+    }
+
+    #[test]
+    fn a_reviewer_already_asked_is_not_asked_again() {
+        let mut on = reviewed_by(&["alice"]);
+        on.requested = vec!["Alice".into()];
+        assert!(asked(&[settled(Ask::Answer)], &on).is_empty());
+    }
+
+    #[test]
+    fn a_commenter_who_never_reviewed_is_not_asked_to() {
+        assert!(asked(&[settled(Ask::Answer)], &reviewed_by(&["bob"])).is_empty());
+        assert!(asked(&[settled(Ask::Answer)], &reviewed_by(&[])).is_empty());
+    }
+
+    /// A reply in a thread answers everybody in it, not only whoever spoke
+    /// last.
+    #[test]
+    fn everybody_who_wrote_in_a_thread_was_answered() {
+        let mut item = settled(Ask::Answer);
+        item.pending.author = "bob".into();
+        item.pending.writers = vec!["alice".into(), "bob".into()];
+        assert_eq!(
+            vec!["alice", "bob"],
+            asked(&[item], &reviewed_by(&["alice", "bob", "carol"]))
+        );
+    }
+
+    #[test]
+    fn nobody_is_asked_again_when_it_is_off_or_not_your_pull_request() {
+        let off = Mode {
+            rerequest: false,
+            ..mode()
+        };
+        let on = reviewed_by(&["alice"]);
+        assert!(to_rerequest(&[fixed()], &[true], &on, &off).is_empty());
+
+        let theirs = Reviewing { own: false, ..on };
+        assert!(asked(&[fixed()], &theirs).is_empty());
     }
 
     /// The absence of anything to say is the message, on the same principle as

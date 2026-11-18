@@ -6032,6 +6032,21 @@ impl Repo {
         }
     }
 
+    /// Ask these people to review a pull request again, in one write.
+    ///
+    /// The REST endpoint takes somebody who has already reviewed, which is
+    /// everybody this is for.
+    pub fn rerequest_review(&self, number: i64, logins: &[String]) -> Result<()> {
+        let path = format!("repos/{{owner}}/{{repo}}/pulls/{number}/requested_reviewers");
+        let mut args: Vec<String> = vec!["api".into(), "-X".into(), "POST".into(), path];
+        for login in logins {
+            args.push("-f".into());
+            args.push(format!("reviewers[]={login}"));
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.record_write(self.gh(&args).map(|_| ()))
+    }
+
     /// The worktree that has `branch` checked out, if one does.
     fn worktree_holding(&self, branch: &str) -> Option<PathBuf> {
         let listed = self

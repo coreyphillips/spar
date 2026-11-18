@@ -653,6 +653,13 @@ pub struct LoopCfg {
     /// A thread spar disagreed with is left open whatever this says: the person
     /// who raised it has not had their say yet, and it is their thread.
     pub checkin_resolve: bool,
+    /// On a pull request the authenticated user wrote, ask each reviewer spar
+    /// answered in a check-in to review it again.
+    ///
+    /// Submitting a review clears the request for it, so without this the pull
+    /// request leaves their queue until somebody asks again by hand. Bots are
+    /// never asked: one that reviews on request would answer every check-in.
+    pub checkin_rerequest_review: bool,
     /// Most unanswered comments spar answers on one pull request in a run.
     ///
     /// A backstop against a long argument being read back to somebody, not a
@@ -712,6 +719,7 @@ impl Default for LoopCfg {
             max_triage_chars: 200_000,
             checkin_trust: Trust::Write,
             checkin_resolve: true,
+            checkin_rerequest_review: true,
             max_checkin_comments: 20,
             setup: CheckCommand::default(),
             check: CheckCommand::default(),
@@ -1490,6 +1498,13 @@ model = "gpt-5.6-sol"
     #[test]
     fn the_config_layer_does_not_keep_its_own_copy_of_the_budgets() {
         assert_eq!(Style::default(), StyleCfg::default().to_style());
+    }
+
+    #[test]
+    fn reviewers_are_asked_again_after_a_checkin_unless_turned_off() {
+        assert!(parse(TWO_AGENTS).unwrap().loop_cfg.checkin_rerequest_review);
+        let text = format!("{TWO_AGENTS}\n[loop]\ncheckin_rerequest_review = false\n");
+        assert!(!parse(&text).unwrap().loop_cfg.checkin_rerequest_review);
     }
 
     // -- drafts ------------------------------------------------------------

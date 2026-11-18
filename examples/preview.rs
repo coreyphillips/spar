@@ -560,6 +560,7 @@ fn settled(
             at: "2026-01-02T03:04:05Z".into(),
             automated: false,
             writers: vec![author.into()],
+            automated_writers: Vec::new(),
         },
         ask,
         request: "add a guard on the retry path".into(),

@@ -445,6 +445,9 @@ pub struct Pending {
     /// Everybody who wrote in it, each once, oldest first. A reply in a thread
     /// answers all of them, which is who is asked to review again.
     pub writers: Vec<String>,
+    /// Whoever wrote any message in it the way `automated` means, not only the
+    /// newest. Asking one of them to review again starts another round.
+    pub automated_writers: Vec<String>,
 }
 
 impl Pending {
@@ -690,6 +693,13 @@ pub fn gather(repo: &Repo, number: i64, pr: bool, seen: &Answered) -> Result<Gat
             at: newest.created_at.clone(),
             automated: newest.is_automated(),
             writers: writers(&live),
+            automated_writers: writers(
+                &live
+                    .iter()
+                    .copied()
+                    .filter(|c| c.is_automated())
+                    .collect::<Vec<_>>(),
+            ),
         });
     }
 
@@ -1149,6 +1159,11 @@ fn loose_comment(
             at,
             automated,
             writers: vec![login.to_string()],
+            automated_writers: if automated {
+                vec![login.to_string()]
+            } else {
+                Vec::new()
+            },
         },
     ))
 }
@@ -1877,6 +1892,7 @@ mod tests {
             at: "2026-01-02T03:04:05Z".into(),
             automated: false,
             writers: vec!["mallory".into()],
+            automated_writers: Vec::new(),
         };
         let out = crate::checkin::fenced(&p);
         assert_eq!(

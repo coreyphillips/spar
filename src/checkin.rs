@@ -1629,9 +1629,7 @@ pub fn to_rerequest(
             || comments::is_bot_account(login, "")
             || named(&on.requested)
             || named(&out)
-            || items
-                .iter()
-                .any(|i| i.pending.automated && comments::same_login(&i.pending.author, login))
+            || items.iter().any(|i| named(&i.pending.automated_writers))
         {
             continue;
         }
@@ -1835,6 +1833,7 @@ mod tests {
             at: "2026-01-02T03:04:05Z".into(),
             automated: false,
             writers: vec!["alice".into()],
+            automated_writers: Vec::new(),
         }
     }
 
@@ -2408,8 +2407,15 @@ mod tests {
 
         // A person's account whose spar signed the review.
         let mut signed = settled(Ask::Answer);
-        signed.pending.automated = true;
-        assert!(asked(&[signed, fixed()], &reviewed_by(&["alice"])).is_empty());
+        signed.pending.automated_writers = vec!["alice".into()];
+        assert!(asked(&[signed.clone(), fixed()], &reviewed_by(&["alice"])).is_empty());
+        // Still so when somebody else wrote after it in the thread.
+        signed.pending.author = "bob".into();
+        signed.pending.writers = vec!["alice".into(), "bob".into()];
+        assert_eq!(
+            vec!["bob"],
+            asked(&[signed], &reviewed_by(&["alice", "bob"]))
+        );
 
         let rows = vec![
             serde_json::json!({"state": "COMMENTED", "user": {"login": "review-app", "type": "Bot"}}),

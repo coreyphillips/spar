@@ -1573,6 +1573,7 @@ fn dispatch(
                 trust: cfg.loop_cfg.checkin_trust,
                 again: false,
                 resolve: cfg.loop_cfg.checkin_resolve,
+                rerequest: cfg.loop_cfg.checkin_rerequest_review,
                 posts: checkin::posts(cfg),
                 auto: true,
             },

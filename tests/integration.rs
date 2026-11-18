@@ -7950,8 +7950,10 @@ fn a_recheck_without_a_posted_review_on_record_reviews_afresh() {
 /// issues assigned to the viewer, none when it is missing, and
 /// `$SPAR_FAKE_ISSUE_ASSIGNED` is who issue 42 is assigned to, nobody when it
 /// is missing. `$SPAR_FAKE_THREADS` is the pull request's review threads as
-/// GraphQL gives them, none when it is missing. The viewer is in team `ours`
-/// and in no other.
+/// GraphQL gives them, none when it is missing. `$SPAR_FAKE_REVIEWS` is the
+/// pull request's submitted reviews, none when it is missing, and
+/// `SPAR_FAKE_REREQUEST_FAILS=1` refuses a request for another review. The
+/// viewer is in team `ours` and in no other.
 fn listen_gh(number: i64, head: &str, author: &str, state: &str) -> String {
     format!(
         r#"set -eu
@@ -8008,6 +8010,8 @@ case "$*" in
   "api --paginate repos/{{owner}}/{{repo}}/issues/{number}/comments"|"api --paginate repos/{{owner}}/{{repo}}/issues/42/comments")
     if [ "${{SPAR_FAKE_COMMENTS_FAIL:-}}" = 1 ]; then printf 'gh: HTTP 502: Bad Gateway\n' >&2; exit 1; fi
     if [ -f "${{SPAR_FAKE_COMMENTS:-/nonexistent}}" ]; then cat "$SPAR_FAKE_COMMENTS"; else printf '[]\n'; fi ;;
+  "api --paginate repos/{{owner}}/{{repo}}/pulls/{number}/reviews")
+    if [ -f "${{SPAR_FAKE_REVIEWS:-/nonexistent}}" ]; then cat "$SPAR_FAKE_REVIEWS"; else printf '[]\n'; fi ;;
   "api --paginate "*) printf '[]\n' ;;
   "api graphql "*filterBy*)
     if [ -f "${{SPAR_FAKE_ASSIGNED:-/nonexistent}}" ]; then cat "$SPAR_FAKE_ASSIGNED"
@@ -8023,6 +8027,8 @@ case "$*" in
     else printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[]}}}}}}}}}}'; fi ;;
   "api -X POST repos/{{owner}}/{{repo}}/pulls/{number}/reviews "*)
     if [ "${{SPAR_FAKE_REVIEW_FAILS:-}}" = 1 ]; then printf 'gh: Unprocessable Entity (HTTP 422)\n' >&2; exit 1; fi ;;
+  "api -X POST repos/{{owner}}/{{repo}}/pulls/{number}/requested_reviewers "*)
+    if [ "${{SPAR_FAKE_REREQUEST_FAILS:-}}" = 1 ]; then printf 'gh: Unprocessable Entity (HTTP 422)\n' >&2; exit 1; fi ;;
   "pr comment "*) : ;;
   *) printf 'unexpected gh call: %s\n' "$*" >&2; exit 64 ;;
 esac"#
@@ -9732,6 +9738,167 @@ fn listen_leaves_your_pull_request_checked_in_on_max_checkins_times_to_a_person(
         record.contains("\"automatic\":0") || record.contains("\"automatic\": 0"),
         "{record}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Asking a reviewer to look again
+// ---------------------------------------------------------------------------
+
+const ALICE_ANSWERED: &str = r#"{"verdicts":[{"ref_id":"c1","ask":"answer","request":"asks whether it retries","reasoning":"It retries three times, then gives up.","unambiguous":true,"new_issue_title":null,"new_issue_body":null}]}"#;
+const ALICE_CHECKED: &str = r#"{"checks":[{"ref_id":"c1","agrees":true,"ask":"answer","unambiguous":true,"reasoning":"checked the loop"}]}"#;
+const REREQUEST: &str = "api -X POST repos/{owner}/{repo}/pulls/7/requested_reviewers";
+
+/// Pull request 7, written by `author`, which alice reviewed and then asked a
+/// question on. The environment that says so.
+fn reviewed_by_alice(tag: &str, author: &str) -> (Listening, Vec<(String, String)>) {
+    let l = Listening::new(
+        tag,
+        ALICE_ANSWERED,
+        ALICE_CHECKED,
+        &listen_gh(7, "aaa", author, "OPEN"),
+    );
+    git(&l.fx.work, &["push", "-q", "origin", "HEAD:feature-7"]);
+    let comments = l.with_comments(serde_json::json!([{
+        "id": 501,
+        "user": {"login": "alice", "type": "User"},
+        "author_association": "MEMBER",
+        "body": "does it retry?",
+        "created_at": "2026-10-20T10:00:00Z"
+    }]));
+    let reviews = l.fx.dir.join("reviews.json");
+    std::fs::write(
+        &reviews,
+        serde_json::json!([{
+            "id": 9,
+            "state": "COMMENTED",
+            "body": "",
+            "user": {"login": "alice", "type": "User"},
+            "submitted_at": "2026-10-20T09:30:00Z"
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    let env = vec![
+        ("SPAR_FAKE_COMMENTS".into(), comments.display().to_string()),
+        ("SPAR_FAKE_REVIEWS".into(), reviews.display().to_string()),
+    ];
+    (l, env)
+}
+
+fn checkin_7(l: &Listening, env: &[(String, String)], args: &[&str]) -> (bool, String, String) {
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut argv = vec!["7"];
+    argv.extend_from_slice(args);
+    l.command("checkin", &argv, &env)
+}
+
+fn rerequests(log: &str) -> Vec<&str> {
+    log.lines().filter(|c| c.starts_with(REREQUEST)).collect()
+}
+
+/// Answering a reviewer on your own pull request hands it back to them: their
+/// request was cleared when they reviewed, so spar makes it again, after the
+/// answer is up.
+#[test]
+#[cfg(unix)]
+fn checkin_on_your_own_pull_request_asks_the_reviewer_it_answered_to_look_again() {
+    let (l, env) = reviewed_by_alice("rerequest", "viewer");
+
+    let (ok, out, log) = checkin_7(&l, &env, &[]);
+
+    assert!(ok, "{out}");
+    assert_eq!(
+        vec![format!("{REREQUEST} -f reviewers[]=alice")],
+        rerequests(&log),
+        "{log}"
+    );
+    assert!(out.contains("#7: asked @alice to review again"), "{out}");
+    let answered = log.find("pr comment 7").expect("the answer was posted");
+    let asked = log.find(REREQUEST).unwrap();
+    assert!(answered < asked, "asked before the answer was up:\n{log}");
+}
+
+#[test]
+#[cfg(unix)]
+fn checkin_asks_nobody_again_when_turned_off() {
+    let (l, env) = reviewed_by_alice("rerequestoff", "viewer");
+    l.configure("[loop]\ncheckin_rerequest_review = false\n");
+
+    let (ok, out, log) = checkin_7(&l, &env, &[]);
+
+    assert!(ok, "{out}");
+    assert!(log.contains("pr comment 7"), "{log}");
+    assert!(rerequests(&log).is_empty(), "{log}");
+}
+
+/// Somebody else's pull request is theirs to hand back.
+#[test]
+#[cfg(unix)]
+fn checkin_asks_nobody_again_on_somebody_elses_pull_request() {
+    let (l, env) = reviewed_by_alice("rerequesttheirs", "alice");
+
+    let (ok, out, log) = checkin_7(&l, &env, &[]);
+
+    assert!(ok, "{out}");
+    assert!(log.contains("pr comment 7"), "{log}");
+    assert!(rerequests(&log).is_empty(), "{log}");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_checkin_dry_run_names_who_it_would_ask_again_and_asks_nobody() {
+    let (l, env) = reviewed_by_alice("rerequestdry", "viewer");
+
+    let (ok, out, log) = checkin_7(&l, &env, &["--dry-run"]);
+
+    assert!(ok, "{out}");
+    assert!(out.contains("[would re-request review] @alice"), "{out}");
+    assert!(rerequests(&log).is_empty(), "{log}");
+    assert!(!log.contains("pr comment"), "{log}");
+}
+
+/// A refused request is a failed write like any other: said, counted, and
+/// the answer already posted stands.
+#[test]
+#[cfg(unix)]
+fn a_refused_request_for_another_review_is_reported_and_the_answer_stands() {
+    let (l, mut env) = reviewed_by_alice("rerequestfails", "viewer");
+    env.push(("SPAR_FAKE_REREQUEST_FAILS".into(), "1".into()));
+
+    let (ok, out, log) = checkin_7(&l, &env, &[]);
+
+    assert!(!ok, "a failed write has to fail the command:\n{out}");
+    assert!(log.contains("pr comment 7"), "{log}");
+    assert_eq!(1, rerequests(&log).len(), "{log}");
+    assert!(
+        out.contains("could not ask @alice to review again"),
+        "{out}"
+    );
+    assert!(out.contains("1 failed"), "{out}");
+}
+
+/// Under the listener the same holds, and asking alice again is not news to
+/// the viewer: the next sweep checks in on nothing.
+#[test]
+#[cfg(unix)]
+fn listen_asks_a_reviewer_again_once_and_does_not_check_in_on_its_own_request() {
+    let (l, env) = reviewed_by_alice("listenrerequest", "viewer");
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    l.with_notifications(&[notification("1", "comment", "PullRequest", 7)]);
+
+    let (ok, out, log) = l.run_with(&["--once"], &env);
+
+    assert!(ok, "{out}");
+    assert_eq!(2, l.agent_calls(), "{out}");
+    assert_eq!(1, rerequests(&log).len(), "{log}");
+
+    l.with_notifications(&[]);
+    l.with_review_requests(r#"[{"__typename":"User","login":"alice"}]"#);
+    let (ok, out, log) = l.run_with(&["--once"], &env);
+
+    assert!(ok, "{out}");
+    assert_eq!(2, l.agent_calls(), "{out}");
+    assert_eq!(1, rerequests(&log).len(), "{log}");
 }
 
 /// A dry run prints the answer and posts nothing, and `spar post` puts up

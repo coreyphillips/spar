@@ -634,6 +634,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 },
                 again,
                 resolve: cfg.loop_cfg.checkin_resolve,
+                rerequest: cfg.loop_cfg.checkin_rerequest_review,
                 posts: checkin::posts(&cfg),
                 auto: false,
             };
@@ -2328,6 +2329,7 @@ const LOOP_OPTIONS: &[Setting] = &[
     (true, "max_triage_chars", "Most every issue together, bodies and comments, may add to one triage prompt, or every recorded follow-up in one screening prompt. Past it, whole items wait for the next run rather than all of them losing their tails."),
     (true, "checkin_trust", "Whose comments `spar checkin` will act on, and whose comments under an issue reach the prompts that implement, triage, and review it. write is anybody GitHub says can write to this repository, which is the default because acting on a comment means pushing a commit to somebody's branch. The person who filed an issue and the authenticated GitHub user are always read under it, regardless of write access. anyone answers everyone, and still only changes code when both agents agree."),
     (true, "checkin_resolve", "Mark a review thread resolved when spar made the change it asked for. A thread spar disagreed with is left open whatever this says."),
+    (true, "checkin_rerequest_review", "On a pull request you wrote, ask each reviewer a check-in answered or fixed something for to review it again. Bots, and anybody already asked, are not asked."),
     (true, "max_checkin_comments", "Most unanswered comments spar will answer on one pull request in a run. A backstop against a long argument being read back to somebody, not a target."),
 ];
 

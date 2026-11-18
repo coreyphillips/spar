@@ -884,6 +884,17 @@ Replies to inline threads go into those threads. A review summary and a top
 level comment have no thread to reply into, so they are answered together in one
 comment on the pull request rather than five comments in a row.
 
+On a pull request you wrote, once the replies are up and any fix is pushed, spar
+asks each reviewer it answered to review again, in one request. Submitting a
+review clears the request for it, so otherwise the pull request drops out of
+their queue until somebody clicks "Re-request review". Only people who have
+submitted a review are asked, and only when spar replied to them or pushed a
+change they asked for in this run. A reviewer whose comments all asked for
+nothing, or who has a point the two agents could not agree on, is not asked yet.
+Neither is a bot, or anybody whose request is already open. A dry run, or
+`pr_comments = "none"`, prints who would be asked. A run whose fix could not be
+pushed asks nobody. Turn it off with `[loop] checkin_rerequest_review = false`.
+
 A thread is handed to the agents whole, with what was already said from your
 side marked and the newest message from somebody else marked as the one to
 judge. A reply that only agrees with or thanks an earlier answer is nothing

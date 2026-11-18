@@ -249,6 +249,10 @@ checkin_resolve   = true     # mark a review thread resolved when spar made the
                              # change it asked for. A thread spar disagreed
                              # with is left open whatever this says: the person
                              # who raised it has not had their say yet.
+checkin_rerequest_review = true # on a pull request you wrote, ask each
+                             # reviewer a check-in answered or fixed something
+                             # for to review it again. Bots, and anybody
+                             # already asked, are not asked.
 setup             = []       # a command spar runs in every worktree it creates,
                              # before any agent works there or the check runs:
                              # `setup = "npm ci"`, `uv sync`, `bundle install`,

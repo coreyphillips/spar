@@ -5357,7 +5357,23 @@ impl Repo {
                 "#{issue}: the base branch is `{base}` and the default is `{default}`. GitHub                  links closing issues only on the default branch, so an existing pull request                  for this issue may not be found. Name the pull request instead of the issue if                  there is one."
             );
         }
-        Ok(pick_linked_pr(&listed, issue))
+        let picked = pick_linked_pr(&listed, issue);
+        // Resuming a pull request merges it into whatever it targets, so one
+        // on another base would land the work somewhere the run did not mean.
+        if let Some(pr) = &picked {
+            let row = listed.iter().find(|r| r.number == pr.number);
+            if let Some(other) = row
+                .map(|r| r.base_ref_name.as_str())
+                .filter(|b| !b.is_empty() && !b.eq_ignore_ascii_case(base))
+            {
+                return Err(spar_err!(
+                    "#{issue} already has pull request #{} open against `{other}`, not `{base}`. \
+                     Retarget or close it before spar works #{issue}.",
+                    pr.number
+                ));
+            }
+        }
+        Ok(picked)
     }
 
     /// spar's own branch, with a failed lookup kept as a failure.
@@ -9452,6 +9468,8 @@ pub struct LinkedPrRow {
     url: String,
     #[serde(default)]
     title: String,
+    #[serde(default)]
+    base_ref_name: String,
     #[serde(default)]
     closing_issues_references: Vec<IssueRef>,
 }

@@ -836,7 +836,7 @@ impl Layout {
         let item_lines: BTreeMap<usize, &Item> = parsed.iter().map(|i| (i.line, i)).collect();
         let mut layout = Layout::default();
         let mut current: Option<usize> = None;
-        let mut fence: Option<char> = None;
+        let mut fence: Option<(char, usize)> = None;
         let mut position = 0usize;
         for (index, raw) in split_keep(body).into_iter().enumerate() {
             let line = without_eol(raw);
@@ -860,9 +860,15 @@ impl Layout {
             // Headings and directives inside a fence are somebody's example.
             if let Some(caps) = FENCE.captures(line) {
                 let glyph = caps["fence"].chars().next().unwrap_or('`');
+                let len = caps["fence"].len();
                 match fence {
-                    None => fence = Some(glyph),
-                    Some(open) if open == glyph && caps["info"].trim().is_empty() => fence = None,
+                    None => fence = Some((glyph, len)),
+                    // A shorter run of the same glyph is text inside the fence.
+                    Some((open, opened))
+                        if open == glyph && len >= opened && caps["info"].trim().is_empty() =>
+                    {
+                        fence = None
+                    }
                     Some(_) => {}
                 }
             } else if fence.is_none() {
@@ -1078,6 +1084,9 @@ pub fn sentence_of(text: &str) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct Scope {
     pub tracker: i64,
+    /// The child issue itself, which GitHub does not link to a pull request
+    /// on a branch other than the default.
+    pub child: i64,
     pub context: String,
     pub title: Option<String>,
 }
@@ -1483,11 +1492,30 @@ pub fn decompose(cfg: &Config, repo: &Repo, tracker: i64) -> Decomposed {
         let what = style::clip(&style::one_line(&stop.item.text), 80);
         log!("#{tracker}: the checklist is worked in order, so nothing after '{what}' starts this run");
     }
-    let decision = stop
-        .filter(|s| s.action == Action::Decide)
-        .map(|s| s.item.clone());
+    // An independent tracker never stops, so its first decision is asked
+    // about whatever else is worked.
+    let decision = match layout.order() {
+        Order::Independent => steps.iter().find(|s| s.action == Action::Decide),
+        Order::Sequential => stop.filter(|s| s.action == Action::Decide),
+    }
+    .map(|s| s.item.clone());
+    let children = apply(repo, tracker, &layout, worked);
+    // A section a person finished by hand is promoted as well as one spar
+    // merged the last step of. `promote` reads the tracker again and does
+    // nothing unless every item on the branch is ticked.
+    let default = cfg.base_branch();
+    let bases: BTreeSet<String> = worked
+        .iter()
+        .filter(|s| matches!(s.action, Action::Tick(_)))
+        .filter_map(|s| layout.placed(&s.item.raw))
+        .filter_map(|p| layout.base_for(p))
+        .filter(|b| !b.eq_ignore_ascii_case(default))
+        .collect();
+    for base in bases {
+        promote(repo, tracker, &base, default);
+    }
     Decomposed {
-        children: apply(repo, tracker, &layout, worked),
+        children,
         sequential: layout.order() == Order::Sequential,
         decision,
     }
@@ -1583,6 +1611,14 @@ fn apply(repo: &Repo, tracker: i64, layout: &Layout, steps: &[Step]) -> Vec<i64>
                         continue;
                     }
                 };
+                // A failed create can hand back an existing exact match, and a
+                // closed one here would be ticked on the next run.
+                if !repo.read_issue(number).is_ok_and(|i| !i.is_closed()) {
+                    logdim!(
+                        "  '{what}' came back as #{number}, which is not open, so it is not linked"
+                    );
+                    continue;
+                }
                 log!("  filed #{number} for '{what}'");
                 if write(
                     repo,
@@ -1698,6 +1734,7 @@ pub fn scope_for(repo: &Repo, tracker: i64, child: i64) -> Option<(Scope, Option
     Some((
         Scope {
             tracker,
+            child,
             context,
             title,
         },
@@ -1705,9 +1742,19 @@ pub fn scope_for(repo: &Repo, tracker: i64, child: i64) -> Option<(Scope, Option
     ))
 }
 
+/// The first paragraph that says something, past a pull request body's
+/// opening `Closes #N`.
 fn first_paragraph(text: &str) -> &str {
-    text.trim().split("\n\n").next().unwrap_or("").trim()
+    text.split("\n\n")
+        .map(str::trim)
+        .find(|p| !p.is_empty() && !CLOSES_ONLY.is_match(p))
+        .unwrap_or("")
 }
+
+static CLOSES_ONLY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^((close[sd]?|fix(e[sd])?|resolve[sd]?|part of)\s+#\d+[.,]?\s*)+$")
+        .expect("closes pattern")
+});
 
 /// A child spar merged: tick its line with the record of what landed it, close
 /// the child when the merge went somewhere `Closes` does not reach, and open
@@ -1719,12 +1766,17 @@ pub fn landed(repo: &Repo, tracker: i64, child: i64, pr: i64, base: &str, defaul
         return false;
     };
     let layout = Layout::read(&body);
-    let Some(placed) = layout.items.iter().find(|p| {
-        !p.item.checked && p.item.reference.as_ref().and_then(|r| r.local(&home)) == Some(child)
-    }) else {
-        logdim!("#{tracker} has no unchecked line naming #{child}, so nothing was ticked");
+    let Some(placed) = layout
+        .items
+        .iter()
+        .find(|p| p.item.reference.as_ref().and_then(|r| r.local(&home)) == Some(child))
+    else {
+        logdim!("#{tracker} has no line naming #{child}, so nothing was ticked");
         return false;
     };
+    if placed.item.checked {
+        return true;
+    }
     let change = Change::Done(record(pr, base, default));
     let ticked = write(repo, tracker, &placed.item.raw, &change, None);
     if ticked {
@@ -1745,6 +1797,9 @@ pub fn landed(repo: &Repo, tracker: i64, child: i64, pr: i64, base: &str, defaul
     }
     ticked
 }
+
+/// Carried in a promotion pull request's body so no spar path merges it.
+pub const PROMOTION_MARKER: &str = "<!-- spar-promotion -->";
 
 /// One pull request from a section's branch to the default branch, once every
 /// item built on it is ticked. Never merged by spar: promoting a section is a
@@ -1775,7 +1830,8 @@ fn promote(repo: &Repo, tracker: i64, base: &str, default: &str) {
         .collect();
     let text = format!(
         "Part of #{tracker}. Every step built on `{base}` is ticked, so this brings them to \
-         `{default}` together. Merging it is a release decision and is left to a person.\n\n{}",
+         `{default}` together. Merging it is a release decision and is left to a person.\n\n{}\n\n\
+         {PROMOTION_MARKER}",
         steps.join("\n")
     );
     match repo.open_promotion_pr(base, default, &title, &text) {
@@ -2331,6 +2387,19 @@ Splicing lands on its own branch.
         assert_eq!(None, read.base);
         assert!(read.decision);
         assert_eq!(1, read.warnings.len());
+    }
+
+    #[test]
+    fn a_shorter_fence_inside_a_fence_does_not_close_it() {
+        let body = "### A. One\n````\n```\n<!-- spar: base=feat/example -->\n````\n- [ ] one\n";
+        let layout = Layout::read(body);
+        assert_eq!(None, layout.base_for(&layout.items[0]));
+    }
+
+    #[test]
+    fn a_summary_skips_the_closing_line() {
+        assert_eq!("Adds X.", first_paragraph("Closes #51\n\nAdds X.\n\nMore."));
+        assert_eq!("Adds X.", first_paragraph("Adds X."));
     }
 
     #[test]

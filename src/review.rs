@@ -1021,11 +1021,24 @@ fn resume_inner(
     if !pr.is_open() {
         return Err(spar_err!("PR #{pr_number} is {}", pr.state.to_lowercase()));
     }
+    // Promoting a tracker's section is a release, so it is reviewed like any
+    // other pull request and left for a person to merge.
+    let unmerged;
+    let cfg = if pr.body.contains(tracker::PROMOTION_MARKER) && cfg.loop_cfg.auto_merge {
+        log!("PR #{pr_number} promotes a tracker's branch, so it is left for a person to merge");
+        let mut copy = cfg.clone();
+        copy.loop_cfg.auto_merge = false;
+        unmerged = copy;
+        &unmerged
+    } else {
+        cfg
+    };
 
     let subject = pr
         .closing_issues_references
         .first()
         .map(|r| r.number)
+        .or(cfg.tracker.as_ref().map(|s| s.child))
         .unwrap_or(pr_number);
     let closing_url = pr.closing_issues_references.first().map(|r| &r.url);
 

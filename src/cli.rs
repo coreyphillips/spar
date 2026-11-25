@@ -1227,6 +1227,9 @@ fn work_issues(
     // anything else, so both agents still have to agree each one is worth
     // doing.
     while let Some(mut wave) = queue.pop_front() {
+        // Before anything is dropped below, so a step parked or handled
+        // earlier still holds the steps under it.
+        let checklist = wave.numbers.clone();
         wave.numbers.retain(|n| !handled.contains(n));
         if !retriage {
             // One line in the progress log, however many are waiting. Both
@@ -1352,7 +1355,7 @@ fn work_issues(
                 if let Some(decision) = found
                     .decision
                     .as_ref()
-                    .filter(|_| found.children.is_empty())
+                    .filter(|_| found.children.is_empty() || !found.sequential)
                 {
                     decide(agents, cfg, repo, item.issue, decision);
                 }
@@ -1373,14 +1376,14 @@ fn work_issues(
         if wave.sequential {
             // Checklist order is the order the tracker's author meant, so it
             // wins over whatever triage inferred from one line apiece.
-            order.sort_by_key(|item| wave.numbers.iter().position(|n| *n == item.issue));
+            order.sort_by_key(|item| checklist.iter().position(|n| *n == item.issue));
         }
         for item in order {
             let Some(issue) = fetched.iter().find(|i| i.number == item.issue) else {
                 continue;
             };
             let held = match wave.parent.filter(|_| wave.sequential) {
-                Some(tracker) => above_not_landed(item.issue, &wave.numbers, &landed, tracker),
+                Some(tracker) => above_not_landed(item.issue, &checklist, &landed, tracker),
                 None => None,
             }
             .or_else(|| held_back(item, &plan, &landed));
@@ -1412,19 +1415,36 @@ fn work_issues(
             let run = review::run_nth_issue(agents, run_cfg, repo, item, issue, worked);
             worked += 1;
             if run.status == Status::Merged {
-                landed.insert(item.issue);
                 // Ticked now rather than on the next run, so the line says
                 // what landed it and the step below can start in this one.
+                // A merge queue reports success before it merges, so the tick
+                // waits for GitHub to say merged, and a step whose line was
+                // not ticked does not release the one below it.
                 let pr = run.pr.as_deref().and_then(number_at_end);
-                if let (Some(tracker), Some(pr)) = (wave.parent, pr) {
-                    tracker::landed(
-                        repo,
-                        tracker,
-                        item.issue,
-                        pr,
-                        run_cfg.base_branch(),
-                        cfg.base_branch(),
-                    );
+                let ticked = match (wave.parent, pr) {
+                    (Some(tracker), Some(pr))
+                        if repo.pr_state(pr).eq_ignore_ascii_case("MERGED") =>
+                    {
+                        tracker::landed(
+                            repo,
+                            tracker,
+                            item.issue,
+                            pr,
+                            run_cfg.base_branch(),
+                            cfg.base_branch(),
+                        )
+                    }
+                    (Some(tracker), _) => {
+                        log!(
+                            "#{}: not merged yet, so #{tracker} is not ticked",
+                            item.issue
+                        );
+                        false
+                    }
+                    (None, _) => true,
+                };
+                if ticked {
+                    landed.insert(item.issue);
                 }
             }
             progress.finished(&run);

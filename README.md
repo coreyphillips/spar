@@ -831,8 +831,9 @@ landed it, and the next step starts in that run:
 
 With `auto_merge = false`, a person merges each step and the next starts on the
 next `spar run` of the tracker, which ticks the line from the closed child. On a
-`base` branch GitHub does not close the child for you, so close it when you
-merge.
+`base` branch GitHub does not close the child, so that run finds the merged pull
+request from the child's branch, ticks the line with its record, and closes the
+child itself.
 
 ### Directives
 

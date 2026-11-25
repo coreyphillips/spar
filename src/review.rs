@@ -921,7 +921,9 @@ fn implement_and_review(
         })?;
 
     let description = pr_body(number, &work, checked.as_deref(), &criteria, &repo.style);
-    let pr = match repo.pr_for_branch(branch) {
+    // Only one on this base: an open pull request from the same branch to
+    // another one would merge the work somewhere the run did not mean.
+    let pr = match repo.try_pr_for_branch(branch, &base).ok().flatten() {
         Some(existing) => existing,
         None => {
             let body = description.clone();

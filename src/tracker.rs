@@ -1479,9 +1479,24 @@ pub fn decompose(cfg: &Config, repo: &Repo, tracker: i64) -> Decomposed {
     for warning in layout.warnings() {
         logwarn!("#{tracker}: {warning}");
     }
-    let steps = plan(repo, cfg, tracker, &body, &slug);
+    let default = cfg.base_branch();
+    let mut steps = plan(repo, cfg, tracker, &body, &slug);
+    steps.retain(|s| !merged_off_default(repo, tracker, &layout, s, default));
+    // Every section with its own branch, so one a person finished by hand, or
+    // whose promotion failed on an earlier run, is still promoted. `promote`
+    // reads the tracker again and does nothing until every item on the branch
+    // is ticked.
+    let bases: BTreeSet<String> = layout
+        .items
+        .iter()
+        .filter_map(|p| layout.base_for(p))
+        .filter(|b| !b.eq_ignore_ascii_case(default))
+        .collect();
     if steps.is_empty() {
         logdim!("#{tracker} has no unchecked checklist items, so there is nothing to extract");
+        for base in &bases {
+            promote(repo, tracker, base, default);
+        }
         return Decomposed::default();
     }
     log!("#{tracker}: {} unchecked checklist item(s)", steps.len());
@@ -1492,32 +1507,65 @@ pub fn decompose(cfg: &Config, repo: &Repo, tracker: i64) -> Decomposed {
         let what = style::clip(&style::one_line(&stop.item.text), 80);
         log!("#{tracker}: the checklist is worked in order, so nothing after '{what}' starts this run");
     }
-    // An independent tracker never stops, so its first decision is asked
-    // about whatever else is worked.
-    let decision = match layout.order() {
-        Order::Independent => steps.iter().find(|s| s.action == Action::Decide),
-        Order::Sequential => stop.filter(|s| s.action == Action::Decide),
+    let (children, stuck) = apply(repo, tracker, &layout, worked);
+    // An independent tracker never stops, so every decision in it is asked
+    // about. A sequential one asks only about the one it stopped at, and not
+    // while a step above it was left neither ticked nor worked.
+    let decisions = match layout.order() {
+        Order::Independent => steps
+            .iter()
+            .filter(|s| s.action == Action::Decide)
+            .collect(),
+        Order::Sequential => stop
+            .filter(|s| s.action == Action::Decide && !stuck)
+            .into_iter()
+            .collect::<Vec<_>>(),
     }
-    .map(|s| s.item.clone());
-    let children = apply(repo, tracker, &layout, worked);
-    // A section a person finished by hand is promoted as well as one spar
-    // merged the last step of. `promote` reads the tracker again and does
-    // nothing unless every item on the branch is ticked.
-    let default = cfg.base_branch();
-    let bases: BTreeSet<String> = worked
+    .into_iter()
+    .map(|s| s.item.clone())
+    .collect();
+    for base in &bases {
+        promote(repo, tracker, base, default);
+    }
+    let named = steps
         .iter()
-        .filter(|s| matches!(s.action, Action::Tick(_)))
-        .filter_map(|s| layout.placed(&s.item.raw))
-        .filter_map(|p| layout.base_for(p))
-        .filter(|b| !b.eq_ignore_ascii_case(default))
+        .filter_map(|s| match s.action {
+            Action::Adopt(n) => Some(n),
+            _ => None,
+        })
         .collect();
-    for base in bases {
-        promote(repo, tracker, &base, default);
-    }
     Decomposed {
         children,
         sequential: layout.order() == Order::Sequential,
-        decision,
+        decisions,
+        named,
+    }
+}
+
+/// Whether an item's child already merged into its section's branch, in
+/// which case it is ticked and closed here rather than adopted and built
+/// again. `Closes` reaches only the default branch, so a merge into another
+/// one that spar did not see land leaves the child open.
+fn merged_off_default(
+    repo: &Repo,
+    tracker: i64,
+    layout: &Layout,
+    step: &Step,
+    default: &str,
+) -> bool {
+    let Action::Adopt(child) = step.action else {
+        return false;
+    };
+    let Some(base) = layout
+        .placed(&step.item.raw)
+        .and_then(|p| layout.base_for(p))
+        .filter(|b| !b.eq_ignore_ascii_case(default))
+    else {
+        return false;
+    };
+    match repo.merged_pr_into(&repo.branch_for_issue(child), &base) {
+        Some(pr) => landed(repo, tracker, child, pr, &base, default),
+        None => false,
     }
 }
 
@@ -1528,8 +1576,12 @@ pub struct Decomposed {
     pub children: Vec<i64>,
     /// Whether each child waits for the one above it.
     pub sequential: bool,
-    /// The decision item the order stopped at, for both agents to weigh in on.
-    pub decision: Option<Item>,
+    /// The decision items to ask both agents about now: every one under
+    /// independent order, or the one sequential order stopped at.
+    pub decisions: Vec<Item>,
+    /// Every open issue an unchecked line names, worked or not, so a run that
+    /// picked one up on its own leaves it to the tracker.
+    pub named: Vec<i64>,
 }
 
 /// The steps a run may act on, and the one the order stops at.
@@ -1550,10 +1602,21 @@ pub fn in_order<'a>(layout: &Layout, steps: &'a [Step]) -> (&'a [Step], Option<&
     }
 }
 
-fn apply(repo: &Repo, tracker: i64, layout: &Layout, steps: &[Step]) -> Vec<i64> {
+/// The children to work, and whether sequential order stopped short at a step
+/// that was neither ticked nor worked.
+fn apply(repo: &Repo, tracker: i64, layout: &Layout, steps: &[Step]) -> (Vec<i64>, bool) {
     let mut children = Vec::new();
+    // Whether the step before this one was ticked or became a child. One that
+    // did neither is still the step above the next, and the next one's wave
+    // would not know it was there.
+    let (mut ticked, mut mark, mut last) = (true, 0usize, String::new());
     for step in steps {
+        if layout.order() == Order::Sequential && !ticked && children.len() == mark {
+            log!("#{tracker}: the checklist is worked in order, so nothing after '{last}' starts this run");
+            return (unique_children(children), true);
+        }
         let what = style::clip(&style::one_line(&step.item.text), 80);
+        (ticked, mark, last) = (false, children.len(), what.clone());
         match &step.action {
             Action::Hold(why) => logdim!("  left '{what}' alone: {why}"),
             // Already named by `report_overflow`, in one line rather than one
@@ -1567,7 +1630,8 @@ fn apply(repo: &Repo, tracker: i64, layout: &Layout, steps: &[Step]) -> Vec<i64>
                 let Some(change) = step.action.change() else {
                     continue;
                 };
-                if write(repo, tracker, &step.item.raw, &change, None) {
+                ticked = write(repo, tracker, &step.item.raw, &change, None);
+                if ticked {
                     log!("  ticked '{what}' off, #{number} is finished");
                 }
             }
@@ -1611,12 +1675,7 @@ fn apply(repo: &Repo, tracker: i64, layout: &Layout, steps: &[Step]) -> Vec<i64>
                         continue;
                     }
                 };
-                // A failed create can hand back an existing exact match, and a
-                // closed one here would be ticked on the next run.
-                if !repo.read_issue(number).is_ok_and(|i| !i.is_closed()) {
-                    logdim!(
-                        "  '{what}' came back as #{number}, which is not open, so it is not linked"
-                    );
+                if !came_back_open(repo, number, &what) {
                     continue;
                 }
                 log!("  filed #{number} for '{what}'");
@@ -1651,6 +1710,9 @@ fn apply(repo: &Repo, tracker: i64, layout: &Layout, steps: &[Step]) -> Vec<i64>
                 ) {
                     Ok(filed) => {
                         let number = filed.issue();
+                        if !came_back_open(repo, number, &what) {
+                            continue;
+                        }
                         log!("  {} for '{what}'", filed.note());
                         // The link is written the moment the issue exists, not
                         // once at the end over the whole checklist. The window
@@ -1677,7 +1739,18 @@ fn apply(repo: &Repo, tracker: i64, layout: &Layout, steps: &[Step]) -> Vec<i64>
             }
         }
     }
-    unique_children(children)
+    (unique_children(children), false)
+}
+
+/// Whether the issue a filing went to is open. A failed create or a similar
+/// match can hand back an existing issue, and a closed one linked here would
+/// be ticked on the next run with no work behind it.
+fn came_back_open(repo: &Repo, number: i64, what: &str) -> bool {
+    let open = repo.read_issue(number).is_ok_and(|i| !i.is_closed());
+    if !open {
+        logdim!("  '{what}' came back as #{number}, which is not open, so it is not linked");
+    }
+    open
 }
 
 /// What a child of this tracker carries into its run, and the branch it is
@@ -1805,7 +1878,7 @@ pub const PROMOTION_MARKER: &str = "<!-- spar-promotion -->";
 /// item built on it is ticked. Never merged by spar: promoting a section is a
 /// release, and that is a person's call.
 fn promote(repo: &Repo, tracker: i64, base: &str, default: &str) {
-    let Some((body, _)) = read(repo, tracker) else {
+    let Some((body, home)) = read(repo, tracker) else {
         return;
     };
     let layout = Layout::read(&body);
@@ -1815,6 +1888,10 @@ fn promote(repo: &Repo, tracker: i64, base: &str, default: &str) {
         .filter(|p| layout.base_for(p).as_deref() == Some(base))
         .collect();
     if on_base.is_empty() || on_base.iter().any(|p| !p.item.checked) {
+        return;
+    }
+    if let Some(merged) = repo.merged_pr_into(base, default) {
+        record_promotion(repo, tracker, &on_base, &home, default, merged);
         return;
     }
     let title = match on_base[0]
@@ -1834,7 +1911,7 @@ fn promote(repo: &Repo, tracker: i64, base: &str, default: &str) {
          {PROMOTION_MARKER}",
         steps.join("\n")
     );
-    match repo.open_promotion_pr(base, default, &title, &text) {
+    match repo.open_promotion_pr(base, default, &title, &text, PROMOTION_MARKER) {
         Ok(Some(url)) => {
             log!("#{tracker}: opened {url} to promote `{base}`, for a person to merge")
         }
@@ -1843,6 +1920,33 @@ fn promote(repo: &Repo, tracker: i64, base: &str, default: &str) {
             "#{tracker}: could not open the promotion pull request: {}",
             e.first_line()
         ),
+    }
+}
+
+/// `In <default> via #N.` on each step the merged promotion brought over. A
+/// step whose own pull request is newer than the promotion landed after it,
+/// so it is not in the default branch by that promotion and is left alone.
+fn record_promotion(
+    repo: &Repo,
+    tracker: i64,
+    on_base: &[&Placed],
+    home: &str,
+    default: &str,
+    merged: i64,
+) {
+    let record = format!("In `{default}` via #{merged}.");
+    for placed in on_base {
+        let step = landed_by(&placed.item, home);
+        if placed.item.text.contains(&record) || step.is_none_or(|n| n > merged) {
+            continue;
+        }
+        let change = Change::Reference(record.clone());
+        if write(repo, tracker, &placed.item.raw, &change, None) {
+            log!(
+                "#{tracker}: recorded that `{default}` has '{}'",
+                style::clip(&placed.item.text, 60)
+            );
+        }
     }
 }
 

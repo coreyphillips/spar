@@ -1347,20 +1347,35 @@ fn work_issues(
         // No recursion: a child that triage calls a tracker in its turn is
         // commented on and held like any other. `file_non_blocking` records
         // what happened the last time this codebase let something multiply.
+        // A tracker's children that this wave also picked up, as a bare run
+        // does, are worked in the tracker's own wave, in its order and on
+        // its bases, and not here.
+        let mut deferred: BTreeSet<i64> = BTreeSet::new();
         if cfg.loop_cfg.decompose_trackers && wave.parent.is_none() {
             for item in plan.skipped.iter().filter(|i| i.tracker) {
                 let found = tracker::decompose(cfg, repo, item.issue);
                 // A decision is asked about only once it is next in order,
-                // which is when nothing above it is still to be worked.
-                if let Some(decision) = found
-                    .decision
-                    .as_ref()
-                    .filter(|_| found.children.is_empty() || !found.sequential)
-                {
-                    decide(agents, cfg, repo, item.issue, decision);
+                // which is when nothing above it is still to be worked. Under
+                // sequential order that can be after this tracker's wave.
+                let waits = found.sequential && !found.children.is_empty();
+                if !waits {
+                    for decision in &found.decisions {
+                        decide(agents, cfg, repo, item.issue, decision);
+                    }
                 }
+                deferred.extend(found.named.iter().copied());
                 if !found.children.is_empty() {
-                    queue.push_back(wave.child(item.issue, found.children, found.sequential));
+                    for child in &found.children {
+                        handled.remove(child);
+                        deferred.insert(*child);
+                    }
+                    let decision = found.decisions.first().filter(|_| waits).cloned();
+                    queue.push_back(wave.child(
+                        item.issue,
+                        found.children,
+                        found.sequential,
+                        decision,
+                    ));
                 }
             }
         }
@@ -1369,6 +1384,7 @@ fn work_issues(
             plan.order
                 .iter()
                 .filter(|item| fetched.iter().any(|i| i.number == item.issue))
+                .filter(|item| !deferred.contains(&item.issue))
                 .count(),
         );
         let before = results.len();
@@ -1382,6 +1398,13 @@ fn work_issues(
             let Some(issue) = fetched.iter().find(|i| i.number == item.issue) else {
                 continue;
             };
+            if deferred.contains(&item.issue) {
+                logdim!(
+                    "#{}: worked with its tracker's checklist instead",
+                    item.issue
+                );
+                continue;
+            }
             let held = match wave.parent.filter(|_| wave.sequential) {
                 Some(tracker) => above_not_landed(item.issue, &checklist, &landed, tracker),
                 None => None,
@@ -1449,6 +1472,13 @@ fn work_issues(
             }
             progress.finished(&run);
             results.push(run);
+        }
+        // The decision the tracker stopped at is next once every step above
+        // it has landed, which this wave may just have done.
+        if let (Some(tracker), Some(decision)) = (wave.parent, &wave.decision) {
+            if checklist.iter().all(|n| landed.contains(n)) {
+                decide(agents, cfg, repo, tracker, decision);
+            }
         }
 
         // Whatever this wave filed becomes the next one, budget allowing.
@@ -1676,6 +1706,8 @@ struct Wave {
     /// Whether each number waits for the one before it, which is the order a
     /// tracker's checklist is written in.
     sequential: bool,
+    /// The decision item below this wave's steps, asked about once they land.
+    decision: Option<tracker::Item>,
 }
 
 impl Wave {
@@ -1685,15 +1717,23 @@ impl Wave {
             absorbed: 0,
             parent: None,
             sequential: false,
+            decision: None,
         }
     }
 
-    fn child(&self, tracker: i64, numbers: Vec<i64>, sequential: bool) -> Self {
+    fn child(
+        &self,
+        tracker: i64,
+        numbers: Vec<i64>,
+        sequential: bool,
+        decision: Option<tracker::Item>,
+    ) -> Self {
         Self {
             numbers,
             absorbed: self.absorbed,
             parent: Some(tracker),
             sequential,
+            decision,
         }
     }
 
@@ -1703,6 +1743,7 @@ impl Wave {
             absorbed: self.absorbed + 1,
             parent: None,
             sequential: false,
+            decision: None,
         }
     }
 }

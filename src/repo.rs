@@ -5753,6 +5753,7 @@ impl Repo {
         base: &str,
         title: &str,
         body: &str,
+        marker: &str,
     ) -> Result<Option<String>> {
         let listed = self.gh(&[
             "pr",
@@ -5764,15 +5765,27 @@ impl Repo {
             "--state",
             "all",
             "--json",
-            "number,state",
+            "number,state,body",
         ])?;
         let rows: Vec<Value> = serde_json::from_str(&listed).unwrap_or_default();
-        if rows.iter().any(|r| {
-            matches!(
-                r.get("state").and_then(Value::as_str),
-                Some("OPEN" | "MERGED")
-            )
-        }) {
+        fn state(r: &Value) -> &str {
+            r.get("state").and_then(Value::as_str).unwrap_or("")
+        }
+        // One somebody else opened is the promotion too, so it carries the
+        // marker that keeps `spar resume` from merging it.
+        for row in rows.iter().filter(|r| state(r) == "OPEN") {
+            let text = row.get("body").and_then(Value::as_str).unwrap_or("");
+            let number = row.get("number").and_then(Value::as_i64).unwrap_or(0);
+            if number > 0 && !text.contains(marker) {
+                let marked = format!("{}\n\n{marker}\n", text.trim_end());
+                let edited = self.gh_stdin(
+                    &["pr", "edit", &number.to_string(), "--body-file", "-"],
+                    &marked,
+                );
+                self.record_write(edited)?;
+            }
+        }
+        if rows.iter().any(|r| matches!(state(r), "OPEN" | "MERGED")) {
             return Ok(None);
         }
         let title = self.record_failed_write(self.clean_title(title))?;
@@ -5782,6 +5795,21 @@ impl Repo {
         ]);
         self.record_write(opened)
             .map(|url| Some(url.trim().to_string()))
+    }
+
+    /// The newest merged pull request from `head` into `base`, or `None` when
+    /// there is none or the lookup failed.
+    pub fn merged_pr_into(&self, head: &str, base: &str) -> Option<i64> {
+        let listed = self
+            .gh(&[
+                "pr", "list", "--head", head, "--base", base, "--state", "merged", "--json",
+                "number",
+            ])
+            .ok()?;
+        let rows: Vec<Value> = serde_json::from_str(listed.trim()).ok()?;
+        rows.iter()
+            .filter_map(|r| r.get("number").and_then(Value::as_i64))
+            .max()
     }
 
     /// Replace an issue body, refusing unless it is still byte for byte what

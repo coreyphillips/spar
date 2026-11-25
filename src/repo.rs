@@ -5797,19 +5797,29 @@ impl Repo {
             .map(|url| Some(url.trim().to_string()))
     }
 
-    /// The newest merged pull request from `head` into `base`, or `None` when
-    /// there is none or the lookup failed.
-    pub fn merged_pr_into(&self, head: &str, base: &str) -> Option<i64> {
-        let listed = self
-            .gh(&[
-                "pr", "list", "--head", head, "--base", base, "--state", "merged", "--json",
-                "number",
-            ])
-            .ok()?;
-        let rows: Vec<Value> = serde_json::from_str(listed.trim()).ok()?;
-        rows.iter()
+    /// The newest merged pull request from `head` on origin into `base`, or
+    /// `None` when there is none. `--head` matches a fork's branch of the same
+    /// name too, and that is somebody else's work.
+    pub fn merged_pr_into(&self, head: &str, base: &str) -> Result<Option<i64>> {
+        let listed = self.gh(&[
+            "pr",
+            "list",
+            "--head",
+            head,
+            "--base",
+            base,
+            "--state",
+            "merged",
+            "--json",
+            "number,isCrossRepository",
+        ])?;
+        let rows: Vec<Value> = serde_json::from_str(listed.trim())
+            .map_err(|e| spar_err!("could not read the merged pull requests from `{head}`: {e}"))?;
+        Ok(rows
+            .iter()
+            .filter(|r| r.get("isCrossRepository").and_then(Value::as_bool) == Some(false))
             .filter_map(|r| r.get("number").and_then(Value::as_i64))
-            .max()
+            .max())
     }
 
     /// Replace an issue body, refusing unless it is still byte for byte what

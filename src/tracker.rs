@@ -255,6 +255,14 @@ pub struct Skipped {
 }
 
 pub fn parse_reporting(body: &str) -> (Vec<Item>, Vec<Skipped>) {
+    let (items, skipped, _) = walk(body);
+    (items, skipped)
+}
+
+/// The items, the skipped lines, and the 1-based number of every line in a
+/// code fence, its opening and closing lines included.
+fn walk(body: &str) -> (Vec<Item>, Vec<Skipped>, BTreeSet<usize>) {
+    let mut fenced = BTreeSet::new();
     let mut out = Vec::new();
     let mut skipped: Vec<Skipped> = Vec::new();
     let note = |index: usize, line: &str, why: &'static str, skipped: &mut Vec<Skipped>| {
@@ -299,6 +307,7 @@ pub fn parse_reporting(body: &str) -> (Vec<Item>, Vec<Skipped>) {
         }
         let indent = indent_width(line);
         if let Some((glyph, len, column)) = fence {
+            fenced.insert(index + 1);
             // Only the same glyph, at least as long, with nothing after it, and
             // not indented so far past the opening one that it is code.
             if let Some(caps) = FENCE.captures(line) {
@@ -337,6 +346,7 @@ pub fn parse_reporting(body: &str) -> (Vec<Item>, Vec<Skipped>) {
                 marker.len(),
                 indent,
             ));
+            fenced.insert(index + 1);
             continue;
         }
         if let Some(column) = content_column(line) {
@@ -366,7 +376,7 @@ pub fn parse_reporting(body: &str) -> (Vec<Item>, Vec<Skipped>) {
             checked: &caps["state"] != " ",
         });
     }
-    (out, skipped)
+    (out, skipped, fenced)
 }
 
 /// Where a list line's content starts, in columns, or `None` if it is not one.
@@ -832,11 +842,12 @@ pub struct Layout {
 
 impl Layout {
     pub fn read(body: &str) -> Self {
-        let parsed = parse(body);
+        // The checklist's own walk decides what is fenced, so a fence it keeps
+        // open cannot end early here and turn an example into live settings.
+        let (parsed, _, fenced) = walk(body);
         let item_lines: BTreeMap<usize, &Item> = parsed.iter().map(|i| (i.line, i)).collect();
         let mut layout = Layout::default();
         let mut current: Option<usize> = None;
-        let mut fence: Option<(char, usize)> = None;
         let mut position = 0usize;
         for (index, raw) in split_keep(body).into_iter().enumerate() {
             let line = without_eol(raw);
@@ -858,20 +869,7 @@ impl Layout {
                 continue;
             }
             // Headings and directives inside a fence are somebody's example.
-            if let Some(caps) = FENCE.captures(line) {
-                let glyph = caps["fence"].chars().next().unwrap_or('`');
-                let len = caps["fence"].len();
-                match fence {
-                    None => fence = Some((glyph, len)),
-                    // A shorter run of the same glyph is text inside the fence.
-                    Some((open, opened))
-                        if open == glyph && len >= opened && caps["info"].trim().is_empty() =>
-                    {
-                        fence = None
-                    }
-                    Some(_) => {}
-                }
-            } else if fence.is_none() {
+            if !fenced.contains(&(index + 1)) {
                 if let Some(caps) = DIRECTIVE_LINE.captures(line) {
                     let read = Directives::read(&caps["body"]);
                     match current {
@@ -1358,9 +1356,11 @@ pub fn plan(repo: &Repo, cfg: &Config, tracker: i64, body: &str, home: &str) -> 
             let decision = layout
                 .placed(&item.raw)
                 .is_some_and(|p| p.directives.decision);
+            // A decision is asked about whatever its line cites, so one naming
+            // another repository's issue is not held without a recommendation.
             let action = match shape {
+                _ if decision && !item.text.is_empty() => Action::Decide,
                 Shape::Hold(why) => Action::Hold(why),
-                _ if decision => Action::Decide,
                 Shape::Over => Action::Over,
                 Shape::Names(number) => resolve(repo, number),
                 // `file_as_issue` runs this search itself, so doing it here
@@ -1481,7 +1481,24 @@ pub fn decompose(cfg: &Config, repo: &Repo, tracker: i64) -> Decomposed {
     }
     let default = cfg.base_branch();
     let mut steps = plan(repo, cfg, tracker, &body, &slug);
-    steps.retain(|s| !merged_off_default(repo, tracker, &layout, s, default));
+    // Taken before a merged step drops out below, so a run that picked that
+    // child up on its own still leaves it to the tracker.
+    let named: Vec<i64> = steps
+        .iter()
+        .filter_map(|s| match s.action {
+            Action::Adopt(n) => Some(n),
+            _ => None,
+        })
+        .collect();
+    steps.retain_mut(
+        |s| match merged_off_default(repo, tracker, &layout, s, default) {
+            Ok(merged) => !merged,
+            Err(why) => {
+                s.action = Action::Hold(why);
+                true
+            }
+        },
+    );
     // Every section with its own branch, so one a person finished by hand, or
     // whose promotion failed on an earlier run, is still promoted. `promote`
     // reads the tracker again and does nothing until every item on the branch
@@ -1497,7 +1514,10 @@ pub fn decompose(cfg: &Config, repo: &Repo, tracker: i64) -> Decomposed {
         for base in &bases {
             promote(repo, tracker, base, default);
         }
-        return Decomposed::default();
+        return Decomposed {
+            named,
+            ..Decomposed::default()
+        };
     }
     log!("#{tracker}: {} unchecked checklist item(s)", steps.len());
     report_overflow(cfg, tracker, &steps);
@@ -1527,13 +1547,6 @@ pub fn decompose(cfg: &Config, repo: &Repo, tracker: i64) -> Decomposed {
     for base in &bases {
         promote(repo, tracker, base, default);
     }
-    let named = steps
-        .iter()
-        .filter_map(|s| match s.action {
-            Action::Adopt(n) => Some(n),
-            _ => None,
-        })
-        .collect();
     Decomposed {
         children,
         sequential: layout.order() == Order::Sequential,
@@ -1546,26 +1559,36 @@ pub fn decompose(cfg: &Config, repo: &Repo, tracker: i64) -> Decomposed {
 /// which case it is ticked and closed here rather than adopted and built
 /// again. `Closes` reaches only the default branch, so a merge into another
 /// one that spar did not see land leaves the child open.
+///
+/// An error is why the step is held: not knowing whether it merged, or
+/// knowing it did and failing to tick it, must not build it a second time.
 fn merged_off_default(
     repo: &Repo,
     tracker: i64,
     layout: &Layout,
     step: &Step,
     default: &str,
-) -> bool {
+) -> std::result::Result<bool, String> {
     let Action::Adopt(child) = step.action else {
-        return false;
+        return Ok(false);
     };
     let Some(base) = layout
         .placed(&step.item.raw)
         .and_then(|p| layout.base_for(p))
         .filter(|b| !b.eq_ignore_ascii_case(default))
     else {
-        return false;
+        return Ok(false);
     };
     match repo.merged_pr_into(&repo.branch_for_issue(child), &base) {
-        Some(pr) => landed(repo, tracker, child, pr, &base, default),
-        None => false,
+        Ok(Some(pr)) if landed(repo, tracker, child, pr, &base, default) => Ok(true),
+        Ok(Some(pr)) => Err(format!(
+            "#{pr} merged #{child} into `{base}`, but its line could not be ticked"
+        )),
+        Ok(None) => Ok(false),
+        Err(e) => Err(format!(
+            "could not tell whether #{child} already merged into `{base}`: {}",
+            e.first_line()
+        )),
     }
 }
 
@@ -1739,7 +1762,10 @@ fn apply(repo: &Repo, tracker: i64, layout: &Layout, steps: &[Step]) -> (Vec<i64
             }
         }
     }
-    (unique_children(children), false)
+    // The last step counts too, which is what keeps a failed tick right above
+    // a decision from letting the decision be asked about.
+    let stuck = layout.order() == Order::Sequential && !ticked && children.len() == mark;
+    (unique_children(children), stuck)
 }
 
 /// Whether the issue a filing went to is open. A failed create or a similar
@@ -1839,21 +1865,29 @@ pub fn landed(repo: &Repo, tracker: i64, child: i64, pr: i64, base: &str, defaul
         return false;
     };
     let layout = Layout::read(&body);
-    let Some(placed) = layout
+    // Every line naming the child, since one left unchecked is a step the
+    // next one would start ahead of. A decision line is a person's to tick.
+    let lines: Vec<&Placed> = layout
         .items
         .iter()
-        .find(|p| p.item.reference.as_ref().and_then(|r| r.local(&home)) == Some(child))
-    else {
+        .filter(|p| p.item.reference.as_ref().and_then(|r| r.local(&home)) == Some(child))
+        .filter(|p| !p.directives.decision)
+        .collect();
+    if lines.is_empty() {
         logdim!("#{tracker} has no line naming #{child}, so nothing was ticked");
         return false;
-    };
-    if placed.item.checked {
+    }
+    if lines.iter().all(|p| p.item.checked) {
         return true;
     }
     let change = Change::Done(record(pr, base, default));
-    let ticked = write(repo, tracker, &placed.item.raw, &change, None);
-    if ticked {
-        log!("#{tracker}: ticked #{child}, {}", change.inserted());
+    let mut ticked = true;
+    for placed in lines.iter().filter(|p| !p.item.checked) {
+        if write(repo, tracker, &placed.item.raw, &change, None) {
+            log!("#{tracker}: ticked #{child}, {}", change.inserted());
+        } else {
+            ticked = false;
+        }
     }
     if !base.eq_ignore_ascii_case(default) {
         let note = format!(
@@ -1890,10 +1924,6 @@ fn promote(repo: &Repo, tracker: i64, base: &str, default: &str) {
     if on_base.is_empty() || on_base.iter().any(|p| !p.item.checked) {
         return;
     }
-    if let Some(merged) = repo.merged_pr_into(base, default) {
-        record_promotion(repo, tracker, &on_base, &home, default, merged);
-        return;
-    }
     let title = match on_base[0]
         .section
         .map(|at| layout.sections[at].heading.as_str())
@@ -1920,6 +1950,11 @@ fn promote(repo: &Repo, tracker: i64, base: &str, default: &str) {
             "#{tracker}: could not open the promotion pull request: {}",
             e.first_line()
         ),
+    }
+    // After the call above, which marks an open promotion even when an older
+    // one from the same branch has already merged, and opens none then.
+    if let Ok(Some(merged)) = repo.merged_pr_into(base, default) {
+        record_promotion(repo, tracker, &on_base, &home, default, merged);
     }
 }
 
@@ -2498,6 +2533,16 @@ Splicing lands on its own branch.
         let body = "### A. One\n````\n```\n<!-- spar: base=feat/example -->\n````\n- [ ] one\n";
         let layout = Layout::read(body);
         assert_eq!(None, layout.base_for(&layout.items[0]));
+    }
+
+    #[test]
+    fn a_fence_indented_into_code_does_not_close_the_example_it_sits_in() {
+        let body = "### A. One\n```\n    ```\n<!-- spar: tracker order=independent -->\n\
+                    <!-- spar: base=feat/example -->\n```\n- [ ] one\n";
+        let layout = Layout::read(body);
+        assert_eq!(1, layout.items.len());
+        assert_eq!(None, layout.base_for(&layout.items[0]));
+        assert_eq!(Order::Sequential, layout.order());
     }
 
     #[test]

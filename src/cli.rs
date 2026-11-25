@@ -1594,10 +1594,15 @@ fn child_config(
     tracker: i64,
     child: i64,
 ) -> std::result::Result<Config, String> {
-    let mut out = cfg.clone();
+    // Without the line there is no base and no rules, and building on the
+    // default branch instead could merge a step past its section's branch.
     let Some((scope, base)) = tracker::scope_for(repo, tracker, child) else {
-        return Ok(out);
+        return Err(format!(
+            "could not read its line in #{tracker}, so its base and rules are unknown and it is \
+             not worked this run"
+        ));
     };
+    let mut out = cfg.clone();
     if let Some(base) = base.filter(|b| !b.eq_ignore_ascii_case(cfg.base_branch())) {
         repo.ensure_remote_branch(&base, cfg.base_branch())
             .map_err(|e| {

@@ -810,7 +810,9 @@ rather than decomposed in turn.
 Checklist order is dependency order. An unchecked item does not start until
 every unchecked item above it is ticked, so a tracker is worked one step at a
 time, in the order written, and a step that fails, escalates, or is declined
-stops the tracker there. Triage may add dependencies but cannot remove these.
+stops the tracker there. A declined step is commented on and left open,
+whatever `close_skipped` says, since it was judged before the steps above it
+landed. Triage may add dependencies but cannot remove these.
 An item spar has to hold (it names another repository, or was closed as not
 planned) stops the order too, and nothing below it is filed that run.
 
@@ -876,7 +878,11 @@ merge into the default branch, so spar closes the child itself after merging
 into another one. Once the last item on that branch is ticked, spar opens one
 pull request from it to the default branch, titled after the section. That
 pull request is never merged by spar, whatever `auto_merge` says: promoting a
-section is a release decision.
+section is a release decision. An open pull request from that branch to the
+default one, whoever opened it, is marked so `spar resume` leaves it for a
+person too. A step's line gets `In <default> via #N.` once a merged promotion
+carries its commit. A base named like spar's own issue branch (`issue-43`) is
+refused.
 
 **A decision.** spar files no child and implements nothing for it. When it is
 next in order, both agents read the tracker and the code, each writes a

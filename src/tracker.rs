@@ -1481,15 +1481,7 @@ pub fn decompose(cfg: &Config, repo: &Repo, tracker: i64) -> Decomposed {
     }
     let default = cfg.base_branch();
     let mut steps = plan(repo, cfg, tracker, &body, &slug);
-    // Taken before a merged step drops out below, so a run that picked that
-    // child up on its own still leaves it to the tracker.
-    let named: Vec<i64> = steps
-        .iter()
-        .filter_map(|s| match s.action {
-            Action::Adopt(n) => Some(n),
-            _ => None,
-        })
-        .collect();
+    let named = named_in(&body, &slug);
     steps.retain_mut(
         |s| match merged_off_default(repo, tracker, &layout, s, default) {
             Ok(merged) => !merged,
@@ -1555,6 +1547,23 @@ pub fn decompose(cfg: &Config, repo: &Repo, tracker: i64) -> Decomposed {
     }
 }
 
+/// Every issue here that a step's line names, ticked or not, so a run that
+/// picked one up on its own leaves it to the tracker. A ticked line counts
+/// too: its child can still be open when closing it failed. `home` is the
+/// tracker's url or its repository's address.
+pub fn named_in(body: &str, home: &str) -> Vec<i64> {
+    let home = match home.contains("/issues/") {
+        true => home_of(home),
+        false => home.to_string(),
+    };
+    Layout::read(body)
+        .items
+        .iter()
+        .filter(|p| !p.directives.decision)
+        .filter_map(|p| p.item.reference.as_ref().and_then(|r| r.local(&home)))
+        .collect()
+}
+
 /// Whether an item's child already merged into its section's branch, in
 /// which case it is ticked and closed here rather than adopted and built
 /// again. `Closes` reaches only the default branch, so a merge into another
@@ -1602,8 +1611,7 @@ pub struct Decomposed {
     /// The decision items to ask both agents about now: every one under
     /// independent order, or the one sequential order stopped at.
     pub decisions: Vec<Item>,
-    /// Every open issue an unchecked line names, worked or not, so a run that
-    /// picked one up on its own leaves it to the tracker.
+    /// Every issue a step's line names, worked or not. See `named_in`.
     pub named: Vec<i64>,
 }
 
@@ -1787,8 +1795,12 @@ fn came_back_open(repo: &Repo, number: i64, what: &str) -> bool {
 pub fn scope_for(repo: &Repo, tracker: i64, child: i64) -> Option<(Scope, Option<String>)> {
     let (body, home) = read(repo, tracker)?;
     let layout = Layout::read(&body);
+    // A decision that cites the child is not its step, and its section's base
+    // and prose are not the child's.
     let placed = layout.items.iter().find(|p| {
-        !p.item.checked && p.item.reference.as_ref().and_then(|r| r.local(&home)) == Some(child)
+        !p.item.checked
+            && !p.directives.decision
+            && p.item.reference.as_ref().and_then(|r| r.local(&home)) == Some(child)
     })?;
     let earlier: Vec<String> = layout
         .items
@@ -1912,6 +1924,18 @@ pub const PROMOTION_MARKER: &str = "<!-- spar-promotion -->";
 /// item built on it is ticked. Never merged by spar: promoting a section is a
 /// release, and that is a person's call.
 fn promote(repo: &Repo, tracker: i64, base: &str, default: &str) {
+    // First, and whether or not the section is finished, so a promotion a
+    // person opened early is never merged by `spar resume`.
+    let open = match repo.mark_promotion_prs(base, default, PROMOTION_MARKER) {
+        Ok(open) => open,
+        Err(e) => {
+            logwarn!(
+                "#{tracker}: could not look for a pull request from `{base}` to `{default}`: {}",
+                e.first_line()
+            );
+            return;
+        }
+    };
     let Some((body, home)) = read(repo, tracker) else {
         return;
     };
@@ -1921,7 +1945,24 @@ fn promote(repo: &Repo, tracker: i64, base: &str, default: &str) {
         .iter()
         .filter(|p| layout.base_for(p).as_deref() == Some(base))
         .collect();
-    if on_base.is_empty() || on_base.iter().any(|p| !p.item.checked) {
+    if on_base.is_empty() {
+        return;
+    }
+    let pending = match record_promotion(repo, tracker, &on_base, &home, base, default) {
+        Ok(pending) => pending,
+        Err(e) => {
+            logwarn!(
+                "#{tracker}: could not tell what `{default}` already has from `{base}`: {}",
+                e.first_line()
+            );
+            return;
+        }
+    };
+    if open {
+        logdim!("#{tracker}: `{base}` already has a pull request to `{default}`");
+        return;
+    }
+    if !pending || on_base.iter().any(|p| !p.item.checked) {
         return;
     }
     let title = match on_base[0]
@@ -1941,41 +1982,55 @@ fn promote(repo: &Repo, tracker: i64, base: &str, default: &str) {
          {PROMOTION_MARKER}",
         steps.join("\n")
     );
-    match repo.open_promotion_pr(base, default, &title, &text, PROMOTION_MARKER) {
-        Ok(Some(url)) => {
-            log!("#{tracker}: opened {url} to promote `{base}`, for a person to merge")
-        }
-        Ok(None) => logdim!("#{tracker}: `{base}` already has a pull request to `{default}`"),
+    match repo.open_promotion_pr(base, default, &title, &text) {
+        Ok(url) => log!("#{tracker}: opened {url} to promote `{base}`, for a person to merge"),
         Err(e) => logwarn!(
             "#{tracker}: could not open the promotion pull request: {}",
             e.first_line()
         ),
     }
-    // After the call above, which marks an open promotion even when an older
-    // one from the same branch has already merged, and opens none then.
-    if let Ok(Some(merged)) = repo.merged_pr_into(base, default) {
-        record_promotion(repo, tracker, &on_base, &home, default, merged);
-    }
 }
 
-/// `In <default> via #N.` on each step the merged promotion brought over. A
-/// step whose own pull request is newer than the promotion landed after it,
-/// so it is not in the default branch by that promotion and is left alone.
+/// `In <default> via #N.` on each ticked step a merged promotion carried,
+/// where #N is the first promotion whose commits include the step's merge.
+/// Whether any ticked step is still to be promoted: always, before the first
+/// promotion, and otherwise a step no merged promotion carried.
 fn record_promotion(
     repo: &Repo,
     tracker: i64,
     on_base: &[&Placed],
     home: &str,
+    base: &str,
     default: &str,
-    merged: i64,
-) {
-    let record = format!("In `{default}` via #{merged}.");
-    for placed in on_base {
-        let step = landed_by(&placed.item, home);
-        if placed.item.text.contains(&record) || step.is_none_or(|n| n > merged) {
+) -> Result<bool> {
+    let merged = repo.merged_promotions(base, default)?;
+    if merged.is_empty() {
+        return Ok(true);
+    }
+    let recorded = format!("In `{default}` via #");
+    let mut carried: Vec<(i64, BTreeSet<String>)> = Vec::new();
+    let mut pending = false;
+    for placed in on_base.iter().filter(|p| p.item.checked) {
+        if placed.item.text.contains(&recorded) {
             continue;
         }
-        let change = Change::Reference(record.clone());
+        // A line ticked by hand, with nothing that says what merged it, is
+        // left as it is.
+        let Some(commit) =
+            landed_by(&placed.item, home).and_then(|n| repo.pr_merge_commit(n).ok().flatten())
+        else {
+            continue;
+        };
+        if carried.is_empty() {
+            for n in &merged {
+                carried.push((*n, repo.pr_commit_oids(*n)?));
+            }
+        }
+        let Some((via, _)) = carried.iter().find(|(_, oids)| oids.contains(&commit)) else {
+            pending = true;
+            continue;
+        };
+        let change = Change::Reference(format!("In `{default}` via #{via}."));
         if write(repo, tracker, &placed.item.raw, &change, None) {
             log!(
                 "#{tracker}: recorded that `{default}` has '{}'",
@@ -1983,6 +2038,7 @@ fn record_promotion(
             );
         }
     }
+    Ok(pending)
 }
 
 /// The prompt both agents answer for a decision item.
@@ -3294,5 +3350,12 @@ That is all.
             vec!["- - [ ] two".to_string(), "+ - [ ] two #8".to_string()],
             diff(before, &after)
         );
+    }
+
+    #[test]
+    fn named_children_include_ticked_lines_and_leave_out_decisions() {
+        let body = "- [x] one #4\n- [ ] two #5\n- [ ] decide on #6 <!-- spar: decision -->\n";
+        let named = named_in(body, "https://github.com/o/r/issues/1");
+        assert_eq!(named, vec![4, 5]);
     }
 }

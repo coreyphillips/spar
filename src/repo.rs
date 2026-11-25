@@ -5324,9 +5324,19 @@ impl Repo {
     /// that makes spar implement over the top of somebody's work and open a
     /// second pull request for the same issue.
     pub fn try_open_pr_for_issue(&self, issue: i64, base: &str) -> Result<Option<PrRef>> {
-        let mine = self.pr_for_branch_failing_closed(&self.branch_for_issue(issue), base, issue)?;
+        let branch = self.branch_for_issue(issue);
+        let mine = self.pr_for_branch_failing_closed(&branch, base, issue)?;
         if let Some(pr) = mine {
             return Ok(Some(pr));
+        }
+        // Still this issue's work when its base changed since, and building
+        // again would replace that pull request's head.
+        if let Some(pr) = self.pr_for_branch(&branch) {
+            return Err(spar_err!(
+                "#{issue} already has pull request #{} open from `{branch}` against a base other \
+                 than `{base}`. Retarget or close it before spar works #{issue}.",
+                pr.number
+            ));
         }
         let listed = match self.gh(&[
             "pr",
@@ -5744,17 +5754,9 @@ impl Repo {
         self.record_write(pushed)
     }
 
-    /// Open a pull request from one branch on origin to another, unless one is
-    /// already open or merged between them. The url, or `None` when there was
-    /// one already.
-    pub fn open_promotion_pr(
-        &self,
-        head: &str,
-        base: &str,
-        title: &str,
-        body: &str,
-        marker: &str,
-    ) -> Result<Option<String>> {
+    /// Pull requests from `head` on origin into `base`, in the given state. A
+    /// fork's branch of the same name matches `--head` too, and is left out.
+    fn origin_prs(&self, head: &str, base: &str, state: &str) -> Result<Vec<Value>> {
         let listed = self.gh(&[
             "pr",
             "list",
@@ -5763,17 +5765,24 @@ impl Repo {
             "--base",
             base,
             "--state",
-            "all",
+            state,
             "--json",
-            "number,state,body",
+            "number,state,body,isCrossRepository",
         ])?;
-        let rows: Vec<Value> = serde_json::from_str(&listed).unwrap_or_default();
-        fn state(r: &Value) -> &str {
-            r.get("state").and_then(Value::as_str).unwrap_or("")
-        }
-        // One somebody else opened is the promotion too, so it carries the
-        // marker that keeps `spar resume` from merging it.
-        for row in rows.iter().filter(|r| state(r) == "OPEN") {
+        let rows: Vec<Value> = serde_json::from_str(listed.trim())
+            .map_err(|e| spar_err!("could not read the pull requests from `{head}`: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| r.get("isCrossRepository").and_then(Value::as_bool) == Some(false))
+            .collect())
+    }
+
+    /// Put the marker on every open pull request from `head` into `base`, so
+    /// `spar resume` never merges one, whoever opened it and whether or not
+    /// its section is finished. Whether any was open.
+    pub fn mark_promotion_prs(&self, head: &str, base: &str, marker: &str) -> Result<bool> {
+        let rows = self.origin_prs(head, base, "open")?;
+        for row in &rows {
             let text = row.get("body").and_then(Value::as_str).unwrap_or("");
             let number = row.get("number").and_then(Value::as_i64).unwrap_or(0);
             if number > 0 && !text.contains(marker) {
@@ -5785,21 +5794,66 @@ impl Repo {
                 self.record_write(edited)?;
             }
         }
-        if rows.iter().any(|r| matches!(state(r), "OPEN" | "MERGED")) {
-            return Ok(None);
-        }
+        Ok(!rows.is_empty())
+    }
+
+    /// Open a pull request from one branch on origin to another. The url.
+    pub fn open_promotion_pr(
+        &self,
+        head: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<String> {
         let title = self.record_failed_write(self.clean_title(title))?;
         let body = self.record_failed_write(self.clean(body))?;
         let opened = self.gh(&[
             "pr", "create", "--head", head, "--base", base, "--title", &title, "--body", &body,
         ]);
-        self.record_write(opened)
-            .map(|url| Some(url.trim().to_string()))
+        self.record_write(opened).map(|url| url.trim().to_string())
     }
 
-    /// The newest merged pull request from `head` on origin into `base`, or
-    /// `None` when there is none. `--head` matches a fork's branch of the same
-    /// name too, and that is somebody else's work.
+    /// The merged pull requests from `head` on origin into `base`, oldest
+    /// first.
+    pub fn merged_promotions(&self, head: &str, base: &str) -> Result<Vec<i64>> {
+        let mut numbers: Vec<i64> = self
+            .origin_prs(head, base, "merged")?
+            .iter()
+            .filter_map(|r| r.get("number").and_then(Value::as_i64))
+            .collect();
+        numbers.sort_unstable();
+        Ok(numbers)
+    }
+
+    /// The commits a pull request carries.
+    pub fn pr_commit_oids(&self, number: i64) -> Result<BTreeSet<String>> {
+        let text = self.gh(&["pr", "view", &number.to_string(), "--json", "commits"])?;
+        let value: Value = serde_json::from_str(text.trim())
+            .map_err(|e| spar_err!("unexpected shape for PR #{number}: {e}"))?;
+        Ok(value
+            .get("commits")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c.get("oid").and_then(Value::as_str).map(str::to_string))
+            .collect())
+    }
+
+    /// The commit a merged pull request put on its base.
+    pub fn pr_merge_commit(&self, number: i64) -> Result<Option<String>> {
+        let text = self.gh(&["pr", "view", &number.to_string(), "--json", "mergeCommit"])?;
+        let value: Value = serde_json::from_str(text.trim())
+            .map_err(|e| spar_err!("unexpected shape for PR #{number}: {e}"))?;
+        Ok(value
+            .pointer("/mergeCommit/oid")
+            .and_then(Value::as_str)
+            .map(str::to_string))
+    }
+
+    /// The newest merged pull request from `head` into `base`, or `None` when
+    /// there is none. From origin or from the fork spar pushes to when origin
+    /// refuses it. Anybody else's fork with a branch of the same name is
+    /// somebody else's work.
     pub fn merged_pr_into(&self, head: &str, base: &str) -> Result<Option<i64>> {
         let listed = self.gh(&[
             "pr",
@@ -5811,13 +5865,26 @@ impl Repo {
             "--state",
             "merged",
             "--json",
-            "number,isCrossRepository",
+            "number,isCrossRepository,headRepositoryOwner",
         ])?;
         let rows: Vec<Value> = serde_json::from_str(listed.trim())
             .map_err(|e| spar_err!("could not read the merged pull requests from `{head}`: {e}"))?;
+        let ours = |r: &Value| match r.get("isCrossRepository").and_then(Value::as_bool) {
+            Some(false) => true,
+            Some(true) => {
+                let owner = r
+                    .pointer("/headRepositoryOwner/login")
+                    .and_then(Value::as_str);
+                owner.is_some_and(|o| {
+                    self.viewer_login()
+                        .is_ok_and(|me| me.eq_ignore_ascii_case(o))
+                })
+            }
+            None => false,
+        };
         Ok(rows
             .iter()
-            .filter(|r| r.get("isCrossRepository").and_then(Value::as_bool) == Some(false))
+            .filter(|r| ours(r))
             .filter_map(|r| r.get("number").and_then(Value::as_i64))
             .max())
     }

@@ -1212,6 +1212,10 @@ fn work_issues(
     // built. Only a merge puts it there, which is why `auto_merge = false`,
     // the default, means a dependent waits for a person.
     let mut landed: BTreeSet<i64> = BTreeSet::new();
+    // Each (tracker, child) whose line this run ticked. Per tracker, because
+    // two trackers can name one child and a tick in one is not a tick in the
+    // other.
+    let mut ticked_in: BTreeSet<(i64, i64)> = BTreeSet::new();
     let mut leftover: BTreeSet<i64> = BTreeSet::new();
     // How many issues this run has actually implemented, which is what the
     // alternating first implementor policy counts. Across waves, so a
@@ -1316,7 +1320,11 @@ fn work_issues(
                 break;
             }
         };
-        act_on_plan(cfg, repo, &plan);
+        // A later step of a sequential tracker is judged before the steps above
+        // it have landed, so it is commented on and left for the order to reach.
+        let close_skipped =
+            cfg.loop_cfg.close_skipped && !(wave.parent.is_some() && wave.sequential);
+        act_on_plan(repo, &plan, close_skipped);
         repo.remember_contested(&plan.contested);
         for item in &plan.contested {
             parked.push(format!(
@@ -1328,7 +1336,7 @@ fn work_issues(
         for item in &plan.skipped {
             let what = if item.tracker {
                 "left open as a tracker"
-            } else if cfg.loop_cfg.close_skipped {
+            } else if close_skipped {
                 "commented on and closed"
             } else {
                 "commented on and left open"
@@ -1364,6 +1372,12 @@ fn work_issues(
                     }
                 }
                 deferred.extend(found.named.iter().copied());
+                // Also from the text this wave fetched, so a failed read in
+                // `decompose` does not let a child run alone on the default
+                // branch.
+                if let Some(read) = fetched.iter().find(|i| i.number == item.issue) {
+                    deferred.extend(tracker::named_in(read.body_text(), &read.url));
+                }
                 if !found.children.is_empty() {
                     for child in &found.children {
                         handled.remove(child);
@@ -1406,7 +1420,7 @@ fn work_issues(
                 continue;
             }
             let held = match wave.parent.filter(|_| wave.sequential) {
-                Some(tracker) => above_not_landed(item.issue, &checklist, &landed, tracker),
+                Some(tracker) => above_not_landed(item.issue, &checklist, &ticked_in, tracker),
                 None => None,
             }
             .or_else(|| held_back(item, &plan, &landed));
@@ -1468,6 +1482,9 @@ fn work_issues(
                 };
                 if ticked {
                     landed.insert(item.issue);
+                    if let Some(tracker) = wave.parent {
+                        ticked_in.insert((tracker, item.issue));
+                    }
                 }
             }
             progress.finished(&run);
@@ -1476,7 +1493,7 @@ fn work_issues(
         // The decision the tracker stopped at is next once every step above
         // it has landed, which this wave may just have done.
         if let (Some(tracker), Some(decision)) = (wave.parent, &wave.decision) {
-            if checklist.iter().all(|n| landed.contains(n)) {
+            if checklist.iter().all(|n| ticked_in.contains(&(tracker, *n))) {
                 decide(agents, cfg, repo, tracker, decision);
             }
         }
@@ -1575,11 +1592,13 @@ fn held_back(item: &PlanItem, plan: &Plan, landed: &BTreeSet<i64>) -> Option<Str
 fn above_not_landed(
     child: i64,
     in_order: &[i64],
-    landed: &BTreeSet<i64>,
+    ticked_in: &BTreeSet<(i64, i64)>,
     tracker: i64,
 ) -> Option<String> {
     let at = in_order.iter().position(|n| *n == child)?;
-    let waiting = in_order[..at].iter().find(|n| !landed.contains(n))?;
+    let waiting = in_order[..at]
+        .iter()
+        .find(|n| !ticked_in.contains(&(tracker, **n)))?;
     Some(format!(
         "held back: #{waiting} is the step above it in #{tracker} and has not landed. The \
          tracker is worked in order, so this starts once #{waiting} is merged."
@@ -1604,6 +1623,19 @@ fn child_config(
     };
     let mut out = cfg.clone();
     if let Some(base) = base.filter(|b| !b.eq_ignore_ascii_case(cfg.base_branch())) {
+        // A step's own branch is pushed before review, so as a base it would
+        // put unreviewed work straight onto the section's branch.
+        let issue_branch = base
+            .rsplit('-')
+            .next()
+            .and_then(|n| n.parse::<i64>().ok())
+            .is_some_and(|n| repo.branch_for_issue(n).eq_ignore_ascii_case(&base));
+        if issue_branch {
+            return Err(format!(
+                "#{tracker} builds it on `{base}`, which is the name spar gives an issue's own \
+                 branch, so it is not worked. Name the section's branch something else."
+            ));
+        }
         repo.ensure_remote_branch(&base, cfg.base_branch())
             .map_err(|e| {
                 format!(
@@ -2099,10 +2131,10 @@ fn make_plan(
 /// somebody recorded against are the reason the issue exists. spar closed a
 /// real one as "not planned" while all three of its subtasks were open, which
 /// is what this exists to stop.
-fn act_on_plan(cfg: &Config, repo: &Repo, plan: &Plan) {
+fn act_on_plan(repo: &Repo, plan: &Plan, close_skipped: bool) {
     for item in &plan.skipped {
         let body = review::skip_comment(item, &repo.style);
-        let close = cfg.loop_cfg.close_skipped && !item.tracker;
+        let close = close_skipped && !item.tracker;
         let outcome = if close {
             repo.close_issue(item.issue, &body)
         } else {
@@ -3144,6 +3176,17 @@ mod tests {
         // Merged is the only thing that puts the work on the base.
         landed.insert(9);
         assert!(held_back(&plan.order[1], &plan, &landed).is_none());
+    }
+
+    /// Two trackers can name one child, and its tick in one leaves the other's
+    /// next step waiting on its own line.
+    #[test]
+    fn a_tick_in_one_tracker_does_not_release_another() {
+        let mut ticked = BTreeSet::new();
+        ticked.insert((1, 9));
+        assert!(above_not_landed(10, &[9, 10], &ticked, 1).is_none());
+        let why = above_not_landed(10, &[9, 10], &ticked, 2).expect("held");
+        assert!(why.contains("#9"), "{why}");
     }
 
     /// The case the ordering stayed quietest about: a dependency nobody is

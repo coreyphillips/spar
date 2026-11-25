@@ -1346,9 +1346,18 @@ fn work_issues(
         // what happened the last time this codebase let something multiply.
         if cfg.loop_cfg.decompose_trackers && wave.parent.is_none() {
             for item in plan.skipped.iter().filter(|i| i.tracker) {
-                let children = tracker::decompose(cfg, repo, item.issue);
-                if !children.is_empty() {
-                    queue.push_back(wave.child(item.issue, children));
+                let found = tracker::decompose(cfg, repo, item.issue);
+                // A decision is asked about only once it is next in order,
+                // which is when nothing above it is still to be worked.
+                if let Some(decision) = found
+                    .decision
+                    .as_ref()
+                    .filter(|_| found.children.is_empty())
+                {
+                    decide(agents, cfg, repo, item.issue, decision);
+                }
+                if !found.children.is_empty() {
+                    queue.push_back(wave.child(item.issue, found.children, found.sequential));
                 }
             }
         }
@@ -1360,11 +1369,22 @@ fn work_issues(
                 .count(),
         );
         let before = results.len();
-        for item in &plan.order {
+        let mut order: Vec<&PlanItem> = plan.order.iter().collect();
+        if wave.sequential {
+            // Checklist order is the order the tracker's author meant, so it
+            // wins over whatever triage inferred from one line apiece.
+            order.sort_by_key(|item| wave.numbers.iter().position(|n| *n == item.issue));
+        }
+        for item in order {
             let Some(issue) = fetched.iter().find(|i| i.number == item.issue) else {
                 continue;
             };
-            if let Some(why) = held_back(item, &plan, &landed) {
+            let held = match wave.parent.filter(|_| wave.sequential) {
+                Some(tracker) => above_not_landed(item.issue, &wave.numbers, &landed, tracker),
+                None => None,
+            }
+            .or_else(|| held_back(item, &plan, &landed));
+            if let Some(why) = held {
                 log!("#{}: {why}", item.issue);
                 let mut held = IssueRun::new(item.issue, item.title.clone());
                 held.status = Status::Pending;
@@ -1373,10 +1393,39 @@ fn work_issues(
                 results.push(held);
                 continue;
             }
-            let run = review::run_nth_issue(agents, cfg, repo, item, issue, worked);
+            let child_cfg = match wave.parent {
+                Some(tracker) => match child_config(cfg, repo, tracker, item.issue) {
+                    Ok(child) => Some(child),
+                    Err(why) => {
+                        log!("#{}: {why}", item.issue);
+                        let mut held = IssueRun::new(item.issue, item.title.clone());
+                        held.status = Status::Error;
+                        held.notes.push(why);
+                        progress.finished(&held);
+                        results.push(held);
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            let run_cfg = child_cfg.as_ref().unwrap_or(cfg);
+            let run = review::run_nth_issue(agents, run_cfg, repo, item, issue, worked);
             worked += 1;
             if run.status == Status::Merged {
                 landed.insert(item.issue);
+                // Ticked now rather than on the next run, so the line says
+                // what landed it and the step below can start in this one.
+                let pr = run.pr.as_deref().and_then(number_at_end);
+                if let (Some(tracker), Some(pr)) = (wave.parent, pr) {
+                    tracker::landed(
+                        repo,
+                        tracker,
+                        item.issue,
+                        pr,
+                        run_cfg.base_branch(),
+                        cfg.base_branch(),
+                    );
+                }
             }
             progress.finished(&run);
             results.push(run);
@@ -1470,6 +1519,130 @@ fn held_back(item: &PlanItem, plan: &Plan, landed: &BTreeSet<i64>) -> Option<Str
     None
 }
 
+/// Why a child of a sequential tracker waits: a child above it in the
+/// checklist has not landed yet. Covers what `held_back` cannot see, such as
+/// a step parked as contested before triage or one that failed this run.
+fn above_not_landed(
+    child: i64,
+    in_order: &[i64],
+    landed: &BTreeSet<i64>,
+    tracker: i64,
+) -> Option<String> {
+    let at = in_order.iter().position(|n| *n == child)?;
+    let waiting = in_order[..at].iter().find(|n| !landed.contains(n))?;
+    Some(format!(
+        "held back: #{waiting} is the step above it in #{tracker} and has not landed. The \
+         tracker is worked in order, so this starts once #{waiting} is merged."
+    ))
+}
+
+/// The config a tracker's child runs under: the tracker's context for its
+/// prompts, its title convention, and the branch its section builds on.
+fn child_config(
+    cfg: &Config,
+    repo: &Repo,
+    tracker: i64,
+    child: i64,
+) -> std::result::Result<Config, String> {
+    let mut out = cfg.clone();
+    let Some((scope, base)) = tracker::scope_for(repo, tracker, child) else {
+        return Ok(out);
+    };
+    if let Some(base) = base.filter(|b| !b.eq_ignore_ascii_case(cfg.base_branch())) {
+        repo.ensure_remote_branch(&base, cfg.base_branch())
+            .map_err(|e| {
+                format!(
+                    "#{tracker} builds it on `{base}`, which could not be created from `{}`: {}",
+                    cfg.base_branch(),
+                    e.first_line()
+                )
+            })?;
+        log!("#{child}: building on `{base}`, as #{tracker} says");
+        out.loop_cfg.base_branch = base;
+    }
+    out.tracker = Some(scope);
+    Ok(out)
+}
+
+/// The number at the end of a pull request's url.
+fn number_at_end(url: &str) -> Option<i64> {
+    url.trim_end_matches('/').rsplit('/').next()?.parse().ok()
+}
+
+/// Both agents' recommendations on a decision item, posted once as one
+/// comment on the tracker. The box is a person's to tick.
+fn decide(agents: &[Agent], cfg: &Config, repo: &Repo, tracker: i64, item: &tracker::Item) {
+    let marker = tracker::decision_marker(item);
+    match repo.try_issue_comments(tracker) {
+        Ok(comments) => {
+            let posted = comments.iter().any(|c| {
+                c.get("body")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|b| b.contains(&marker))
+            });
+            if posted {
+                logdim!("#{tracker}: the decision is already written up, waiting on a person");
+                return;
+            }
+        }
+        Err(e) => {
+            logdim!(
+                "#{tracker}: could not read its comments: {}",
+                e.first_line()
+            );
+            return;
+        }
+    }
+    let body = match repo.read_issue(tracker) {
+        Ok(issue) => issue.body_text().to_string(),
+        Err(e) => {
+            logdim!("could not read #{tracker}: {}", e.first_line());
+            return;
+        }
+    };
+    let prompt = tracker::decision_prompt(tracker, &body, item);
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "position": {"type": "string"},
+            "recommendation": {"type": "string"}
+        },
+        "required": ["position", "recommendation"],
+        "additionalProperties": false
+    });
+    #[derive(serde::Deserialize)]
+    struct Answer {
+        position: String,
+        recommendation: String,
+    }
+    log!("#{tracker}: asking both agents about a decision item");
+    let mut answers = Vec::new();
+    for agent in agents {
+        let effort = agent
+            .effort(cfg, crate::config::Call::Triage)
+            .about(tracker);
+        match agent.ask_json::<Answer>(&prompt, &schema, repo.root(), &effort) {
+            Ok(a) => answers.push((agent.name().to_string(), a.position, a.recommendation)),
+            Err(e) => {
+                logwarn!(
+                    "#{tracker}: {} could not answer the decision: {}",
+                    agent.name(),
+                    e.first_line()
+                );
+                return;
+            }
+        }
+    }
+    let comment = tracker::decision_comment(item, &answers);
+    match repo.comment_issue(tracker, &comment) {
+        Ok(()) => log!("#{tracker}: posted both recommendations on the decision for a person"),
+        Err(e) => logwarn!(
+            "#{tracker}: could not post the decision: {}",
+            e.first_line()
+        ),
+    }
+}
+
 /// One pass of the pipeline, and where it came from.
 struct Wave {
     numbers: Vec<i64>,
@@ -1480,6 +1653,9 @@ struct Wave {
     absorbed: u32,
     /// The tracker whose checklist this wave came out of.
     parent: Option<i64>,
+    /// Whether each number waits for the one before it, which is the order a
+    /// tracker's checklist is written in.
+    sequential: bool,
 }
 
 impl Wave {
@@ -1488,14 +1664,16 @@ impl Wave {
             numbers,
             absorbed: 0,
             parent: None,
+            sequential: false,
         }
     }
 
-    fn child(&self, tracker: i64, numbers: Vec<i64>) -> Self {
+    fn child(&self, tracker: i64, numbers: Vec<i64>, sequential: bool) -> Self {
         Self {
             numbers,
             absorbed: self.absorbed,
             parent: Some(tracker),
+            sequential,
         }
     }
 
@@ -1504,6 +1682,7 @@ impl Wave {
             numbers,
             absorbed: self.absorbed + 1,
             parent: None,
+            sequential: false,
         }
     }
 }

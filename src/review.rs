@@ -779,7 +779,7 @@ fn implement_and_review(
         cfg.loop_cfg.checkin_trust,
     );
     issue_text.report(&format!("#{number}"));
-    let body = issue_text.text;
+    let body = with_tracker_context(cfg, issue_text.text);
     let criteria = tracker::criteria(issue.body_text());
     let prompt = implement_prompt(number, &item.title, &issue.url, &body, &criteria);
     let implementation_schema = if criteria.is_empty() {
@@ -930,7 +930,7 @@ fn implement_and_review(
                 branch,
                 &target,
                 &base,
-                &format!("{} (#{number})", item.title),
+                &pr_title(cfg, &item.title, number),
                 &body,
             )?
         }
@@ -1130,7 +1130,7 @@ fn resume_inner(
                 cfg.loop_cfg.checkin_trust,
             );
             text.report(&format!("PR #{pr_number}"));
-            (text.text, issue.url.clone())
+            (with_tracker_context(cfg, text.text), issue.url.clone())
         }
         None => (String::new(), String::new()),
     };
@@ -3903,6 +3903,45 @@ fn respond_prompt(
 /// which has no network at all, so a URL alone would leave it judging the title.
 /// And an agent that can follow it has no reason to when the body reads as
 /// complete, which is exactly when a comment that superseded it matters most.
+/// The issue's text with its tracker's context after it, when the run is
+/// working a child of one.
+///
+/// Counted against `max_issue_chars` like a long comment would be: what does
+/// not fit beside the issue is cut from the end, and the cut is said.
+fn with_tracker_context(cfg: &Config, body: String) -> String {
+    let Some(scope) = cfg.tracker.as_ref().filter(|s| !s.context.is_empty()) else {
+        return body;
+    };
+    let room = cfg
+        .loop_cfg
+        .max_issue_chars
+        .saturating_sub(body.chars().count() + 2);
+    let context = if scope.context.chars().count() <= room {
+        scope.context.clone()
+    } else {
+        let kept: String = scope
+            .context
+            .chars()
+            .take(room.saturating_sub(120))
+            .collect();
+        format!(
+            "{kept}\n\n[The rest of #{}'s text was left out to fit. Read the tracker itself for \
+             it.]",
+            scope.tracker
+        )
+    };
+    format!("{body}\n\n{context}")
+}
+
+/// The pull request's title: the tracker's own convention when it states
+/// one, otherwise the issue's title and number.
+fn pr_title(cfg: &Config, title: &str, number: i64) -> String {
+    match cfg.tracker.as_ref().and_then(|s| s.title.clone()) {
+        Some(title) if !title.trim().is_empty() => title,
+        _ => format!("{title} (#{number})"),
+    }
+}
+
 fn implement_prompt(number: i64, title: &str, url: &str, body: &str, criteria: &[Item]) -> String {
     let criteria = if criteria.is_empty() {
         String::new()

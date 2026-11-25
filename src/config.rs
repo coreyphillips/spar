@@ -957,6 +957,10 @@ pub struct Config {
     pub alternate_first: bool,
     /// Where this config was read from, for error messages.
     pub source: Option<PathBuf>,
+    /// Set by the run on its own copy while it works a child of a tracker,
+    /// never read from the file: the tracker's context for the prompts and
+    /// what it asks of the pull request.
+    pub tracker: Option<crate::tracker::Scope>,
 }
 
 impl Config {
@@ -1400,6 +1404,7 @@ pub fn parse(text: &str) -> Result<Config> {
         first_implementor: first,
         alternate_first: alternate,
         source: None,
+        tracker: None,
     })
 }
 

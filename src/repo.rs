@@ -5693,6 +5693,81 @@ impl Repo {
         self.record_write(closed)
     }
 
+    /// Close an issue as done, with a comment saying where its work went.
+    ///
+    /// For a merge into a branch that is not the default one, where GitHub
+    /// does not honour `Closes`.
+    pub fn close_issue_completed(&self, number: i64, body: &str) -> Result<()> {
+        self.comment_issue(number, body)?;
+        let n = number.to_string();
+        let closed = self
+            .gh(&["issue", "close", &n, "--reason", "completed"])
+            .or_else(|_| self.gh(&["issue", "close", &n]))
+            .map(|_| ())
+            .map_err(|e| {
+                spar_err!(
+                    "commented on #{number} but could not close it: {}",
+                    e.last_line()
+                )
+            });
+        self.record_write(closed)
+    }
+
+    /// Make sure `branch` exists on origin, creating it from `from` if not.
+    pub fn ensure_remote_branch(&self, branch: &str, from: &str) -> Result<()> {
+        let heads = self.git(&["ls-remote", "--heads", "origin", branch])?;
+        if heads
+            .lines()
+            .any(|l| l.trim_end().ends_with(&format!("refs/heads/{branch}")))
+        {
+            return Ok(());
+        }
+        self.git(&["fetch", "origin", from])?;
+        let refspec = format!("refs/remotes/origin/{from}:refs/heads/{branch}");
+        let pushed = self.git(&["push", "origin", &refspec]).map(|_| ());
+        self.record_write(pushed)
+    }
+
+    /// Open a pull request from one branch on origin to another, unless one is
+    /// already open or merged between them. The url, or `None` when there was
+    /// one already.
+    pub fn open_promotion_pr(
+        &self,
+        head: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<Option<String>> {
+        let listed = self.gh(&[
+            "pr",
+            "list",
+            "--head",
+            head,
+            "--base",
+            base,
+            "--state",
+            "all",
+            "--json",
+            "number,state",
+        ])?;
+        let rows: Vec<Value> = serde_json::from_str(&listed).unwrap_or_default();
+        if rows.iter().any(|r| {
+            matches!(
+                r.get("state").and_then(Value::as_str),
+                Some("OPEN" | "MERGED")
+            )
+        }) {
+            return Ok(None);
+        }
+        let title = self.record_failed_write(self.clean_title(title))?;
+        let body = self.record_failed_write(self.clean(body))?;
+        let opened = self.gh(&[
+            "pr", "create", "--head", head, "--base", base, "--title", &title, "--body", &body,
+        ]);
+        self.record_write(opened)
+            .map(|url| Some(url.trim().to_string()))
+    }
+
     /// Replace an issue body, refusing unless it is still byte for byte what
     /// the caller read and validating only the fragment spar inserted.
     ///

@@ -784,8 +784,11 @@ max_tracker_children = 5
 For each unchecked `- [ ]` item, in order:
 
 - It already names an issue (`#123`, or a link to one here): that is its issue.
-- It names none, but an issue already covers it: link it, file nothing.
-- Neither: file one, then link it.
+- It names none, but an open issue already covers it: link it, file nothing.
+- Neither: file one, then link it. A closed issue that matches is never linked,
+  because one similarity hit against an older tracker's finished step would
+  otherwise tick an item nobody did. It is named in the log and in `spar
+  triage`, and if it really covers the item, add the reference by hand.
 
 `max_tracker_children` caps the issues one run files from a checklist. An item
 that already links an issue costs nothing against it, since it needs a tick or
@@ -797,10 +800,88 @@ one token in your own issue. An item whose issue is closed gets its box ticked,
 whoever closed it and whenever, so a tracker somebody has been working by hand
 catches up too.
 
-The children are a wave like any other: dependency order, cheapest first, and
-both agents triage each one before anything is implemented. An item that is
-stale or already fixed is declined there rather than guessed at here. A child
-that is itself a tracker is held rather than decomposed in turn.
+The children are a wave like any other, and both agents triage each one before
+anything is implemented. An item that is stale or already fixed is declined
+there rather than guessed at here. A child that is itself a tracker is held
+rather than decomposed in turn.
+
+### A tracker is a plan, worked in order
+
+Checklist order is dependency order. An unchecked item does not start until
+every unchecked item above it is ticked, so a tracker is worked one step at a
+time, in the order written, and a step that fails, escalates, or is declined
+stops the tracker there. Triage may add dependencies but cannot remove these.
+An item spar has to hold (it names another repository, or was closed as not
+planned) stops the order too, and nothing below it is filed that run.
+
+Each child's implement and review prompts carry the tracker under its own
+heading, counted against `max_issue_chars`: the introduction, the heading and
+prose of the item's section, every section that is not a checklist (standing
+rules, notes on order), the item's line as written, and for each checked item
+above it, its line and the title and summary of the pull request that landed it.
+The child issue's own body stays short and says where to look: `Step 15 of the
+checklist in #2098, section D. The tracker's rules apply.`
+
+When spar merges a child, its line is ticked in the same run and records what
+landed it, and the next step starts in that run:
+
+```
+- [x] **Step 15.** A splice of an asset channel. #2142 Done in #2150, on `feat/asset-splicing`.
+```
+
+With `auto_merge = false`, a person merges each step and the next starts on the
+next `spar run` of the tracker, which ticks the line from the closed child. On a
+`base` branch GitHub does not close the child for you, so close it when you
+merge.
+
+### Directives
+
+Per tracker settings live in the tracker, as HTML comments GitHub does not
+render, so two trackers in one repository can differ and the settings sit
+beside the plan they govern. For the whole tracker (anywhere, with the word
+`tracker`, or above its first heading):
+
+```
+<!-- spar: tracker order=sequential title="Step {n} of #{tracker}: {sentence}" -->
+```
+
+For one section, on its own line under the heading:
+
+```
+### D. Splicing and dual funding
+<!-- spar: base=feat/asset-splicing -->
+```
+
+For one item, at the end of its line:
+
+```
+- [ ] **Step 17.** A decision, written down here: ... <!-- spar: decision -->
+```
+
+| Key | Means |
+| --- | --- |
+| `order` | `sequential`, the default, or `independent` for a list of unrelated chores that may all start at once. |
+| `title` | The pull request title, from `{n}` (the step's number), `{tracker}`, `{section}`, and `{sentence}` (the item's first sentence). Without it the title is the child's own. |
+| `base` | The branch this tracker's, section's, or item's steps build on. |
+| `decision` | A person decides this item. See below. |
+| `children` | `issues`, the default. `pull_requests` is read but not acted on yet, and is warned about. |
+| `check` | A heavier check for these steps. Read and warned about, not run yet. |
+
+An unknown key, or a value spar will not use, is a warning and never a guess.
+
+**A base branch.** spar creates the branch from the default branch if it does
+not exist and bases every step on it. GitHub honours `Closes #N` only for a
+merge into the default branch, so spar closes the child itself after merging
+into another one. Once the last item on that branch is ticked, spar opens one
+pull request from it to the default branch, titled after the section. That
+pull request is never merged by spar, whatever `auto_merge` says: promoting a
+section is a release decision.
+
+**A decision.** spar files no child and implements nothing for it. When it is
+next in order, both agents read the tracker and the code, each writes a
+recommendation, and spar posts one comment on the tracker with both and where
+they differ. It is posted once. The box stays unchecked until a person ticks
+it, and nothing after it starts until then.
 
 Read it before you let it act. With the setting on, `spar triage` prints the
 whole decomposition, item by item, with the exact body diff, and writes none of
@@ -810,9 +891,14 @@ it. `triage` never calls the acting path, so this is the dry run:
 spar triage 42    # what it would file, link, and tick, and the lines it would write
 ```
 
+The preview also prints the directives it read and any warnings about them,
+the order and where it stops, the branch each step builds on, the record line
+each would get once merged, and which branches would be promoted.
+
 Three restraints worth knowing, because this and ticking an issue's acceptance
 criteria after a merge are the only things spar does that rewrite text a person
-wrote. Both go through the same line surgery:
+wrote. Both, and the record line a merge writes, go through the same line
+surgery:
 
 - **Only a checklist.** Task list items, never an agent's reading of your prose.
   A tracker with no checklist behaves exactly as it did before. Anything GitHub
@@ -823,11 +909,11 @@ wrote. Both go through the same line surgery:
   is left alone: every state that produces one is a state where you are right
   and the heuristic is wrong. A tick means the work landed, so an issue closed
   as not planned, which is what `close_skipped` writes when both agents decline
-  an item, leaves the box alone and says why. An item linked by a fuzzy match is not ticked in
-  the same run that linked it, even when the match is closed, so the link is in
-  front of you first.
+  an item, leaves the box alone and says why. An item linked by a fuzzy match is
+  not ticked in the same run that linked it, so the link is in front of you
+  first, and a closed match is not linked at all.
 - **Line surgery, proved.** A reference is appended to one line, or one `[ ]`
-  becomes `[x]`. Nothing is reflowed, reordered, or re-emitted from a parsed
+  becomes `[x]`, or both at once for the record a merge writes. Nothing is reflowed, reordered, or re-emitted from a parsed
   model, every other line is checked byte identical before the write, and the
   body is read again immediately before each one so an edit you make mid run is
   not lost.

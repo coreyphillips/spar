@@ -597,6 +597,492 @@ fn eol_of(line: &str) -> &str {
 }
 
 // ---------------------------------------------------------------------------
+// Layout and directives
+// ---------------------------------------------------------------------------
+
+/// A `<!-- spar: ... -->` comment. GitHub renders none of it, so a setting
+/// can sit beside the plan it governs without showing up in it.
+static DIRECTIVE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"<!--\s*spar:(?P<body>.*?)-->").expect("directive pattern"));
+
+/// A line that is a directive and nothing else, which is how a tracker or a
+/// section is configured.
+static DIRECTIVE_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[ \t]*<!--\s*spar:(?P<body>.*?)-->[ \t]*$").expect("directive line pattern")
+});
+
+/// An ATX heading, which is what a tracker's sections are written as.
+static HEADING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^ {0,3}#{1,6}[ \t]+(?P<text>.*?)[ \t#]*$").expect("heading pattern")
+});
+
+/// `Step 15` in an item's text, which is the number its author gave it.
+static STEP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bstep\s+(?P<n>[0-9]{1,4})\b").expect("step pattern"));
+
+/// `Done in #2140`, which names the pull request that landed an item.
+static DONE_IN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bdone in #(?P<n>[0-9]{1,9})\b").expect("done pattern"));
+
+/// The order a tracker's unchecked items are worked in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Order {
+    /// Each one after the one above it, which is what a written plan means.
+    #[default]
+    Sequential,
+    /// All at once, for a list of chores that do not build on each other.
+    Independent,
+}
+
+/// What one directive comment, or several at one level, said.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Directives {
+    pub order: Option<Order>,
+    pub children: Option<String>,
+    pub title: Option<String>,
+    pub base: Option<String>,
+    pub decision: bool,
+    pub check: Option<String>,
+    /// Whether it carried the `tracker` word, which makes it the tracker's
+    /// own wherever it sits.
+    pub tracker: bool,
+    /// What was not understood, said rather than guessed at.
+    pub warnings: Vec<String>,
+}
+
+impl Directives {
+    fn read(text: &str) -> Self {
+        let mut out = Directives::default();
+        for (key, value) in tokens(text) {
+            match (key.as_str(), value) {
+                ("tracker", None) => out.tracker = true,
+                ("decision", None) => out.decision = true,
+                ("order", Some(v)) => match v.as_str() {
+                    "sequential" => out.order = Some(Order::Sequential),
+                    "independent" => out.order = Some(Order::Independent),
+                    _ => out.warnings.push(format!(
+                        "order={v} is not sequential or independent, so it was ignored"
+                    )),
+                },
+                ("children", Some(v)) => match v.as_str() {
+                    "issues" | "pull_requests" => out.children = Some(v),
+                    _ => out.warnings.push(format!(
+                        "children={v} is not issues or pull_requests, so it was ignored"
+                    )),
+                },
+                ("title", Some(v)) => out.title = Some(v),
+                ("base", Some(v)) if valid_branch(&v) => out.base = Some(v),
+                ("base", Some(v)) => out.warnings.push(format!(
+                    "base={v} is not a branch name spar will push to, so it was ignored"
+                )),
+                ("check", Some(v)) => out.check = Some(v),
+                (key, Some(v)) => out
+                    .warnings
+                    .push(format!("unknown directive {key}={v}, ignored")),
+                (key, None) => out
+                    .warnings
+                    .push(format!("unknown directive {key}, ignored")),
+            }
+        }
+        out
+    }
+
+    /// Everything `later` sets wins over what this one set.
+    fn merge(&mut self, later: Directives) {
+        self.order = later.order.or(self.order);
+        self.children = later.children.or(self.children.take());
+        self.title = later.title.or(self.title.take());
+        self.base = later.base.or(self.base.take());
+        self.check = later.check.or(self.check.take());
+        self.decision |= later.decision;
+        self.tracker |= later.tracker;
+        self.warnings.extend(later.warnings);
+    }
+
+    /// The directive as it would be written, for `spar triage`.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(order) = self.order {
+            parts.push(format!(
+                "order={}",
+                match order {
+                    Order::Sequential => "sequential",
+                    Order::Independent => "independent",
+                }
+            ));
+        }
+        if let Some(v) = &self.children {
+            parts.push(format!("children={v}"));
+        }
+        if let Some(v) = &self.title {
+            parts.push(format!("title=\"{v}\""));
+        }
+        if let Some(v) = &self.base {
+            parts.push(format!("base={v}"));
+        }
+        if let Some(v) = &self.check {
+            parts.push(format!("check=\"{v}\""));
+        }
+        if self.decision {
+            parts.push("decision".into());
+        }
+        parts.join(" ")
+    }
+}
+
+/// A branch name with nothing a shell, a refspec, or git itself would read
+/// as something else.
+fn valid_branch(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(['-', '/', '.'])
+        && !name.ends_with(['/', '.'])
+        && !name.contains("..")
+        && !name.contains("//")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.'))
+}
+
+/// `key=value`, `key="a quoted value"`, and bare words, in order.
+fn tokens(text: &str) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut at = 0;
+    while at < chars.len() {
+        while at < chars.len() && chars[at].is_whitespace() {
+            at += 1;
+        }
+        let start = at;
+        while at < chars.len() && !chars[at].is_whitespace() && chars[at] != '=' {
+            at += 1;
+        }
+        let key: String = chars[start..at].iter().collect();
+        if key.is_empty() && at >= chars.len() {
+            break;
+        }
+        if at < chars.len() && chars[at] == '=' {
+            at += 1;
+            let value: String = if at < chars.len() && chars[at] == '"' {
+                at += 1;
+                let begin = at;
+                while at < chars.len() && chars[at] != '"' {
+                    at += 1;
+                }
+                let value = chars[begin..at].iter().collect();
+                at += 1;
+                value
+            } else {
+                let begin = at;
+                while at < chars.len() && !chars[at].is_whitespace() {
+                    at += 1;
+                }
+                chars[begin..at].iter().collect()
+            };
+            out.push((key, Some(value)));
+        } else if !key.is_empty() {
+            out.push((key, None));
+        } else {
+            at += 1;
+        }
+    }
+    out
+}
+
+/// One heading and what sits under it, up to the next heading.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Section {
+    pub heading: String,
+    /// The lines under it that are neither items nor directives.
+    pub prose: String,
+    pub directives: Directives,
+    pub has_items: bool,
+}
+
+/// One item, placed in the tracker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placed {
+    pub item: Item,
+    /// Index into `Layout::sections`, `None` above the first heading.
+    pub section: Option<usize>,
+    /// What the item's own line says, after the comment GitHub hides.
+    pub directives: Directives,
+    /// 1-based, among every item in the checklist.
+    pub position: usize,
+}
+
+impl Placed {
+    /// The number a person would call the step by: the one written in it when
+    /// there is one, its place in the checklist otherwise.
+    pub fn step(&self) -> usize {
+        STEP.captures(&self.item.text)
+            .and_then(|c| c["n"].parse().ok())
+            .unwrap_or(self.position)
+    }
+}
+
+/// A tracker read as a plan: what it says outside the checklist, where each
+/// item sits, and the settings written into it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Layout {
+    pub intro: String,
+    pub sections: Vec<Section>,
+    pub items: Vec<Placed>,
+    pub directives: Directives,
+}
+
+impl Layout {
+    pub fn read(body: &str) -> Self {
+        let parsed = parse(body);
+        let item_lines: BTreeMap<usize, &Item> = parsed.iter().map(|i| (i.line, i)).collect();
+        let mut layout = Layout::default();
+        let mut current: Option<usize> = None;
+        let mut fence: Option<char> = None;
+        let mut position = 0usize;
+        for (index, raw) in split_keep(body).into_iter().enumerate() {
+            let line = without_eol(raw);
+            if let Some(item) = item_lines.get(&(index + 1)) {
+                position += 1;
+                let mut directives = Directives::default();
+                for caps in DIRECTIVE.captures_iter(line) {
+                    directives.merge(Directives::read(&caps["body"]));
+                }
+                if let Some(at) = current {
+                    layout.sections[at].has_items = true;
+                }
+                layout.items.push(Placed {
+                    item: (*item).clone(),
+                    section: current,
+                    directives,
+                    position,
+                });
+                continue;
+            }
+            // Headings and directives inside a fence are somebody's example.
+            if let Some(caps) = FENCE.captures(line) {
+                let glyph = caps["fence"].chars().next().unwrap_or('`');
+                match fence {
+                    None => fence = Some(glyph),
+                    Some(open) if open == glyph && caps["info"].trim().is_empty() => fence = None,
+                    Some(_) => {}
+                }
+            } else if fence.is_none() {
+                if let Some(caps) = DIRECTIVE_LINE.captures(line) {
+                    let read = Directives::read(&caps["body"]);
+                    match current {
+                        Some(at) if !read.tracker => layout.sections[at].directives.merge(read),
+                        _ => layout.directives.merge(read),
+                    }
+                    continue;
+                }
+                if let Some(caps) = HEADING.captures(line) {
+                    layout.sections.push(Section {
+                        heading: caps["text"].trim().to_string(),
+                        ..Section::default()
+                    });
+                    current = Some(layout.sections.len() - 1);
+                    continue;
+                }
+            }
+            let prose = match current {
+                Some(at) => &mut layout.sections[at].prose,
+                None => &mut layout.intro,
+            };
+            prose.push_str(line);
+            prose.push('\n');
+        }
+        layout.intro = layout.intro.trim().to_string();
+        for section in &mut layout.sections {
+            section.prose = section.prose.trim().to_string();
+        }
+        layout
+    }
+
+    pub fn order(&self) -> Order {
+        self.directives.order.unwrap_or_default()
+    }
+
+    pub fn placed(&self, raw: &str) -> Option<&Placed> {
+        self.items.iter().find(|p| p.item.raw == raw)
+    }
+
+    /// The branch an item's work is built on, when the tracker names one: the
+    /// item's own, then its section's, then the tracker's.
+    pub fn base_for(&self, placed: &Placed) -> Option<String> {
+        placed
+            .directives
+            .base
+            .clone()
+            .or_else(|| {
+                placed
+                    .section
+                    .and_then(|at| self.sections[at].directives.base.clone())
+            })
+            .or_else(|| self.directives.base.clone())
+    }
+
+    /// A heavier check an item names, its own first.
+    pub fn check_for(&self, placed: &Placed) -> Option<String> {
+        placed
+            .directives
+            .check
+            .clone()
+            .or_else(|| {
+                placed
+                    .section
+                    .and_then(|at| self.sections[at].directives.check.clone())
+            })
+            .or_else(|| self.directives.check.clone())
+    }
+
+    pub fn section_name(&self, placed: &Placed) -> Option<&str> {
+        placed.section.map(|at| self.sections[at].heading.as_str())
+    }
+
+    /// Every directive warning, wherever it was written.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = self.directives.warnings.clone();
+        for section in &self.sections {
+            out.extend(section.directives.warnings.iter().cloned());
+        }
+        for placed in &self.items {
+            out.extend(placed.directives.warnings.iter().cloned());
+        }
+        out
+    }
+
+    /// Where an item sits, in the words its child issue uses.
+    pub fn place(&self, placed: &Placed, tracker: i64) -> String {
+        let section = self
+            .section_name(placed)
+            .map(|s| format!(", section {}", section_label(s)))
+            .unwrap_or_default();
+        format!(
+            "Step {} of the checklist in #{tracker}{section}. The tracker's rules apply.",
+            placed.step()
+        )
+    }
+
+    /// Every item that has to be ticked before this one may start: the
+    /// unchecked items above it, unless the tracker says its items are
+    /// independent.
+    pub fn blockers<'a>(&'a self, placed: &Placed) -> Vec<&'a Placed> {
+        if self.order() == Order::Independent {
+            return Vec::new();
+        }
+        self.items
+            .iter()
+            .filter(|p| p.position < placed.position && !p.item.checked)
+            .collect()
+    }
+
+    /// The tracker's text outside its checklist and the item as written, for
+    /// a child's prompts. `earlier` is the record of each step above it that
+    /// landed, already read.
+    pub fn context(&self, placed: &Placed, tracker: i64, earlier: &[String]) -> String {
+        let mut out = vec![format!(
+            "## The tracker this is part of\n\nThis issue is {} Read the tracker's own text below \
+             before starting: what it asks of every step applies to this one.",
+            self.place(placed, tracker)
+                .trim_end_matches(" The tracker's rules apply.")
+        )];
+        if !self.intro.is_empty() {
+            out.push(format!("### The tracker's introduction\n\n{}", self.intro));
+        }
+        if let Some(at) = placed.section {
+            let section = &self.sections[at];
+            let prose = if section.prose.is_empty() {
+                String::new()
+            } else {
+                format!("\n\n{}", section.prose)
+            };
+            out.push(format!(
+                "### The section it sits in: {}{prose}",
+                section.heading
+            ));
+        }
+        for section in self
+            .sections
+            .iter()
+            .filter(|s| !s.has_items && !s.prose.is_empty())
+        {
+            out.push(format!("### {}\n\n{}", section.heading, section.prose));
+        }
+        out.push(format!(
+            "### The item, as written\n\n{}",
+            placed.item.raw.trim()
+        ));
+        if !earlier.is_empty() {
+            out.push(format!(
+                "### The steps above it that landed\n\n{}",
+                earlier.join("\n\n")
+            ));
+        }
+        out.join("\n\n")
+    }
+}
+
+/// `D` out of `D. Splicing and dual funding`, or the whole heading when it
+/// does not start with a short label.
+fn section_label(heading: &str) -> String {
+    match heading.split_once('.') {
+        Some((label, _)) if !label.is_empty() && label.chars().count() <= 3 => label.to_string(),
+        _ => format!("\"{heading}\""),
+    }
+}
+
+/// The record a merge writes onto an item's line.
+pub fn record(pr: i64, base: &str, default: &str) -> String {
+    if base.eq_ignore_ascii_case(default) {
+        format!("Done in #{pr}.")
+    } else {
+        format!("Done in #{pr}, on `{base}`.")
+    }
+}
+
+/// The pull request a checked item's line says landed it.
+pub fn landed_by(item: &Item, home: &str) -> Option<i64> {
+    DONE_IN
+        .captures(&item.text)
+        .and_then(|c| c["n"].parse().ok())
+        .or_else(|| item.reference.as_ref().and_then(|r| r.local(home)))
+}
+
+/// A pull request title from the tracker's template, or `None` without one.
+pub fn title_from(
+    template: &str,
+    step: usize,
+    tracker: i64,
+    section: &str,
+    sentence: &str,
+) -> String {
+    template
+        .replace("{n}", &step.to_string())
+        .replace("{tracker}", &tracker.to_string())
+        .replace("{section}", section)
+        .replace("{sentence}", sentence)
+}
+
+/// The item's first sentence, with the step label and any reference or
+/// directive taken off, for a title.
+pub fn sentence_of(text: &str) -> String {
+    let text = COMMENT.replace_all(text, "");
+    let text = Regex::new(r"^\*\*[^*]*\*\*\s*")
+        .expect("label pattern")
+        .replace(text.trim(), "");
+    let first = text.split(". ").next().unwrap_or(&text).trim();
+    first.trim_end_matches('.').to_string()
+}
+
+/// What a child of a tracker carries through its run: where it sits, what
+/// its prompts are told, and what the tracker asks of its pull request.
+#[derive(Debug, Clone, Default)]
+pub struct Scope {
+    pub tracker: i64,
+    pub context: String,
+    pub title: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Line surgery
 // ---------------------------------------------------------------------------
 
@@ -611,6 +1097,9 @@ pub enum Change {
     Tick,
     /// Append a reference to the item's text.
     Reference(String),
+    /// Tick the box and append the record of what landed it, in one edit, so
+    /// the line is never ticked without saying why.
+    Done(String),
 }
 
 impl Change {
@@ -619,7 +1108,7 @@ impl Change {
     pub fn inserted(&self) -> &str {
         match self {
             Change::Tick => "x",
-            Change::Reference(reference) => reference,
+            Change::Reference(reference) | Change::Done(reference) => reference,
         }
     }
 }
@@ -694,6 +1183,10 @@ fn changed(line: &str, change: &Change) -> Result<String> {
             }
             Ok(format!("{}x{}", &line[..at], &line[at + 1..]))
         }
+        Change::Done(record) => {
+            let ticked = changed(line, &Change::Tick)?;
+            changed(&ticked, &Change::Reference(record.clone()))
+        }
         Change::Reference(reference) => {
             let rest = caps.name("rest").expect("a rest");
             let text = rest.as_str();
@@ -749,6 +1242,12 @@ pub enum Action {
     },
     /// Nothing covers it. One is filed, then linked.
     File,
+    /// The only match is closed. A closed match is never linked: one hit
+    /// against an older tracker's finished step would otherwise tick an item
+    /// nobody did. It is filed like any other, and the match is named.
+    FileOverClosed { number: i64, title: String },
+    /// A person decides it. Nothing is filed and the box is never ticked.
+    Decide,
     /// Left alone, with the reason.
     Hold(String),
     /// Past `max_tracker_children`, and said out loud rather than dropped.
@@ -771,7 +1270,12 @@ impl Action {
         match self {
             Action::Tick(_) => Some(Change::Tick),
             Action::Link { number, .. } => Some(Change::Reference(format!("#{number}"))),
-            Action::Adopt(_) | Action::File | Action::Hold(_) | Action::Over => None,
+            Action::Adopt(_)
+            | Action::File
+            | Action::FileOverClosed { .. }
+            | Action::Decide
+            | Action::Hold(_)
+            | Action::Over => None,
         }
     }
 }
@@ -838,11 +1342,16 @@ fn shape(body: &str, home: &str, max: usize) -> Vec<(Item, Shape)> {
 /// search for one that does not. `spar triage` prints exactly this and the
 /// acting path applies it, so the preview and the run cannot drift apart.
 pub fn plan(repo: &Repo, cfg: &Config, tracker: i64, body: &str, home: &str) -> Vec<Step> {
+    let layout = Layout::read(body);
     shape(body, home, cfg.loop_cfg.max_tracker_children)
         .into_iter()
         .map(|(item, shape)| {
+            let decision = layout
+                .placed(&item.raw)
+                .is_some_and(|p| p.directives.decision);
             let action = match shape {
                 Shape::Hold(why) => Action::Hold(why),
+                _ if decision => Action::Decide,
                 Shape::Over => Action::Over,
                 Shape::Names(number) => resolve(repo, number),
                 // `file_as_issue` runs this search itself, so doing it here
@@ -852,10 +1361,14 @@ pub fn plan(repo: &Repo, cfg: &Config, tracker: i64, body: &str, home: &str) -> 
                 // done item that wants a link. Doing it first is also what lets
                 // the log say "linked #40, filed nothing".
                 Shape::Needs => match search(repo, tracker, &item.text) {
-                    Some(found) => Action::Link {
+                    Some(found) if found.open => Action::Link {
                         number: found.number,
                         title: found.title,
-                        open: found.open,
+                        open: true,
+                    },
+                    Some(found) => Action::FileOverClosed {
+                        number: found.number,
+                        title: found.title,
                     },
                     None => Action::File,
                 },
@@ -922,13 +1435,21 @@ fn issue_action(issue: &Issue) -> Action {
 /// work nothing.
 fn search(repo: &Repo, tracker: i64, text: &str) -> Option<crate::repo::ExistingIssue> {
     let title = repo.clean_title(text).ok()?;
-    repo.find_similar_issue_apart_from(&title, &child_body(text, tracker), Some(tracker))
+    let body = format!("{text}\n\nFrom the checklist in #{tracker}.");
+    repo.find_similar_issue_apart_from(&title, &body, Some(tracker))
 }
 
 /// What a child issue says, when spar has to file one. The item's own words,
 /// and where they came from.
-fn child_body(text: &str, tracker: i64) -> String {
-    format!("{text}\n\nFrom the checklist in #{tracker}.")
+///
+/// Short on purpose. The rest of the tracker reaches the child's prompts on
+/// every run, read fresh, so the body only has to say where it lives.
+fn child_body(layout: &Layout, item: &Item, tracker: i64) -> String {
+    let text = item.text.as_str();
+    match layout.placed(&item.raw) {
+        Some(placed) => format!("{text}\n\n{}", layout.place(placed, tracker)),
+        None => format!("{text}\n\nFrom the checklist in #{tracker}."),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -941,22 +1462,67 @@ fn child_body(text: &str, tracker: i64) -> String {
 /// triage like anything else, which is what makes deterministic extraction
 /// safe. An item that is stale or already fixed is declined there rather than
 /// judged here.
-pub fn decompose(cfg: &Config, repo: &Repo, tracker: i64) -> Vec<i64> {
+pub fn decompose(cfg: &Config, repo: &Repo, tracker: i64) -> Decomposed {
     let Some((body, slug)) = read_for_write(repo, tracker) else {
-        return Vec::new();
+        return Decomposed::default();
     };
+    let layout = Layout::read(&body);
+    for warning in layout.warnings() {
+        logwarn!("#{tracker}: {warning}");
+    }
     let steps = plan(repo, cfg, tracker, &body, &slug);
     if steps.is_empty() {
         logdim!("#{tracker} has no unchecked checklist items, so there is nothing to extract");
-        return Vec::new();
+        return Decomposed::default();
     }
     log!("#{tracker}: {} unchecked checklist item(s)", steps.len());
     report_overflow(cfg, tracker, &steps);
     report_skipped(tracker, &body);
-    apply(repo, tracker, &steps)
+    let (worked, stop) = in_order(&layout, &steps);
+    if let Some(stop) = stop {
+        let what = style::clip(&style::one_line(&stop.item.text), 80);
+        log!("#{tracker}: the checklist is worked in order, so nothing after '{what}' starts this run");
+    }
+    let decision = stop
+        .filter(|s| s.action == Action::Decide)
+        .map(|s| s.item.clone());
+    Decomposed {
+        children: apply(repo, tracker, &layout, worked),
+        sequential: layout.order() == Order::Sequential,
+        decision,
+    }
 }
 
-fn apply(repo: &Repo, tracker: i64, steps: &[Step]) -> Vec<i64> {
+/// What decomposing a tracker handed back to the run.
+#[derive(Debug, Clone, Default)]
+pub struct Decomposed {
+    /// In checklist order.
+    pub children: Vec<i64>,
+    /// Whether each child waits for the one above it.
+    pub sequential: bool,
+    /// The decision item the order stopped at, for both agents to weigh in on.
+    pub decision: Option<Item>,
+}
+
+/// The steps a run may act on, and the one the order stops at.
+///
+/// A tick is always safe, so it never stops anything. Anything else that is
+/// not a child to work (a hold, the cap, a decision) is a step that will not
+/// land this run, and under sequential order nothing below it may start.
+pub fn in_order<'a>(layout: &Layout, steps: &'a [Step]) -> (&'a [Step], Option<&'a Step>) {
+    if layout.order() == Order::Independent {
+        return (steps, None);
+    }
+    match steps
+        .iter()
+        .position(|s| matches!(s.action, Action::Hold(_) | Action::Over | Action::Decide))
+    {
+        Some(at) => (&steps[..at], Some(&steps[at])),
+        None => (steps, None),
+    }
+}
+
+fn apply(repo: &Repo, tracker: i64, layout: &Layout, steps: &[Step]) -> Vec<i64> {
     let mut children = Vec::new();
     for step in steps {
         let what = style::clip(&style::one_line(&step.item.text), 80);
@@ -992,6 +1558,42 @@ fn apply(repo: &Repo, tracker: i64, steps: &[Step]) -> Vec<i64> {
                     children.push(*number);
                 }
             }
+            Action::Decide => {
+                logdim!("  '{what}' is a person's decision, so nothing is filed for it")
+            }
+            Action::FileOverClosed { number, title } => {
+                log!(
+                    "  '{what}' matches #{number} '{title}', which is closed, so it is not linked \
+                     and a new issue is filed"
+                );
+                let Ok(clean) = repo.clean_nonempty_title_for_write(&step.item.text) else {
+                    logdim!("  could not clean a title out of '{what}'");
+                    continue;
+                };
+                if !still_asked_for(repo, tracker, &step.item.raw) {
+                    logdim!("  '{what}' is no longer in #{tracker}, so nothing was filed for it");
+                    continue;
+                }
+                let body = child_body(layout, &step.item, tracker);
+                let filed = repo.create_issue_apart_from(&clean, &body, Some(tracker));
+                let number = match filed.as_deref().map(review::filed_issue_number) {
+                    Ok(Some(number)) => number,
+                    Ok(None) | Err(_) => {
+                        logdim!("  could not file an issue for '{what}'");
+                        continue;
+                    }
+                };
+                log!("  filed #{number} for '{what}'");
+                if write(
+                    repo,
+                    tracker,
+                    &step.item.raw,
+                    &Change::Reference(format!("#{number}")),
+                    None,
+                ) {
+                    children.push(number);
+                }
+            }
             Action::File => {
                 let Ok(title) = repo.clean_nonempty_title_for_write(&step.item.text) else {
                     logdim!("  could not clean a title out of '{what}'");
@@ -1008,7 +1610,7 @@ fn apply(repo: &Repo, tracker: i64, steps: &[Step]) -> Vec<i64> {
                 match review::file_as_issue_apart_from(
                     repo,
                     &title,
-                    &child_body(&step.item.text, tracker),
+                    &child_body(layout, &step.item, tracker),
                     Some(tracker),
                 ) {
                     Ok(filed) => {
@@ -1040,6 +1642,209 @@ fn apply(repo: &Repo, tracker: i64, steps: &[Step]) -> Vec<i64> {
         }
     }
     unique_children(children)
+}
+
+/// What a child of this tracker carries into its run, and the branch it is
+/// built on when the tracker names one.
+///
+/// Read fresh for each child rather than once per wave, so a step that landed
+/// earlier in this run is in the next one's record of what came before.
+pub fn scope_for(repo: &Repo, tracker: i64, child: i64) -> Option<(Scope, Option<String>)> {
+    let (body, home) = read(repo, tracker)?;
+    let layout = Layout::read(&body);
+    let placed = layout.items.iter().find(|p| {
+        !p.item.checked && p.item.reference.as_ref().and_then(|r| r.local(&home)) == Some(child)
+    })?;
+    let earlier: Vec<String> = layout
+        .items
+        .iter()
+        .filter(|p| p.item.checked && p.position < placed.position)
+        .map(|p| {
+            let line = p.item.raw.trim().to_string();
+            match landed_by(&p.item, &home).and_then(|n| repo.pr_view(n).ok()) {
+                Some(pr) => format!(
+                    "{line}\nPull request #{}: {}\n{}",
+                    pr.number,
+                    pr.title,
+                    style::clip(first_paragraph(&pr.body), 400)
+                ),
+                None => line,
+            }
+        })
+        .collect();
+    let context = layout.context(placed, tracker, &earlier);
+    let section = layout
+        .section_name(placed)
+        .map(section_label)
+        .unwrap_or_default();
+    let title = layout.directives.title.as_ref().map(|template| {
+        title_from(
+            template,
+            placed.step(),
+            tracker,
+            section.trim_matches('"'),
+            &sentence_of(&placed.item.text),
+        )
+    });
+    if let Some(check) = layout.check_for(placed) {
+        logwarn!(
+            "#{tracker}: check=\"{check}\" is read but not run yet, so #{child} gets the \
+             configured check only"
+        );
+    }
+    if layout.directives.children.as_deref() == Some("pull_requests") {
+        logwarn!("#{tracker}: children=pull_requests is not supported yet, so children are issues");
+    }
+    Some((
+        Scope {
+            tracker,
+            context,
+            title,
+        },
+        layout.base_for(placed),
+    ))
+}
+
+fn first_paragraph(text: &str) -> &str {
+    text.trim().split("\n\n").next().unwrap_or("").trim()
+}
+
+/// A child spar merged: tick its line with the record of what landed it, close
+/// the child when the merge went somewhere `Closes` does not reach, and open
+/// the promotion pull request once a section's last item is in.
+///
+/// Returns whether the line was ticked.
+pub fn landed(repo: &Repo, tracker: i64, child: i64, pr: i64, base: &str, default: &str) -> bool {
+    let Some((body, home)) = read_for_write(repo, tracker) else {
+        return false;
+    };
+    let layout = Layout::read(&body);
+    let Some(placed) = layout.items.iter().find(|p| {
+        !p.item.checked && p.item.reference.as_ref().and_then(|r| r.local(&home)) == Some(child)
+    }) else {
+        logdim!("#{tracker} has no unchecked line naming #{child}, so nothing was ticked");
+        return false;
+    };
+    let change = Change::Done(record(pr, base, default));
+    let ticked = write(repo, tracker, &placed.item.raw, &change, None);
+    if ticked {
+        log!("#{tracker}: ticked #{child}, {}", change.inserted());
+    }
+    if !base.eq_ignore_ascii_case(default) {
+        let note = format!(
+            "Done in #{pr}, merged into `{base}`. GitHub closes an issue only for a merge into \
+             `{default}`, so it is closed here. Part of #{tracker}."
+        );
+        match repo.close_issue_completed(child, &note) {
+            Ok(()) => log!("#{child}: closed, its work is on `{base}`"),
+            Err(e) => logwarn!("#{child}: could not close it: {}", e.first_line()),
+        }
+        if ticked {
+            promote(repo, tracker, base, default);
+        }
+    }
+    ticked
+}
+
+/// One pull request from a section's branch to the default branch, once every
+/// item built on it is ticked. Never merged by spar: promoting a section is a
+/// release, and that is a person's call.
+fn promote(repo: &Repo, tracker: i64, base: &str, default: &str) {
+    let Some((body, _)) = read(repo, tracker) else {
+        return;
+    };
+    let layout = Layout::read(&body);
+    let on_base: Vec<&Placed> = layout
+        .items
+        .iter()
+        .filter(|p| layout.base_for(p).as_deref() == Some(base))
+        .collect();
+    if on_base.is_empty() || on_base.iter().any(|p| !p.item.checked) {
+        return;
+    }
+    let title = match on_base[0]
+        .section
+        .map(|at| layout.sections[at].heading.as_str())
+    {
+        Some(heading) => format!("{heading} (#{tracker})"),
+        None => format!("Promote {base} (#{tracker})"),
+    };
+    let steps: Vec<String> = on_base
+        .iter()
+        .map(|p| p.item.raw.trim().to_string())
+        .collect();
+    let text = format!(
+        "Part of #{tracker}. Every step built on `{base}` is ticked, so this brings them to \
+         `{default}` together. Merging it is a release decision and is left to a person.\n\n{}",
+        steps.join("\n")
+    );
+    match repo.open_promotion_pr(base, default, &title, &text) {
+        Ok(Some(url)) => {
+            log!("#{tracker}: opened {url} to promote `{base}`, for a person to merge")
+        }
+        Ok(None) => logdim!("#{tracker}: `{base}` already has a pull request to `{default}`"),
+        Err(e) => logwarn!(
+            "#{tracker}: could not open the promotion pull request: {}",
+            e.first_line()
+        ),
+    }
+}
+
+/// The prompt both agents answer for a decision item.
+pub fn decision_prompt(tracker: i64, body: &str, item: &Item) -> String {
+    format!(
+        "Issue #{tracker} is a tracker, and one of its items is a decision for a person to make \
+         rather than code to write:\n\n{}\n\nRead the tracker below and the code in this \
+         repository, then recommend what to decide and why. Change no files. Put your \
+         recommendation in `recommendation` as a few short paragraphs, and the decision itself \
+         in one sentence in `position`.\n\n----- the tracker -----\n{body}",
+        item.raw.trim()
+    )
+}
+
+/// Marks the comment that answers one decision item, so it is posted once.
+pub fn decision_marker(item: &Item) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in item.text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("<!-- spar-decision:{hash:016x} -->")
+}
+
+/// The one comment a decision item gets: each agent's recommendation, and
+/// whether their one line positions agree.
+pub fn decision_comment(item: &Item, answers: &[(String, String, String)]) -> String {
+    let mut out = vec![format!(
+        "{}\nThis item is marked as a decision, so spar has not acted on it and will not tick it. \
+         Both reviewers read the tracker and the code; their recommendations are below. Nothing \
+         after it starts until a person ticks it.\n\n> {}",
+        decision_marker(item),
+        item.text.trim()
+    )];
+    for (name, position, recommendation) in answers {
+        out.push(format!(
+            "**{name}** recommends: {position}\n\n{}",
+            recommendation.trim()
+        ));
+    }
+    let positions: BTreeSet<String> = answers
+        .iter()
+        .map(|(_, p, _)| style::one_line(p).trim().to_lowercase())
+        .collect();
+    if answers.len() > 1 && positions.len() > 1 {
+        out.push(format!(
+            "Where they differ: {}.",
+            answers
+                .iter()
+                .map(|(name, p, _)| format!("{name} would {}", style::one_line(p).trim()))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    } else if answers.len() > 1 {
+        out.push("They agree.".to_string());
+    }
+    out.join("\n\n")
 }
 
 fn unique_children(mut children: Vec<i64>) -> Vec<i64> {
@@ -1243,9 +2048,47 @@ pub fn preview(cfg: &Config, repo: &Repo, tracker: i64) {
     }
     println!("\n#{tracker}, if decompose_trackers let it act on the checklist:");
     report_skipped(tracker, &body);
+    let layout = Layout::read(&body);
+    let default = cfg.base_branch();
+    let said = layout.directives.describe();
+    println!(
+        "  directives: {}",
+        if said.is_empty() {
+            "none, so the defaults"
+        } else {
+            &said
+        }
+    );
+    for section in layout
+        .sections
+        .iter()
+        .filter(|s| !s.directives.describe().is_empty())
+    {
+        println!(
+            "    under '{}': {}",
+            section.heading,
+            section.directives.describe()
+        );
+    }
+    for warning in layout.warnings() {
+        println!("    warning: {warning}");
+    }
+    let (worked, stop) = in_order(&layout, &steps);
+    match layout.order() {
+        Order::Sequential => println!(
+            "  order: sequential, one item at a time from the top, each after the one above it lands"
+        ),
+        Order::Independent => println!("  order: independent, every item at once"),
+    }
+    if let Some(stop) = stop {
+        println!(
+            "  stops at '{}', so nothing after it starts",
+            style::clip(&style::one_line(&stop.item.text), 80)
+        );
+    }
 
     let mut projected = body.clone();
-    for step in &steps {
+    for step in worked.iter().chain(stop) {
         let what = style::clip(&style::one_line(&step.item.text), 80);
         match &step.action {
             Action::Adopt(number) => println!("  keep  '{what}' is already #{number}"),
@@ -1259,6 +2102,13 @@ pub fn preview(cfg: &Config, repo: &Repo, tracker: i64) {
                 println!("  link  '{what}' to #{number} '{title}' ({state}), filing nothing");
             }
             Action::File => println!("  file  '{what}'"),
+            Action::FileOverClosed { number, title } => println!(
+                "  file  '{what}': #{number} '{title}' matches but is closed, so it is not linked"
+            ),
+            Action::Decide => println!(
+                "  ask   '{what}' is a decision: both agents comment on #{tracker}, nobody ticks it \
+                 but a person"
+            ),
             Action::Over => println!("  over  '{what}' is past max_tracker_children"),
             Action::Hold(why) => println!("  hold  '{what}': {why}"),
         }
@@ -1266,13 +2116,55 @@ pub fn preview(cfg: &Config, repo: &Repo, tracker: i64) {
         // what a run would write cannot drift. Only `File` is the preview's own,
         // since the issue it would link to does not exist yet.
         let change = match &step.action {
-            Action::File => Some(Change::Reference(FILED.to_string())),
+            Action::File | Action::FileOverClosed { .. } => {
+                Some(Change::Reference(FILED.to_string()))
+            }
             other => other.change(),
         };
+        if let Some(placed) = layout.placed(&step.item.raw) {
+            let worked = matches!(
+                step.action,
+                Action::Adopt(_)
+                    | Action::Link { .. }
+                    | Action::File
+                    | Action::FileOverClosed { .. }
+            );
+            if worked {
+                let base = layout
+                    .base_for(placed)
+                    .unwrap_or_else(|| default.to_string());
+                println!("        built on `{base}`");
+                let line = match &change {
+                    Some(change) => {
+                        changed(&step.item.raw, change).unwrap_or(step.item.raw.clone())
+                    }
+                    None => step.item.raw.clone(),
+                };
+                let done =
+                    Change::Done(record(0, &base, default).replace("#0", "#(its pull request)"));
+                if let Ok(after) = changed(&line, &done) {
+                    println!("        once merged: {}", after.trim());
+                }
+            }
+        }
         let Some(change) = change else { continue };
         match rewrite(&projected, &step.item.raw, &change) {
             Ok(next) => projected = next,
             Err(e) => println!("        the line will not be rewritten: {e}"),
+        }
+    }
+    let mut promoted: BTreeSet<String> = BTreeSet::new();
+    for placed in &layout.items {
+        if let Some(base) = layout
+            .base_for(placed)
+            .filter(|b| !b.eq_ignore_ascii_case(default))
+        {
+            if promoted.insert(base.clone()) {
+                println!(
+                    "  `{base}` is promoted to `{default}` in one pull request once its last item \
+                     is ticked, which spar opens and never merges"
+                );
+            }
         }
     }
 
@@ -1310,6 +2202,136 @@ fn diff(before: &str, after: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PLANNED: &str = "\
+Splice assets in five sections.
+<!-- spar: tracker order=sequential title=\"Step {n} of #{tracker}: {sentence}\" bogus=1 -->
+
+## Rules every step keeps
+
+No release between two steps.
+
+### D. Splicing
+<!-- spar: base=feat/asset-splicing -->
+Splicing lands on its own branch.
+
+- [x] **Step 14.** Splice out. Done in #2140, on `feat/asset-splicing`.
+- [ ] **Step 15.** A splice of an asset channel. Fund-relevant. #2142
+- [ ] **Step 16.** Dual funding. #2143
+
+### E. Later
+- [ ] **Step 17.** A decision, written down here. <!-- spar: decision -->
+";
+
+    #[test]
+    fn a_tracker_is_read_as_sections_directives_and_placed_items() {
+        let layout = Layout::read(PLANNED);
+        assert_eq!("Splice assets in five sections.", layout.intro);
+        assert_eq!(Order::Sequential, layout.order());
+        assert!(layout.directives.tracker);
+        assert_eq!(1, layout.warnings().len(), "{:?}", layout.warnings());
+        assert_eq!(4, layout.items.len());
+        let step15 = &layout.items[1];
+        assert_eq!(15, step15.step());
+        assert_eq!(Some("D. Splicing"), layout.section_name(step15));
+        assert_eq!(
+            Some("feat/asset-splicing".to_string()),
+            layout.base_for(step15)
+        );
+        assert_eq!(None, layout.base_for(&layout.items[3]));
+        assert!(layout.items[3].directives.decision);
+        assert_eq!(
+            "Step 15 of the checklist in #2098, section D. The tracker's rules apply.",
+            layout.place(step15, 2098)
+        );
+        // Step 16 waits for 15, and 15 for nothing checked.
+        assert_eq!(1, layout.blockers(&layout.items[2]).len());
+        assert!(layout.blockers(step15).is_empty());
+    }
+
+    #[test]
+    fn a_childs_context_carries_the_tracker_outside_its_checklist() {
+        let layout = Layout::read(PLANNED);
+        let context = layout.context(&layout.items[1], 2098, &["earlier".to_string()]);
+        for part in [
+            "Splice assets in five sections.",
+            "Rules every step keeps",
+            "No release between two steps.",
+            "D. Splicing",
+            "Splicing lands on its own branch.",
+            "**Step 15.** A splice of an asset channel",
+            "earlier",
+        ] {
+            assert!(context.contains(part), "missing {part}:\n{context}");
+        }
+        assert!(!context.contains("spar:"), "{context}");
+    }
+
+    #[test]
+    fn independent_order_starts_everything_and_sequential_stops_at_a_hold() {
+        let item = |text: &str| parse(&format!("- [ ] {text}\n")).remove(0);
+        let steps = vec![
+            Step {
+                item: item("one"),
+                action: Action::File,
+            },
+            Step {
+                item: item("two"),
+                action: Action::Decide,
+            },
+            Step {
+                item: item("three"),
+                action: Action::File,
+            },
+        ];
+        let (worked, stop) = in_order(&Layout::read("- [ ] one\n"), &steps);
+        assert_eq!(1, worked.len());
+        assert_eq!(Some(Action::Decide), stop.map(|s| s.action.clone()));
+        let independent = Layout::read("<!-- spar: order=independent -->\n- [ ] one\n");
+        let (worked, stop) = in_order(&independent, &steps);
+        assert_eq!(3, worked.len());
+        assert!(stop.is_none());
+    }
+
+    #[test]
+    fn a_landed_record_ticks_and_appends_in_one_edit() {
+        let body = "Intro\n- [ ] **Step 15.** Splice. #2142\n- [ ] next\n";
+        let change = Change::Done(record(2150, "feat/asset-splicing", "master"));
+        let out = rewrite(body, "- [ ] **Step 15.** Splice. #2142", &change).unwrap();
+        assert_eq!(
+            "Intro\n- [x] **Step 15.** Splice. #2142 Done in #2150, on `feat/asset-splicing`.\n- [ ] next\n",
+            out
+        );
+        assert_eq!("Done in #7.", record(7, "main", "main"));
+        let ticked = parse(&out).remove(0);
+        assert_eq!(Some(2150), landed_by(&ticked, HOME));
+    }
+
+    #[test]
+    fn a_title_follows_the_trackers_template() {
+        let sentence =
+            sentence_of("**Step 15.** A splice of an asset channel. Fund-relevant. #2142");
+        assert_eq!("A splice of an asset channel", sentence);
+        assert_eq!(
+            "Step 15 of #2098: A splice of an asset channel",
+            title_from(
+                "Step {n} of #{tracker}: {sentence}",
+                15,
+                2098,
+                "D",
+                &sentence
+            )
+        );
+    }
+
+    #[test]
+    fn a_directive_reads_quoted_values_and_rejects_a_bad_branch() {
+        let read = Directives::read(r#" check="npm run a && npm run b" base=../x decision"#);
+        assert_eq!(Some("npm run a && npm run b".to_string()), read.check);
+        assert_eq!(None, read.base);
+        assert!(read.decision);
+        assert_eq!(1, read.warnings.len());
+    }
 
     #[test]
     fn a_criterion_line_that_moved_out_or_doubled_is_not_ticked_and_says_why() {

@@ -10050,6 +10050,40 @@ case "$1 $2" in
     if [ "${SPAR_CODE_MODE:-}" != queued ]; then touch "$SPAR_CODE_DIR/pr-merged"; fi
     ;;
   "pr list")
+    case "${SPAR_CODE_MODE:-}:$*" in
+      "other-base:pr list --head issue-42 --state open --json number,url,title,baseRefName")
+        printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Older export","baseRefName":"feat/old"}]'
+        exit 0
+        ;;
+      "branch-lookup-failure:pr list --head issue-42 --state open --json "* \
+      | "unreachable-then-linked:pr list --head issue-42 --state open --json "*)
+        printf '%s\n' 'HTTP 502: Bad Gateway' >&2
+        exit 1
+        ;;
+      "unreachable-then-linked:pr list --state open --limit "*)
+        printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Older export","baseRefName":"feat/old","closingIssuesReferences":[]}]'
+        exit 0
+        ;;
+      "closed-and-open:pr list --head issue-42 --state all --json "* \
+      | "fork-closed-and-open:pr list --head issue-42 --state all --json "*)
+        printf '%s\n' '[{"number":70,"state":"CLOSED"},{"number":71,"state":"OPEN"}]'
+        exit 0
+        ;;
+      "linked-other-base:pr list --state open --limit "*)
+        printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Export","baseRefName":"main","closingIssuesReferences":[{"number":42}]}]'
+        exit 0
+        ;;
+      "open-pr-holds:pr list --head issue-42 --state all --json "* \
+      | "other-base:pr list --head issue-42 --state all --json "* \
+      | "branch-lookup-failure:pr list --head issue-42 --state all --json "*)
+        printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Older export","state":"OPEN"}]'
+        exit 0
+        ;;
+      "closed-pr-holds:pr list --head issue-42 --state all --json "*)
+        printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Older export","state":"CLOSED"}]'
+        exit 0
+        ;;
+    esac
     if [ -f "$SPAR_CODE_DIR/pr-created" ]; then
       printf '%s\n' '[{"number":43,"url":"https://github.com/example/project/pull/43","title":"Add CSV export","baseRefName":"main"}]'
     else
@@ -10074,9 +10108,27 @@ case "$1 $2" in
     esac
     ;;
   "pr comment"|"issue comment") : ;;
-  "repo view") printf '%s\n' '{"name":"project"}' ;;
+  "repo view")
+    if [ "${SPAR_CODE_MODE:-}" = unreachable-then-linked ]; then
+      printf '%s\n' 'HTTP 502: Bad Gateway' >&2
+      exit 1
+    fi
+    printf '%s\n' '{"name":"project"}'
+    ;;
   "api repos/{owner}/{repo}/issues/42") printf '%s\n' 'issue' ;;
   "api --paginate") printf '%s\n' '[]' ;;
+  "api repos/{owner}/{repo}"|"api graphql")
+    if [ "${SPAR_CODE_MODE:-}" != fork-closed-and-open ]; then
+      printf 'unexpected gh call: %s\n' "$*" >&2
+      exit 64
+    fi
+    if [ "$2" = graphql ]; then
+      printf '[{"nameWithOwner":"someone/project","owner":{"login":"someone"},"sshUrl":"%s","url":"%s"}]\n' \
+        "$SPAR_CODE_DIR/fork.git" "$SPAR_CODE_DIR/fork.git"
+    else
+      printf '%s\n' false
+    fi
+    ;;
   *) printf 'unexpected gh call: %s\n' "$*" >&2; exit 64 ;;
 esac
 "#,
@@ -10170,6 +10222,248 @@ esac
     fn log(&self, file: &str) -> String {
         std::fs::read_to_string(self.fx.dir.join(file)).unwrap_or_default()
     }
+
+    /// `spar run 42` rather than `spar code`, for issue 42 as already filed.
+    fn run_issue(&self, extra: &[&str], mode: &str) -> (bool, String, String) {
+        let mut args = vec![
+            "run",
+            "42",
+            "--config",
+            self.config.to_str().unwrap(),
+            "--repo",
+            self.fx.work.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        let vars = [
+            ("PATH", self.path.as_str()),
+            ("SPAR_CODE_DIR", self.fx.dir.to_str().unwrap()),
+            ("SPAR_CODE_DRAFT", ""),
+            ("SPAR_CODE_MODE", mode),
+        ];
+        spar_with_env(&args, &self.fx.dir, &vars)
+    }
+
+    /// Publish a commit as `issue-42` on origin, the way an earlier run's pull
+    /// request would have left it, also as `refs/pull/70/head`.
+    fn publish_issue_branch(&self) -> String {
+        let work = &self.fx.work;
+        git(work, &["checkout", "-q", "-b", "earlier-42"]);
+        commit(
+            work,
+            "earlier.txt",
+            "earlier round\n",
+            "earlier round of 42",
+        );
+        git(work, &["push", "-q", "origin", "HEAD:refs/heads/issue-42"]);
+        git(work, &["push", "-q", "origin", "HEAD:refs/pull/70/head"]);
+        git(work, &["checkout", "-q", "main"]);
+        git(work, &["branch", "-q", "-D", "earlier-42"]);
+        self.origin_issue_branch()
+    }
+
+    fn origin_issue_branch(&self) -> String {
+        git(
+            &self.fx.work,
+            &["ls-remote", "origin", "refs/heads/issue-42"],
+        )
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn run_refuses_an_issue_whose_branch_is_open_into_another_base() {
+    let test = CodeFixture::new();
+    let before = test.publish_issue_branch();
+
+    let (ok, out, err) = test.run_issue(&[], "other-base");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(
+        said.contains(
+            "#42 already has pull request #70 open from `issue-42` into `feat/old`, not \
+             `main`. Retarget it, close it, or run `spar resume 70`."
+        ),
+        "{said}"
+    );
+    assert!(!test.log("stages.log").contains("implement:"), "{said}");
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_refuses_when_the_any_base_lookup_fails() {
+    let test = CodeFixture::new();
+    let before = test.publish_issue_branch();
+
+    let (ok, out, err) = test.run_issue(&[], "branch-lookup-failure");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(
+        said.contains("could not check whether a pull request already exists for #42"),
+        "{said}"
+    );
+    assert!(said.contains("HTTP 502"), "{said}");
+    assert!(!test.log("stages.log").contains("implement:"), "{said}");
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_reports_a_linked_pr_on_another_base_instead_of_resuming_it() {
+    let test = CodeFixture::new();
+    git(
+        &test.fx.work,
+        &["push", "-q", "origin", "main:refs/heads/feat/old"],
+    );
+
+    let (ok, out, err) = test.run_issue(&["--base", "feat/old"], "linked-other-base");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(
+        said.contains(
+            "#42 already has pull request #70 open into `main`, not `feat/old`. Retarget it, \
+             close it, or run `spar resume 70`."
+        ),
+        "{said}"
+    );
+    assert!(!test.log("stages.log").contains("implement:"), "{said}");
+    let calls = test.log("gh.log");
+    assert!(!calls.contains("pr create"), "{calls}");
+    assert!(!calls.contains("pr merge"), "{calls}");
+}
+
+/// An open pull request's `refs/pull/N/head` follows its branch, so it keeps
+/// nothing safe from the force push a rebuild would end with.
+#[cfg(unix)]
+#[test]
+fn an_open_pull_request_does_not_let_the_issue_branch_be_rebuilt() {
+    let test = CodeFixture::new();
+    let before = test.publish_issue_branch();
+
+    let (ok, out, err) = test.run_issue(&[], "open-pr-holds");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(
+        said.contains("origin/issue-42 already has 1 commit(s) that are not on main"),
+        "{said}"
+    );
+    assert!(!test.log("stages.log").contains("implement:"), "{said}");
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_closed_pull_request_still_lets_the_issue_branch_be_rebuilt() {
+    let test = CodeFixture::new();
+    test.publish_issue_branch();
+
+    let (_, out, err) = test.run_issue(&[], "closed-pr-holds");
+
+    let said = format!("{out}{err}");
+    assert!(
+        !said.contains("no pull request accounts for them"),
+        "{said}"
+    );
+    assert!(test.log("stages.log").contains("implement:"), "{said}");
+}
+
+/// #71 opened after the first lookup, and closed #70 holds the same tip.
+#[cfg(unix)]
+#[test]
+fn a_closed_pull_request_does_not_cover_for_an_open_one_on_the_same_branch() {
+    let test = CodeFixture::new();
+    let before = test.publish_issue_branch();
+
+    let (ok, out, err) = test.run_issue(&[], "closed-and-open");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(said.contains("pull request #71 is open from it"), "{said}");
+    assert!(!test.log("stages.log").contains("implement:"), "{said}");
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+/// Origin refuses pushes, so the branch would go to the fork, where closed
+/// #70 and open #71 share its tip.
+#[cfg(unix)]
+#[test]
+fn a_closed_pull_request_does_not_cover_for_an_open_one_on_the_fork() {
+    let test = CodeFixture::new();
+    let fork = test.fx.dir.join("fork.git");
+    std::fs::create_dir_all(&fork).unwrap();
+    git(&fork, &["init", "-q", "--bare", "-b", "main"]);
+    let work = &test.fx.work;
+    git(work, &["checkout", "-q", "-b", "earlier-42"]);
+    commit(
+        work,
+        "earlier.txt",
+        "earlier round\n",
+        "earlier round of 42",
+    );
+    git(
+        work,
+        &[
+            "push",
+            "-q",
+            fork.to_str().unwrap(),
+            "HEAD:refs/heads/issue-42",
+        ],
+    );
+    git(work, &["push", "-q", "origin", "HEAD:refs/pull/70/head"]);
+    let before = git(work, &["rev-parse", "HEAD"]);
+    git(work, &["checkout", "-q", "main"]);
+    git(work, &["branch", "-q", "-D", "earlier-42"]);
+
+    let (ok, out, err) = test.run_issue(&[], "fork-closed-and-open");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(
+        said.contains("the fork someone/project already has issue-42"),
+        "{said}"
+    );
+    assert!(said.contains("pull request #71 is open from it"), "{said}");
+    assert!(!test.log("stages.log").contains("implement:"), "{said}");
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, git(&fork, &["rev-parse", "issue-42"]), "{said}");
+}
+
+/// The branch lookup and `repo view` fail, then the linked lookup is answered
+/// without the pull request open from `issue-42` into `feat/old`.
+#[cfg(unix)]
+#[test]
+fn a_later_answer_overrules_reading_a_failed_lookup_as_unreachable() {
+    let test = CodeFixture::new();
+    git(
+        &test.fx.work,
+        &["push", "-q", "origin", "main:refs/heads/issue-42"],
+    );
+    let before = test.origin_issue_branch();
+
+    let (ok, out, err) = test.run_issue(&[], "unreachable-then-linked");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(
+        said.contains("could not check whether a pull request already exists for #42"),
+        "{said}"
+    );
+    assert!(said.contains("HTTP 502"), "{said}");
+    assert!(!test.log("stages.log").contains("implement:"), "{said}");
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
 }
 
 const CODE_DRAFT: &str = r###"{"title":"Add CSV export","body":"## Context\nRows cannot be exported.\n\n## Requested behavior\nExport the current rows as CSV.\n\n## Acceptance criteria\n- [ ] Preserve column order.\n\n## Test plan\nCheck an export with quoted fields."}"###;

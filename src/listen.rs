@@ -1459,10 +1459,7 @@ fn facts(
         }
         ItemKind::Issue => {
             let issue = repo.read_issue(number)?;
-            let open_pr = repo
-                .try_open_pr_for_issue(number, cfg.base_branch())
-                .ok()
-                .flatten();
+            let open_pr = repo.try_open_pr_for_issue(number, cfg.base_branch())?;
             let linked = open_pr.as_ref().and_then(|pr| {
                 repo.read_review_record(pr.number)
                     .filter(|r| r.posted)

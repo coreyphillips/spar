@@ -1242,29 +1242,96 @@ fn reconcile_pr_creation(
     }
 }
 
-fn pr_for_base(text: &str, branch: &str, base: &str) -> Result<Option<PrRef>> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Row {
-        number: i64,
-        #[serde(default)]
-        url: String,
-        #[serde(default)]
-        title: String,
-        base_ref_name: String,
-    }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BasedPrRow {
+    number: i64,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    title: String,
+    base_ref_name: String,
+}
 
-    let rows = serde_json::from_str::<Vec<Row>>(text.trim()).map_err(|e| {
-        spar_err!("unexpected pull request list for branch {branch} against {base}: {e}")
-    })?;
-    Ok(rows
-        .into_iter()
+impl BasedPrRow {
+    fn pr_ref(&self) -> PrRef {
+        PrRef {
+            number: self.number,
+            url: self.url.clone(),
+            title: self.title.clone(),
+        }
+    }
+}
+
+/// One row of `gh pr list --head <branch> --state all --json number,state`.
+#[derive(Deserialize)]
+struct BranchPr {
+    number: i64,
+    #[serde(default)]
+    state: String,
+}
+
+impl BranchPr {
+    /// Closed or merged, so its `refs/pull/N/head` no longer moves with the
+    /// branch. A missing state is not taken for either.
+    fn is_settled(&self) -> bool {
+        self.state.eq_ignore_ascii_case("CLOSED") || self.state.eq_ignore_ascii_case("MERGED")
+    }
+}
+
+fn based_pr_rows(text: &str, branch: &str) -> Result<Vec<BasedPrRow>> {
+    serde_json::from_str::<Vec<BasedPrRow>>(text.trim())
+        .map_err(|e| spar_err!("unexpected pull request list for branch {branch}: {e}"))
+}
+
+fn pr_for_base(text: &str, branch: &str, base: &str) -> Result<Option<PrRef>> {
+    Ok(based_pr_rows(text, branch)?
+        .iter()
         .find(|row| row.base_ref_name == base)
-        .map(|row| PrRef {
-            number: row.number,
-            url: row.url,
-            title: row.title,
-        }))
+        .map(BasedPrRow::pr_ref))
+}
+
+/// The open pull request from `branch` into `base`, out of every open one from
+/// `branch`. One open into any other base is an error, because it shares the
+/// branch: rebuilding the branch would force push over it, and resuming it
+/// would merge into a base this run did not mean.
+fn issue_branch_pr(text: &str, issue: i64, branch: &str, base: &str) -> Result<Option<PrRef>> {
+    let rows = based_pr_rows(text, branch)?;
+    if let Some(row) = rows.iter().find(|row| row.base_ref_name == base) {
+        return Ok(Some(row.pr_ref()));
+    }
+    match rows.first() {
+        Some(row) => Err(open_on_another_base(
+            issue,
+            row.number,
+            Some(branch),
+            &row.base_ref_name,
+            base,
+        )),
+        None => Ok(None),
+    }
+}
+
+fn refused_pr_lookup(issue: i64, e: &crate::error::SparError) -> crate::error::SparError {
+    spar_err!(
+        "could not check whether a pull request already exists for #{issue}: {}. Refusing to \
+         implement over the top of work that may already be open.",
+        e.last_line()
+    )
+}
+
+fn open_on_another_base(
+    issue: i64,
+    pr: i64,
+    head: Option<&str>,
+    pr_base: &str,
+    base: &str,
+) -> crate::error::SparError {
+    let from = head.map(|h| format!(" from `{h}`")).unwrap_or_default();
+    spar_err!(
+        "#{issue} already has pull request #{pr} open{from} into `{pr_base}`, not `{base}`. \
+         Retarget it, close it, or run `spar resume {pr}`."
+    )
 }
 
 /// Sign a comment spar composed, so it can be told from one the same account
@@ -2240,14 +2307,28 @@ impl Repo {
 
         if let Some(remote_ref) = self.refresh_issue_remote_ref(&branch)? {
             let ahead = self.commit_count_checked(&self.root, &remote_ref, base)?;
-            if ahead > 0 && !self.pull_request_holds(&branch, &remote_ref, base) {
-                bail!(
-                    "origin/{branch} already has {ahead} commit(s) that are not on {base}, and no \
-                     pull request accounts for them. Rebuilding it would force push over that \
-                     work.\nOpen a pull request for the branch and run `spar resume <pr>` to continue \
-                     it, or delete it with `git push origin --delete {branch}` if the remote \
-                     branch is no longer needed."
-                );
+            if ahead > 0 {
+                let prs = self.prs_for_branch(&branch);
+                // Whatever a closed one holds, the force push would still move
+                // the head of an open one.
+                if let Some(open) = prs.iter().find(|pr| !pr.is_settled()) {
+                    bail!(
+                        "origin/{branch} already has {ahead} commit(s) that are not on {base}, and \
+                         pull request #{n} is open from it. Rebuilding the branch would force push \
+                         over that pull request.\nRun `spar resume {n}` to continue it, or close it \
+                         first.",
+                        n = open.number
+                    );
+                }
+                if !self.settled_pr_holds(&prs, &remote_ref, base) {
+                    bail!(
+                        "origin/{branch} already has {ahead} commit(s) that are not on {base}, and \
+                         no pull request accounts for them. Rebuilding it would force push over \
+                         that work.\nOpen a pull request for the branch and run `spar resume <pr>` \
+                         to continue it, or delete it with `git push origin --delete {branch}` if \
+                         the remote branch is no longer needed."
+                    );
+                }
             }
         }
 
@@ -2344,17 +2425,25 @@ impl Repo {
         Ok(None)
     }
 
-    /// Whether a pull request from `branch` already holds every commit `refname`
-    /// has beyond `base`.
+    /// Whether a closed or merged pull request from `branch` already holds
+    /// every commit `refname` has beyond `base`.
     ///
     /// GitHub serves `refs/pull/N/head` for as long as the repository lives, so
     /// commits that reached a pull request outlive the branch they were pushed
     /// from. A matching branch name does not establish that on its own: an
     /// issue worked twice reuses the name, and the merged pull request from the
     /// first round says nothing about where the second round's commits are.
+    ///
+    /// An open pull request never counts. Its `refs/pull/N/head` follows the
+    /// branch, so the force push a rebuild ends with moves it too, and the
+    /// commits it held are left reachable from nothing.
     fn pull_request_holds(&self, branch: &str, refname: &str, base: &str) -> bool {
-        self.prs_for_branch(branch)
-            .iter()
+        self.settled_pr_holds(&self.prs_for_branch(branch), refname, base)
+    }
+
+    fn settled_pr_holds(&self, prs: &[BranchPr], refname: &str, base: &str) -> bool {
+        prs.iter()
+            .filter(|pr| pr.is_settled())
             .any(|pr| self.pr_head_holds(pr.number, refname, base))
     }
 
@@ -4671,9 +4760,24 @@ impl Repo {
         ])
         .map_err(unreadable)?;
         let ahead = self.commit_count_checked(&self.root, &local, base);
-        let held = matches!(ahead, Ok(0)) || self.pull_request_holds(branch, &local, base);
+        let prs = match ahead {
+            Ok(n) if n > 0 => self.prs_for_branch(branch),
+            _ => Vec::new(),
+        };
+        let held = matches!(ahead, Ok(0)) || self.settled_pr_holds(&prs, &local, base);
         self.git_try(&["update-ref", "-d", &local]);
         let ahead = ahead?;
+        // Whatever a closed one holds, the push would still move the head of
+        // an open one.
+        if let Some(open) = prs.iter().find(|pr| !pr.is_settled()) {
+            bail!(
+                "the fork {} already has {branch} with {ahead} commit(s) that are not on {base}, \
+                 and pull request #{n} is open from it. Publishing over it would force push over \
+                 that pull request.\nRun `spar resume {n}` to continue it, or close it first.",
+                fork.full_name,
+                n = open.number
+            );
+        }
         if !held {
             bail!(
                 "the fork {} already has {branch} with {ahead} commit(s) that are not on {base}, \
@@ -5266,8 +5370,18 @@ impl Repo {
     /// Every pull request opened from this branch, merged and closed ones
     /// included, because a commit is preserved by whichever one carries it and
     /// that is rarely the newest.
-    fn prs_for_branch(&self, branch: &str) -> Vec<PrRef> {
-        self.branch_prs(branch, "all")
+    fn prs_for_branch(&self, branch: &str) -> Vec<BranchPr> {
+        let text = self.gh_try(&[
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--json",
+            "number,state",
+        ]);
+        serde_json::from_str::<Vec<BranchPr>>(text.trim()).unwrap_or_default()
     }
 
     fn branch_prs(&self, branch: &str, state: &str) -> Vec<PrRef> {
@@ -5323,11 +5437,32 @@ impl Repo {
     /// two answers are not interchangeable: "no pull request exists" is the one
     /// that makes spar implement over the top of somebody's work and open a
     /// second pull request for the same issue.
+    ///
+    /// An open pull request for the issue on a base other than `base` is an
+    /// error too, naming it: neither resuming it nor building beside it is
+    /// what a run on `base` should do.
     pub fn try_open_pr_for_issue(&self, issue: i64, base: &str) -> Result<Option<PrRef>> {
-        let mine = self.pr_for_branch_failing_closed(&self.branch_for_issue(issue), base, issue)?;
-        if let Some(pr) = mine {
-            return Ok(Some(pr));
-        }
+        let branch = self.branch_for_issue(issue);
+        // Not `pr_for_branch`, which reads a failed lookup as no pull request.
+        let unanswered = match self.gh(&[
+            "pr",
+            "list",
+            "--head",
+            &branch,
+            "--state",
+            "open",
+            "--json",
+            "number,url,title,baseRefName",
+        ]) {
+            Ok(text) => match issue_branch_pr(&text, issue, &branch, base)? {
+                Some(pr) => return Ok(Some(pr)),
+                None => None,
+            },
+            Err(e) => {
+                self.unanswered_pr_lookup(issue, e.clone())?;
+                Some(e)
+            }
+        };
         let listed = match self.gh(&[
             "pr",
             "list",
@@ -5338,14 +5473,22 @@ impl Repo {
             "--json",
             "number,url,title,baseRefName,closingIssuesReferences",
         ]) {
-            Ok(text) => linked_pr_rows(&text).ok_or_else(|| {
-                spar_err!("could not read the pull request list while looking for #{issue}")
-            })?,
+            Ok(text) => {
+                // gh answered, so the repository can be reached after all, and
+                // the branch lookup's failure was not the case that only warns.
+                if let Some(e) = &unanswered {
+                    return Err(refused_pr_lookup(issue, e));
+                }
+                linked_pr_rows(&text).ok_or_else(|| {
+                    spar_err!("could not read the pull request list while looking for #{issue}")
+                })?
+            }
             Err(e) => return self.unanswered_pr_lookup(issue, e).map(|()| None),
         };
         if listed.len() >= FETCH_CEILING {
             logwarn!(
-                "#{issue}: the open pull request list filled its page of {FETCH_CEILING}, so a                  pull request past it cannot be seen from here."
+                "#{issue}: the open pull request list filled its page of {FETCH_CEILING}, so a \
+                 pull request past it cannot be seen from here."
             );
         }
         let default = self.default_branch(base);
@@ -5354,23 +5497,13 @@ impl Repo {
             // targeting the default branch, so on any other base the linkage is
             // silence rather than an answer.
             logwarn!(
-                "#{issue}: the base branch is `{base}` and the default is `{default}`. GitHub                  links closing issues only on the default branch, so an existing pull request                  for this issue may not be found. Name the pull request instead of the issue if                  there is one."
+                "#{issue}: the base branch is `{base}` and the default is `{default}`. GitHub \
+                 links closing issues only on the default branch, so an existing pull request \
+                 for this issue may not be found. Name the pull request instead of the issue if \
+                 there is one."
             );
         }
-        Ok(pick_linked_pr(&listed, issue))
-    }
-
-    /// spar's own branch, with a failed lookup kept as a failure.
-    fn pr_for_branch_failing_closed(
-        &self,
-        branch: &str,
-        base: &str,
-        issue: i64,
-    ) -> Result<Option<PrRef>> {
-        match self.try_pr_for_branch(branch, base) {
-            Ok(found) => Ok(found),
-            Err(e) => self.unanswered_pr_lookup(issue, e).map(|()| None),
-        }
+        linked_pr_on_base(&listed, issue, base)
     }
 
     /// What to do when GitHub would not say whether a pull request exists.
@@ -5383,11 +5516,7 @@ impl Repo {
     /// a `None`, so a run against a plain git remote behaves as it always did.
     fn unanswered_pr_lookup(&self, issue: i64, e: crate::error::SparError) -> Result<()> {
         if self.gh(&["repo", "view", "--json", "name"]).is_ok() {
-            return Err(spar_err!(
-                "could not check whether a pull request already exists for #{issue}: {}. \
-                 Refusing to implement over the top of work that may already be open.",
-                e.last_line()
-            ));
+            return Err(refused_pr_lookup(issue, &e));
         }
         logwarn!(
             "#{issue}: this repository could not be read through gh ({}), so spar cannot tell \
@@ -9378,7 +9507,25 @@ pub struct LinkedPrRow {
     #[serde(default)]
     title: String,
     #[serde(default)]
+    base_ref_name: String,
+    #[serde(default)]
     closing_issues_references: Vec<IssueRef>,
+}
+
+impl LinkedPrRow {
+    fn closes(&self, issue: i64) -> bool {
+        self.closing_issues_references
+            .iter()
+            .any(|linked| linked.number == issue)
+    }
+
+    fn pr_ref(&self) -> PrRef {
+        PrRef {
+            number: self.number,
+            url: self.url.clone(),
+            title: self.title.clone(),
+        }
+    }
 }
 
 /// The listed pull requests, or `None` when the payload could not be read.
@@ -9394,16 +9541,28 @@ pub fn linked_pr_rows(json: &str) -> Option<Vec<LinkedPrRow>> {
 /// Among the listed pull requests, the first that would close `issue`.
 pub fn pick_linked_pr(rows: &[LinkedPrRow], issue: i64) -> Option<PrRef> {
     rows.iter()
-        .find(|row| {
-            row.closing_issues_references
-                .iter()
-                .any(|linked| linked.number == issue)
-        })
-        .map(|row| PrRef {
-            number: row.number,
-            url: row.url.clone(),
-            title: row.title.clone(),
-        })
+        .find(|row| row.closes(issue))
+        .map(LinkedPrRow::pr_ref)
+}
+
+/// The listed pull request that would close `issue` into `base`. One that
+/// would close it into another base is an error naming it, because resuming
+/// it would merge into a base the run did not mean.
+pub fn linked_pr_on_base(rows: &[LinkedPrRow], issue: i64, base: &str) -> Result<Option<PrRef>> {
+    let linked = || rows.iter().filter(|row| row.closes(issue));
+    if let Some(row) = linked().find(|row| row.base_ref_name == base) {
+        return Ok(Some(row.pr_ref()));
+    }
+    match linked().next() {
+        Some(row) => Err(open_on_another_base(
+            issue,
+            row.number,
+            None,
+            &row.base_ref_name,
+            base,
+        )),
+        None => Ok(None),
+    }
 }
 
 /// Both halves together, for the tests that hold the real payload.
@@ -11214,6 +11373,43 @@ mod tests {
     }
 
     #[test]
+    fn an_issue_branch_pr_on_another_base_is_refused_by_name() {
+        let other = r#"[{"number":70,"url":"https://example.test/pull/70","title":"t","baseRefName":"feat/old"}]"#;
+        let error = issue_branch_pr(other, 43, "issue-43", "main").unwrap_err();
+        assert_eq!(
+            "#43 already has pull request #70 open from `issue-43` into `feat/old`, not `main`. \
+             Retarget it, close it, or run `spar resume 70`.",
+            error.to_string()
+        );
+
+        // One on the run's base is the one to continue, wherever else the
+        // branch is also open.
+        let both = r#"[{"number":70,"url":"u70","title":"t","baseRefName":"feat/old"},
+                       {"number":71,"url":"u71","title":"t","baseRefName":"main"}]"#;
+        let found = issue_branch_pr(both, 43, "issue-43", "main")
+            .unwrap()
+            .unwrap();
+        assert_eq!(71, found.number);
+
+        assert!(issue_branch_pr("[]", 43, "issue-43", "main")
+            .unwrap()
+            .is_none());
+        assert!(issue_branch_pr("gh: HTTP 502", 43, "issue-43", "main").is_err());
+    }
+
+    #[test]
+    fn only_a_closed_or_merged_pull_request_is_settled() {
+        let row = |state: &str| BranchPr {
+            number: 1,
+            state: state.into(),
+        };
+        assert!(row("CLOSED").is_settled());
+        assert!(row("MERGED").is_settled());
+        assert!(!row("OPEN").is_settled());
+        assert!(!row("").is_settled());
+    }
+
+    #[test]
     fn an_ambiguous_comment_is_success_when_the_exact_body_exists() {
         let result = reconcile_comment_post(
             34,
@@ -12450,6 +12646,27 @@ mod linked_pr_tests {
         let listed = linked_pr_rows(REAL_PAYLOAD).expect("the real payload reads");
         assert_eq!(3, listed.len());
         assert_eq!(14252, pick_linked_pr(&listed, 14238).unwrap().number);
+    }
+
+    #[test]
+    fn a_linked_pr_on_another_base_is_reported_not_returned() {
+        let listed = linked_pr_rows(
+            r#"[{"number":70,"url":"u70","title":"t","baseRefName":"main",
+                 "closingIssuesReferences":[{"number":43}]}]"#,
+        )
+        .unwrap();
+        let found = linked_pr_on_base(&listed, 43, "main").unwrap().unwrap();
+        assert_eq!(70, found.number);
+
+        let error = linked_pr_on_base(&listed, 43, "feat/old").unwrap_err();
+        assert_eq!(
+            "#43 already has pull request #70 open into `main`, not `feat/old`. Retarget it, \
+             close it, or run `spar resume 70`.",
+            error.to_string()
+        );
+        assert!(linked_pr_on_base(&listed, 44, "feat/old")
+            .unwrap()
+            .is_none());
     }
 
     /// A fork PR cannot be pushed to, so the flag has to survive parsing.

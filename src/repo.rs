@@ -4760,9 +4760,24 @@ impl Repo {
         ])
         .map_err(unreadable)?;
         let ahead = self.commit_count_checked(&self.root, &local, base);
-        let held = matches!(ahead, Ok(0)) || self.pull_request_holds(branch, &local, base);
+        let prs = match ahead {
+            Ok(n) if n > 0 => self.prs_for_branch(branch),
+            _ => Vec::new(),
+        };
+        let held = matches!(ahead, Ok(0)) || self.settled_pr_holds(&prs, &local, base);
         self.git_try(&["update-ref", "-d", &local]);
         let ahead = ahead?;
+        // Whatever a closed one holds, the push would still move the head of
+        // an open one.
+        if let Some(open) = prs.iter().find(|pr| !pr.is_settled()) {
+            bail!(
+                "the fork {} already has {branch} with {ahead} commit(s) that are not on {base}, \
+                 and pull request #{n} is open from it. Publishing over it would force push over \
+                 that pull request.\nRun `spar resume {n}` to continue it, or close it first.",
+                fork.full_name,
+                n = open.number
+            );
+        }
         if !held {
             bail!(
                 "the fork {} already has {branch} with {ahead} commit(s) that are not on {base}, \

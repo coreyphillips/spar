@@ -10064,7 +10064,8 @@ case "$1 $2" in
         printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Older export","baseRefName":"feat/old","closingIssuesReferences":[]}]'
         exit 0
         ;;
-      "closed-and-open:pr list --head issue-42 --state all --json "*)
+      "closed-and-open:pr list --head issue-42 --state all --json "* \
+      | "fork-closed-and-open:pr list --head issue-42 --state all --json "*)
         printf '%s\n' '[{"number":70,"state":"CLOSED"},{"number":71,"state":"OPEN"}]'
         exit 0
         ;;
@@ -10116,6 +10117,18 @@ case "$1 $2" in
     ;;
   "api repos/{owner}/{repo}/issues/42") printf '%s\n' 'issue' ;;
   "api --paginate") printf '%s\n' '[]' ;;
+  "api repos/{owner}/{repo}"|"api graphql")
+    if [ "${SPAR_CODE_MODE:-}" != fork-closed-and-open ]; then
+      printf 'unexpected gh call: %s\n' "$*" >&2
+      exit 64
+    fi
+    if [ "$2" = graphql ]; then
+      printf '[{"nameWithOwner":"someone/project","owner":{"login":"someone"},"sshUrl":"%s","url":"%s"}]\n' \
+        "$SPAR_CODE_DIR/fork.git" "$SPAR_CODE_DIR/fork.git"
+    else
+      printf '%s\n' false
+    fi
+    ;;
   *) printf 'unexpected gh call: %s\n' "$*" >&2; exit 64 ;;
 esac
 "#,
@@ -10380,6 +10393,51 @@ fn a_closed_pull_request_does_not_cover_for_an_open_one_on_the_same_branch() {
     assert!(!test.log("stages.log").contains("implement:"), "{said}");
     assert!(!test.log("gh.log").contains("pr create"), "{said}");
     assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+/// Origin refuses pushes, so the branch would go to the fork, where closed
+/// #70 and open #71 share its tip.
+#[cfg(unix)]
+#[test]
+fn a_closed_pull_request_does_not_cover_for_an_open_one_on_the_fork() {
+    let test = CodeFixture::new();
+    let fork = test.fx.dir.join("fork.git");
+    std::fs::create_dir_all(&fork).unwrap();
+    git(&fork, &["init", "-q", "--bare", "-b", "main"]);
+    let work = &test.fx.work;
+    git(work, &["checkout", "-q", "-b", "earlier-42"]);
+    commit(
+        work,
+        "earlier.txt",
+        "earlier round\n",
+        "earlier round of 42",
+    );
+    git(
+        work,
+        &[
+            "push",
+            "-q",
+            fork.to_str().unwrap(),
+            "HEAD:refs/heads/issue-42",
+        ],
+    );
+    git(work, &["push", "-q", "origin", "HEAD:refs/pull/70/head"]);
+    let before = git(work, &["rev-parse", "HEAD"]);
+    git(work, &["checkout", "-q", "main"]);
+    git(work, &["branch", "-q", "-D", "earlier-42"]);
+
+    let (ok, out, err) = test.run_issue(&[], "fork-closed-and-open");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(
+        said.contains("the fork someone/project already has issue-42"),
+        "{said}"
+    );
+    assert!(said.contains("pull request #71 is open from it"), "{said}");
+    assert!(!test.log("stages.log").contains("implement:"), "{said}");
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, git(&fork, &["rev-parse", "issue-42"]), "{said}");
 }
 
 /// The branch lookup and `repo view` fail, then the linked lookup is answered

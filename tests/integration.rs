@@ -10055,9 +10055,18 @@ case "$1 $2" in
         printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Older export","baseRefName":"feat/old"}]'
         exit 0
         ;;
-      "branch-lookup-failure:pr list --head issue-42 --state open --json "*)
+      "branch-lookup-failure:pr list --head issue-42 --state open --json "* \
+      | "unreachable-then-linked:pr list --head issue-42 --state open --json "*)
         printf '%s\n' 'HTTP 502: Bad Gateway' >&2
         exit 1
+        ;;
+      "unreachable-then-linked:pr list --state open --limit "*)
+        printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Older export","baseRefName":"feat/old","closingIssuesReferences":[]}]'
+        exit 0
+        ;;
+      "closed-and-open:pr list --head issue-42 --state all --json "*)
+        printf '%s\n' '[{"number":70,"state":"CLOSED"},{"number":71,"state":"OPEN"}]'
+        exit 0
         ;;
       "linked-other-base:pr list --state open --limit "*)
         printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Export","baseRefName":"main","closingIssuesReferences":[{"number":42}]}]'
@@ -10098,7 +10107,13 @@ case "$1 $2" in
     esac
     ;;
   "pr comment"|"issue comment") : ;;
-  "repo view") printf '%s\n' '{"name":"project"}' ;;
+  "repo view")
+    if [ "${SPAR_CODE_MODE:-}" = unreachable-then-linked ]; then
+      printf '%s\n' 'HTTP 502: Bad Gateway' >&2
+      exit 1
+    fi
+    printf '%s\n' '{"name":"project"}'
+    ;;
   "api repos/{owner}/{repo}/issues/42") printf '%s\n' 'issue' ;;
   "api --paginate") printf '%s\n' '[]' ;;
   *) printf 'unexpected gh call: %s\n' "$*" >&2; exit 64 ;;
@@ -10348,6 +10363,49 @@ fn a_closed_pull_request_still_lets_the_issue_branch_be_rebuilt() {
         "{said}"
     );
     assert!(test.log("stages.log").contains("implement:"), "{said}");
+}
+
+/// #71 opened after the first lookup, and closed #70 holds the same tip.
+#[cfg(unix)]
+#[test]
+fn a_closed_pull_request_does_not_cover_for_an_open_one_on_the_same_branch() {
+    let test = CodeFixture::new();
+    let before = test.publish_issue_branch();
+
+    let (ok, out, err) = test.run_issue(&[], "closed-and-open");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(said.contains("pull request #71 is open from it"), "{said}");
+    assert!(!test.log("stages.log").contains("implement:"), "{said}");
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+/// The branch lookup and `repo view` fail, then the linked lookup is answered
+/// without the pull request open from `issue-42` into `feat/old`.
+#[cfg(unix)]
+#[test]
+fn a_later_answer_overrules_reading_a_failed_lookup_as_unreachable() {
+    let test = CodeFixture::new();
+    git(
+        &test.fx.work,
+        &["push", "-q", "origin", "main:refs/heads/issue-42"],
+    );
+    let before = test.origin_issue_branch();
+
+    let (ok, out, err) = test.run_issue(&[], "unreachable-then-linked");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(
+        said.contains("could not check whether a pull request already exists for #42"),
+        "{said}"
+    );
+    assert!(said.contains("HTTP 502"), "{said}");
+    assert!(!test.log("stages.log").contains("implement:"), "{said}");
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
 }
 
 const CODE_DRAFT: &str = r###"{"title":"Add CSV export","body":"## Context\nRows cannot be exported.\n\n## Requested behavior\nExport the current rows as CSV.\n\n## Acceptance criteria\n- [ ] Preserve column order.\n\n## Test plan\nCheck an export with quoted fields."}"###;

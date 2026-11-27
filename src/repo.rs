@@ -1312,6 +1312,14 @@ fn issue_branch_pr(text: &str, issue: i64, branch: &str, base: &str) -> Result<O
     }
 }
 
+fn refused_pr_lookup(issue: i64, e: &crate::error::SparError) -> crate::error::SparError {
+    spar_err!(
+        "could not check whether a pull request already exists for #{issue}: {}. Refusing to \
+         implement over the top of work that may already be open.",
+        e.last_line()
+    )
+}
+
 fn open_on_another_base(
     issue: i64,
     pr: i64,
@@ -2299,14 +2307,28 @@ impl Repo {
 
         if let Some(remote_ref) = self.refresh_issue_remote_ref(&branch)? {
             let ahead = self.commit_count_checked(&self.root, &remote_ref, base)?;
-            if ahead > 0 && !self.pull_request_holds(&branch, &remote_ref, base) {
-                bail!(
-                    "origin/{branch} already has {ahead} commit(s) that are not on {base}, and no \
-                     pull request accounts for them. Rebuilding it would force push over that \
-                     work.\nOpen a pull request for the branch and run `spar resume <pr>` to continue \
-                     it, or delete it with `git push origin --delete {branch}` if the remote \
-                     branch is no longer needed."
-                );
+            if ahead > 0 {
+                let prs = self.prs_for_branch(&branch);
+                // Whatever a closed one holds, the force push would still move
+                // the head of an open one.
+                if let Some(open) = prs.iter().find(|pr| !pr.is_settled()) {
+                    bail!(
+                        "origin/{branch} already has {ahead} commit(s) that are not on {base}, and \
+                         pull request #{n} is open from it. Rebuilding the branch would force push \
+                         over that pull request.\nRun `spar resume {n}` to continue it, or close it \
+                         first.",
+                        n = open.number
+                    );
+                }
+                if !self.settled_pr_holds(&prs, &remote_ref, base) {
+                    bail!(
+                        "origin/{branch} already has {ahead} commit(s) that are not on {base}, and \
+                         no pull request accounts for them. Rebuilding it would force push over \
+                         that work.\nOpen a pull request for the branch and run `spar resume <pr>` \
+                         to continue it, or delete it with `git push origin --delete {branch}` if \
+                         the remote branch is no longer needed."
+                    );
+                }
             }
         }
 
@@ -2416,8 +2438,11 @@ impl Repo {
     /// branch, so the force push a rebuild ends with moves it too, and the
     /// commits it held are left reachable from nothing.
     fn pull_request_holds(&self, branch: &str, refname: &str, base: &str) -> bool {
-        self.prs_for_branch(branch)
-            .iter()
+        self.settled_pr_holds(&self.prs_for_branch(branch), refname, base)
+    }
+
+    fn settled_pr_holds(&self, prs: &[BranchPr], refname: &str, base: &str) -> bool {
+        prs.iter()
             .filter(|pr| pr.is_settled())
             .any(|pr| self.pr_head_holds(pr.number, refname, base))
     }
@@ -5402,9 +5427,27 @@ impl Repo {
     /// error too, naming it: neither resuming it nor building beside it is
     /// what a run on `base` should do.
     pub fn try_open_pr_for_issue(&self, issue: i64, base: &str) -> Result<Option<PrRef>> {
-        if let Some(pr) = self.issue_branch_pr_failing_closed(issue, base)? {
-            return Ok(Some(pr));
-        }
+        let branch = self.branch_for_issue(issue);
+        // Not `pr_for_branch`, which reads a failed lookup as no pull request.
+        let unanswered = match self.gh(&[
+            "pr",
+            "list",
+            "--head",
+            &branch,
+            "--state",
+            "open",
+            "--json",
+            "number,url,title,baseRefName",
+        ]) {
+            Ok(text) => match issue_branch_pr(&text, issue, &branch, base)? {
+                Some(pr) => return Ok(Some(pr)),
+                None => None,
+            },
+            Err(e) => {
+                self.unanswered_pr_lookup(issue, e.clone())?;
+                Some(e)
+            }
+        };
         let listed = match self.gh(&[
             "pr",
             "list",
@@ -5415,9 +5458,16 @@ impl Repo {
             "--json",
             "number,url,title,baseRefName,closingIssuesReferences",
         ]) {
-            Ok(text) => linked_pr_rows(&text).ok_or_else(|| {
-                spar_err!("could not read the pull request list while looking for #{issue}")
-            })?,
+            Ok(text) => {
+                // gh answered, so the repository can be reached after all, and
+                // the branch lookup's failure was not the case that only warns.
+                if let Some(e) = &unanswered {
+                    return Err(refused_pr_lookup(issue, e));
+                }
+                linked_pr_rows(&text).ok_or_else(|| {
+                    spar_err!("could not read the pull request list while looking for #{issue}")
+                })?
+            }
             Err(e) => return self.unanswered_pr_lookup(issue, e).map(|()| None),
         };
         if listed.len() >= FETCH_CEILING {
@@ -5441,28 +5491,6 @@ impl Repo {
         linked_pr_on_base(&listed, issue, base)
     }
 
-    /// Every open pull request from spar's own branch for the issue, whatever
-    /// its base, with a failed lookup kept as a failure.
-    ///
-    /// Not `pr_for_branch`, which reads a failed lookup as no pull request.
-    fn issue_branch_pr_failing_closed(&self, issue: i64, base: &str) -> Result<Option<PrRef>> {
-        let branch = self.branch_for_issue(issue);
-        let listed = self.gh(&[
-            "pr",
-            "list",
-            "--head",
-            &branch,
-            "--state",
-            "open",
-            "--json",
-            "number,url,title,baseRefName",
-        ]);
-        match listed {
-            Ok(text) => issue_branch_pr(&text, issue, &branch, base),
-            Err(e) => self.unanswered_pr_lookup(issue, e).map(|()| None),
-        }
-    }
-
     /// What to do when GitHub would not say whether a pull request exists.
     ///
     /// An error, because "no pull request exists" is the answer that makes spar
@@ -5473,11 +5501,7 @@ impl Repo {
     /// a `None`, so a run against a plain git remote behaves as it always did.
     fn unanswered_pr_lookup(&self, issue: i64, e: crate::error::SparError) -> Result<()> {
         if self.gh(&["repo", "view", "--json", "name"]).is_ok() {
-            return Err(spar_err!(
-                "could not check whether a pull request already exists for #{issue}: {}. \
-                 Refusing to implement over the top of work that may already be open.",
-                e.last_line()
-            ));
+            return Err(refused_pr_lookup(issue, &e));
         }
         logwarn!(
             "#{issue}: this repository could not be read through gh ({}), so spar cannot tell \

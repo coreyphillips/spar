@@ -2407,10 +2407,51 @@ impl Repo {
             .trim()
             .to_string();
         let ahead = self.commit_count_checked(&self.root, &tip, base)?;
-        let prs = self.prs_for_branch(branch);
-        // Whatever a closed one holds, the force push would still move the
-        // head of an open one. A tip already on `base` is no exception: the
-        // pull request can be into another base.
+        let prs = self.refuse_open_pr(branch, base, ahead)?;
+        if ahead > 0 {
+            if !self.settled_pr_holds(&prs, &tip, base) {
+                bail!(
+                    "origin/{branch} already has {ahead} commit(s) that are not on {base}, and no \
+                     pull request accounts for them. Rebuilding it would force push over that \
+                     work.\nOpen a pull request for the branch and run `spar resume <pr>` to \
+                     continue it, or delete it with `git push origin --delete {branch}` if the \
+                     remote branch is no longer needed."
+                );
+            }
+            // Fetching the closed heads takes long enough for one to open.
+            self.refuse_open_pr(branch, base, ahead)?;
+        }
+        Ok(Some(tip))
+    }
+
+    /// Every pull request from `branch`, refused if one is open. Whatever a
+    /// closed one holds, the force push would still move the head of an open
+    /// one. A tip already on `base` is no exception: the pull request can be
+    /// into another base.
+    ///
+    /// A failed lookup is refused too, unless gh cannot reach the repository
+    /// at all, in which case there is no pull request to move.
+    fn refuse_open_pr(&self, branch: &str, base: &str, ahead: usize) -> Result<Vec<BranchPr>> {
+        let listed = self.gh(&[
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--json",
+            "number,state",
+        ]);
+        let prs = match listed {
+            Ok(text) => serde_json::from_str::<Vec<BranchPr>>(text.trim())
+                .map_err(|e| spar_err!("could not read pull requests for {branch}: {e}"))?,
+            Err(e) if self.gh_can_reach() => bail!(
+                "could not check whether a pull request is open from origin/{branch}: {}. \
+                 Refusing to force push over one that may be.",
+                e.last_line()
+            ),
+            Err(_) => Vec::new(),
+        };
         if let Some(open) = prs.iter().find(|pr| !pr.is_settled()) {
             bail!(
                 "origin/{branch} already has {ahead} commit(s) that are not on {base}, and pull \
@@ -2419,16 +2460,7 @@ impl Repo {
                 n = open.number
             );
         }
-        if ahead > 0 && !self.settled_pr_holds(&prs, &tip, base) {
-            bail!(
-                "origin/{branch} already has {ahead} commit(s) that are not on {base}, and no pull \
-                 request accounts for them. Rebuilding it would force push over that work.\nOpen a \
-                 pull request for the branch and run `spar resume <pr>` to continue it, or delete \
-                 it with `git push origin --delete {branch}` if the remote branch is no longer \
-                 needed."
-            );
-        }
-        Ok(Some(tip))
+        Ok(prs)
     }
 
     fn refresh_issue_remote_ref(&self, branch: &str) -> Result<Option<String>> {
@@ -4743,8 +4775,40 @@ impl Repo {
         let origin = PushTarget::Origin;
         // An empty lease makes the push a create, refused if the branch has
         // appeared since.
-        let lease = replaced.as_deref().unwrap_or("");
-        let refused = match self.git_push(cwd, &origin, branch, Some(lease)) {
+        let lease = format!(
+            "--force-with-lease=refs/heads/{branch}:{}",
+            replaced.as_deref().unwrap_or("")
+        );
+        let refspec = format!("HEAD:refs/heads/{branch}");
+        // Not `git_push`: a retry comes tens of seconds after the check, long
+        // enough for a pull request to open, so each wait ends by asking again.
+        let mut reopened = None;
+        let pushed = retry_transient_push(
+            &origin.describe(branch),
+            || {
+                self.git_at(Some(cwd), &["push", &lease, "origin", &refspec])
+                    .map(|_| ())
+            },
+            || self.remote_branch_is_head(cwd, "origin", branch),
+            &PUSH_RETRY_WAITS,
+            |wait| {
+                if proc::sleep_unless_interrupted(wait) {
+                    return true;
+                }
+                let Some(tip) = &replaced else {
+                    return false;
+                };
+                reopened = self
+                    .commit_count_checked(&self.root, tip, base)
+                    .and_then(|ahead| self.refuse_open_pr(branch, base, ahead))
+                    .err();
+                reopened.is_some()
+            },
+        );
+        if let Some(refusal) = reopened {
+            return self.record_write(Err(refusal));
+        }
+        let refused = match pushed {
             Ok(()) => return self.record_write(Ok(origin)),
             Err(e) if self.fork_when_denied && push_denial(&e.to_string()).is_some() => e,
             Err(e) => {
@@ -5590,11 +5654,7 @@ impl Repo {
     /// play, and every later write would fail anyway. That case is a warning and
     /// a `None`, so a run against a plain git remote behaves as it always did.
     fn unanswered_pr_lookup(&self, issue: i64, e: crate::error::SparError) -> Result<()> {
-        let probe = match self.gh(&["repo", "view", "--json", "name"]) {
-            Ok(_) => return Err(refused_pr_lookup(issue, &e)),
-            Err(probe) => probe,
-        };
-        if !gh_cannot_reach(&probe, self.gh_answered.load(Ordering::Relaxed)) {
+        if self.gh_can_reach() {
             return Err(refused_pr_lookup(issue, &e));
         }
         logwarn!(
@@ -5603,6 +5663,15 @@ impl Repo {
             e.last_line()
         );
         Ok(())
+    }
+
+    /// Whether gh can reach this repository's GitHub repository, asked after a
+    /// lookup failed. See `gh_cannot_reach`.
+    fn gh_can_reach(&self) -> bool {
+        match self.gh(&["repo", "view", "--json", "name"]) {
+            Ok(_) => true,
+            Err(probe) => !gh_cannot_reach(&probe, self.gh_answered.load(Ordering::Relaxed)),
+        }
     }
 
     pub fn pr_view(&self, number: i64) -> Result<PrView> {

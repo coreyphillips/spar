@@ -10098,7 +10098,17 @@ case "$1 $2" in
         printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Older export","state":"CLOSED"}]'
         exit 0
         ;;
-      "opened-during-implementation:pr list --head issue-42 --state all --json "*)
+      "publish-lookup-failure:pr list --head issue-42 --state all --json "*)
+        if [ -f "$SPAR_CODE_DIR/pr-71-opened" ]; then
+          printf '%s\n' 'HTTP 502: Bad Gateway' >&2
+          exit 1
+        fi
+        printf '%s\n' '[]'
+        exit 0
+        ;;
+      "opened-during-implementation:pr list --head issue-42 --state all --json "* \
+      | "opened-during-fetch:pr list --head issue-42 --state all --json "* \
+      | "opened-during-retry:pr list --head issue-42 --state all --json "*)
         if [ -f "$SPAR_CODE_DIR/pr-71-opened" ]; then
           printf '%s\n' '[{"number":70,"state":"CLOSED"},{"number":71,"state":"OPEN"}]'
         else
@@ -10106,7 +10116,10 @@ case "$1 $2" in
         fi
         exit 0
         ;;
-      "opened-during-implementation:pr list --head issue-42 --state open --json "*)
+      "opened-during-implementation:pr list --head issue-42 --state open --json "* \
+      | "publish-lookup-failure:pr list --head issue-42 --state open --json "* \
+      | "opened-during-fetch:pr list --head issue-42 --state open --json "* \
+      | "opened-during-retry:pr list --head issue-42 --state open --json "*)
         if [ -f "$SPAR_CODE_DIR/pr-71-opened" ]; then
           printf '%s\n' '[{"number":71,"url":"https://github.com/example/project/pull/71","title":"Older export","baseRefName":"feat/old"}]'
         else
@@ -10198,7 +10211,10 @@ case "$*" in
     ;;
   *"Implement GitHub issue #42"*)
     printf '%s\n' "implement:$1" >> "$SPAR_CODE_DIR/stages.log"
-    if [ "${SPAR_CODE_MODE:-}" = opened-during-implementation ]; then touch "$SPAR_CODE_DIR/pr-71-opened"; fi
+    touch "$SPAR_CODE_DIR/implemented"
+    case "${SPAR_CODE_MODE:-}" in
+      opened-during-implementation|publish-lookup-failure) touch "$SPAR_CODE_DIR/pr-71-opened" ;;
+    esac
     printf 'CSV export\n' > export.txt
     printf '%s\n' '{"summary":"Add CSV export","problem":"Rows cannot be exported","changes":["Export rows"],"testing":["Checked the fixture"],"notes":null,"criteria":[{"number":1,"status":"done","reason":"Columns keep their order"}]}'
     ;;
@@ -10315,6 +10331,24 @@ esac
         .next()
         .unwrap_or_default()
         .to_string()
+    }
+
+    /// A `git` that runs `cases`, a shell `case "$*"` body, before the real
+    /// one. `REAL_GIT` in it names the real one.
+    fn shim_git(&self, cases: &str) {
+        let real = Command::new("/bin/sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap();
+        assert!(real.status.success());
+        let real = String::from_utf8(real.stdout).unwrap();
+        let real = format!("'{}'", real.trim().replace('\'', "'\\''"));
+        let shim =
+            format!("#!/bin/sh\nset -eu\ncase \"$*\" in\n{cases}\nesac\nexec REAL_GIT \"$@\"\n");
+        executable(
+            &self.fx.dir.join("fake-bin/git"),
+            &shim.replace("REAL_GIT", &real),
+        );
     }
 }
 
@@ -10487,6 +10521,79 @@ fn a_pull_request_opened_during_implementation_on_a_tip_already_on_base_is_not_p
     assert!(!ok, "{out}\n{err}");
     let said = format!("{out}{err}");
     assert!(test.log("stages.log").contains("implement:"), "{said}");
+    assert!(said.contains("pull request #71 is open from it"), "{said}");
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+/// The old tip is on `main`, #71 opens during implementation, and the lookup
+/// before publishing fails with a 502.
+#[cfg(unix)]
+#[test]
+fn a_failed_pull_request_lookup_before_publishing_is_not_read_as_none_open() {
+    let test = CodeFixture::new();
+    let before = test.publish_issue_branch();
+    git(
+        &test.fx.work,
+        &["push", "-q", "origin", &format!("{before}:refs/heads/main")],
+    );
+
+    let (ok, out, err) = test.run_issue(&[], "publish-lookup-failure");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(test.log("stages.log").contains("implement:"), "{said}");
+    assert!(
+        said.contains("could not check whether a pull request is open from origin/issue-42"),
+        "{said}"
+    );
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+/// #71 opens while the publish check fetches closed #70's head.
+#[cfg(unix)]
+#[test]
+fn a_pull_request_opened_while_a_closed_head_is_fetched_is_not_published_over() {
+    let test = CodeFixture::new();
+    let before = test.publish_issue_branch();
+    test.shim_git(
+        r#"*refs/pull/70/head*)
+    if [ -f "$SPAR_CODE_DIR/implemented" ]; then touch "$SPAR_CODE_DIR/pr-71-opened"; fi
+    ;;"#,
+    );
+
+    let (ok, out, err) = test.run_issue(&[], "opened-during-fetch");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(test.log("stages.log").contains("implement:"), "{said}");
+    assert!(said.contains("pull request #71 is open from it"), "{said}");
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+/// The first push fails with a 502, and #71 opens before it is tried again.
+#[cfg(unix)]
+#[test]
+fn a_pull_request_opened_before_a_push_is_retried_is_not_published_over() {
+    let test = CodeFixture::new();
+    let before = test.publish_issue_branch();
+    test.shim_git(
+        r#"*"push --force-with-lease=refs/heads/issue-42:"*)
+    if [ ! -f "$SPAR_CODE_DIR/pr-71-opened" ]; then
+        touch "$SPAR_CODE_DIR/pr-71-opened"
+        printf '%s\n' 'error: RPC failed; HTTP 502 curl 22 The requested URL returned error: 502' >&2
+        exit 1
+    fi
+    ;;"#,
+    );
+
+    let (ok, out, err) = test.run_issue(&[], "opened-during-retry");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(said.contains("Pushing again in 10s"), "{said}");
     assert!(said.contains("pull request #71 is open from it"), "{said}");
     assert!(!test.log("gh.log").contains("pr create"), "{said}");
     assert_eq!(before, test.origin_issue_branch(), "{said}");

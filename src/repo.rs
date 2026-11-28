@@ -5867,15 +5867,22 @@ impl Repo {
     /// agent's opinion is not enough to close somebody's report.
     pub fn close_issue(&self, number: i64) -> Result<()> {
         let n = number.to_string();
+        let could_not_close = |e: crate::error::SparError| {
+            spar_err!(
+                "commented on #{number} but could not close it: {}",
+                e.last_line()
+            )
+        };
         let closed = match self.gh(&["issue", "close", &n, "--reason", "not planned"]) {
             Ok(_) => Ok(()),
-            // Older gh builds do not take --reason.
-            Err(_) => self.gh(&["issue", "close", &n]).map(|_| ()).map_err(|e| {
-                spar_err!(
-                    "commented on #{number} but could not close it: {}",
-                    e.last_line()
-                )
-            }),
+            // Older gh builds do not take --reason. Any other failure is not
+            // retried: the caller's pull request check predates it, and one
+            // may have opened since.
+            Err(e) if e.message().contains("unknown flag") => self
+                .gh(&["issue", "close", &n])
+                .map(|_| ())
+                .map_err(could_not_close),
+            Err(e) => Err(could_not_close(e)),
         };
         self.record_write(closed)
     }

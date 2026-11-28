@@ -1287,6 +1287,7 @@ fn work_issues(
         // a pull request on another base or one GitHub would not answer, is
         // that issue's result, and no agent is asked about it.
         let mut open_prs: BTreeMap<i64, PrRef> = BTreeMap::new();
+        let mut refused: BTreeSet<i64> = BTreeSet::new();
         let mut checked = Vec::with_capacity(fetched.len());
         for issue in fetched {
             match repo.try_open_pr_for_issue(issue.number, cfg.base_branch()) {
@@ -1304,6 +1305,7 @@ fn work_issues(
                     progress.add(1);
                     progress.finished(&run);
                     results.push(run);
+                    refused.insert(issue.number);
                 }
             }
         }
@@ -1342,7 +1344,7 @@ fn work_issues(
                 break;
             }
         };
-        let closed = act_on_plan(cfg, repo, &plan, &open_prs);
+        let closed = act_on_plan(cfg, repo, &plan, &open_prs, stopped);
         repo.remember_contested(&plan.contested);
         for item in &plan.contested {
             parked.push(format!(
@@ -1398,7 +1400,7 @@ fn work_issues(
             let Some(issue) = fetched.iter().find(|i| i.number == item.issue) else {
                 continue;
             };
-            if let Some(why) = held_back(item, &plan, &landed) {
+            if let Some(why) = held_back(item, &plan, &landed, &refused) {
                 log!("#{}: {why}", item.issue);
                 let mut held = IssueRun::new(item.issue, item.title.clone());
                 held.status = Status::Pending;
@@ -1478,10 +1480,24 @@ fn positions_of(known: &crate::model::Contested) -> String {
 ///
 /// Holding is the honest answer: the work is not there, and building on a base
 /// that lacks it spends a full issue's budget to find that out.
-fn held_back(item: &PlanItem, plan: &Plan, landed: &BTreeSet<i64>) -> Option<String> {
+///
+/// `refused` is the issues in this wave whose pull request lookup failed
+/// before triage. They are not in the plan, but they are not outside the run
+/// either.
+fn held_back(
+    item: &PlanItem,
+    plan: &Plan,
+    landed: &BTreeSet<i64>,
+    refused: &BTreeSet<i64>,
+) -> Option<String> {
     for dep in &item.depends_on {
         if landed.contains(dep) {
             continue;
+        }
+        if refused.contains(dep) {
+            return Some(format!(
+                "held back: #{dep}, which it depends on, was refused before triage"
+            ));
         }
         if plan.order.iter().any(|other| other.issue == *dep) {
             return Some(format!(
@@ -1898,6 +1914,7 @@ fn act_on_plan(
     repo: &Repo,
     plan: &Plan,
     open_prs: &BTreeMap<i64, PrRef>,
+    stopped: &mut Vec<String>,
 ) -> BTreeSet<i64> {
     let mut closed = BTreeSet::new();
     for item in &plan.skipped {
@@ -1926,7 +1943,10 @@ fn act_on_plan(
                     Err(e) => logdim!("could not update #{}: {e}", item.issue),
                 },
                 Ok(Some(pr)) => log!("  left #{} open, {} is open for it", item.issue, pr.url),
-                Err(e) => log!("  left #{} open: {e}", item.issue),
+                Err(e) => {
+                    log!("  left #{} open: {e}", item.issue);
+                    stopped.push(format!("#{} was not closed: {e}", item.issue));
+                }
             }
         }
     }
@@ -2947,14 +2967,14 @@ mod tests {
         };
         let mut landed = BTreeSet::new();
 
-        let why = held_back(&plan.order[1], &plan, &landed).expect("held");
+        let why = held_back(&plan.order[1], &plan, &landed, &BTreeSet::new()).expect("held");
         assert!(why.contains("#9"), "{why}");
         assert!(why.contains("has not merged"), "{why}");
-        assert!(held_back(&plan.order[0], &plan, &landed).is_none());
+        assert!(held_back(&plan.order[0], &plan, &landed, &BTreeSet::new()).is_none());
 
         // Merged is the only thing that puts the work on the base.
         landed.insert(9);
-        assert!(held_back(&plan.order[1], &plan, &landed).is_none());
+        assert!(held_back(&plan.order[1], &plan, &landed, &BTreeSet::new()).is_none());
     }
 
     /// The case the ordering stayed quietest about: a dependency nobody is
@@ -2971,7 +2991,13 @@ mod tests {
             }],
             ..Plan::default()
         };
-        let why = held_back(&declined.order[0], &declined, &BTreeSet::new()).expect("held");
+        let why = held_back(
+            &declined.order[0],
+            &declined,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect("held");
         assert!(why.contains("declined by both reviewers"), "{why}");
 
         let contested = Plan {
@@ -2985,7 +3011,13 @@ mod tests {
             }],
             ..Plan::default()
         };
-        let why = held_back(&contested.order[0], &contested, &BTreeSet::new()).expect("held");
+        let why = held_back(
+            &contested.order[0],
+            &contested,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect("held");
         assert!(why.contains("disagree about #9"), "{why}");
     }
 
@@ -2998,7 +3030,25 @@ mod tests {
             order: vec![planned(10, vec![900])],
             ..Plan::default()
         };
-        assert!(held_back(&plan.order[0], &plan, &BTreeSet::new()).is_none());
+        assert!(held_back(&plan.order[0], &plan, &BTreeSet::new(), &BTreeSet::new()).is_none());
+    }
+
+    /// Refused before triage, so it is in neither the plan nor the base.
+    #[test]
+    fn a_dependent_on_an_issue_refused_before_triage_is_held() {
+        let plan = Plan {
+            order: vec![planned(43, vec![42])],
+            ..Plan::default()
+        };
+        let why = held_back(
+            &plan.order[0],
+            &plan,
+            &BTreeSet::new(),
+            &BTreeSet::from([42]),
+        )
+        .expect("held");
+        assert!(why.contains("#42"), "{why}");
+        assert!(why.contains("refused before triage"), "{why}");
     }
 
     /// A disagreement is the one triage outcome that needs a person, and it

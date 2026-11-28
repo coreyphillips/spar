@@ -16,7 +16,7 @@ use crate::config::{self, Config};
 use crate::error::Result;
 use crate::followups;
 use crate::listen;
-use crate::model::{Issue, IssueRun, ItemKind, Plan, PlanItem, Status};
+use crate::model::{Issue, IssueRun, ItemKind, Plan, PlanItem, PrRef, Status};
 use crate::proc::{self, ExecOpts};
 use crate::progress::Progress;
 use crate::repo::{Repo, WriteSummary};
@@ -1282,6 +1282,35 @@ fn work_issues(
                 continue;
             }
         };
+        // Asked before triage, because a declined issue is commented on and
+        // closed before `run_nth_issue` would look. A lookup that refuses, for
+        // a pull request on another base or one GitHub would not answer, is
+        // that issue's result, and no agent is asked about it.
+        let mut open_prs: BTreeMap<i64, PrRef> = BTreeMap::new();
+        let mut checked = Vec::with_capacity(fetched.len());
+        for issue in fetched {
+            match repo.try_open_pr_for_issue(issue.number, cfg.base_branch()) {
+                Ok(found) => {
+                    if let Some(pr) = found {
+                        open_prs.insert(issue.number, pr);
+                    }
+                    checked.push(issue);
+                }
+                Err(e) => {
+                    log!("#{} failed: {e}", issue.number);
+                    let mut run = IssueRun::new(issue.number, issue.title.clone());
+                    run.status = Status::Error;
+                    run.notes.push(e.to_string());
+                    progress.add(1);
+                    progress.finished(&run);
+                    results.push(run);
+                }
+            }
+        }
+        let fetched = checked;
+        if fetched.is_empty() {
+            continue;
+        }
         // Named for the order the plans were written in, so the first is
         // plan.json exactly as before and no two waves overwrite each other.
         let plan_path = if plans_written == 0 {
@@ -1313,7 +1342,7 @@ fn work_issues(
                 break;
             }
         };
-        act_on_plan(cfg, repo, &plan);
+        act_on_plan(cfg, repo, &plan, &open_prs);
         repo.remember_contested(&plan.contested);
         for item in &plan.contested {
             parked.push(format!(
@@ -1324,11 +1353,16 @@ fn work_issues(
         }
         for item in &plan.skipped {
             let what = if item.tracker {
-                "left open as a tracker"
+                "left open as a tracker".to_string()
+            } else if let Some(pr) = open_prs.get(&item.issue) {
+                format!(
+                    "commented on and left open since pull request #{} is open for it",
+                    pr.number
+                )
             } else if cfg.loop_cfg.close_skipped {
-                "commented on and closed"
+                "commented on and closed".to_string()
             } else {
-                "commented on and left open"
+                "commented on and left open".to_string()
             };
             parked.push(format!(
                 "#{} skipped by both reviewers, {what}: {}",
@@ -1854,10 +1888,15 @@ fn make_plan(
 /// somebody recorded against are the reason the issue exists. spar closed a
 /// real one as "not planned" while all three of its subtasks were open, which
 /// is what this exists to stop.
-fn act_on_plan(cfg: &Config, repo: &Repo, plan: &Plan) {
+///
+/// Nor is an issue in `open_prs`, which maps an issue to the pull request open
+/// for it. Closing it as not planned leaves that pull request open against an
+/// issue that says it will not be done.
+fn act_on_plan(cfg: &Config, repo: &Repo, plan: &Plan, open_prs: &BTreeMap<i64, PrRef>) {
     for item in &plan.skipped {
         let body = review::skip_comment(item, &repo.style);
-        let close = cfg.loop_cfg.close_skipped && !item.tracker;
+        let open_pr = open_prs.get(&item.issue);
+        let close = cfg.loop_cfg.close_skipped && !item.tracker && open_pr.is_none();
         let outcome = if close {
             repo.close_issue(item.issue, &body)
         } else {
@@ -1871,7 +1910,11 @@ fn act_on_plan(cfg: &Config, repo: &Repo, plan: &Plan) {
                     item.issue
                 )
             }
-            Ok(()) => {}
+            Ok(()) => {
+                if let Some(pr) = open_pr {
+                    log!("  left #{} open, {} is open for it", item.issue, pr.url)
+                }
+            }
             Err(e) => logdim!("could not update #{}: {e}", item.issue),
         }
     }

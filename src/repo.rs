@@ -5526,7 +5526,7 @@ impl Repo {
             "--limit",
             &FETCH_CEILING.to_string(),
             "--json",
-            "number,url,title,baseRefName,closingIssuesReferences",
+            "number,url,title,baseRefName,closingIssuesReferences,headRefName",
         ]) {
             Ok(text) => {
                 // gh answered, so the repository can be reached after all, and
@@ -5558,7 +5558,7 @@ impl Repo {
                  there is one."
             );
         }
-        linked_pr_on_base(&listed, issue, base)
+        linked_pr_on_base(&listed, issue, &branch, base)
     }
 
     /// What to do when GitHub would not say whether a pull request exists.
@@ -5861,22 +5861,28 @@ impl Repo {
         self.record_write(result)
     }
 
-    /// Comment, then close as not planned.
+    /// Close as not planned, once the caller has commented with the reasoning.
     ///
     /// Only ever called when both agents independently declined the issue: one
     /// agent's opinion is not enough to close somebody's report.
-    pub fn close_issue(&self, number: i64, body: &str) -> Result<()> {
-        self.comment_issue(number, body)?;
+    pub fn close_issue(&self, number: i64) -> Result<()> {
         let n = number.to_string();
+        let could_not_close = |e: crate::error::SparError| {
+            spar_err!(
+                "commented on #{number} but could not close it: {}",
+                e.last_line()
+            )
+        };
         let closed = match self.gh(&["issue", "close", &n, "--reason", "not planned"]) {
             Ok(_) => Ok(()),
-            // Older gh builds do not take --reason.
-            Err(_) => self.gh(&["issue", "close", &n]).map(|_| ()).map_err(|e| {
-                spar_err!(
-                    "commented on #{number} but could not close it: {}",
-                    e.last_line()
-                )
-            }),
+            // Older gh builds do not take --reason. Any other failure is not
+            // retried: the caller's pull request check predates it, and one
+            // may have opened since.
+            Err(e) if e.message().contains("unknown flag") => self
+                .gh(&["issue", "close", &n])
+                .map(|_| ())
+                .map_err(could_not_close),
+            Err(e) => Err(could_not_close(e)),
         };
         self.record_write(closed)
     }
@@ -9556,7 +9562,7 @@ pub fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<
     write_text_atomic(path, &serde_json::to_string_pretty(value)?)
 }
 
-/// One row of `gh pr list --json number,url,title,baseRefName,closingIssuesReferences`.
+/// One row of `gh pr list --json number,url,title,baseRefName,closingIssuesReferences,headRefName`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LinkedPrRow {
@@ -9569,6 +9575,8 @@ pub struct LinkedPrRow {
     base_ref_name: String,
     #[serde(default)]
     closing_issues_references: Vec<IssueRef>,
+    #[serde(default)]
+    head_ref_name: String,
 }
 
 impl LinkedPrRow {
@@ -9607,8 +9615,19 @@ pub fn pick_linked_pr(rows: &[LinkedPrRow], issue: i64) -> Option<PrRef> {
 /// The listed pull request that would close `issue` into `base`. One that
 /// would close it into another base is an error naming it, because resuming
 /// it would merge into a base the run did not mean.
-pub fn linked_pr_on_base(rows: &[LinkedPrRow], issue: i64, base: &str) -> Result<Option<PrRef>> {
-    let linked = || rows.iter().filter(|row| row.closes(issue));
+///
+/// One from `branch` counts as well. It may have opened after the branch's own
+/// lookup, and a closing reference is not required of it.
+pub fn linked_pr_on_base(
+    rows: &[LinkedPrRow],
+    issue: i64,
+    branch: &str,
+    base: &str,
+) -> Result<Option<PrRef>> {
+    let linked = || {
+        rows.iter()
+            .filter(|row| row.closes(issue) || row.head_ref_name == branch)
+    };
     if let Some(row) = linked().find(|row| row.base_ref_name == base) {
         return Ok(Some(row.pr_ref()));
     }
@@ -12749,16 +12768,36 @@ mod linked_pr_tests {
                  "closingIssuesReferences":[{"number":43}]}]"#,
         )
         .unwrap();
-        let found = linked_pr_on_base(&listed, 43, "main").unwrap().unwrap();
+        let found = linked_pr_on_base(&listed, 43, "issue-43", "main")
+            .unwrap()
+            .unwrap();
         assert_eq!(70, found.number);
 
-        let error = linked_pr_on_base(&listed, 43, "feat/old").unwrap_err();
+        let error = linked_pr_on_base(&listed, 43, "issue-43", "feat/old").unwrap_err();
         assert_eq!(
             "#43 already has pull request #70 open into `main`, not `feat/old`. Retarget it, \
              close it, or run `spar resume 70`.",
             error.to_string()
         );
-        assert!(linked_pr_on_base(&listed, 44, "feat/old")
+        assert!(linked_pr_on_base(&listed, 44, "issue-44", "feat/old")
+            .unwrap()
+            .is_none());
+    }
+
+    /// Opened from the issue's branch after the branch lookup, and with no
+    /// closing reference in its body.
+    #[test]
+    fn a_pr_from_the_issue_branch_counts_without_a_closing_reference() {
+        let listed = linked_pr_rows(
+            r#"[{"number":70,"url":"u70","title":"t","baseRefName":"main",
+                 "closingIssuesReferences":[],"headRefName":"issue-42"}]"#,
+        )
+        .unwrap();
+        let found = linked_pr_on_base(&listed, 42, "issue-42", "main")
+            .unwrap()
+            .unwrap();
+        assert_eq!(70, found.number);
+        assert!(linked_pr_on_base(&listed, 43, "issue-43", "main")
             .unwrap()
             .is_none());
     }

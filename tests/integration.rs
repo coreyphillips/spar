@@ -3429,6 +3429,10 @@ if [ "$1" = issue ] && [ "$2" = list ]; then
   printf '%s\n' '[]'
   exit 0
 fi
+if [ "$1" = pr ] && [ "$2" = list ]; then
+  printf '%s\n' '[]'
+  exit 0
+fi
 printf 'unexpected gh call: %s\n' "$*" >&2
 exit 64
 "#;
@@ -7987,7 +7991,7 @@ case "$*" in
     exit 1 ;;
   "repo view --json nameWithOwner --jq .nameWithOwner") printf 'example/project\n' ;;
   "pr list --state open --limit 500 --json number,title,headRefOid,"*) cat "$SPAR_FAKE_PRS" ;;
-  "pr list --state open --limit 500 --json number,url,title,baseRefName,closingIssuesReferences")
+  "pr list --state open --limit 500 --json number,url,title,baseRefName,closingIssuesReferences,headRefName")
     if [ -f "${{SPAR_FAKE_LINKED:-/nonexistent}}" ]; then cat "$SPAR_FAKE_LINKED"; else printf '[]\n'; fi ;;
   "pr list "*) printf '[]\n' ;;
   "pr view {number} --json number,title,headRefOid,"*)
@@ -10056,6 +10060,18 @@ case "$1 $2" in
         printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Older export","baseRefName":"feat/old"}]'
         exit 0
         ;;
+      "declined-open-pr:pr list --head issue-42 --state open --json number,url,title,baseRefName")
+        printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Older export","baseRefName":"main"}]'
+        exit 0
+        ;;
+      "pr-opens-after-comment:pr list --head issue-42 --state open --json number,url,title,baseRefName")
+        if [ -f "$SPAR_CODE_DIR/commented" ]; then
+          printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Older export","baseRefName":"main"}]'
+        else
+          printf '%s\n' '[]'
+        fi
+        exit 0
+        ;;
       "branch-lookup-failure:pr list --head issue-42 --state open --json "* \
       | "unreachable-then-linked:pr list --head issue-42 --state open --json "*)
         printf '%s\n' 'HTTP 502: Bad Gateway' >&2
@@ -10122,7 +10138,8 @@ case "$1 $2" in
       *) exit 64 ;;
     esac
     ;;
-  "pr comment"|"issue comment") : ;;
+  "issue comment") touch "$SPAR_CODE_DIR/commented" ;;
+  "pr comment"|"issue close") : ;;
   "repo view")
     case "${SPAR_CODE_MODE:-}" in
       unreachable-then-linked|no-github)
@@ -10178,6 +10195,10 @@ case "$*" in
   *"You are triaging GitHub issues"*)
     printf '%s\n' "triage:$1" >> "$SPAR_CODE_DIR/stages.log"
     if [ "${SPAR_CODE_MODE:-}" = triage-failure ]; then exit 1; fi
+    if [ "${SPAR_CODE_MODE:-}" = declined-open-pr ] || [ "${SPAR_CODE_MODE:-}" = pr-opens-after-comment ]; then
+      printf '%s\n' '{"issues":[{"issue":42,"worth_doing":false,"tracker":false,"reason":"Not worth it","complexity":"s","depends_on":[],"risk":"low"}]}'
+      exit 0
+    fi
     printf '%s\n' '{"issues":[{"issue":42,"worth_doing":true,"tracker":false,"reason":"Useful export","complexity":"s","depends_on":[],"risk":"low"}]}'
     ;;
   *"Implement GitHub issue #42"*)
@@ -10318,9 +10339,66 @@ fn run_refuses_an_issue_whose_branch_is_open_into_another_base() {
         ),
         "{said}"
     );
-    assert!(!test.log("stages.log").contains("implement:"), "{said}");
+    // Refused before triage, so no agent was asked about an issue it cannot work.
+    assert!(test.log("stages.log").is_empty(), "{said}");
     assert!(!test.log("gh.log").contains("pr create"), "{said}");
     assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_declined_issue_with_an_open_pull_request_is_not_closed() {
+    let test = CodeFixture::new();
+
+    let (ok, out, err) = test.run_issue(&["--close-skipped"], "declined-open-pr");
+
+    let said = format!("{out}{err}");
+    assert!(ok, "{said}");
+    assert_eq!(
+        2,
+        test.log("stages.log").matches("triage:").count(),
+        "{said}"
+    );
+    let calls = test.log("gh.log");
+    let looked = calls
+        .find("pr list --head issue-42 --state open")
+        .expect(&calls);
+    let commented = calls.find("issue comment 42").expect(&calls);
+    assert!(looked < commented, "{calls}");
+    assert!(!calls.contains("issue close"), "{calls}");
+    assert!(
+        said.contains(
+            "#42 skipped by both reviewers, commented on and left open since pull request #70 \
+             is open for it"
+        ),
+        "{said}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_declined_issue_is_not_closed_when_its_pull_request_opens_during_the_run() {
+    let test = CodeFixture::new();
+
+    let (ok, out, err) = test.run_issue(&["--close-skipped"], "pr-opens-after-comment");
+
+    let said = format!("{out}{err}");
+    assert!(ok, "{said}");
+    let calls = test.log("gh.log");
+    let commented = calls.find("issue comment 42").expect(&calls);
+    assert!(
+        calls[commented..].contains("pr list --head issue-42 --state open"),
+        "{calls}"
+    );
+    assert!(!calls.contains("issue close"), "{calls}");
+    assert!(
+        said.contains("left #42 open, https://github.com/example/project/pull/70 is open for it"),
+        "{said}"
+    );
+    assert!(
+        said.contains("#42 skipped by both reviewers, commented on and left open:"),
+        "{said}"
+    );
 }
 
 #[cfg(unix)]

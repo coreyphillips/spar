@@ -16,7 +16,7 @@ use crate::config::{self, Config};
 use crate::error::Result;
 use crate::followups;
 use crate::listen;
-use crate::model::{Issue, IssueRun, ItemKind, Plan, PlanItem, Status};
+use crate::model::{Issue, IssueRun, ItemKind, Plan, PlanItem, PrRef, Status};
 use crate::proc::{self, ExecOpts};
 use crate::progress::Progress;
 use crate::repo::{Repo, WriteSummary};
@@ -806,7 +806,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             // Deliberately no act_on_plan here. `triage` is the command you
             // reach for to look before leaping, and a preview that comments on
             // and closes issues is a trap.
-            let plan = make_plan(&agents, &cfg, &repo, &issues, &plan_out)?;
+            let plan = make_plan(&agents, &cfg, &repo, &issues, &[], &plan_out)?;
             // A preview that files issues and rewrites somebody's issue body is
             // that same trap, so this prints the decomposition and writes none
             // of it. It is where the first few real trackers should be checked.
@@ -1282,6 +1282,40 @@ fn work_issues(
                 continue;
             }
         };
+        // Asked before triage, because a declined issue is commented on and
+        // closed before `run_nth_issue` would look. A lookup that refuses, for
+        // a pull request on another base or one GitHub would not answer, is
+        // that issue's result, and no agent is asked about it.
+        let mut open_prs: BTreeMap<i64, PrRef> = BTreeMap::new();
+        let mut refused: BTreeSet<i64> = BTreeSet::new();
+        // Still named to triage, so an issue that needs one first says so.
+        let mut dropped = Vec::new();
+        let mut checked = Vec::with_capacity(fetched.len());
+        for issue in fetched {
+            match repo.try_open_pr_for_issue(issue.number, cfg.base_branch()) {
+                Ok(found) => {
+                    if let Some(pr) = found {
+                        open_prs.insert(issue.number, pr);
+                    }
+                    checked.push(issue);
+                }
+                Err(e) => {
+                    log!("#{} failed: {e}", issue.number);
+                    let mut run = IssueRun::new(issue.number, issue.title.clone());
+                    run.status = Status::Error;
+                    run.notes.push(e.to_string());
+                    progress.add(1);
+                    progress.finished(&run);
+                    results.push(run);
+                    refused.insert(issue.number);
+                    dropped.push(issue);
+                }
+            }
+        }
+        let fetched = checked;
+        if fetched.is_empty() {
+            continue;
+        }
         // Named for the order the plans were written in, so the first is
         // plan.json exactly as before and no two waves overwrite each other.
         let plan_path = if plans_written == 0 {
@@ -1294,7 +1328,7 @@ fn work_issues(
         // step of the next wave, on a run that may have spent an hour. It ends
         // the waves; it does not throw away the record of what the earlier ones
         // did, which is the only place a person learns what the run made.
-        let plan = match make_plan(agents, cfg, repo, &fetched, &plan_path) {
+        let plan = match make_plan(agents, cfg, repo, &fetched, &dropped, &plan_path) {
             Ok(plan) => plan,
             Err(e) => {
                 logwarn!("triage failed for {}: {e}", numbers(&wave.numbers));
@@ -1313,7 +1347,7 @@ fn work_issues(
                 break;
             }
         };
-        act_on_plan(cfg, repo, &plan);
+        let closed = act_on_plan(cfg, repo, &plan, &open_prs, stopped);
         repo.remember_contested(&plan.contested);
         for item in &plan.contested {
             parked.push(format!(
@@ -1324,11 +1358,16 @@ fn work_issues(
         }
         for item in &plan.skipped {
             let what = if item.tracker {
-                "left open as a tracker"
-            } else if cfg.loop_cfg.close_skipped {
-                "commented on and closed"
+                "left open as a tracker".to_string()
+            } else if let Some(pr) = open_prs.get(&item.issue) {
+                format!(
+                    "commented on and left open since pull request #{} is open for it",
+                    pr.number
+                )
+            } else if closed.contains(&item.issue) {
+                "commented on and closed".to_string()
             } else {
-                "commented on and left open"
+                "commented on and left open".to_string()
             };
             parked.push(format!(
                 "#{} skipped by both reviewers, {what}: {}",
@@ -1364,7 +1403,7 @@ fn work_issues(
             let Some(issue) = fetched.iter().find(|i| i.number == item.issue) else {
                 continue;
             };
-            if let Some(why) = held_back(item, &plan, &landed) {
+            if let Some(why) = held_back(item, &plan, &landed, &refused) {
                 log!("#{}: {why}", item.issue);
                 let mut held = IssueRun::new(item.issue, item.title.clone());
                 held.status = Status::Pending;
@@ -1444,10 +1483,24 @@ fn positions_of(known: &crate::model::Contested) -> String {
 ///
 /// Holding is the honest answer: the work is not there, and building on a base
 /// that lacks it spends a full issue's budget to find that out.
-fn held_back(item: &PlanItem, plan: &Plan, landed: &BTreeSet<i64>) -> Option<String> {
+///
+/// `refused` is the issues in this wave whose pull request lookup failed
+/// before triage. They are not in the plan, but they are not outside the run
+/// either.
+fn held_back(
+    item: &PlanItem,
+    plan: &Plan,
+    landed: &BTreeSet<i64>,
+    refused: &BTreeSet<i64>,
+) -> Option<String> {
     for dep in &item.depends_on {
         if landed.contains(dep) {
             continue;
+        }
+        if refused.contains(dep) {
+            return Some(format!(
+                "held back: #{dep}, which it depends on, was refused before triage"
+            ));
         }
         if plan.order.iter().any(|other| other.issue == *dep) {
             return Some(format!(
@@ -1798,9 +1851,10 @@ fn make_plan(
     cfg: &Config,
     repo: &Repo,
     issues: &[Issue],
+    elsewhere: &[Issue],
     plan_out: &Path,
 ) -> Result<Plan> {
-    let plan = triage::triage(agents, cfg, repo, issues)?;
+    let plan = triage::triage(agents, cfg, repo, issues, elsewhere)?;
 
     std::fs::write(plan_out, serde_json::to_vec_pretty(&plan)?)
         .map_err(|e| spar_err!("could not write {}: {e}", plan_out.display()))?;
@@ -1854,27 +1908,53 @@ fn make_plan(
 /// somebody recorded against are the reason the issue exists. spar closed a
 /// real one as "not planned" while all three of its subtasks were open, which
 /// is what this exists to stop.
-fn act_on_plan(cfg: &Config, repo: &Repo, plan: &Plan) {
+///
+/// Nor is an issue with an open pull request, whether `open_prs` found it
+/// before triage or a second lookup finds it just before closing. Closing it as
+/// not planned leaves that pull request open against an issue that says it will
+/// not be done. Returns the issues it closed.
+fn act_on_plan(
+    cfg: &Config,
+    repo: &Repo,
+    plan: &Plan,
+    open_prs: &BTreeMap<i64, PrRef>,
+    stopped: &mut Vec<String>,
+) -> BTreeSet<i64> {
+    let mut closed = BTreeSet::new();
     for item in &plan.skipped {
         let body = review::skip_comment(item, &repo.style);
-        let close = cfg.loop_cfg.close_skipped && !item.tracker;
-        let outcome = if close {
-            repo.close_issue(item.issue, &body)
-        } else {
-            repo.comment_issue(item.issue, &body)
-        };
-        match outcome {
-            Ok(()) if close => log!("  closed #{}", item.issue),
-            Ok(()) if item.tracker => {
-                log!(
-                    "  left #{} open, it tracks work filed elsewhere",
-                    item.issue
-                )
+        if let Err(e) = repo.comment_issue(item.issue, &body) {
+            logdim!("could not update #{}: {e}", item.issue);
+            continue;
+        }
+        if item.tracker {
+            log!(
+                "  left #{} open, it tracks work filed elsewhere",
+                item.issue
+            );
+        } else if let Some(pr) = open_prs.get(&item.issue) {
+            log!("  left #{} open, {} is open for it", item.issue, pr.url);
+        } else if cfg.loop_cfg.close_skipped {
+            // Asked again because triage can take minutes, and a pull request
+            // opened in that time, or while the comment posted, would otherwise
+            // be left open against an issue closed as not planned.
+            match repo.try_open_pr_for_issue(item.issue, cfg.base_branch()) {
+                Ok(None) => match repo.close_issue(item.issue) {
+                    Ok(()) => {
+                        log!("  closed #{}", item.issue);
+                        closed.insert(item.issue);
+                    }
+                    Err(e) => logdim!("could not update #{}: {e}", item.issue),
+                },
+                Ok(Some(pr)) => log!("  left #{} open, {} is open for it", item.issue, pr.url),
+                Err(e) => {
+                    log!("  left #{} open: {e}", item.issue);
+                    stopped.push(format!("#{} was not closed: {e}", item.issue));
+                }
             }
-            Ok(()) => {}
-            Err(e) => logdim!("could not update #{}: {e}", item.issue),
         }
     }
+    closed
 }
 
 // ---------------------------------------------------------------------------
@@ -2891,14 +2971,14 @@ mod tests {
         };
         let mut landed = BTreeSet::new();
 
-        let why = held_back(&plan.order[1], &plan, &landed).expect("held");
+        let why = held_back(&plan.order[1], &plan, &landed, &BTreeSet::new()).expect("held");
         assert!(why.contains("#9"), "{why}");
         assert!(why.contains("has not merged"), "{why}");
-        assert!(held_back(&plan.order[0], &plan, &landed).is_none());
+        assert!(held_back(&plan.order[0], &plan, &landed, &BTreeSet::new()).is_none());
 
         // Merged is the only thing that puts the work on the base.
         landed.insert(9);
-        assert!(held_back(&plan.order[1], &plan, &landed).is_none());
+        assert!(held_back(&plan.order[1], &plan, &landed, &BTreeSet::new()).is_none());
     }
 
     /// The case the ordering stayed quietest about: a dependency nobody is
@@ -2915,7 +2995,13 @@ mod tests {
             }],
             ..Plan::default()
         };
-        let why = held_back(&declined.order[0], &declined, &BTreeSet::new()).expect("held");
+        let why = held_back(
+            &declined.order[0],
+            &declined,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect("held");
         assert!(why.contains("declined by both reviewers"), "{why}");
 
         let contested = Plan {
@@ -2929,7 +3015,13 @@ mod tests {
             }],
             ..Plan::default()
         };
-        let why = held_back(&contested.order[0], &contested, &BTreeSet::new()).expect("held");
+        let why = held_back(
+            &contested.order[0],
+            &contested,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .expect("held");
         assert!(why.contains("disagree about #9"), "{why}");
     }
 
@@ -2942,7 +3034,25 @@ mod tests {
             order: vec![planned(10, vec![900])],
             ..Plan::default()
         };
-        assert!(held_back(&plan.order[0], &plan, &BTreeSet::new()).is_none());
+        assert!(held_back(&plan.order[0], &plan, &BTreeSet::new(), &BTreeSet::new()).is_none());
+    }
+
+    /// Refused before triage, so it is in neither the plan nor the base.
+    #[test]
+    fn a_dependent_on_an_issue_refused_before_triage_is_held() {
+        let plan = Plan {
+            order: vec![planned(43, vec![42])],
+            ..Plan::default()
+        };
+        let why = held_back(
+            &plan.order[0],
+            &plan,
+            &BTreeSet::new(),
+            &BTreeSet::from([42]),
+        )
+        .expect("held");
+        assert!(why.contains("#42"), "{why}");
+        assert!(why.contains("refused before triage"), "{why}");
     }
 
     /// A disagreement is the one triage outcome that needs a person, and it

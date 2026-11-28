@@ -2348,32 +2348,7 @@ impl Repo {
                 )
             })?;
 
-        if let Some(remote_ref) = self.refresh_issue_remote_ref(&branch)? {
-            let ahead = self.commit_count_checked(&self.root, &remote_ref, base)?;
-            if ahead > 0 {
-                let prs = self.prs_for_branch(&branch);
-                // Whatever a closed one holds, the force push would still move
-                // the head of an open one.
-                if let Some(open) = prs.iter().find(|pr| !pr.is_settled()) {
-                    bail!(
-                        "origin/{branch} already has {ahead} commit(s) that are not on {base}, and \
-                         pull request #{n} is open from it. Rebuilding the branch would force push \
-                         over that pull request.\nRun `spar resume {n}` to continue it, or close it \
-                         first.",
-                        n = open.number
-                    );
-                }
-                if !self.settled_pr_holds(&prs, &remote_ref, base) {
-                    bail!(
-                        "origin/{branch} already has {ahead} commit(s) that are not on {base}, and \
-                         no pull request accounts for them. Rebuilding it would force push over \
-                         that work.\nOpen a pull request for the branch and run `spar resume <pr>` \
-                         to continue it, or delete it with `git push origin --delete {branch}` if \
-                         the remote branch is no longer needed."
-                    );
-                }
-            }
-        }
+        self.replaceable_origin_tip(&branch, base)?;
 
         // The same question of the fork a refused push would go to, asked here
         // rather than after an agent has spent its call implementing.
@@ -2416,6 +2391,46 @@ impl Repo {
             }
         }
         Ok(())
+    }
+
+    /// The tip of `origin/<branch>` that rebuilding the issue branch would
+    /// replace, or `None` when origin has no such branch. A tip with commits
+    /// beyond `base` is refused when a pull request is open from it, or when
+    /// no closed one holds those commits.
+    fn replaceable_origin_tip(&self, branch: &str, base: &str) -> Result<Option<String>> {
+        let Some(remote_ref) = self.refresh_issue_remote_ref(branch)? else {
+            return Ok(None);
+        };
+        // The oid rather than the tracking ref, which any `git fetch` moves.
+        let tip = self
+            .git_at(Some(&self.root), &["rev-parse", "--verify", &remote_ref])?
+            .trim()
+            .to_string();
+        let ahead = self.commit_count_checked(&self.root, &tip, base)?;
+        if ahead == 0 {
+            return Ok(Some(tip));
+        }
+        let prs = self.prs_for_branch(branch);
+        // Whatever a closed one holds, the force push would still move the
+        // head of an open one.
+        if let Some(open) = prs.iter().find(|pr| !pr.is_settled()) {
+            bail!(
+                "origin/{branch} already has {ahead} commit(s) that are not on {base}, and pull \
+                 request #{n} is open from it. Rebuilding the branch would force push over that \
+                 pull request.\nRun `spar resume {n}` to continue it, or close it first.",
+                n = open.number
+            );
+        }
+        if !self.settled_pr_holds(&prs, &tip, base) {
+            bail!(
+                "origin/{branch} already has {ahead} commit(s) that are not on {base}, and no pull \
+                 request accounts for them. Rebuilding it would force push over that work.\nOpen a \
+                 pull request for the branch and run `spar resume <pr>` to continue it, or delete \
+                 it with `git push origin --delete {branch}` if the remote branch is no longer \
+                 needed."
+            );
+        }
+        Ok(Some(tip))
     }
 
     fn refresh_issue_remote_ref(&self, branch: &str) -> Result<Option<String>> {
@@ -4723,8 +4738,15 @@ impl Repo {
     /// failure when the fork takes the branch: the run did what it set out to,
     /// and a failed write makes the exit status say otherwise.
     pub fn publish_new_branch(&self, cwd: &Path, branch: &str, base: &str) -> Result<PushTarget> {
+        // Asked again rather than trusted from before the implementation. A
+        // pull request can open on the old tip while the agent works, and
+        // opening one does not move the tip, so no lease would notice it.
+        let replaced = self.replaceable_origin_tip(branch, base)?;
         let origin = PushTarget::Origin;
-        let refused = match self.git_push(cwd, &origin, branch, None) {
+        // An empty lease makes the push a create, refused if the branch has
+        // appeared since.
+        let lease = replaced.as_deref().unwrap_or("");
+        let refused = match self.git_push(cwd, &origin, branch, Some(lease)) {
             Ok(()) => return self.record_write(Ok(origin)),
             Err(e) if self.fork_when_denied && push_denial(&e.to_string()).is_some() => e,
             Err(e) => {

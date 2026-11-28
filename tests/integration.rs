@@ -10098,6 +10098,22 @@ case "$1 $2" in
         printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Older export","state":"CLOSED"}]'
         exit 0
         ;;
+      "opened-during-implementation:pr list --head issue-42 --state all --json "*)
+        if [ -f "$SPAR_CODE_DIR/pr-71-opened" ]; then
+          printf '%s\n' '[{"number":70,"state":"CLOSED"},{"number":71,"state":"OPEN"}]'
+        else
+          printf '%s\n' '[{"number":70,"state":"CLOSED"}]'
+        fi
+        exit 0
+        ;;
+      "opened-during-implementation:pr list --head issue-42 --state open --json "*)
+        if [ -f "$SPAR_CODE_DIR/pr-71-opened" ]; then
+          printf '%s\n' '[{"number":71,"url":"https://github.com/example/project/pull/71","title":"Older export","baseRefName":"feat/old"}]'
+        else
+          printf '%s\n' '[]'
+        fi
+        exit 0
+        ;;
     esac
     if [ -f "$SPAR_CODE_DIR/pr-created" ]; then
       printf '%s\n' '[{"number":43,"url":"https://github.com/example/project/pull/43","title":"Add CSV export","baseRefName":"main"}]'
@@ -10182,6 +10198,7 @@ case "$*" in
     ;;
   *"Implement GitHub issue #42"*)
     printf '%s\n' "implement:$1" >> "$SPAR_CODE_DIR/stages.log"
+    if [ "${SPAR_CODE_MODE:-}" = opened-during-implementation ]; then touch "$SPAR_CODE_DIR/pr-71-opened"; fi
     printf 'CSV export\n' > export.txt
     printf '%s\n' '{"summary":"Add CSV export","problem":"Rows cannot be exported","changes":["Export rows"],"testing":["Checked the fixture"],"notes":null,"criteria":[{"number":1,"status":"done","reason":"Columns keep their order"}]}'
     ;;
@@ -10421,6 +10438,36 @@ fn a_closed_pull_request_does_not_cover_for_an_open_one_on_the_same_branch() {
     assert!(!test.log("stages.log").contains("implement:"), "{said}");
     assert!(!test.log("gh.log").contains("pr create"), "{said}");
     assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+/// Closed #70 holds the tip when the run starts, and #71 opens from it into
+/// `feat/old` while the agent implements.
+#[cfg(unix)]
+#[test]
+fn a_pull_request_opened_during_implementation_is_not_published_over() {
+    let test = CodeFixture::new();
+    let before = test.publish_issue_branch();
+
+    let (ok, out, err) = test.run_issue(&[], "opened-during-implementation");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(test.log("stages.log").contains("implement:"), "{said}");
+    assert!(said.contains("pull request #71 is open from it"), "{said}");
+    assert!(
+        said.contains("The work is kept on the local branch issue-42"),
+        "{said}"
+    );
+    assert!(!test.log("stages.log").contains("review:"), "{said}");
+    let calls = test.log("gh.log");
+    assert!(!calls.contains("pr create"), "{calls}");
+    assert!(!calls.contains("pr merge"), "{calls}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
+    assert_eq!(
+        "CSV export\n",
+        git(&test.fx.work, &["show", "issue-42:export.txt"]),
+        "{said}"
+    );
 }
 
 /// Origin refuses pushes, so the branch would go to the fork, where closed

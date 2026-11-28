@@ -7991,7 +7991,7 @@ case "$*" in
     exit 1 ;;
   "repo view --json nameWithOwner --jq .nameWithOwner") printf 'example/project\n' ;;
   "pr list --state open --limit 500 --json number,title,headRefOid,"*) cat "$SPAR_FAKE_PRS" ;;
-  "pr list --state open --limit 500 --json number,url,title,baseRefName,closingIssuesReferences")
+  "pr list --state open --limit 500 --json number,url,title,baseRefName,closingIssuesReferences,headRefName")
     if [ -f "${{SPAR_FAKE_LINKED:-/nonexistent}}" ]; then cat "$SPAR_FAKE_LINKED"; else printf '[]\n'; fi ;;
   "pr list "*) printf '[]\n' ;;
   "pr view {number} --json number,title,headRefOid,"*)

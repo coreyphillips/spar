@@ -806,7 +806,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             // Deliberately no act_on_plan here. `triage` is the command you
             // reach for to look before leaping, and a preview that comments on
             // and closes issues is a trap.
-            let plan = make_plan(&agents, &cfg, &repo, &issues, &plan_out)?;
+            let plan = make_plan(&agents, &cfg, &repo, &issues, &[], &plan_out)?;
             // A preview that files issues and rewrites somebody's issue body is
             // that same trap, so this prints the decomposition and writes none
             // of it. It is where the first few real trackers should be checked.
@@ -1288,6 +1288,8 @@ fn work_issues(
         // that issue's result, and no agent is asked about it.
         let mut open_prs: BTreeMap<i64, PrRef> = BTreeMap::new();
         let mut refused: BTreeSet<i64> = BTreeSet::new();
+        // Still named to triage, so an issue that needs one first says so.
+        let mut dropped = Vec::new();
         let mut checked = Vec::with_capacity(fetched.len());
         for issue in fetched {
             match repo.try_open_pr_for_issue(issue.number, cfg.base_branch()) {
@@ -1306,6 +1308,7 @@ fn work_issues(
                     progress.finished(&run);
                     results.push(run);
                     refused.insert(issue.number);
+                    dropped.push(issue);
                 }
             }
         }
@@ -1325,7 +1328,7 @@ fn work_issues(
         // step of the next wave, on a run that may have spent an hour. It ends
         // the waves; it does not throw away the record of what the earlier ones
         // did, which is the only place a person learns what the run made.
-        let plan = match make_plan(agents, cfg, repo, &fetched, &plan_path) {
+        let plan = match make_plan(agents, cfg, repo, &fetched, &dropped, &plan_path) {
             Ok(plan) => plan,
             Err(e) => {
                 logwarn!("triage failed for {}: {e}", numbers(&wave.numbers));
@@ -1848,9 +1851,10 @@ fn make_plan(
     cfg: &Config,
     repo: &Repo,
     issues: &[Issue],
+    elsewhere: &[Issue],
     plan_out: &Path,
 ) -> Result<Plan> {
-    let plan = triage::triage(agents, cfg, repo, issues)?;
+    let plan = triage::triage(agents, cfg, repo, issues, elsewhere)?;
 
     std::fs::write(plan_out, serde_json::to_vec_pretty(&plan)?)
         .map_err(|e| spar_err!("could not write {}: {e}", plan_out.display()))?;

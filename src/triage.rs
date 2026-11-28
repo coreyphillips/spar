@@ -137,8 +137,32 @@ fn numbers(items: &[i64]) -> String {
         .join(", ")
 }
 
-/// Ask both agents, then reconcile.
-pub fn triage(agents: &[Agent], cfg: &Config, repo: &Repo, issues: &[Issue]) -> Result<Plan> {
+/// The issues in this run that are not being triaged, listed so that one of
+/// them can still be named in `depends_on`. An agent reports dependencies only
+/// from the list it sees.
+fn also_in_run(elsewhere: &[Issue]) -> String {
+    if elsewhere.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = elsewhere
+        .iter()
+        .map(|i| format!("#{}: {}", i.number, i.title))
+        .collect();
+    format!(
+        "\n\nAlso in this run, but not for you to judge, because spar will not work them this \
+         time. An issue above may still list one of these in depends_on:\n{}",
+        lines.join("\n")
+    )
+}
+
+/// Ask both agents, then reconcile. `elsewhere` is in the run but not judged.
+pub fn triage(
+    agents: &[Agent],
+    cfg: &Config,
+    repo: &Repo,
+    issues: &[Issue],
+    elsewhere: &[Issue],
+) -> Result<Plan> {
     let rendered = render(issues, cfg);
     // Never silently. An agent cannot report a gap it was not told about, and
     // a verdict on part of an issue looks exactly like a verdict on all of it.
@@ -156,9 +180,10 @@ pub fn triage(agents: &[Agent], cfg: &Config, repo: &Repo, issues: &[Issue]) -> 
         );
     }
     let prompt = format!(
-        "{}{}",
+        "{}{}{}",
         TRIAGE_PROMPT.replace("{thread_rule}", THREAD_RULE),
-        rendered.text
+        rendered.text,
+        also_in_run(elsewhere)
     );
     let schema = schema::triage();
 
@@ -538,6 +563,16 @@ mod tests {
         .expect("an issue");
         i.body = Some(body.to_string());
         i
+    }
+
+    /// Named by number, with no body to judge.
+    #[test]
+    fn an_issue_dropped_before_triage_is_still_named_as_a_dependency() {
+        assert_eq!("", also_in_run(&[]));
+        let text = also_in_run(&[issue_of(42, "body of 42")]);
+        assert!(text.contains("depends_on"), "{text}");
+        assert!(text.contains("#42: t"), "{text}");
+        assert!(!text.contains("body of 42"), "{text}");
     }
 
     /// The case that is every real queue. Nothing is cut, nothing is deferred,

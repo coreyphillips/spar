@@ -5861,12 +5861,11 @@ impl Repo {
         self.record_write(result)
     }
 
-    /// Comment, then close as not planned.
+    /// Close as not planned, once the caller has commented with the reasoning.
     ///
     /// Only ever called when both agents independently declined the issue: one
     /// agent's opinion is not enough to close somebody's report.
-    pub fn close_issue(&self, number: i64, body: &str) -> Result<()> {
-        self.comment_issue(number, body)?;
+    pub fn close_issue(&self, number: i64) -> Result<()> {
         let n = number.to_string();
         let closed = match self.gh(&["issue", "close", &n, "--reason", "not planned"]) {
             Ok(_) => Ok(()),

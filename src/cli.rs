@@ -1342,7 +1342,7 @@ fn work_issues(
                 break;
             }
         };
-        act_on_plan(cfg, repo, &plan, &open_prs);
+        let closed = act_on_plan(cfg, repo, &plan, &open_prs);
         repo.remember_contested(&plan.contested);
         for item in &plan.contested {
             parked.push(format!(
@@ -1359,7 +1359,7 @@ fn work_issues(
                     "commented on and left open since pull request #{} is open for it",
                     pr.number
                 )
-            } else if cfg.loop_cfg.close_skipped {
+            } else if closed.contains(&item.issue) {
                 "commented on and closed".to_string()
             } else {
                 "commented on and left open".to_string()
@@ -1889,35 +1889,48 @@ fn make_plan(
 /// real one as "not planned" while all three of its subtasks were open, which
 /// is what this exists to stop.
 ///
-/// Nor is an issue in `open_prs`, which maps an issue to the pull request open
-/// for it. Closing it as not planned leaves that pull request open against an
-/// issue that says it will not be done.
-fn act_on_plan(cfg: &Config, repo: &Repo, plan: &Plan, open_prs: &BTreeMap<i64, PrRef>) {
+/// Nor is an issue with an open pull request, whether `open_prs` found it
+/// before triage or a second lookup finds it just before closing. Closing it as
+/// not planned leaves that pull request open against an issue that says it will
+/// not be done. Returns the issues it closed.
+fn act_on_plan(
+    cfg: &Config,
+    repo: &Repo,
+    plan: &Plan,
+    open_prs: &BTreeMap<i64, PrRef>,
+) -> BTreeSet<i64> {
+    let mut closed = BTreeSet::new();
     for item in &plan.skipped {
         let body = review::skip_comment(item, &repo.style);
-        let open_pr = open_prs.get(&item.issue);
-        let close = cfg.loop_cfg.close_skipped && !item.tracker && open_pr.is_none();
-        let outcome = if close {
-            repo.close_issue(item.issue, &body)
-        } else {
-            repo.comment_issue(item.issue, &body)
-        };
-        match outcome {
-            Ok(()) if close => log!("  closed #{}", item.issue),
-            Ok(()) if item.tracker => {
-                log!(
-                    "  left #{} open, it tracks work filed elsewhere",
-                    item.issue
-                )
+        if let Err(e) = repo.comment_issue(item.issue, &body) {
+            logdim!("could not update #{}: {e}", item.issue);
+            continue;
+        }
+        if item.tracker {
+            log!(
+                "  left #{} open, it tracks work filed elsewhere",
+                item.issue
+            );
+        } else if let Some(pr) = open_prs.get(&item.issue) {
+            log!("  left #{} open, {} is open for it", item.issue, pr.url);
+        } else if cfg.loop_cfg.close_skipped {
+            // Asked again because triage can take minutes, and a pull request
+            // opened in that time, or while the comment posted, would otherwise
+            // be left open against an issue closed as not planned.
+            match repo.try_open_pr_for_issue(item.issue, cfg.base_branch()) {
+                Ok(None) => match repo.close_issue(item.issue) {
+                    Ok(()) => {
+                        log!("  closed #{}", item.issue);
+                        closed.insert(item.issue);
+                    }
+                    Err(e) => logdim!("could not update #{}: {e}", item.issue),
+                },
+                Ok(Some(pr)) => log!("  left #{} open, {} is open for it", item.issue, pr.url),
+                Err(e) => log!("  left #{} open: {e}", item.issue),
             }
-            Ok(()) => {
-                if let Some(pr) = open_pr {
-                    log!("  left #{} open, {} is open for it", item.issue, pr.url)
-                }
-            }
-            Err(e) => logdim!("could not update #{}: {e}", item.issue),
         }
     }
+    closed
 }
 
 // ---------------------------------------------------------------------------

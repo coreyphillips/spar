@@ -2407,9 +2407,9 @@ impl Repo {
             .trim()
             .to_string();
         let ahead = self.commit_count_checked(&self.root, &tip, base)?;
-        let prs = self.refuse_open_pr(branch, base, ahead)?;
+        self.refuse_open_pr(branch, base, ahead)?;
         if ahead > 0 {
-            if !self.settled_pr_holds(&prs, &tip, base) {
+            if !self.pull_request_holds(branch, &tip, base) {
                 bail!(
                     "origin/{branch} already has {ahead} commit(s) that are not on {base}, and no \
                      pull request accounts for them. Rebuilding it would force push over that \
@@ -2424,25 +2424,21 @@ impl Repo {
         Ok(Some(tip))
     }
 
-    /// Every pull request from `branch`, refused if one is open. Whatever a
-    /// closed one holds, the force push would still move the head of an open
-    /// one. A tip already on `base` is no exception: the pull request can be
-    /// into another base.
+    /// Refused if a pull request is open from `branch`. Whatever a closed one
+    /// holds, the force push would still move the head of an open one. A tip
+    /// already on `base` is no exception: the pull request can be into another
+    /// base.
+    ///
+    /// Asked with `--state open` because `--state all` returns only the newest
+    /// pull requests, and enough closed ones push an older open one out.
     ///
     /// A failed lookup is refused too, unless gh cannot reach the repository
     /// at all, in which case there is no pull request to move.
-    fn refuse_open_pr(&self, branch: &str, base: &str, ahead: usize) -> Result<Vec<BranchPr>> {
+    fn refuse_open_pr(&self, branch: &str, base: &str, ahead: usize) -> Result<()> {
         let listed = self.gh(&[
-            "pr",
-            "list",
-            "--head",
-            branch,
-            "--state",
-            "all",
-            "--json",
-            "number,state",
+            "pr", "list", "--head", branch, "--state", "open", "--json", "number",
         ]);
-        let prs = match listed {
+        let open = match listed {
             Ok(text) => serde_json::from_str::<Vec<BranchPr>>(text.trim())
                 .map_err(|e| spar_err!("could not read pull requests for {branch}: {e}"))?,
             Err(e) if self.gh_can_reach() => bail!(
@@ -2452,7 +2448,7 @@ impl Repo {
             ),
             Err(_) => Vec::new(),
         };
-        if let Some(open) = prs.iter().find(|pr| !pr.is_settled()) {
+        if let Some(open) = open.first() {
             bail!(
                 "origin/{branch} already has {ahead} commit(s) that are not on {base}, and pull \
                  request #{n} is open from it. Rebuilding the branch would force push over that \
@@ -2460,7 +2456,7 @@ impl Repo {
                 n = open.number
             );
         }
-        Ok(prs)
+        Ok(())
     }
 
     fn refresh_issue_remote_ref(&self, branch: &str) -> Result<Option<String>> {

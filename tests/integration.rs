@@ -10084,6 +10084,10 @@ case "$1 $2" in
         printf '%s\n' '[{"number":70,"state":"CLOSED"},{"number":71,"state":"OPEN"}]'
         exit 0
         ;;
+      "closed-and-open:pr list --head issue-42 --state open --json number")
+        printf '%s\n' '[{"number":71}]'
+        exit 0
+        ;;
       "linked-other-base:pr list --state open --limit "*)
         printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Export","baseRefName":"main","closingIssuesReferences":[{"number":42}]}]'
         exit 0
@@ -10094,11 +10098,12 @@ case "$1 $2" in
         printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Older export","state":"OPEN"}]'
         exit 0
         ;;
-      "closed-pr-holds:pr list --head issue-42 --state all --json "*)
+      "closed-pr-holds:pr list --head issue-42 --state all --json "* \
+      | "crowded-out:pr list --head issue-42 --state all --json "*)
         printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Older export","state":"CLOSED"}]'
         exit 0
         ;;
-      "publish-lookup-failure:pr list --head issue-42 --state all --json "*)
+      "publish-lookup-failure:pr list --head issue-42 --state open --json number")
         if [ -f "$SPAR_CODE_DIR/pr-71-opened" ]; then
           printf '%s\n' 'HTTP 502: Bad Gateway' >&2
           exit 1
@@ -10119,7 +10124,8 @@ case "$1 $2" in
       "opened-during-implementation:pr list --head issue-42 --state open --json "* \
       | "publish-lookup-failure:pr list --head issue-42 --state open --json "* \
       | "opened-during-fetch:pr list --head issue-42 --state open --json "* \
-      | "opened-during-retry:pr list --head issue-42 --state open --json "*)
+      | "opened-during-retry:pr list --head issue-42 --state open --json "* \
+      | "crowded-out:pr list --head issue-42 --state open --json "*)
         if [ -f "$SPAR_CODE_DIR/pr-71-opened" ]; then
           printf '%s\n' '[{"number":71,"url":"https://github.com/example/project/pull/71","title":"Older export","baseRefName":"feat/old"}]'
         else
@@ -10213,7 +10219,8 @@ case "$*" in
     printf '%s\n' "implement:$1" >> "$SPAR_CODE_DIR/stages.log"
     touch "$SPAR_CODE_DIR/implemented"
     case "${SPAR_CODE_MODE:-}" in
-      opened-during-implementation|publish-lookup-failure) touch "$SPAR_CODE_DIR/pr-71-opened" ;;
+      opened-during-implementation|publish-lookup-failure|crowded-out)
+        touch "$SPAR_CODE_DIR/pr-71-opened" ;;
     esac
     printf 'CSV export\n' > export.txt
     printf '%s\n' '{"summary":"Add CSV export","problem":"Rows cannot be exported","changes":["Export rows"],"testing":["Checked the fixture"],"notes":null,"criteria":[{"number":1,"status":"done","reason":"Columns keep their order"}]}'
@@ -10517,6 +10524,24 @@ fn a_pull_request_opened_during_implementation_on_a_tip_already_on_base_is_not_p
     );
 
     let (ok, out, err) = test.run_issue(&[], "opened-during-implementation");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(test.log("stages.log").contains("implement:"), "{said}");
+    assert!(said.contains("pull request #71 is open from it"), "{said}");
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+/// #71 reopens during implementation, older than every closed pull request
+/// `--state all` returns, so that list shows only closed #70 holding the tip.
+#[cfg(unix)]
+#[test]
+fn an_open_pull_request_past_the_closed_ones_listed_is_not_published_over() {
+    let test = CodeFixture::new();
+    let before = test.publish_issue_branch();
+
+    let (ok, out, err) = test.run_issue(&[], "crowded-out");
 
     assert!(!ok, "{out}\n{err}");
     let said = format!("{out}{err}");

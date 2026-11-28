@@ -6,7 +6,7 @@ use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde::Deserialize;
@@ -294,6 +294,10 @@ pub struct Repo {
     /// after a resume already loaded a newer checkpoint.
     checkpoints: Mutex<BTreeMap<i64, u64>>,
     writes: WriteStats,
+    /// Whether any gh call has succeeded against this repository. Once one
+    /// has, a later failure is GitHub having trouble, not a repository gh
+    /// cannot reach.
+    gh_answered: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -1320,6 +1324,44 @@ fn refused_pr_lookup(issue: i64, e: &crate::error::SparError) -> crate::error::S
     )
 }
 
+/// Whether a failed `gh repo view` means there is no GitHub repository to
+/// reach, rather than GitHub failing to answer for one that exists.
+///
+/// The error saying so outright settles it. Otherwise an earlier answer for
+/// this repository, a server error, or a timeout all say the repository is
+/// there and GitHub is having trouble, which is the case to refuse on.
+fn gh_cannot_reach(probe: &crate::error::SparError, answered_before: bool) -> bool {
+    let text = probe.message().to_ascii_lowercase();
+    let no_repository = [
+        "known github host",
+        "correspond to the gh_host",
+        "no git remotes",
+        "not a git repository",
+        "could not resolve to a repository",
+    ];
+    if no_repository.iter().any(|said| text.contains(said)) {
+        return true;
+    }
+    if answered_before || probe.kind() == crate::error::ErrorKind::TimedOut {
+        return false;
+    }
+    let timed_out = ["timeout", "timed out", "deadline exceeded"]
+        .iter()
+        .any(|said| text.contains(said));
+    !(timed_out || says_server_error(&text))
+}
+
+/// An HTTP 5xx in gh's wording: `HTTP 502: Bad Gateway` from the REST client,
+/// `status code: 502 Bad Gateway` from the GraphQL one.
+fn says_server_error(text: &str) -> bool {
+    ["http 5", "status code: 5"].iter().any(|lead| {
+        text.match_indices(lead).any(|(at, _)| {
+            let rest = &text.as_bytes()[at + lead.len()..];
+            rest.len() >= 2 && rest[..2].iter().all(u8::is_ascii_digit)
+        })
+    })
+}
+
 fn open_on_another_base(
     issue: i64,
     pr: i64,
@@ -1913,6 +1955,7 @@ impl Repo {
             viewer: OnceLock::new(),
             checkpoints: Mutex::new(BTreeMap::new()),
             writes: WriteStats::default(),
+            gh_answered: AtomicBool::new(false),
         };
         repo.self_exclude();
         Ok(repo)
@@ -5007,12 +5050,20 @@ impl Repo {
     pub fn gh_at(&self, cwd: Option<&Path>, args: &[&str]) -> Result<String> {
         let mut argv = vec!["gh".to_string()];
         argv.extend(args.iter().map(|s| s.to_string()));
-        proc::run(
+        let result = proc::run(
             &argv,
             &ExecOpts::new()
                 .cwd(cwd.unwrap_or(&self.root))
                 .timeout_secs(300),
-        )
+        );
+        self.note_gh_answer(result.is_ok());
+        result
+    }
+
+    fn note_gh_answer(&self, answered: bool) {
+        if answered {
+            self.gh_answered.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Run gh with something on its stdin.
@@ -5023,26 +5074,27 @@ impl Repo {
     pub fn gh_stdin(&self, args: &[&str], stdin: &str) -> Result<String> {
         let mut argv = vec!["gh".to_string()];
         argv.extend(args.iter().map(|s| s.to_string()));
-        proc::run(
+        let result = proc::run(
             &argv,
             &ExecOpts::new()
                 .cwd(&self.root)
                 .timeout_secs(300)
                 .stdin(stdin),
-        )
+        );
+        self.note_gh_answer(result.is_ok());
+        result
     }
 
     pub fn gh_try(&self, args: &[&str]) -> String {
         let mut argv = vec!["gh".to_string()];
         argv.extend(args.iter().map(|s| s.to_string()));
-        proc::run(
-            &argv,
-            &ExecOpts::new()
-                .cwd(&self.root)
-                .check(false)
-                .timeout_secs(300),
-        )
-        .unwrap_or_default()
+        match proc::exec(&argv, &ExecOpts::new().cwd(&self.root).timeout_secs(300)) {
+            Ok(out) => {
+                self.note_gh_answer(out.ok());
+                out.stdout
+            }
+            Err(_) => String::new(),
+        }
     }
 
     /// `gh api -i`: the status line and headers with the body, and the exit
@@ -5063,8 +5115,11 @@ impl Repo {
                 .check(false)
                 .timeout_secs(300),
         )?;
-        parse_api_response(&out.stdout)
-            .ok_or_else(|| crate::error::SparError::call_failed(proc::failure_message(&argv, &out)))
+        let response = parse_api_response(&out.stdout).ok_or_else(|| {
+            crate::error::SparError::call_failed(proc::failure_message(&argv, &out))
+        })?;
+        self.note_gh_answer((200..400).contains(&response.status));
+        Ok(response)
     }
 
     /// Every open pull request, with what a sweep needs to know about each.
@@ -5515,7 +5570,11 @@ impl Repo {
     /// play, and every later write would fail anyway. That case is a warning and
     /// a `None`, so a run against a plain git remote behaves as it always did.
     fn unanswered_pr_lookup(&self, issue: i64, e: crate::error::SparError) -> Result<()> {
-        if self.gh(&["repo", "view", "--json", "name"]).is_ok() {
+        let probe = match self.gh(&["repo", "view", "--json", "name"]) {
+            Ok(_) => return Err(refused_pr_lookup(issue, &e)),
+            Err(probe) => probe,
+        };
+        if !gh_cannot_reach(&probe, self.gh_answered.load(Ordering::Relaxed)) {
             return Err(refused_pr_lookup(issue, &e));
         }
         logwarn!(
@@ -9731,6 +9790,7 @@ mod tests {
             viewer: OnceLock::new(),
             checkpoints: Mutex::new(BTreeMap::new()),
             writes: WriteStats::default(),
+            gh_answered: AtomicBool::new(false),
         }
     }
 
@@ -11395,6 +11455,38 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(issue_branch_pr("gh: HTTP 502", 43, "issue-43", "main").is_err());
+    }
+
+    #[test]
+    fn only_a_missing_github_repository_reads_as_one_gh_cannot_reach() {
+        use crate::error::SparError;
+        let failed = |said: &str| SparError::call_failed(format!("gh repo view failed\n{said}"));
+        let no_remote = failed(
+            "none of the git remotes configured for this repository point to a known GitHub \
+             host. To tell gh about a new GitHub host, please use `gh auth login`",
+        );
+        let missing = failed("GraphQL: Could not resolve to a Repository with the name 'a/b'.");
+        let bad_gateway = failed("HTTP 502: Bad Gateway (https://api.github.com/graphql)");
+        let graphql_5xx = failed("non-200 OK status code: 503 Service Unavailable body: \"\"");
+        let slow = failed("Post \"https://api.github.com/graphql\": context deadline exceeded");
+        let killed = SparError::timed_out("timed out after 300s: gh repo view");
+        let other = failed("HTTP 401: Bad credentials");
+
+        // Said outright, whatever came before.
+        for answered in [false, true] {
+            assert!(gh_cannot_reach(&no_remote, answered));
+            assert!(gh_cannot_reach(&missing, answered));
+        }
+        // An outage, whatever came before.
+        for probe in [&bad_gateway, &graphql_5xx, &slow, &killed] {
+            assert!(!gh_cannot_reach(probe, false), "{probe}");
+            assert!(!gh_cannot_reach(probe, true), "{probe}");
+        }
+        // Anything else is unreachable only if gh never answered here.
+        assert!(gh_cannot_reach(&other, false));
+        assert!(!gh_cannot_reach(&other, true));
+        assert!(!says_server_error("http 5"));
+        assert!(!says_server_error("http 404: not found"));
     }
 
     #[test]

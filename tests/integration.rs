@@ -10024,6 +10024,7 @@ impl CodeFixture {
             r#"
 set -eu
 printf '%s\n' "$*" >> "$SPAR_CODE_DIR/gh.log"
+SPAR_NO_GITHUB='none of the git remotes configured for this repository point to a known GitHub host. To tell gh about a new GitHub host, please use `gh auth login`'
 case "$1 $2" in
   "issue create")
     if [ "${SPAR_CODE_MODE:-}" = create-failure ]; then exit 1; fi
@@ -10063,6 +10064,20 @@ case "$1 $2" in
       "unreachable-then-linked:pr list --state open --limit "*)
         printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Older export","baseRefName":"feat/old","closingIssuesReferences":[]}]'
         exit 0
+        ;;
+      "outage:pr list --head issue-42 --state open --json "* \
+      | "outage:pr list --state open --limit "*)
+        if [ ! -f "$SPAR_CODE_DIR/gh-recovered" ]; then
+          printf '%s\n' 'HTTP 502: Bad Gateway' >&2
+          exit 1
+        fi
+        printf '%s\n' '[{"number":71,"url":"https://github.com/example/project/pull/71","title":"Older export","baseRefName":"feat/old","closingIssuesReferences":[]}]'
+        exit 0
+        ;;
+      "no-github:pr list --head issue-42 --state open --json "* \
+      | "no-github:pr list --state open --limit "*)
+        printf '%s\n' "$SPAR_NO_GITHUB" >&2
+        exit 1
         ;;
       "closed-and-open:pr list --head issue-42 --state all --json "* \
       | "fork-closed-and-open:pr list --head issue-42 --state all --json "*)
@@ -10109,10 +10124,23 @@ case "$1 $2" in
     ;;
   "pr comment"|"issue comment") : ;;
   "repo view")
-    if [ "${SPAR_CODE_MODE:-}" = unreachable-then-linked ]; then
-      printf '%s\n' 'HTTP 502: Bad Gateway' >&2
-      exit 1
-    fi
+    case "${SPAR_CODE_MODE:-}" in
+      unreachable-then-linked|no-github)
+        printf '%s\n' "$SPAR_NO_GITHUB" >&2
+        exit 1
+        ;;
+      outage)
+        # Both probes fail, and gh recovers after the second.
+        if [ ! -f "$SPAR_CODE_DIR/gh-recovered" ]; then
+          if [ -f "$SPAR_CODE_DIR/repo-view-failed" ]; then
+            touch "$SPAR_CODE_DIR/gh-recovered"
+          fi
+          touch "$SPAR_CODE_DIR/repo-view-failed"
+          printf '%s\n' 'HTTP 502: Bad Gateway' >&2
+          exit 1
+        fi
+        ;;
+    esac
     printf '%s\n' '{"name":"project"}'
     ;;
   "api repos/{owner}/{repo}/issues/42") printf '%s\n' 'issue' ;;
@@ -10440,8 +10468,9 @@ fn a_closed_pull_request_does_not_cover_for_an_open_one_on_the_fork() {
     assert_eq!(before, git(&fork, &["rev-parse", "issue-42"]), "{said}");
 }
 
-/// The branch lookup and `repo view` fail, then the linked lookup is answered
-/// without the pull request open from `issue-42` into `feat/old`.
+/// The branch lookup fails and `repo view` says there is no GitHub remote,
+/// then the linked lookup is answered without the pull request open from
+/// `issue-42` into `feat/old`.
 #[cfg(unix)]
 #[test]
 fn a_later_answer_overrules_reading_a_failed_lookup_as_unreachable() {
@@ -10464,6 +10493,56 @@ fn a_later_answer_overrules_reading_a_failed_lookup_as_unreachable() {
     assert!(!test.log("stages.log").contains("implement:"), "{said}");
     assert!(!test.log("gh.log").contains("pr create"), "{said}");
     assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+/// gh answered for the issue, then both lookups and both `repo view` probes
+/// fail with a 502 before gh recovers, with #71 open from `issue-42` into
+/// `feat/old` all along.
+#[cfg(unix)]
+#[test]
+fn a_github_outage_is_not_read_as_a_repository_gh_cannot_reach() {
+    let test = CodeFixture::new();
+    git(
+        &test.fx.work,
+        &["push", "-q", "origin", "main:refs/heads/issue-42"],
+    );
+    let before = test.origin_issue_branch();
+
+    let (ok, out, err) = test.run_issue(&[], "outage");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(
+        said.contains("could not check whether a pull request already exists for #42"),
+        "{said}"
+    );
+    assert!(said.contains("HTTP 502"), "{said}");
+    assert!(!said.contains("could not be read through gh"), "{said}");
+    assert!(!test.log("stages.log").contains("implement:"), "{said}");
+    let calls = test.log("gh.log");
+    assert!(!calls.contains("pr create"), "{calls}");
+    assert!(!calls.contains("pr merge"), "{calls}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+/// Both lookups and the probe say there is no GitHub remote at all.
+#[cfg(unix)]
+#[test]
+fn a_repository_with_no_github_remote_warns_and_proceeds() {
+    let test = CodeFixture::new();
+
+    let (_, out, err) = test.run_issue(&[], "no-github");
+
+    let said = format!("{out}{err}");
+    assert!(
+        said.contains("#42: this repository could not be read through gh"),
+        "{said}"
+    );
+    assert!(
+        !said.contains("could not check whether a pull request already exists"),
+        "{said}"
+    );
+    assert!(test.log("stages.log").contains("implement:"), "{said}");
 }
 
 const CODE_DRAFT: &str = r###"{"title":"Add CSV export","body":"## Context\nRows cannot be exported.\n\n## Requested behavior\nExport the current rows as CSV.\n\n## Acceptance criteria\n- [ ] Preserve column order.\n\n## Test plan\nCheck an export with quoted fields."}"###;

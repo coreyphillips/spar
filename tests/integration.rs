@@ -10470,6 +10470,28 @@ fn a_pull_request_opened_during_implementation_is_not_published_over() {
     );
 }
 
+/// The same, with the old tip already on `main`, so it has nothing a closed
+/// pull request needs to hold.
+#[cfg(unix)]
+#[test]
+fn a_pull_request_opened_during_implementation_on_a_tip_already_on_base_is_not_published_over() {
+    let test = CodeFixture::new();
+    let before = test.publish_issue_branch();
+    git(
+        &test.fx.work,
+        &["push", "-q", "origin", &format!("{before}:refs/heads/main")],
+    );
+
+    let (ok, out, err) = test.run_issue(&[], "opened-during-implementation");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(test.log("stages.log").contains("implement:"), "{said}");
+    assert!(said.contains("pull request #71 is open from it"), "{said}");
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
 /// Origin refuses pushes, so the branch would go to the fork, where closed
 /// #70 and open #71 share its tip.
 #[cfg(unix)]

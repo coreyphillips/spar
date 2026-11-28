@@ -2394,9 +2394,9 @@ impl Repo {
     }
 
     /// The tip of `origin/<branch>` that rebuilding the issue branch would
-    /// replace, or `None` when origin has no such branch. A tip with commits
-    /// beyond `base` is refused when a pull request is open from it, or when
-    /// no closed one holds those commits.
+    /// replace, or `None` when origin has no such branch. The tip is refused
+    /// when a pull request is open from it, or when it has commits beyond
+    /// `base` that no closed one holds.
     fn replaceable_origin_tip(&self, branch: &str, base: &str) -> Result<Option<String>> {
         let Some(remote_ref) = self.refresh_issue_remote_ref(branch)? else {
             return Ok(None);
@@ -2407,12 +2407,10 @@ impl Repo {
             .trim()
             .to_string();
         let ahead = self.commit_count_checked(&self.root, &tip, base)?;
-        if ahead == 0 {
-            return Ok(Some(tip));
-        }
         let prs = self.prs_for_branch(branch);
         // Whatever a closed one holds, the force push would still move the
-        // head of an open one.
+        // head of an open one. A tip already on `base` is no exception: the
+        // pull request can be into another base.
         if let Some(open) = prs.iter().find(|pr| !pr.is_settled()) {
             bail!(
                 "origin/{branch} already has {ahead} commit(s) that are not on {base}, and pull \
@@ -2421,7 +2419,7 @@ impl Repo {
                 n = open.number
             );
         }
-        if !self.settled_pr_holds(&prs, &tip, base) {
+        if ahead > 0 && !self.settled_pr_holds(&prs, &tip, base) {
             bail!(
                 "origin/{branch} already has {ahead} commit(s) that are not on {base}, and no pull \
                  request accounts for them. Rebuilding it would force push over that work.\nOpen a \

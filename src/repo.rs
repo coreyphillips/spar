@@ -1327,28 +1327,28 @@ fn refused_pr_lookup(issue: i64, e: &crate::error::SparError) -> crate::error::S
 /// Whether a failed `gh repo view` means there is no GitHub repository to
 /// reach, rather than GitHub failing to answer for one that exists.
 ///
-/// The error saying so outright settles it. Otherwise an earlier answer for
-/// this repository, a server error, or a timeout all say the repository is
-/// there and GitHub is having trouble, which is the case to refuse on.
+/// A server error or a timeout says GitHub is there and having trouble, which
+/// is the case to refuse on. Past that, gh finding no GitHub remote settles it,
+/// because gh decides that locally from the git remotes. Anything else counts
+/// only if gh has never answered here. GraphQL's "Could not resolve to a
+/// Repository" is in that last group: GitHub also says it for a repository the
+/// token cannot read.
 fn gh_cannot_reach(probe: &crate::error::SparError, answered_before: bool) -> bool {
     let text = probe.message().to_ascii_lowercase();
-    let no_repository = [
+    let timed_out = probe.kind() == crate::error::ErrorKind::TimedOut
+        || ["timeout", "timed out", "deadline exceeded"]
+            .iter()
+            .any(|said| text.contains(said));
+    if timed_out || says_server_error(&text) {
+        return false;
+    }
+    let no_github_remote = [
         "known github host",
         "correspond to the gh_host",
         "no git remotes",
         "not a git repository",
-        "could not resolve to a repository",
     ];
-    if no_repository.iter().any(|said| text.contains(said)) {
-        return true;
-    }
-    if answered_before || probe.kind() == crate::error::ErrorKind::TimedOut {
-        return false;
-    }
-    let timed_out = ["timeout", "timed out", "deadline exceeded"]
-        .iter()
-        .any(|said| text.contains(said));
-    !(timed_out || says_server_error(&text))
+    !answered_before || no_github_remote.iter().any(|said| text.contains(said))
 }
 
 /// An HTTP 5xx in gh's wording: `HTTP 502: Bad Gateway` from the REST client,
@@ -11471,20 +11471,22 @@ mod tests {
         let slow = failed("Post \"https://api.github.com/graphql\": context deadline exceeded");
         let killed = SparError::timed_out("timed out after 300s: gh repo view");
         let other = failed("HTTP 401: Bad credentials");
+        let mixed = failed("HTTP 502: Bad Gateway\nfatal: not a git repository");
 
-        // Said outright, whatever came before.
+        // No GitHub remote, whatever came before.
         for answered in [false, true] {
             assert!(gh_cannot_reach(&no_remote, answered));
-            assert!(gh_cannot_reach(&missing, answered));
         }
-        // An outage, whatever came before.
-        for probe in [&bad_gateway, &graphql_5xx, &slow, &killed] {
+        // An outage, whatever came before or else the error says.
+        for probe in [&bad_gateway, &graphql_5xx, &slow, &killed, &mixed] {
             assert!(!gh_cannot_reach(probe, false), "{probe}");
             assert!(!gh_cannot_reach(probe, true), "{probe}");
         }
         // Anything else is unreachable only if gh never answered here.
-        assert!(gh_cannot_reach(&other, false));
-        assert!(!gh_cannot_reach(&other, true));
+        for probe in [&missing, &other] {
+            assert!(gh_cannot_reach(probe, false), "{probe}");
+            assert!(!gh_cannot_reach(probe, true), "{probe}");
+        }
         assert!(!says_server_error("http 5"));
         assert!(!says_server_error("http 404: not found"));
     }

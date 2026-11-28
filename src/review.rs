@@ -901,10 +901,11 @@ fn implement_and_review(
     // `origin/<base>` in this invocation, and `refuse_issue_branch_rebuild`
     // has already refused to build over a branch that carried commits.
     repo.rewrite_commits_if_needed(work_dir, &base, None)?;
-    // A branch created in this invocation: there is no earlier remote head
-    // to lease against, and `refuse_issue_branch_rebuild` already refused to
-    // build over one that existed. Being new is also what lets it go to a
-    // fork when origin refuses it, since no pull request is on origin yet.
+    // A branch created in this invocation. Whatever origin holds under its
+    // name is checked again here, since a pull request can open on it while
+    // the agent works, and the push leases the tip that check passed. Being
+    // new is also what lets it go to a fork when origin refuses it, since no
+    // pull request is on origin yet.
     //
     // A failure here comes after the most expensive call of the run, so it
     // says where that work is and how to carry on from it. `spar run` cannot:

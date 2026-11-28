@@ -10084,6 +10084,10 @@ case "$1 $2" in
         printf '%s\n' '[{"number":70,"state":"CLOSED"},{"number":71,"state":"OPEN"}]'
         exit 0
         ;;
+      "closed-and-open:pr list --head issue-42 --state open --json number")
+        printf '%s\n' '[{"number":71}]'
+        exit 0
+        ;;
       "linked-other-base:pr list --state open --limit "*)
         printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Export","baseRefName":"main","closingIssuesReferences":[{"number":42}]}]'
         exit 0
@@ -10094,8 +10098,39 @@ case "$1 $2" in
         printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Older export","state":"OPEN"}]'
         exit 0
         ;;
-      "closed-pr-holds:pr list --head issue-42 --state all --json "*)
+      "closed-pr-holds:pr list --head issue-42 --state all --json "* \
+      | "crowded-out:pr list --head issue-42 --state all --json "*)
         printf '%s\n' '[{"number":70,"url":"https://github.com/example/project/pull/70","title":"Older export","state":"CLOSED"}]'
+        exit 0
+        ;;
+      "publish-lookup-failure:pr list --head issue-42 --state open --json number")
+        if [ -f "$SPAR_CODE_DIR/pr-71-opened" ]; then
+          printf '%s\n' 'HTTP 502: Bad Gateway' >&2
+          exit 1
+        fi
+        printf '%s\n' '[]'
+        exit 0
+        ;;
+      "opened-during-implementation:pr list --head issue-42 --state all --json "* \
+      | "opened-during-fetch:pr list --head issue-42 --state all --json "* \
+      | "opened-during-retry:pr list --head issue-42 --state all --json "*)
+        if [ -f "$SPAR_CODE_DIR/pr-71-opened" ]; then
+          printf '%s\n' '[{"number":70,"state":"CLOSED"},{"number":71,"state":"OPEN"}]'
+        else
+          printf '%s\n' '[{"number":70,"state":"CLOSED"}]'
+        fi
+        exit 0
+        ;;
+      "opened-during-implementation:pr list --head issue-42 --state open --json "* \
+      | "publish-lookup-failure:pr list --head issue-42 --state open --json "* \
+      | "opened-during-fetch:pr list --head issue-42 --state open --json "* \
+      | "opened-during-retry:pr list --head issue-42 --state open --json "* \
+      | "crowded-out:pr list --head issue-42 --state open --json "*)
+        if [ -f "$SPAR_CODE_DIR/pr-71-opened" ]; then
+          printf '%s\n' '[{"number":71,"url":"https://github.com/example/project/pull/71","title":"Older export","baseRefName":"feat/old"}]'
+        else
+          printf '%s\n' '[]'
+        fi
         exit 0
         ;;
     esac
@@ -10182,6 +10217,11 @@ case "$*" in
     ;;
   *"Implement GitHub issue #42"*)
     printf '%s\n' "implement:$1" >> "$SPAR_CODE_DIR/stages.log"
+    touch "$SPAR_CODE_DIR/implemented"
+    case "${SPAR_CODE_MODE:-}" in
+      opened-during-implementation|publish-lookup-failure|crowded-out)
+        touch "$SPAR_CODE_DIR/pr-71-opened" ;;
+    esac
     printf 'CSV export\n' > export.txt
     printf '%s\n' '{"summary":"Add CSV export","problem":"Rows cannot be exported","changes":["Export rows"],"testing":["Checked the fixture"],"notes":null,"criteria":[{"number":1,"status":"done","reason":"Columns keep their order"}]}'
     ;;
@@ -10298,6 +10338,24 @@ esac
         .next()
         .unwrap_or_default()
         .to_string()
+    }
+
+    /// A `git` that runs `cases`, a shell `case "$*"` body, before the real
+    /// one. `REAL_GIT` in it names the real one.
+    fn shim_git(&self, cases: &str) {
+        let real = Command::new("/bin/sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap();
+        assert!(real.status.success());
+        let real = String::from_utf8(real.stdout).unwrap();
+        let real = format!("'{}'", real.trim().replace('\'', "'\\''"));
+        let shim =
+            format!("#!/bin/sh\nset -eu\ncase \"$*\" in\n{cases}\nesac\nexec REAL_GIT \"$@\"\n");
+        executable(
+            &self.fx.dir.join("fake-bin/git"),
+            &shim.replace("REAL_GIT", &real),
+        );
     }
 }
 
@@ -10419,6 +10477,149 @@ fn a_closed_pull_request_does_not_cover_for_an_open_one_on_the_same_branch() {
     let said = format!("{out}{err}");
     assert!(said.contains("pull request #71 is open from it"), "{said}");
     assert!(!test.log("stages.log").contains("implement:"), "{said}");
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+/// Closed #70 holds the tip when the run starts, and #71 opens from it into
+/// `feat/old` while the agent implements.
+#[cfg(unix)]
+#[test]
+fn a_pull_request_opened_during_implementation_is_not_published_over() {
+    let test = CodeFixture::new();
+    let before = test.publish_issue_branch();
+
+    let (ok, out, err) = test.run_issue(&[], "opened-during-implementation");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(test.log("stages.log").contains("implement:"), "{said}");
+    assert!(said.contains("pull request #71 is open from it"), "{said}");
+    assert!(
+        said.contains("The work is kept on the local branch issue-42"),
+        "{said}"
+    );
+    assert!(!test.log("stages.log").contains("review:"), "{said}");
+    let calls = test.log("gh.log");
+    assert!(!calls.contains("pr create"), "{calls}");
+    assert!(!calls.contains("pr merge"), "{calls}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
+    assert_eq!(
+        "CSV export\n",
+        git(&test.fx.work, &["show", "issue-42:export.txt"]),
+        "{said}"
+    );
+}
+
+/// The same, with the old tip already on `main`, so it has nothing a closed
+/// pull request needs to hold.
+#[cfg(unix)]
+#[test]
+fn a_pull_request_opened_during_implementation_on_a_tip_already_on_base_is_not_published_over() {
+    let test = CodeFixture::new();
+    let before = test.publish_issue_branch();
+    git(
+        &test.fx.work,
+        &["push", "-q", "origin", &format!("{before}:refs/heads/main")],
+    );
+
+    let (ok, out, err) = test.run_issue(&[], "opened-during-implementation");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(test.log("stages.log").contains("implement:"), "{said}");
+    assert!(said.contains("pull request #71 is open from it"), "{said}");
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+/// #71 reopens during implementation, older than every closed pull request
+/// `--state all` returns, so that list shows only closed #70 holding the tip.
+#[cfg(unix)]
+#[test]
+fn an_open_pull_request_past_the_closed_ones_listed_is_not_published_over() {
+    let test = CodeFixture::new();
+    let before = test.publish_issue_branch();
+
+    let (ok, out, err) = test.run_issue(&[], "crowded-out");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(test.log("stages.log").contains("implement:"), "{said}");
+    assert!(said.contains("pull request #71 is open from it"), "{said}");
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+/// The old tip is on `main`, #71 opens during implementation, and the lookup
+/// before publishing fails with a 502.
+#[cfg(unix)]
+#[test]
+fn a_failed_pull_request_lookup_before_publishing_is_not_read_as_none_open() {
+    let test = CodeFixture::new();
+    let before = test.publish_issue_branch();
+    git(
+        &test.fx.work,
+        &["push", "-q", "origin", &format!("{before}:refs/heads/main")],
+    );
+
+    let (ok, out, err) = test.run_issue(&[], "publish-lookup-failure");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(test.log("stages.log").contains("implement:"), "{said}");
+    assert!(
+        said.contains("could not check whether a pull request is open from origin/issue-42"),
+        "{said}"
+    );
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+/// #71 opens while the publish check fetches closed #70's head.
+#[cfg(unix)]
+#[test]
+fn a_pull_request_opened_while_a_closed_head_is_fetched_is_not_published_over() {
+    let test = CodeFixture::new();
+    let before = test.publish_issue_branch();
+    test.shim_git(
+        r#"*refs/pull/70/head*)
+    if [ -f "$SPAR_CODE_DIR/implemented" ]; then touch "$SPAR_CODE_DIR/pr-71-opened"; fi
+    ;;"#,
+    );
+
+    let (ok, out, err) = test.run_issue(&[], "opened-during-fetch");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(test.log("stages.log").contains("implement:"), "{said}");
+    assert!(said.contains("pull request #71 is open from it"), "{said}");
+    assert!(!test.log("gh.log").contains("pr create"), "{said}");
+    assert_eq!(before, test.origin_issue_branch(), "{said}");
+}
+
+/// The first push fails with a 502, and #71 opens before it is tried again.
+#[cfg(unix)]
+#[test]
+fn a_pull_request_opened_before_a_push_is_retried_is_not_published_over() {
+    let test = CodeFixture::new();
+    let before = test.publish_issue_branch();
+    test.shim_git(
+        r#"*"push --force-with-lease=refs/heads/issue-42:"*)
+    if [ ! -f "$SPAR_CODE_DIR/pr-71-opened" ]; then
+        touch "$SPAR_CODE_DIR/pr-71-opened"
+        printf '%s\n' 'error: RPC failed; HTTP 502 curl 22 The requested URL returned error: 502' >&2
+        exit 1
+    fi
+    ;;"#,
+    );
+
+    let (ok, out, err) = test.run_issue(&[], "opened-during-retry");
+
+    assert!(!ok, "{out}\n{err}");
+    let said = format!("{out}{err}");
+    assert!(said.contains("Pushing again in 10s"), "{said}");
+    assert!(said.contains("pull request #71 is open from it"), "{said}");
     assert!(!test.log("gh.log").contains("pr create"), "{said}");
     assert_eq!(before, test.origin_issue_branch(), "{said}");
 }
